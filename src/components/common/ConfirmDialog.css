@@ -1,0 +1,28 @@
+.confirm-dialog {
+  width: min(420px, 100%);
+}
+
+.confirm-dialog-title {
+  margin-bottom: var(--ui-space-2);
+}
+
+.confirm-dialog-body {
+  margin: 0;
+  color: var(--ui-text-secondary);
+  font-size: var(--ui-size-sm);
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.confirm-dialog-error {
+  margin: var(--ui-space-3) 0 0;
+  color: var(--ui-danger);
+  font-size: var(--ui-size-caption);
+}
+
+.confirm-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--ui-space-2);
+  margin-top: var(--ui-space-5);
+}

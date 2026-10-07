@@ -1,0 +1,13 @@
+[package]
+name = "angelbot-mcp-rmcp-poc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "poc.rs"
+
+[dependencies]
+rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-async-rw"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }

@@ -1,0 +1,78 @@
+.thinking-effort-container {
+  position: relative;
+}
+
+.thinking-effort-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.thinking-effort-trigger:hover {
+  border-color: var(--color-text);
+  color: var(--color-text);
+}
+
+.thinking-effort-trigger svg:first-child {
+  opacity: 0.7;
+}
+
+.thinking-effort-dropdown {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 4px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 140px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+}
+
+.thinking-effort-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.1s;
+}
+
+.thinking-effort-option:hover {
+  background: var(--color-bg);
+}
+
+.thinking-effort-option.active {
+  background: var(--color-accent-subtle);
+}
+
+.effort-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.effort-desc {
+  font-size: 10px;
+  color: var(--color-muted);
+}
+
+.thinking-effort-option.active .effort-label {
+  color: var(--color-accent);
+}

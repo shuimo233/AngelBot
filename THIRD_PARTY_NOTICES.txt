@@ -1,0 +1,214 @@
+AngelBot - additional third-party notices for single-window capture
+
+windows-capture 2.0.1
+https://github.com/NiiightmareXD/windows-capture
+
+MIT License
+
+Copyright (c) 2023 NiiightmareXD
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+image 0.25.8
+https://github.com/image-rs/image
+Distributed under its MIT license option:
+
+MIT License
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+Scope of these additional notices
+
+This file covers the two direct single-window-capture additions and the
+new transitive package versions reachable from windows-capture 2.0.1 and
+image 0.25.8 that were absent from the repository HEAD Cargo.lock when
+these notices were prepared. It is not a complete license audit or notice
+bundle for all AngelBot dependencies.
+MIT or BSD-3-Clause is selected below where the published package permits it.
+License text and copyright notices are reproduced from the fixed versions;
+shared license bodies apply to every package explicitly listed in their group.
+
+Shared MIT license body - the following packages
+
+byteorder-lite 0.1.0
+https://github.com/image-rs/byteorder-lite
+License source: https://docs.rs/crate/byteorder-lite/0.1.0/source/LICENSE-MIT
+Copyright (c) 2015 Andrew Gallant
+Selected license: MIT
+
+crossbeam-deque 0.8.8
+https://github.com/crossbeam-rs/crossbeam
+License source: https://docs.rs/crate/crossbeam-deque/0.8.8/source/LICENSE-MIT
+Copyright (c) 2019 The Crossbeam Project Developers
+Selected license: MIT
+
+crossbeam-epoch 0.9.21
+https://github.com/crossbeam-rs/crossbeam
+License source: https://docs.rs/crate/crossbeam-epoch/0.9.21/source/LICENSE-MIT
+Copyright (c) 2019 The Crossbeam Project Developers
+Selected license: MIT
+
+either 1.19.0
+https://github.com/rayon-rs/either
+License source: https://docs.rs/crate/either/1.19.0/source/LICENSE-MIT
+Copyright (c) 2015
+Selected license: MIT
+
+rayon 1.12.0
+https://github.com/rayon-rs/rayon
+License source: https://docs.rs/crate/rayon/1.12.0/source/LICENSE-MIT
+Copyright (c) 2010 The Rust Project Developers
+Selected license: MIT
+
+rayon-core 1.13.0
+https://github.com/rayon-rs/rayon
+License source: https://docs.rs/crate/rayon-core/1.13.0/source/LICENSE-MIT
+Copyright (c) 2010 The Rust Project Developers
+Selected license: MIT
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Microsoft Windows bindings/support packages - shared MIT license
+
+windows 0.62.2
+https://github.com/microsoft/windows-rs
+License source: https://docs.rs/crate/windows/0.62.2/source/license-mit
+Selected license: MIT
+
+windows-collections 0.3.2
+https://github.com/microsoft/windows-rs
+License source: https://docs.rs/crate/windows-collections/0.3.2/source/license-mit
+Selected license: MIT
+
+windows-future 0.3.2
+https://github.com/microsoft/windows-rs
+License source: https://docs.rs/crate/windows-future/0.3.2/source/license-mit
+Selected license: MIT
+
+windows-numerics 0.3.1
+https://github.com/microsoft/windows-rs
+License source: https://docs.rs/crate/windows-numerics/0.3.1/source/license-mit
+Selected license: MIT
+
+windows-threading 0.2.1
+https://github.com/microsoft/windows-rs
+License source: https://docs.rs/crate/windows-threading/0.2.1/source/license-mit
+Selected license: MIT
+
+MIT License
+
+Copyright (c) Microsoft Corporation.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE
+
+Color-management/math packages - shared BSD-3-Clause license
+
+moxcms 0.7.11
+https://github.com/awxkee/moxcms.git
+License source: https://docs.rs/crate/moxcms/0.7.11/source/LICENSE.md
+Selected license: BSD-3-Clause
+
+pxfm 0.1.30
+https://github.com/awxkee/pxfm
+License source: https://docs.rs/crate/pxfm/0.1.30/source/LICENSE.md
+Selected license: BSD-3-Clause
+
+Copyright (c) Radzivon Bartoshyk. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1.  Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+
+2.  Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+3.  Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

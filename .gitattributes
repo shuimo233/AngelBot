@@ -1,0 +1,13 @@
+# Keep source diffs stable on Windows and CI without rewriting the whole tree.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.ico -text
+*.webp -text
+*.woff -text
+*.woff2 -text

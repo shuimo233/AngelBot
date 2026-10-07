@@ -1,0 +1,47 @@
+.workspace-reminders {
+  box-sizing: border-box;
+  width: min(100%, 560px);
+  margin: 12px auto;
+  border-top: 1px solid var(--color-border-muted);
+  color: var(--color-text);
+  text-align: left;
+}
+
+.workspace-reminders-summary {
+  padding: 10px 0;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--ui-size-caption);
+  line-height: 1.6;
+}
+
+.workspace-reminders-summary:focus-visible {
+  outline: 2px solid var(--color-accent-border);
+  outline-offset: 3px;
+  border-radius: var(--ui-radius-control);
+}
+
+.workspace-reminders-title { font-weight: 600; }
+.workspace-reminders-counts { margin-left: 10px; color: var(--color-muted); }
+.workspace-reminders-content {
+  display: grid;
+  gap: 12px;
+  padding: 0 0 10px;
+  max-height: min(200px, 18vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.workspace-reminders-section .messages-empty-section-title { margin-top: 0; font-weight: 500; }
+.workspace-reminders-note { margin: 6px 0 0; color: var(--color-muted); font-size: var(--ui-size-caption); line-height: 1.6; }
+.workspace-reminders-list .messages-empty-item-name { min-width: 0; }
+
+@media (max-height: 600px) {
+  .workspace-reminders { margin-top: 6px; margin-bottom: 6px; }
+  .workspace-reminders-content { max-height: 12vh; }
+}
+
+@media (max-width: 600px) {
+  .workspace-reminders-counts { display: block; margin-left: 16px; }
+  .workspace-reminders-list li { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .workspace-reminders-list .messages-empty-item-name { max-width: 100%; }
+}

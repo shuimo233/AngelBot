@@ -1,0 +1,3 @@
+-- The additive confirmation-schema column is installed by `migrate()` after a
+-- schema probe. SQLite lacks `ADD COLUMN IF NOT EXISTS`, and recovery may
+-- replay this version after the column survived but its journal record did not.

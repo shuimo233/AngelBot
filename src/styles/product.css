@@ -1,0 +1,513 @@
+/* Daily-driver surface: one restrained visual language across conversation,
+   workspace navigation and the project workbench. Component styles keep
+   ownership of layout; this file owns the shared product hierarchy. */
+
+html,
+body,
+#root {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: Inter, "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-feature-settings: "cv01", "ss03";
+  -webkit-font-smoothing: antialiased;
+}
+
+.app-shell { background: var(--color-bg); }
+
+.sidebar {
+  background: color-mix(in srgb, var(--color-surface) 94%, var(--color-bg));
+  border-right: 0;
+  backdrop-filter: none;
+}
+
+.sidebar-identity {
+  height: 52px;
+  padding: 9px 12px;
+}
+
+.sidebar-profile-mark {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: var(--color-warm-highlight-subtle);
+  color: var(--color-accent);
+  font-size: var(--ui-size-base);
+  font-weight: 600;
+}
+
+.sidebar-profile-name,
+.sidebar-section-heading { font-size: var(--ui-size-base); font-weight: 600; letter-spacing: 0.01em; }
+.sidebar-spacer { flex: 1; }
+
+.sidebar-primary-nav {
+  gap: 2px;
+  padding: 7px 8px;
+}
+
+.sidebar-primary-nav-item {
+  min-height: 34px;
+  border-radius: var(--ui-radius-control);
+  font-size: var(--ui-size-base);
+  transition: background-color var(--motion-feedback) ease, box-shadow var(--motion-feedback) ease, color var(--motion-feedback) ease;
+}
+
+.sidebar-primary-nav-item.active {
+  background: color-mix(in srgb, var(--color-warm-highlight-subtle) 46%, var(--color-surface));
+  box-shadow: inset 2px 0 var(--color-accent);
+  color: var(--color-text);
+}
+
+.sidebar-session-bar { min-height: 42px; padding: 7px 12px; }
+
+.sidebar-add-project,
+.sidebar-quick-switch {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: var(--ui-size-title);
+  font-weight: 400;
+  line-height: 1;
+}
+
+.sidebar-add-project:hover:not(:disabled),
+.sidebar-quick-switch:hover:not(:disabled) {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent);
+}
+
+.sidebar-quick-switch { font-size: 0; }
+
+.sidebar-section { padding: 8px; }
+.sidebar-section-label { padding: 12px 8px 5px; color: var(--color-muted); font-size: var(--ui-size-caption); font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+
+.sidebar-section > .session-item-select {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 36px;
+  margin: 1px 0;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-control);
+  color: var(--color-text-secondary);
+  gap: 8px;
+  transition: background-color var(--motion-feedback) ease, box-shadow var(--motion-feedback) ease, color var(--motion-feedback) ease;
+}
+
+.sidebar-section > .session-item-select:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.sidebar-section > .session-item-select.active {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--color-warm-highlight-subtle) 62%, var(--color-surface));
+  box-shadow: inset 2px 0 var(--color-accent);
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.chat-area { background: var(--color-bg); }
+
+.chat-header-new {
+  height: 52px;
+  padding: 0 18px;
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  border-bottom: 0;
+  backdrop-filter: blur(12px);
+}
+
+.chat-header-session-title { font-size: var(--ui-size-base); font-weight: 600; }
+
+.chat-header-workspace-kind {
+  border: 0;
+  background: var(--color-warm-highlight-subtle);
+  color: var(--color-text-secondary);
+}
+
+.model-config-notice {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px 7px 18px;
+  border-bottom: 1px solid var(--color-border-muted);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--ui-size-base);
+}
+.model-config-notice__marker { width: 3px; height: 26px; flex: 0 0 auto; background: var(--color-accent-fill); }
+.model-config-notice__copy { display: grid; min-width: 0; flex: 1; gap: 1px; }
+.model-config-notice__copy strong { color: var(--color-text); font-size: var(--ui-size-base); font-weight: 600; }
+.model-config-notice__copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-config-notice__actions { display: flex; flex: 0 0 auto; gap: 6px; }
+.model-config-notice__actions button { min-height: 30px; padding: 0 10px; border: 1px solid var(--color-border); border-radius: var(--ui-radius-control); background: var(--color-surface); color: var(--color-text-secondary); cursor: pointer; font: inherit; font-weight: 600; }
+.model-config-notice__actions button.is-primary { border-color: var(--color-accent-border); background: var(--color-accent-fill); color: var(--color-accent-contrast); }
+.model-config-notice__actions button:hover { border-color: var(--color-accent-border); color: var(--color-text); }
+
+.app-update-notice {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 6px 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-accent) 26%, var(--color-border-muted));
+  background: color-mix(in srgb, var(--color-accent-subtle) 72%, var(--color-surface));
+  color: var(--color-text-secondary);
+  font-size: var(--ui-size-base);
+}
+
+.app-update-notice.is-failed {
+  border-bottom-color: color-mix(in srgb, var(--color-warning) 35%, var(--color-border-muted));
+  background: color-mix(in srgb, var(--color-warning-surface) 50%, var(--color-surface));
+}
+
+.app-update-marker {
+  width: 3px;
+  height: 24px;
+  flex: 0 0 auto;
+  background: var(--color-accent-fill);
+}
+
+.app-update-notice.is-failed .app-update-marker { background: var(--color-warning); }
+.app-update-copy { display: grid; min-width: 0; flex: 1; gap: 1px; }
+.app-update-copy strong { color: var(--color-text); font-size: var(--ui-size-caption); letter-spacing: .04em; }
+.app-update-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-update-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
+.app-update-primary,
+.app-update-dismiss {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: var(--ui-radius-control);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+.app-update-primary {
+  border: 1px solid var(--color-accent-border);
+  background: var(--color-accent-subtle);
+  color: var(--color-text);
+}
+.app-update-dismiss {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+.app-update-primary:hover { filter: brightness(.96); }
+.app-update-dismiss:hover { border-color: var(--color-border); background: var(--color-surface); }
+
+.runtime-health-notice {
+  padding: 0 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border-muted));
+  background: color-mix(in srgb, var(--color-warning-surface) 58%, var(--color-surface));
+  color: var(--color-text-secondary);
+  font-size: var(--ui-size-base);
+  line-height: 1.5;
+}
+
+.runtime-health-notice.is-notice {
+  border-bottom-color: var(--color-border-muted);
+  background: color-mix(in srgb, var(--color-surface) 88%, var(--color-bg));
+}
+
+.runtime-health-summary {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+}
+
+.runtime-health-summary::-webkit-details-marker { display: none; }
+.runtime-health-summary::after {
+  margin-left: auto;
+  color: var(--color-muted);
+  content: '展开';
+  font-size: var(--ui-size-caption);
+}
+
+.runtime-health-notice[open] > .runtime-health-summary::after { content: '收起'; }
+.runtime-health-summary strong { color: var(--color-text); font-size: var(--ui-size-caption); letter-spacing: .03em; }
+.runtime-health-summary > span:last-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.runtime-health-indicator {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-warning);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-warning) 14%, transparent);
+}
+
+.runtime-health-notice.is-notice .runtime-health-indicator {
+  background: var(--color-muted);
+  box-shadow: none;
+}
+
+.runtime-health-details {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+  padding: 2px 0 12px 15px;
+}
+
+.runtime-health-details ul { display: grid; flex: 1; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.runtime-health-details li { display: grid; gap: 1px; }
+.runtime-health-details li strong { color: var(--color-text); font-size: var(--ui-size-base); }
+.runtime-health-details li span { color: var(--color-muted); }
+.runtime-health-action {
+  min-height: 30px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--ui-radius-control);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+.runtime-health-action:hover { border-color: var(--color-accent-border); color: var(--color-text); }
+
+@media (max-width: 720px) {
+  .model-config-notice { align-items: flex-start; flex-wrap: wrap; }
+  .model-config-notice__actions { width: 100%; padding-left: 13px; }
+  .app-update-notice { align-items: flex-start; flex-wrap: wrap; }
+  .app-update-actions { width: 100%; padding-left: 13px; }
+  .runtime-health-details { align-items: stretch; flex-direction: column; }
+  .runtime-health-action { align-self: flex-start; }
+}
+
+.messages {
+  width: 100%;
+  padding: 34px clamp(22px, 5vw, 72px) 64px;
+  gap: 22px;
+}
+
+/* Vertical space matters independently of width on high-DPI small laptops. */
+@media (max-height: 600px) {
+  .messages { padding-top: 12px; padding-bottom: 16px; }
+}
+
+.messages-empty {
+  align-items: stretch;
+  justify-content: flex-start;
+  text-align: left;
+  flex: 0 0 auto;
+  min-height: 0;
+  width: min(100%, 560px);
+  margin: clamp(40px, 8vh, 96px) auto auto;
+  padding: 18px 20px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.messages-empty-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  margin-bottom: 12px;
+  margin-left: 0;
+  margin-right: 0;
+  place-items: center;
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: var(--color-surface);
+  color: var(--color-accent);
+}
+
+.messages-empty-context { margin-bottom: 6px; color: var(--color-muted); font-size: var(--ui-size-caption); font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+.messages-empty-title { font-size: var(--ui-size-title); font-weight: 600; letter-spacing: -.02em; }
+.messages-empty-hint { width: 100%; max-width: 500px; margin: 0; color: var(--color-text-secondary); line-height: 1.7; opacity: 1; }
+
+.messages-empty-starters { margin-top: 24px; }
+.messages-empty-starter-list {
+  margin-top: 8px;
+  display: grid;
+  gap: 4px;
+}
+.messages-empty-starter {
+  display: grid;
+  grid-template-columns: minmax(126px, .72fr) minmax(220px, 1.5fr) 18px;
+  gap: 14px;
+  align-items: center;
+  width: 100%;
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.messages-empty-starter:hover,
+.messages-empty-starter:focus-visible { background: var(--ui-hover); }
+.messages-empty-starter:focus-visible { outline: 2px solid var(--color-accent-border); outline-offset: 2px; }
+.messages-empty-starter-title { font-size: var(--ui-size-base); font-weight: 600; }
+.messages-empty-starter-description { color: var(--color-muted); font-size: var(--ui-size-caption); line-height: 1.45; }
+.messages-empty-starter-arrow { color: var(--color-muted); font-size: var(--ui-size-base); text-align: right; }
+
+@media (max-width: 720px) {
+  .messages-empty-starter { grid-template-columns: 1fr 18px; gap: 3px 10px; }
+  .messages-empty-starter-description { grid-column: 1; }
+  .messages-empty-starter-arrow { grid-column: 2; grid-row: 1 / span 2; }
+}
+
+.messages-empty-suggestions {
+  margin-top: 12px;
+  padding: 7px;
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: var(--color-surface);
+}
+
+.message-content { width: min(100%, 820px); }
+.message-row.assistant .message-bubble {
+  padding: 4px 0;
+  color: var(--color-text);
+  background: transparent;
+  border: 0;
+}
+
+/* Location and workbench navigation use a cooler secondary accent so the
+   interface does not collapse every interaction into one brand color. */
+.message-file-link,
+.browser-go-button,
+.file-parent {
+  color: var(--color-cool-accent);
+}
+.message-row.user .message-bubble {
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: var(--color-surface);
+  box-shadow: 0 4px 14px var(--shadow-soft);
+}
+
+.composer-input-root {
+  gap: 9px;
+  padding: 12px clamp(18px, 4vw, 56px) 16px;
+  border-top: 0;
+  background: color-mix(in srgb, var(--color-surface) 94%, transparent);
+  box-shadow: none;
+  backdrop-filter: blur(14px);
+}
+
+/* Short desktop windows still need room to read the conversation when files
+   are staged. Compact spacing, not the disclosure text or input controls. */
+@media (max-height: 600px) {
+  .composer-input-root {
+    gap: 2px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+
+  .composer-files-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
+    gap: 4px 6px;
+    padding-block: 0;
+  }
+
+  .composer-file-chip { min-width: 0; }
+  .composer-file-chip small,
+  .composer-file-chip button { flex-shrink: 0; }
+}
+
+.composer-input { min-height: 72px; font-size: var(--ui-size-base); }
+.composer-send { min-width: 84px; min-height: 40px; border-radius: var(--ui-radius-control); }
+
+.right-panel {
+  background: var(--color-surface);
+}
+
+.right-panel-header { min-height: 52px; padding: 9px 12px; }
+.right-panel-title { color: var(--color-text-secondary); font-size: var(--ui-size-caption); letter-spacing: .09em; }
+.right-panel-content { padding: 10px; }
+
+/* Feature pages share one continuous work surface. Individual components own
+   their content, while this layer keeps their outer rhythm consistent. */
+.automation-page,
+.library-page {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 100%;
+  background: var(--color-bg);
+  animation: feature-surface-enter var(--motion-state) ease-out both;
+}
+
+.automation-header,
+.library-header {
+  border-bottom-color: var(--color-border-muted);
+}
+
+@keyframes feature-surface-enter {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 1100px) {
+  .messages { padding-inline: 22px; }
+}
+
+/* Preserve the conversation as the primary work surface. At compact desktop
+   widths the workbench becomes an inspector drawer before the navigation is
+   collapsed, matching the Windows list/details hierarchy. */
+@media (max-width: 1050px) {
+  .app-shell--workbench {
+    grid-template-areas: "sidebar main";
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  }
+
+  .app-shell--workbench .right-panel {
+    /* The drawer is removed from the grid at this breakpoint. Keeping its
+       desktop `grid-area: right` makes CSS Grid create an implicit third
+       track, which still squeezes the conversation even though the panel is
+       fixed. */
+    grid-area: auto;
+    position: fixed;
+    inset: 0 0 0 auto;
+    z-index: 400;
+    width: min(var(--right-panel-width), calc(100vw - 48px));
+    box-shadow: -12px 0 32px var(--shadow-soft);
+    animation: workbench-drawer-enter var(--motion-state) ease-out both;
+  }
+}
+
+@media (max-width: 959px) {
+  /* The sidebar and workbench are both fixed overlays here. Clear their
+     desktop grid placements so they cannot create implicit columns beside
+     the compact conversation surface. */
+  .app-shell.app-shell--workbench {
+    grid-template-areas:
+      "topbar"
+      "main";
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .app-shell.app-shell--workbench .sidebar {
+    grid-area: auto;
+  }
+
+  .app-shell--workbench .right-panel {
+    top: 44px;
+    width: min(360px, 100vw);
+  }
+}
+
+@keyframes workbench-drawer-enter {
+  from { opacity: 0; transform: translateX(8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* Geometry and surface discipline: functional edges, not decorative softness. */
+
+/* Motion is a navigation aid, never a requirement for understanding state. */

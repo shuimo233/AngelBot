@@ -1,0 +1,14 @@
+{
+  "identifier": "default",
+  "description": "Default capability",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:app:default",
+    "shell:allow-open",
+    "dialog:allow-open",
+    "notification:default",
+    "process:allow-restart"
+  ]
+}

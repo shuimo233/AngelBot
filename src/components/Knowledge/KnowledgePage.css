@@ -1,0 +1,218 @@
+/* src/components/Knowledge/KnowledgePage.css */
+
+.knowledge-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.knowledge-header {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.knowledge-page-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-text);
+  margin: 0 0 12px;
+}
+
+.knowledge-search-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.knowledge-search-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--color-muted);
+  pointer-events: none;
+}
+
+.knowledge-search-input {
+  width: 100%;
+  padding: 8px 12px 8px 34px;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.knowledge-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 20px;
+}
+
+.knowledge-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.knowledge-entry {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.knowledge-entry:hover {
+  border-color: var(--color-accent);
+}
+
+.knowledge-entry-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.knowledge-entry-category {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.knowledge-entry-date {
+  font-size: 11px;
+  color: var(--color-muted);
+}
+
+.knowledge-entry-content {
+  font-size: 13px;
+  color: var(--color-text);
+  line-height: 1.5;
+}
+
+.knowledge-entry-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+
+.knowledge-entry-source {
+  font-size: 11px;
+  color: var(--color-muted);
+}
+
+.knowledge-entry-importance {
+  color: #9a6700;
+  font-size: 11px;
+}
+
+.knowledge-empty {
+  padding: 32px;
+  text-align: center;
+  color: var(--color-muted);
+  font-size: 14px;
+}
+
+.knowledge-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.knowledge-add-button {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.knowledge-add-button:hover {
+  background: var(--color-surface);
+  border-color: var(--color-text-secondary);
+}
+
+.knowledge-add-form {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.knowledge-add-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+}
+
+.knowledge-add-form textarea:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-accent-subtle);
+}
+
+.knowledge-add-form-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.knowledge-add-hint {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.knowledge-add-form-footer button {
+  min-height: 32px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--color-accent-fill);
+  color: var(--color-accent-contrast);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.knowledge-add-form-footer button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.knowledge-add-error {
+  margin: 8px 0 0;
+  color: var(--color-danger);
+  font-size: 12px;
+}
+
+.knowledge-loading {
+  font-style: italic;
+}
+
+.knowledge-error {
+  padding: 8px 20px;
+  background: var(--color-danger);
+  color: white;
+  font-size: 12px;
+}

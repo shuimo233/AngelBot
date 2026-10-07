@@ -1,0 +1,15 @@
+{
+  "app": {
+    "security": {
+      "capabilities": [
+        "default",
+        {
+          "identifier": "desktop-e2e",
+          "description": "Desktop automation bridge enabled only by the isolated E2E build configuration.",
+          "windows": ["main"],
+          "permissions": ["wdio:default"]
+        }
+      ]
+    }
+  }
+}

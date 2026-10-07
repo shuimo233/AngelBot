@@ -1,0 +1,43 @@
+name: PR policy
+
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: PR policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Only read event metadata. Never check out or execute contributor code.
+      - name: Validate title and promotion route
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import sys
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              pr = json.load(event_file)["pull_request"]
+
+          title_pattern = r"(?:feat|fix|docs|refactor|test|build|ci|chore|perf|revert)(?:\([a-zA-Z0-9_./-]+\))?!?: [^\r\n]+"
+          if not re.fullmatch(title_pattern, pr["title"].strip()):
+              sys.exit("PR title must use type(scope): summary, for example: fix(desktop): reject stale window targets")
+
+          if pr["base"]["ref"] == "main":
+              source_repo = (pr["head"].get("repo") or {}).get("full_name")
+              target_repo = pr["base"]["repo"]["full_name"]
+              if pr["head"]["ref"] != "dev" or source_repo != target_repo:
+                  sys.exit("Stable promotions must come from this repository's dev branch.")
+
+          print("PR title and branch route passed.")

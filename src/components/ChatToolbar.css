@@ -1,0 +1,123 @@
+.chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--color-border-muted);
+  flex-shrink: 0;
+  background: rgba(251, 250, 247, 0.84);
+  gap: 8px;
+}
+
+.chat-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-toolbar-label {
+  font-size: 11px;
+  color: var(--color-muted);
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+/* Branch switcher styles */
+.branch-switcher {
+  position: relative;
+}
+
+.branch-switcher-button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 9px;
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid var(--color-border-muted);
+  border-radius: 7px;
+  color: var(--color-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.branch-switcher-button:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.branch-switcher-button.active {
+  background: var(--color-accent-subtle);
+  border-color: var(--color-accent-border);
+  color: var(--color-accent);
+}
+
+.branch-count-badge {
+  background: var(--color-accent-fill);
+  color: var(--color-accent-contrast);
+  border-radius: 10px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  min-width: 16px;
+  text-align: center;
+}
+
+.branch-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 5px;
+  min-width: 220px;
+  background: rgba(251, 250, 247, 0.98);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 18px 32px var(--shadow);
+  z-index: 500;
+}
+
+.branch-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  text-align: left;
+  transition: background 0.08s;
+  color: var(--color-text);
+}
+
+.branch-dropdown-item:hover {
+  background: var(--color-surface-hover);
+}
+
+.branch-dropdown-item.active {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.branch-dropdown-item .check-icon {
+  margin-left: auto;
+  color: var(--color-accent);
+}
+
+/* Dark mode adjustments */
+.dark .branch-dropdown {
+  background: rgba(30, 32, 31, 0.98);
+}

@@ -1,0 +1,66 @@
+/* Foundational behavior belongs to the library, not to a final CSS skin. */
+html, body, #root {
+  background: var(--ui-canvas);
+  color: var(--ui-text);
+  font-family: var(--ui-font-sans);
+  font-size: var(--ui-size-base);
+  line-height: var(--ui-leading-base);
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea { font-family: inherit; }
+code, pre, kbd { font-family: var(--ui-font-mono); }
+::selection { background: var(--ui-accent-soft); color: var(--ui-text); }
+:where(button, input, textarea, select, a, [tabindex]):focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 3px;
+}
+
+.ui-eyebrow {
+  color: var(--ui-muted);
+  font-size: var(--ui-size-caption);
+  font-weight: var(--ui-weight-emphasis);
+  letter-spacing: .07em;
+}
+.ui-surface {
+  background: var(--ui-surface);
+  border-radius: var(--ui-radius-panel);
+}
+.ui-stack { display: grid; gap: var(--ui-space-4); }
+.ui-inline { display: flex; align-items: center; gap: var(--ui-space-2); flex-wrap: wrap; }
+.ui-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--ui-space-3);
+  padding: var(--ui-space-3) var(--ui-space-4);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-subtle);
+  color: var(--ui-text-secondary);
+}
+.ui-notice--success { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-notice--warning { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-notice--danger { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  color: var(--ui-text-secondary);
+  background: var(--ui-subtle);
+  font-size: var(--ui-size-caption);
+  font-weight: var(--ui-weight-emphasis);
+}
+.ui-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ui-divider { height: 1px; border: 0; background: var(--ui-border); }
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --ui-duration-fast: 0ms; --ui-duration-base: 0ms; --ui-duration-enter: 0ms; }
+  html:focus-within { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

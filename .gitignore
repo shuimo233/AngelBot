@@ -1,0 +1,69 @@
+node_modules/
+__pycache__/
+*.pyc
+dist/
+src-tauri/target/
+src-tauri/target-crt-static-probe/
+src-tauri/tauri.release.conf.json
+src-tauri/*.obj
+src-tauri/*.manifest.xml
+target/
+*.log
+.env
+.env.*
+!.env.example
+!.env.*.example
+# Private signing material and isolated local desktop test data.
+*.key
+*.pfx
+*.p12
+/.desktop-test-runtime/
+# Tauri regenerates these from the build and capability configuration.
+/src-tauri/gen/schemas/
+.DS_Store
+tsconfig.tsbuildinfo
+_tmp_*
+.codex-runtime/
+.pet-runs/
+.tmp-agent-loop-validation/
+.tmp/
+# Local AI-editor state and downloaded skills never belong to the repository.
+.cursor/
+output/
+tmp/
+.docker/
+.superpowers/
+# Historical design material stays local. Keep only the canonical product,
+# architecture, release, and primary-source research documents under version
+# control so the repository does not accumulate superseded plans.
+docs/*
+!docs/current-roadmap.md
+!docs/design-philosophy.md
+!docs/desktop-beta-checklist.md
+!docs/adr/
+!docs/adr/**
+!docs/delegated-agent-framework-spec.md
+!docs/delegated-network-capability-spec.md
+!docs/wayfinder/
+!docs/wayfinder/**
+!docs/research/
+docs/research/*
+!docs/research/connected-services-windows.md
+!docs/research/design-principles-ui.md
+!docs/research/windows-daily-use-capabilities.md
+!docs/research/mcp-rust-sdk-2026-evaluation.md
+!docs/research/windows-computer-use-2026-evaluation.md
+!docs/research/windows-generic-computer-use-2026.md
+!docs/research/muse-computer-use-2026.md
+!docs/research/chatgpt-plan-access-2026.md
+!docs/research/codex-daily-capability-reference-2026-10-07.md
+!docs/research/luna-daily-capability-validation-2026-10-07.md
+!docs/research/tool-image-bridge-2026-10-07.md
+!docs/research/single-window-observation-2026-10-07.md
+/issues/
+/tools/
+# Keep the repository's verification guidance available to every coding agent.
+!AGENTS.md
+CLAUDE.md
+PRD.md
+commit_msg.txt
