@@ -1,20 +1,24 @@
 # GitHub PR workflow reference
 
-Verified against official GitHub documentation on 2026-10-07. This is a reference,
+Verified against official GitHub documentation on 2026-10-08. This is a reference,
 not proof that remote repository settings have been configured.
 
-## Current repository limitation
+## Public repository bootstrap
 
-Maintainer inspection on 2026-10-07 found `shuimo233/AngelBot` is **private**, its
-default branch is `dev`, and protection/ruleset API access returned HTTP 403 with
-an instruction to upgrade to GitHub Pro or make the repository public. Admin
-access does not remove a plan limitation. Keep visibility unchanged unless the
-owner explicitly decides otherwise. The owner subsequently chose MIT and
-authorized publication after checks pass. The reachable history inspection
-found deleted personal documents and browser traces, so that condition has not
-passed: keep the repository private pending an explicit cleanup strategy. No
-confirmed live credential was found by the bounded common-pattern scan; this
-is not an exhaustive no-secrets guarantee.
+The original private repository returned HTTP 403 for protection/ruleset APIs.
+The owner then chose MIT and approved preserving that predecessor as a private
+archive while creating a separate public repository. On 2026-10-08 the new
+`shuimo233/AngelBot` was created with default branch `dev` and one clean root from
+the verified source tree; the predecessor remains private and archived at
+`shuimo233/AngelBot-private-archive-20261007`. No old refs/history were uploaded.
+
+The public repository has one active `Integration PR gates` ruleset for `dev`,
+with PRs, resolved conversations, no force pushes/deletions and no bypass actors.
+Required check sources must be observed in this new repository, not inherited
+from the archive. Bootstrap those requirements only after successful runs, then
+read back the actual ruleset. The absent stable `main` is protected by extending
+the same ruleset when it is deliberately established; do not publish old local
+`main` or add a creation exception just to bypass unavailable checks.
 
 Protected branches and branch/tag rulesets are available for public repositories
 on GitHub Free; private repositories require an eligible paid plan. This matches
@@ -22,9 +26,15 @@ the observed limitation, but does not establish the account's exact subscription
 [Protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches),
 [Rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets).
 
-Until access changes, PRs, CI, and a maintainer checklist are a **manual policy**:
-they do not prevent direct pushes or merging a failed PR. Do not claim that a
-checked-in workflow, template, or ruleset example has enabled a remote merge gate.
+Checked-in workflows and templates alone do not establish remote merge gates.
+Verify the ruleset's enforcement, conditions, bypass actors and check sources;
+do not equate a policy example or local full test with GitHub enforcement.
+
+Renaming plus a new repository keeps predecessor objects out of the public
+object graph. Rewriting a branch in the same repository alone does not remove
+all cached or SHA-addressable content. Keep the archive and recovery bundle
+private; an ancestry hook cannot detect sensitive content cherry-picked into a
+new commit. [Sensitive-history limitations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository).
 
 ## Lightweight branch and review policy
 
@@ -59,6 +69,15 @@ must have succeeded in the repository within the past seven days. Where offered,
 select GitHub Actions as their expected source rather than accepting any sender.
 [Check names and sources](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging),
 [Check selection](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks).
+
+The check-run API exposes the exact job name and producing `app.id`. Ruleset
+requirements use `integration_id`; classic protection uses `app_id`, neither a
+check-run ID nor an installation ID. For this repository the three names are
+`Windows full verification`, `Windows desktop smoke test`, and `PR policy`.
+Read their actual runs before attaching them to the single active ruleset with
+`strict_required_status_checks_policy: true` and no branch-creation exemption.
+[Check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference),
+[Ruleset API](https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
 
 Run the canonical `python scripts/verify.py full` gate without credentials, live
 model requests, or user runtime data. Do not path-filter a required workflow:
