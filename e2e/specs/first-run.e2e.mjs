@@ -61,7 +61,7 @@ describe('first-run desktop experience', () => {
     await reminderRecall.waitForDisplayed({ timeout: 5_000 });
     await reminderRecall.$('summary').click();
     assert.match(await reminderRecall.getText(), /核对今天的安排/);
-    assert.match(await reminderRecall.getText(), /待提醒 1 · 今日已触发 0/);
+    assert.match(await reminderRecall.getText(), /待执行 1 · 今日已触发 0/);
     const reminder = (await browser.tauri.execute(({ core }) => core.invoke('get_automations')))
       .find((item) => item.executorKind === 'notification');
     assert.ok(reminder);
@@ -77,10 +77,10 @@ describe('first-run desktop experience', () => {
       await core.invoke('run_automation_now', { id: window.__angelbotE2eReminderId });
     });
     await browser.execute(() => window.dispatchEvent(new Event('focus')));
-    await browser.waitUntil(async () => /待提醒 0 · 今日已触发 1/.test(await reminderRecall.getText()), {
+    await browser.waitUntil(async () => /待执行 0 · 今日已触发 1/.test(await reminderRecall.getText()), {
       timeout: 5_000, timeoutMsg: 'local reminder receipt did not return to the existing Main conversation',
     });
-    assert.match(await reminderRecall.getText(), /不代表系统通知已送达/);
+    assert.match(await reminderRecall.getText(), /不代表任务已完成或系统通知已送达/);
     const reminderRuns = await browser.tauri.execute(({ core }) => core.invoke('get_automation_runs', {
       automationId: window.__angelbotE2eReminderId,
     }));
@@ -107,7 +107,7 @@ describe('first-run desktop experience', () => {
       }
     });
     await browser.execute(() => window.dispatchEvent(new Event('focus')));
-    await browser.waitUntil(async () => /待提醒 3 · 今日已触发 4/.test(await reminderRecall.getText()), { timeout: 5_000 });
+    await browser.waitUntil(async () => /待执行 3 · 今日已触发 4/.test(await reminderRecall.getText()), { timeout: 5_000 });
     await browser.setWindowSize(1200, 800);
     const reminderLayout = await browser.execute(() => ({
       messagesHeight: document.querySelector('.messages')?.getBoundingClientRect().height,
