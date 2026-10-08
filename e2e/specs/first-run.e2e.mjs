@@ -774,7 +774,29 @@ describe('first-run desktop experience', () => {
     assert.equal(readFileSync(approvedFilePath, 'utf8'), approvedFileContent);
 
     const approvedFileLocator = await browser.$('[aria-label="在工作台中定位 approved-by-e2e.txt"]');
-    await approvedFileLocator.waitForDisplayed({ timeout: 20_000 });
+    try {
+      await approvedFileLocator.waitForDisplayed({ timeout: 20_000 });
+    } catch (error) {
+      const replyState = await browser.tauri.execute(async ({ core }) => {
+        const messages = await core.invoke('get_messages', {
+          sessionId: window.__angelbotE2eProjectSessionId,
+        });
+        const writeTurn = messages.findLast((message) =>
+          message.toolCalls?.some((call) => call.id === 'desktop-e2e-approved-write'));
+        return {
+          writeStatus: writeTurn?.taskRun?.status,
+          citationPersisted: messages.some((message) =>
+            message.role === 'assistant' && message.content.includes('angelbot-file:approved-by-e2e.txt')),
+        };
+      }).catch(() => ({ unavailable: true }));
+      const displayState = await browser.execute(() => ({
+        fileLinks: [...document.querySelectorAll('.message-file-link')].map((link) => link.getAttribute('aria-label')),
+        liveBubbles: document.querySelectorAll('.message-bubble--content-stream').length,
+        liveCitation: [...document.querySelectorAll('.content-block-text')].some((block) =>
+          block.textContent.includes('查看 E2E 文件')),
+      })).catch(() => ({ unavailable: true }));
+      throw new Error(`${error.message}; ${JSON.stringify({ replyState, displayState })}`, { cause: error });
+    }
     await approvedFileLocator.click();
     const approvedFileEntry = await browser.$('//button[contains(@class,"file-item")][contains(.,"approved-by-e2e.txt")]');
     await approvedFileEntry.waitForDisplayed({ timeout: 20_000 });
