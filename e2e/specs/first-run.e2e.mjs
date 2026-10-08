@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const projectRoot = mkdtempSync(join(tmpdir(), 'angelbot-e2e-project-'));
+// Windows temp directories may use an 8.3 alias; match the backend's canonical root.
+const projectRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'angelbot-e2e-project-')));
 writeFileSync(join(projectRoot, 'README.md'), '# Desktop E2E Project\n\nThis file verifies the project workbench preview.\n');
 const notepadPath = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'notepad.exe');
 const mcpFixturePath = fileURLToPath(new URL('../fixtures/mcp-stdio.cjs', import.meta.url));
