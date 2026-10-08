@@ -7,6 +7,8 @@ src-tauri/target-crt-static-probe/
 src-tauri/tauri.release.conf.json
 src-tauri/*.obj
 src-tauri/*.manifest.xml
+# Static linker input used by build.rs, not a generated build artifact.
+!src-tauri/AngelBot.test.manifest.xml
 target/
 *.log
 .env

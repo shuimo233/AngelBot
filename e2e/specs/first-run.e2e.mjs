@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const projectRoot = mkdtempSync(join(tmpdir(), 'angelbot-e2e-project-'));
+// Windows temp directories may use an 8.3 alias; match the backend's canonical root.
+const projectRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'angelbot-e2e-project-')));
 writeFileSync(join(projectRoot, 'README.md'), '# Desktop E2E Project\n\nThis file verifies the project workbench preview.\n');
 const notepadPath = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'notepad.exe');
 const mcpFixturePath = fileURLToPath(new URL('../fixtures/mcp-stdio.cjs', import.meta.url));
@@ -61,7 +62,7 @@ describe('first-run desktop experience', () => {
     await reminderRecall.waitForDisplayed({ timeout: 5_000 });
     await reminderRecall.$('summary').click();
     assert.match(await reminderRecall.getText(), /核对今天的安排/);
-    assert.match(await reminderRecall.getText(), /待提醒 1 · 今日已触发 0/);
+    assert.match(await reminderRecall.getText(), /待执行 1 · 今日已触发 0/);
     const reminder = (await browser.tauri.execute(({ core }) => core.invoke('get_automations')))
       .find((item) => item.executorKind === 'notification');
     assert.ok(reminder);
@@ -77,10 +78,10 @@ describe('first-run desktop experience', () => {
       await core.invoke('run_automation_now', { id: window.__angelbotE2eReminderId });
     });
     await browser.execute(() => window.dispatchEvent(new Event('focus')));
-    await browser.waitUntil(async () => /待提醒 0 · 今日已触发 1/.test(await reminderRecall.getText()), {
+    await browser.waitUntil(async () => /待执行 0 · 今日已触发 1/.test(await reminderRecall.getText()), {
       timeout: 5_000, timeoutMsg: 'local reminder receipt did not return to the existing Main conversation',
     });
-    assert.match(await reminderRecall.getText(), /不代表系统通知已送达/);
+    assert.match(await reminderRecall.getText(), /不代表任务已完成或系统通知已送达/);
     const reminderRuns = await browser.tauri.execute(({ core }) => core.invoke('get_automation_runs', {
       automationId: window.__angelbotE2eReminderId,
     }));
@@ -107,7 +108,7 @@ describe('first-run desktop experience', () => {
       }
     });
     await browser.execute(() => window.dispatchEvent(new Event('focus')));
-    await browser.waitUntil(async () => /待提醒 3 · 今日已触发 4/.test(await reminderRecall.getText()), { timeout: 5_000 });
+    await browser.waitUntil(async () => /待执行 3 · 今日已触发 4/.test(await reminderRecall.getText()), { timeout: 5_000 });
     await browser.setWindowSize(1200, 800);
     const reminderLayout = await browser.execute(() => ({
       messagesHeight: document.querySelector('.messages')?.getBoundingClientRect().height,
@@ -773,7 +774,29 @@ describe('first-run desktop experience', () => {
     assert.equal(readFileSync(approvedFilePath, 'utf8'), approvedFileContent);
 
     const approvedFileLocator = await browser.$('[aria-label="在工作台中定位 approved-by-e2e.txt"]');
-    await approvedFileLocator.waitForDisplayed({ timeout: 20_000 });
+    try {
+      await approvedFileLocator.waitForDisplayed({ timeout: 20_000 });
+    } catch (error) {
+      const replyState = await browser.tauri.execute(async ({ core }) => {
+        const messages = await core.invoke('get_messages', {
+          sessionId: window.__angelbotE2eProjectSessionId,
+        });
+        const writeTurn = messages.findLast((message) =>
+          message.toolCalls?.some((call) => call.id === 'desktop-e2e-approved-write'));
+        return {
+          writeStatus: writeTurn?.taskRun?.status,
+          citationPersisted: messages.some((message) =>
+            message.role === 'assistant' && message.content.includes('angelbot-file:approved-by-e2e.txt')),
+        };
+      }).catch(() => ({ unavailable: true }));
+      const displayState = await browser.execute(() => ({
+        fileLinks: [...document.querySelectorAll('.message-file-link')].map((link) => link.getAttribute('aria-label')),
+        liveBubbles: document.querySelectorAll('.message-bubble--content-stream').length,
+        liveCitation: [...document.querySelectorAll('.content-block-text')].some((block) =>
+          block.textContent.includes('查看 E2E 文件')),
+      })).catch(() => ({ unavailable: true }));
+      throw new Error(`${error.message}; ${JSON.stringify({ replyState, displayState })}`, { cause: error });
+    }
     await approvedFileLocator.click();
     const approvedFileEntry = await browser.$('//button[contains(@class,"file-item")][contains(.,"approved-by-e2e.txt")]');
     await approvedFileEntry.waitForDisplayed({ timeout: 20_000 });

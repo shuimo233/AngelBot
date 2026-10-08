@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUNBUFFERED: '1'
+
 concurrency:
   group: verify-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -19,7 +22,9 @@ jobs:
   full:
     name: Windows full verification
     runs-on: windows-latest
-    timeout-minutes: 35
+    # Cold hosted Windows runs can exceed the previous full-job budget.
+    # Keep all cases and per-process bounds; allow the first uncached run to finish.
+    timeout-minutes: 50
 
     steps:
       - uses: actions/checkout@v4
