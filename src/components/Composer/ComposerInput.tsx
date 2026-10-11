@@ -663,7 +663,7 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
               outline: 'none',
               resize: 'none',
               color: 'var(--color-text)',
-              fontSize: 15,
+              fontSize: 'var(--ui-chat-font-size, 14px)',
               lineHeight: 1.65,
               fontFamily: 'inherit',
               minHeight: 24,

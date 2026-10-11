@@ -29,6 +29,32 @@ Use proximity, heading hierarchy and small surface differences to group content.
 
 Theme state lives in `stores/theme.ts`: `light`, `dark`, `system`; `initializeTheme()` handles live system changes and returns listener cleanup. Transitions use short token durations and honor reduced motion. Feedback must also be visible without animation; do not invent execution percentages.
 
+## Settings and reading preferences
+
+Settings share the library's type scale and a single content scroller. At widths
+up to 760 px, the same grouped navigation becomes a native page selector rather
+than consuming the content column. Selection and callbacks are shared; this is
+not another router. The existing dialog focus hook excludes hidden/inert
+branches and keeps Escape, focus trapping and trigger restoration.
+
+`stores/appearance.ts` owns conversation text size (12–20 px), reduced motion,
+and the existing local background preferences. `initializeAppearance()` restores
+them at app startup, not when Settings first opens. The input, persisted message
+bubbles and streamed text all consume `--ui-chat-font-size`; navigation and
+toolbars retain the shared UI scale. `data-reduced-motion` disables transitions
+and animations, while the OS reduced-motion preference always takes precedence.
+The theme store remains the only color-theme owner.
+
+Background selection is a keyboard-accessible native file picker, accepts raster
+images up to 2 MB, and reuses `bgImage`/`bgOpacity` storage keys. Uploads stay on
+this device. A failed storage write leaves the current appearance usable, shows
+a warning, and retries unsaved preferences on the next edit. Slider changes do
+not rewrite background image data on every input event.
+
+Do not expose settings that only change their own local widget state. The
+unconnected language selector has been removed; translated application UI is
+not implemented by this change.
+
 ## Interactive reference and verification
 
 Run `npm run dev`, then open **http://127.0.0.1:5173/ui.html**. The standalone gallery uses the actual controls and theme state but has no backend, model, file or credential operations. Its examples are explicitly illustrative. It is a development entry, not an additional app route or production settings page.

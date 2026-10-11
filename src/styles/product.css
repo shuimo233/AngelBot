@@ -287,6 +287,11 @@ body,
   width: 100%;
   padding: 34px clamp(22px, 5vw, 72px) 64px;
   gap: 22px;
+  /* A flat canvas wash controls image opacity without fading message text. */
+  --chat-background-wash: color-mix(in srgb, var(--ui-canvas) calc(100% - var(--bg-opacity) * 100%), transparent);
+  background-image: linear-gradient(var(--chat-background-wash), var(--chat-background-wash)), var(--bg-image);
+  background-size: cover;
+  background-position: center;
 }
 
 /* Vertical space matters independently of width on high-DPI small laptops. */
@@ -370,6 +375,7 @@ body,
 }
 
 .message-content { width: min(100%, 820px); }
+.message-bubble { font-size: var(--ui-chat-font-size, 14px); }
 .message-row.assistant .message-bubble {
   padding: 4px 0;
   color: var(--color-text);

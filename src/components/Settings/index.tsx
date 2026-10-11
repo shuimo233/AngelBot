@@ -83,12 +83,6 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
         onClick={(e) => e.stopPropagation()}
       >
         <div className="settings-header">
-          <button className="settings-close-btn" onClick={onClose} aria-label="关闭">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
           <h2 id="settings-dialog-title" className="settings-header-title">设置</h2>
           <span id="settings-save-hint" className={`settings-save-hint${saveState === 'error' ? ' is-error' : ''}`} role={saveState === 'error' ? 'alert' : undefined}>
             {saveState === 'error'
@@ -113,6 +107,12 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
               ) : saveState === 'saving' ? '保存中…' : saveState === 'error' ? '重试保存' : '保存'}
             </button>
           )}
+          <button className="settings-close-btn" onClick={onClose} aria-label="关闭">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
         <SettingsRouter activePage={activePage} onNavigate={setActivePage} />
       </div>

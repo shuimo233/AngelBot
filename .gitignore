@@ -7,6 +7,7 @@ src-tauri/target-crt-static-probe/
 src-tauri/tauri.release.conf.json
 src-tauri/*.obj
 src-tauri/*.manifest.xml
+!src-tauri/AngelBot.test.manifest.xml
 target/
 *.log
 .env

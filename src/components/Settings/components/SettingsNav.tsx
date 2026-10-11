@@ -1,26 +1,40 @@
 import { settingsNavItems } from './SettingsIcons';
 import type { SettingsPage } from '../types';
+import { Select } from '../../../ui';
 
 interface SettingsNavProps {
   activePage: SettingsPage;
   onNavigate: (page: SettingsPage) => void;
 }
 
-export function SettingsNav({ activePage, onNavigate }: SettingsNavProps) {
-  const groups = [
-    { label: '智能体', pages: ['personality', 'memory'] },
-    { label: '模型与连接', pages: ['api', 'webSearch', 'mcp', 'channels'] },
-    { label: '权限与工具', pages: ['executionPermission', 'desktopControl', 'fileAccess', 'projectNetwork'] },
-    { label: '偏好与数据', pages: ['workMode', 'appearance', 'notifications', 'data'] },
-  ];
+const groups = [
+  { label: '智能体', pages: ['personality', 'memory'] },
+  { label: '模型与连接', pages: ['api', 'webSearch', 'mcp', 'channels'] },
+  { label: '权限与工具', pages: ['executionPermission', 'desktopControl', 'fileAccess', 'projectNetwork'] },
+  { label: '偏好与数据', pages: ['workMode', 'appearance', 'notifications', 'data'] },
+];
 
+export function SettingsNav({ activePage, onNavigate }: SettingsNavProps) {
   return (
     <nav className="settings-nav" aria-label="设置分类">
-      {groups.map((group) => {
-        const items = settingsNavItems.filter((item) => group.pages.includes(item.id));
-        if (items.length === 0) return null;
+      <label className="settings-nav-compact">
+        <span>设置页面</span>
+        <Select value={activePage} onChange={(event) => onNavigate(event.target.value as SettingsPage)}>
+          {groups.map((group) => (
+            <optgroup key={group.label} label={group.label}>
+              {settingsNavItems.filter((item) => group.pages.includes(item.id)).map((item) => (
+                <option key={item.id} value={item.id}>{item.label}</option>
+              ))}
+            </optgroup>
+          ))}
+        </Select>
+      </label>
+      <div className="settings-nav-list">
+        {groups.map((group) => {
+          const items = settingsNavItems.filter((item) => group.pages.includes(item.id));
+          if (items.length === 0) return null;
 
-        return (
+          return (
           <div className="settings-nav-group" key={group.label}>
             <div className="settings-nav-group-label">{group.label}</div>
             {items.map((item) => (
@@ -35,8 +49,9 @@ export function SettingsNav({ activePage, onNavigate }: SettingsNavProps) {
               </button>
             ))}
           </div>
-        );
-      })}
+          );
+        })}
+      </div>
     </nav>
   );
 }

@@ -54,6 +54,20 @@ code, pre, kbd { font-family: var(--ui-font-mono); }
 .ui-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .ui-divider { height: 1px; border: 0; background: var(--ui-border); }
 
+:root[data-reduced-motion] {
+  --ui-duration-fast: 0ms;
+  --ui-duration-base: 0ms;
+  --ui-duration-enter: 0ms;
+}
+:root[data-reduced-motion] *,
+:root[data-reduced-motion] *::before,
+:root[data-reduced-motion] *::after {
+  animation-duration: .01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: .01ms !important;
+  scroll-behavior: auto !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   :root { --ui-duration-fast: 0ms; --ui-duration-base: 0ms; --ui-duration-enter: 0ms; }
   html:focus-within { scroll-behavior: auto; }
