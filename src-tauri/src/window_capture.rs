@@ -508,7 +508,7 @@ mod tests {
                 .stderr(Stdio::piped());
             command
         };
-        let output = run_bounded_child(&mut make("$b=New-Object byte[] 1048576; [Console]::OpenStandardOutput().Write($b,0,$b.Length); [Console]::Error.Write('fixture')"), None, MAX_PNG_BYTES, &|| false, Duration::from_secs(5)).unwrap();
+        let output = run_bounded_child(&mut make("$b=[byte[]]::new(1048576); [Console]::OpenStandardOutput().Write($b,0,$b.Length); [Console]::Error.Write('fixture')"), None, MAX_PNG_BYTES, &|| false, Duration::from_secs(5)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 1_048_576);
         assert_eq!(output.stderr, b"fixture");
