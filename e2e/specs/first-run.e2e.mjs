@@ -358,7 +358,7 @@ describe('first-run desktop experience', () => {
       itemIconLeft: settingsNavigationLayout?.groupTextLeft,
       expectedLabelLeft: settingsNavigationLayout?.expectedLabelLeft,
       groupTextLeft: settingsNavigationLayout?.groupTextLeft,
-      itemFontSize: '13px',
+      itemFontSize: '14px',
       groupFontSize: '12px',
     });
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), '模型与 API');

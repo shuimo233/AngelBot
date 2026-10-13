@@ -1,8 +1,10 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { SettingsSection } from '../components/SettingsSection';
 import { SelectField } from '../components/SelectField';
 import { ToggleField } from '../components/ToggleField';
 import { useThemeStore } from '$stores/theme';
+import { useAppearanceStore } from '$stores/appearance';
+import { Button } from '../../../ui';
 
 const themeOptions = [
   { value: 'light', label: '浅色' },
@@ -10,133 +12,74 @@ const themeOptions = [
   { value: 'system', label: '跟随系统' },
 ];
 
-const langOptions = [
-  { value: 'zh-CN', label: '中文' },
-  { value: 'en', label: 'English' },
-];
-
 export function AppearanceSettings() {
   const theme = useThemeStore((state) => state.theme);
   const setTheme = useThemeStore((state) => state.setTheme);
-  const [language, setLanguage] = useState('zh-CN');
-  const [fontSize, setFontSize] = useState(14);
-  const [animations, setAnimations] = useState(true);
-  const [bgImage, setBgImage] = useState(() => localStorage.getItem('bgImage') || '');
-  const [bgOpacity, setBgOpacity] = useState(() => Number(localStorage.getItem('bgOpacity') || 30));
+  const fontSize = useAppearanceStore((state) => state.chatFontSize);
+  const reduceMotion = useAppearanceStore((state) => state.reduceMotion);
+  const bgImage = useAppearanceStore((state) => state.bgImage);
+  const bgOpacity = useAppearanceStore((state) => state.bgOpacity);
+  const persistenceError = useAppearanceStore((state) => state.persistenceError);
+  const update = useAppearanceStore((state) => state.update);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [imageError, setImageError] = useState('');
 
-  const handleThemeChange = (value: string) => {
-    if (value === 'light' || value === 'dark' || value === 'system') setTheme(value);
-  };
-
-  const handleBgImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleBgImageUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
     if (!file) return;
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type) || file.size > 2 * 1024 * 1024) {
+      setImageError('请选择不超过 2 MB 的 PNG、JPG、WebP 或 GIF 图片。');
+      return;
+    }
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = ev.target?.result as string;
-      setBgImage(dataUrl);
-      localStorage.setItem('bgImage', dataUrl);
-      applyBgImage(dataUrl, bgOpacity);
+    reader.onload = () => {
+      update({ bgImage: String(reader.result) });
+      setImageError('');
     };
+    reader.onerror = () => setImageError('无法读取图片，请重新选择。');
     reader.readAsDataURL(file);
   };
 
-  const applyBgImage = (url: string, opacity: number) => {
-    const root = document.documentElement;
-    root.style.setProperty('--bg-image', url ? `url("${url}")` : 'none');
-    root.style.setProperty('--bg-opacity', String(opacity / 100));
-  };
-
-  const handleBgOpacityChange = (value: number) => {
-    setBgOpacity(value);
-    localStorage.setItem('bgOpacity', String(value));
-    applyBgImage(bgImage, value);
-  };
-
-  const handleRemoveBgImage = () => {
-    setBgImage('');
-    localStorage.removeItem('bgImage');
-    document.documentElement.style.removeProperty('--bg-image');
-  };
-
-  // 初始化背景图片
-  if (bgImage && !document.documentElement.style.getPropertyValue('--bg-image')) {
-    applyBgImage(bgImage, bgOpacity);
-  }
-
   return (
-    <div className="settings-page-content">
-      <SettingsSection title="主题" description="选择应用的外观主题">
-        <SelectField
-          label="颜色主题"
-          value={theme}
-          options={themeOptions}
-          onChange={handleThemeChange}
-        />
+    <div className="settings-page-content appearance-settings">
+      {persistenceError && <p className="ui-notice ui-notice--warning" role="status">外观已应用，但本机存储不可用或空间不足，重启后可能无法保留。</p>}
+      <SettingsSection title="主题" description="颜色主题与侧栏快捷切换保持同步。" defaultOpen>
+        <SelectField label="颜色主题" value={theme} options={themeOptions} onChange={(value) => {
+          if (value === 'light' || value === 'dark' || value === 'system') setTheme(value);
+        }} />
       </SettingsSection>
-
-      <SettingsSection title="背景图片" description="设置聊天区域的背景图片">
-        {bgImage ? (
-          <div className="bg-preview">
-            <img src={bgImage} alt="背景预览" className="bg-preview-img" />
-            <div className="bg-preview-actions">
-              <button className="btn btn-secondary btn-sm" onClick={handleRemoveBgImage}>移除</button>
-            </div>
-          </div>
-        ) : (
-          <div className="bg-upload-area">
-            <label className="bg-upload-btn">
-              <input type="file" accept="image/*" onChange={handleBgImageUpload} hidden />
-              <span>上传背景图片</span>
-            </label>
-          </div>
-        )}
-        {bgImage && (
-          <div className="slider-field" style={{ marginTop: 12 }}>
-            <label>背景透明度</label>
-            <div className="slider-row">
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={bgOpacity}
-                onChange={(e) => handleBgOpacityChange(Number(e.target.value))}
-              />
-              <span className="slider-value">{bgOpacity}%</span>
-            </div>
-          </div>
-        )}
-      </SettingsSection>
-
-      <SettingsSection title="语言" description="选择界面显示语言">
-        <SelectField
-          label="界面语言"
-          value={language}
-          options={langOptions}
-          onChange={setLanguage}
-        />
-      </SettingsSection>
-
-      <SettingsSection title="显示" description="调整界面显示效果">
+      <SettingsSection title="阅读与动效" description="调整对话文字，不改变工具栏和导航的大小。" defaultOpen>
         <div className="slider-field">
-          <label>字体大小</label>
+          <label htmlFor="chat-font-size">对话文字大小</label>
           <div className="slider-row">
-            <input
-              type="range"
-              min="12"
-              max="20"
-              value={fontSize}
-              onChange={(e) => setFontSize(Number(e.target.value))}
-            />
-            <span className="slider-value">{fontSize}px</span>
+            <input id="chat-font-size" type="range" min="12" max="20" value={fontSize}
+              onChange={(event) => update({ chatFontSize: Number(event.target.value) })} />
+            <output className="slider-value" htmlFor="chat-font-size">{fontSize}px</output>
           </div>
         </div>
-        <ToggleField
-          label="界面动画"
-          description="页面切换和元素动画效果"
-          checked={animations}
-          onChange={setAnimations}
-        />
+        <p className="appearance-reading-preview" aria-label="对话文字预览" style={{ fontSize }}>
+          把要处理的事情告诉我，我们一起理清下一步。
+        </p>
+        <ToggleField label="减少动态效果" description="关闭非必要的过渡和位移动画；始终尊重系统的减少动态效果设置。"
+          checked={reduceMotion} onChange={(value) => update({ reduceMotion: value })} />
+      </SettingsSection>
+      <SettingsSection title="背景图片" description="仅在本机保存，用于聊天区域。支持 PNG、JPG、WebP 或 GIF，最大 2 MB。">
+        {bgImage && <img src={bgImage} alt="背景预览" className="bg-preview-img" />}
+        <div className="ui-inline">
+          <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={handleBgImageUpload} hidden />
+          <Button onClick={() => fileInput.current?.click()}>{bgImage ? '更换背景图片' : '选择背景图片'}</Button>
+          {bgImage && <Button variant="ghost" onClick={() => { update({ bgImage: '' }); setImageError(''); }}>移除背景</Button>}
+        </div>
+        {imageError && <p role="alert" className="ui-notice ui-notice--danger">{imageError}</p>}
+        {bgImage && <div className="slider-field">
+          <label htmlFor="bg-opacity">背景不透明度</label>
+          <div className="slider-row">
+            <input id="bg-opacity" type="range" min="0" max="100" value={bgOpacity}
+              onChange={(event) => update({ bgOpacity: Number(event.target.value) })} />
+            <output className="slider-value" htmlFor="bg-opacity">{bgOpacity}%</output>
+          </div>
+        </div>}
       </SettingsSection>
     </div>
   );

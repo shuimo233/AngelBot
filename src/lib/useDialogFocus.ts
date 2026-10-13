@@ -49,7 +49,17 @@ export function useDialogFocus<T extends HTMLElement>({
       const dialog = dialogRef.current;
       if (event.key !== 'Tab' || !dialog) return;
 
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+        .filter((element) => {
+          if (element.closest('[hidden], [inert]')) return false;
+          // Responsive navigation can remain mounted while CSS hides its branch.
+          for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
+            const style = getComputedStyle(ancestor);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (ancestor === dialog) break;
+          }
+          return true;
+        });
       if (focusable.length === 0) {
         event.preventDefault();
         dialog.focus();

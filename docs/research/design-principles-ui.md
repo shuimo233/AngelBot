@@ -173,3 +173,16 @@ Windows 将运动描述为 reactive、direct、context appropriate，用于反�
 - Apple, [Human Interface Guidelines — Motion](https://developer.apple.com/design/human-interface-guidelines/motion)
 - Material Design 3, [Canonical layout examples](https://m3.material.io/foundations/layout/canonical-examples/overview)
 - Max Wertheimer (1923), [Laws of Organization in Perceptual Forms](https://www.yorku.ca/pclassic/Wertheimer/Forms/forms.htm), York University Classics in the History of Psychology archive
+
+## 2026-10-11 补充：日常使用界面的克制精修
+
+本轮仅调整现有组件的层级、间距、焦点、导航和运动，不增加产品功能，不做全站重设计。以下均复核自 Microsoft Fluent 2 与 W3C 一手资料；具体配色、像素组合与时长是 AngelBot 实施建议，不是规范强制值。
+
+1. **用留白取代重复分隔。** Fluent 明确指出，间距可以建立信息分组，不必借助线条等图形分隔。现有侧栏、设置分组与辅助面板优先移除“外层面板 + 内层卡片”的重复包裹；保留输入框、可交互边界和必要区域分界。验收以“组内距离小于组间距离、同层级共享对齐线”为准。[Fluent 2：Layout](https://fluent2.microsoft.design/layout)
+2. **建立少量稳定的层级与间距。** Fluent 使用以 4px 为基础的间距阶梯，并强调一致节奏不等于机械使用相同间距。现有页面可用 `8/12px` 表达紧密关联、`16px` 容器内距、`24/32px` 章节间距；标题、正文、说明用字重和位置形成三层，避免同时缩小和淡化说明文字。这是本项目建议，需结合实际内容验证，不要求套用 Fluent 组件皮肤。[Fluent 2：Layout](https://fluent2.microsoft.design/layout)
+3. **暖色来自中性底，不来自整面强调色。** Fluent 用中性色承载表面、文字和布局，通过更明亮表面突出主内容；同时警告大面积或过量品牌色会冲淡层级。推论：AngelBot 可保持轻微暖灰底与明亮主工作区，把暖色强调收敛到主操作、当前选中与少量状态；不要给每层容器都加暖色边框、阴影或渐变。[Fluent 2：Color](https://fluent2.microsoft.design/color)
+4. **导航用于定位，次级动作不抢主层级。** Fluent 建议导航简短、易扫读、面向用户目标，并用选中指示明确当前位置；每个导航节点一般只保留一个次级动作。现有导航保留文字标签和统一的当前页状态，不通过新增入口或嵌套层级“优化”；会话行的次级操作可在 hover 与 keyboard focus 时显现，但始终留在 DOM，不只为鼠标创建。[Fluent 2：Nav](https://fluent2.microsoft.design/components/web/react/core/nav/usage/)
+5. **边框可减，键盘焦点不可减。** WCAG 2.4.7 要求键盘焦点有持续可见的指示；2.4.11 AA 要求焦点组件不被作者内容完全遮住，完全无遮挡是更高目标。实施时保留统一 `:focus-visible` 样式，检查侧栏行操作、输入区和弹层的 Tab 路径；必要时用滚动内边距避免 sticky 头尾遮挡焦点。不能用“选中背景”代替“当前键盘焦点”。[W3C：Focus Visible](https://www.w3.org/WAI/WCAG22/Understanding/focus-visible.html)；[W3C：Focus Not Obscured (Minimum)](https://www.w3.org/WAI/WCAG22/Understanding/focus-not-obscured-minimum.html)
+6. **动效只解释局部变化，日常路径保持安静。** Fluent 建议顶级页面使用快速淡入淡出而非整页滑动，并把运动限制在当前关注的元素。现有 hover/press 可统一为约 `100–150ms`，小浮层约 `160–200ms`；不新增逐项错峰入场、背景脉动或页面大位移。在 `prefers-reduced-motion: reduce` 下移除非必要位移和缩放，而非只缩短动画；W3C C39 是实现该偏好的充分技术之一，不是独立的 AA 强制技术。[Fluent 2：Motion](https://fluent2.microsoft.design/motion)；[W3C：C39 Reduced Motion](https://www.w3.org/WAI/WCAG22/Techniques/css/C39)
+
+本轮验收应覆盖浅色/深色、宽/窄窗口与纯键盘；“边框更少”不能造成输入边界、当前页、焦点或运行状态难以辨认。此补充为设计决策依据，不宣称完成可访问性合规审计。

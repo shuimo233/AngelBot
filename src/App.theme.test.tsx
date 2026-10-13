@@ -74,7 +74,7 @@ describe('App theme synchronization', () => {
     vi.stubGlobal('matchMedia', vi.fn(() => media));
     localStorage.setItem('theme', 'system');
     const view = render(<StrictMode><App /><AppearanceSettings /></StrictMode>);
-    await user.click(screen.getByRole('button', { name: '主题' }));
+    expect(screen.getByLabelText('颜色主题')).toBeVisible();
     expect(screen.getByLabelText('颜色主题')).toHaveValue('system');
 
     act(() => {
@@ -93,5 +93,17 @@ describe('App theme synchronization', () => {
     view.unmount();
     expect(listeners.size).toBe(0);
     expect(media.removeEventListener).toHaveBeenCalledTimes(media.addEventListener.mock.calls.length);
+  });
+
+  it('restores reading and background preferences without opening Settings', () => {
+    localStorage.setItem('chatFontSize', '18');
+    localStorage.setItem('reduceMotion', 'true');
+    localStorage.setItem('bgImage', 'data:image/png;base64,example');
+    localStorage.setItem('bgOpacity', '40');
+    render(<StrictMode><App /></StrictMode>);
+    expect(document.documentElement.style.getPropertyValue('--ui-chat-font-size')).toBe('18px');
+    expect(document.documentElement.style.getPropertyValue('--bg-image')).toContain('data:image/png;base64,example');
+    expect(document.documentElement.style.getPropertyValue('--bg-opacity')).toBe('0.4');
+    expect(document.documentElement).toHaveAttribute('data-reduced-motion');
   });
 });

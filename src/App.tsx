@@ -11,6 +11,7 @@ import { useNavigationStore } from './stores/navigation';
 import { useSettingsStore } from './stores/settings';
 import { useWorkspacesStore } from './stores/workspaces';
 import { initializeTheme, useThemeStore } from './stores/theme';
+import { initializeAppearance } from './stores/appearance';
 import { runDueAutomations } from './lib/commands/automation';
 import { isTauriRuntime } from './lib/invoke';
 import { AUTOMATIONS_UPDATED_EVENT } from './components/WorkspaceReminders';
@@ -59,6 +60,7 @@ export default function App() {
   }, [apiConfigLoaded, loadApiConfig]);
 
   useEffect(() => initializeTheme(), []);
+  useEffect(() => initializeAppearance(), []);
 
   useEffect(() => {
     const handleLocateFile = (event: Event) => {
