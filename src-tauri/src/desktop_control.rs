@@ -3584,6 +3584,44 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    const FIXTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    #[cfg(windows)]
+    fn run_fixture_commands(
+        mut commands: Vec<std::process::Command>,
+    ) -> Vec<crate::window_capture::BoundedChildOutput> {
+        // Overlap slow PowerShell/CLR startup, keeping each fixture process-local.
+        // The canonical runner serializes Rust tests, so batches do not overlap.
+        let mut outputs = Vec::with_capacity(commands.len());
+        for batch in commands.chunks_mut(4) {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = batch
+                    .iter_mut()
+                    .map(|command| {
+                        scope.spawn(move || {
+                            command
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped());
+                            crate::window_capture::run_bounded_child(
+                                command,
+                                None,
+                                8192,
+                                &|| false,
+                                FIXTURE_TIMEOUT,
+                            )
+                            .expect("synthetic PowerShell fixture failed")
+                        })
+                    })
+                    .collect();
+                outputs.extend(workers.into_iter().map(|worker| worker.join().unwrap()));
+            });
+        }
+        assert_eq!(outputs.len(), commands.len());
+        outputs
+    }
+
+    #[cfg(windows)]
     #[test]
     fn capture_window_selector_enumerates_hwnds_without_changing_control_observation() {
         assert!(CAPTURE_WINDOW_SCRIPT.contains("EnumWindows("));
@@ -3633,7 +3671,7 @@ function Test-Selection($candidates) {
             None,
             8192,
             &|| false,
-            std::time::Duration::from_secs(5),
+            FIXTURE_TIMEOUT,
         )
         .unwrap();
         assert!(output.status.success());
@@ -4848,7 +4886,7 @@ else { $firstControl.Failure = $failure }
             "$walker = New-Object ObservationTestWalker",
         );
         let script = format!("{fixture}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{observation}");
-        for (failure, expected_controls) in [
+        let cases = [
             ("current", 1),
             ("role", 1),
             ("visibility", 1),
@@ -4875,12 +4913,21 @@ else { $firstControl.Failure = $failure }
             ("runtimeNegative", 2),
             ("healthyEdit", 2),
             ("none", 2),
-        ] {
-            let output = desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap())
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                .env("ANGELBOT_TEST_FAILURE", failure)
-                .output()
-                .unwrap();
+        ];
+        let commands = cases
+            .iter()
+            .map(|(failure, _)| {
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .env("ANGELBOT_TEST_FAILURE", failure);
+                command
+            })
+            .collect();
+        for ((failure, expected_controls), output) in
+            cases.into_iter().zip(run_fixture_commands(commands))
+        {
             if matches!(failure, "rootCurrent" | "rootVisibility" | "rootPassword") {
                 assert!(!output.status.success(), "fixture {failure}");
                 assert_eq!(
@@ -4973,7 +5020,7 @@ $firstControl.RoleOverride = $env:ANGELBOT_TEST_ROLE
 $firstControl.NextSibling = $null
 "#;
         let script = format!("{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\n{observation}");
-        for (role, failure) in [
+        let cases = [
             ("Pane", "none"),
             ("Document", "none"),
             ("List", "none"),
@@ -4982,13 +5029,20 @@ $firstControl.NextSibling = $null
             ("List", "invalidPosition"),
             ("Pane", "emptyName"),
             ("Pane", "disabled"),
-        ] {
-            let output = desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap())
-                .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
-                .env("ANGELBOT_TEST_FAILURE", failure)
-                .env("ANGELBOT_TEST_ROLE", format!("ControlType.{role}"))
-                .output()
-                .unwrap();
+        ];
+        let commands = cases
+            .iter()
+            .map(|(role, failure)| {
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
+                    .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env("ANGELBOT_TEST_ROLE", format!("ControlType.{role}"));
+                command
+            })
+            .collect();
+        for ((role, failure), output) in cases.into_iter().zip(run_fixture_commands(commands)) {
             assert!(
                 output.status.success(),
                 "{role}/{failure}: {}",
@@ -5046,7 +5100,7 @@ function Get-Process {
         let script = format!(
             "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\ntry {{\n{VERIFIED_SET_VALUE_SCRIPT}\n}} catch {{ @{{ code = ($_.Exception.Message -split '\\|')[0]; written = $firstControl.Written }} | ConvertTo-Json -Compress }}"
         );
-        for failure in [
+        let failures = [
             "current",
             "password",
             "visibility",
@@ -5066,17 +5120,24 @@ function Get-Process {
             "readBackCase",
             "readBackNull",
             "none",
-        ] {
-            let output = desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap())
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                .env("ANGELBOT_TEST_FAILURE", failure)
-                .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
-                .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
-                .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
-                .env("ANGELBOT_FIELD_LABEL", "first")
-                .env("ANGELBOT_DRAFT_TEXT", "Exact Case")
-                .output()
-                .unwrap();
+        ];
+        let commands = failures
+            .iter()
+            .map(|failure| {
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
+                    .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
+                    .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
+                    .env("ANGELBOT_FIELD_LABEL", "first")
+                    .env("ANGELBOT_DRAFT_TEXT", "Exact Case");
+                command
+            })
+            .collect();
+        for (failure, output) in failures.into_iter().zip(run_fixture_commands(commands)) {
             assert!(
                 output.status.success(),
                 "fixture {failure}: {}",
@@ -5130,7 +5191,7 @@ else { $firstControl.Failure = $failure }
         let script = format!(
             "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\ntry {{\n{target_script}\n{mutate}\n{CONTROL_OPERATION_SCRIPT}\n}} catch {{ @{{ code = ($_.Exception.Message -split '\\|')[0]; invoked = $firstControl.Invoked }} | ConvertTo-Json -Compress }}"
         );
-        for failure in [
+        let failures = [
             "renamed",
             "changedRole",
             "disabled",
@@ -5154,18 +5215,25 @@ else { $firstControl.Failure = $failure }
             "invokePattern",
             "invokeThrows",
             "none",
-        ] {
-            let output = desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap())
-                .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
-                .env("ANGELBOT_TEST_FAILURE", failure)
-                .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
-                .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
-                .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
-                .env("ANGELBOT_CONTROL_LABEL", "first")
-                .env("ANGELBOT_CONTROL_ROLE", "button")
-                .env("ANGELBOT_CONTROL_OPERATION", "invoke")
-                .output()
-                .unwrap();
+        ];
+        let commands = failures
+            .iter()
+            .map(|failure| {
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
+                    .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
+                    .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
+                    .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
+                    .env("ANGELBOT_CONTROL_LABEL", "first")
+                    .env("ANGELBOT_CONTROL_ROLE", "button")
+                    .env("ANGELBOT_CONTROL_OPERATION", "invoke");
+                command
+            })
+            .collect();
+        for (failure, output) in failures.into_iter().zip(run_fixture_commands(commands)) {
             assert!(
                 output.status.success(),
                 "fixture {failure}: {}",
@@ -5234,6 +5302,8 @@ if ($failure -ceq 'noop') {
         let script = format!(
             "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\ntry {{\n{target_script}\n{mutate}\n{operation_script}\n}} catch {{ @{{ code = ($_.Exception.Message -split '\\|')[0]; applied = $firstControl.Applied; mutationCount = $firstControl.MutationCount }} | ConvertTo-Json -Compress }}"
         );
+        let mut cases = Vec::new();
+        let mut commands = Vec::new();
         for operation in [
             DesktopControlOperation::Select,
             DesktopControlOperation::Expand,
@@ -5272,84 +5342,88 @@ if ($failure -ceq 'noop') {
                 {
                     continue;
                 }
-                let output =
-                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap())
-                        .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
-                        .env("ANGELBOT_TEST_FAILURE", failure)
-                        .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
-                        .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
-                        .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
-                        .env("ANGELBOT_CONTROL_LABEL", "first")
-                        .env(
-                            "ANGELBOT_CONTROL_ROLE",
-                            if operation == DesktopControlOperation::Select {
-                                "radioButton"
-                            } else if scrolling {
-                                "pane"
-                            } else {
-                                "menuItem"
-                            },
-                        )
-                        .env("ANGELBOT_CONTROL_OPERATION", operation.as_str())
-                        .output()
-                        .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{operation:?}/{failure}: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
+                    .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
+                    .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
+                    .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
+                    .env("ANGELBOT_CONTROL_LABEL", "first")
+                    .env(
+                        "ANGELBOT_CONTROL_ROLE",
+                        if operation == DesktopControlOperation::Select {
+                            "radioButton"
+                        } else if scrolling {
+                            "pane"
+                        } else {
+                            "menuItem"
+                        },
+                    )
+                    .env("ANGELBOT_CONTROL_OPERATION", operation.as_str());
+                cases.push((operation, failure));
+                commands.push(command);
+            }
+        }
+        for ((operation, failure), output) in cases.into_iter().zip(run_fixture_commands(commands))
+        {
+            assert!(
+                output.status.success(),
+                "{operation:?}/{failure}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!(
+                        "{operation:?}/{failure}: {error}; {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    )
+                });
+            if matches!(failure, "none" | "delayedState" | "noop") {
+                assert_eq!(result["status"], "verified", "{operation:?}/{failure}");
+                assert_eq!(result["action"], operation.as_str());
+                assert_eq!(
+                    result["applied"],
+                    failure != "noop",
+                    "{operation:?}/{failure}"
                 );
-                let result: serde_json::Value = serde_json::from_slice(&output.stdout)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "{operation:?}/{failure}: {error}; {}",
-                            String::from_utf8_lossy(&output.stdout)
-                        )
-                    });
-                if matches!(failure, "none" | "delayedState" | "noop") {
-                    assert_eq!(result["status"], "verified", "{operation:?}/{failure}");
-                    assert_eq!(result["action"], operation.as_str());
-                    assert_eq!(
-                        result["applied"],
-                        failure != "noop",
-                        "{operation:?}/{failure}"
-                    );
-                } else if matches!(
+            } else if matches!(
+                failure,
+                "missingPattern"
+                    | "stateUnavailable"
+                    | "leaf"
+                    | "invalidPosition"
+                    | "nonScrollable"
+            ) {
+                assert!(
+                    matches!(
+                        result["code"].as_str(),
+                        Some("UNSUPPORTED_CONTROL" | "TARGET_UNAVAILABLE")
+                    ),
+                    "{operation:?}/{failure}: {result}"
+                );
+                assert_eq!(result["applied"], false, "{operation:?}/{failure}");
+            } else {
+                assert_eq!(
+                    result["code"], "RESULT_UNKNOWN",
+                    "{operation:?}/{failure}: {result}"
+                );
+                assert_eq!(result["applied"], true, "{operation:?}/{failure}");
+            }
+            assert_eq!(
+                result["mutationCount"],
+                u32::from(!matches!(
                     failure,
-                    "missingPattern"
+                    "noop"
+                        | "missingPattern"
                         | "stateUnavailable"
                         | "leaf"
                         | "invalidPosition"
                         | "nonScrollable"
-                ) {
-                    assert!(
-                        matches!(
-                            result["code"].as_str(),
-                            Some("UNSUPPORTED_CONTROL" | "TARGET_UNAVAILABLE")
-                        ),
-                        "{operation:?}/{failure}: {result}"
-                    );
-                    assert_eq!(result["applied"], false, "{operation:?}/{failure}");
-                } else {
-                    assert_eq!(
-                        result["code"], "RESULT_UNKNOWN",
-                        "{operation:?}/{failure}: {result}"
-                    );
-                    assert_eq!(result["applied"], true, "{operation:?}/{failure}");
-                }
-                assert_eq!(
-                    result["mutationCount"],
-                    u32::from(!matches!(
-                        failure,
-                        "noop"
-                            | "missingPattern"
-                            | "stateUnavailable"
-                            | "leaf"
-                            | "invalidPosition"
-                            | "nonScrollable"
-                    )),
-                    "the effect must never repeat: {operation:?}/{failure}"
-                );
-            }
+                )),
+                "the effect must never repeat: {operation:?}/{failure}"
+            );
         }
     }
 

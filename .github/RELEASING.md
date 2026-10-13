@@ -47,16 +47,26 @@ updater plugin and creates signed update artifacts.
 - One maintainer cannot approve their own PR: use zero mandatory approvals until
   another eligible reviewer joins, while still requiring explicit maintainer
   review/merge and resolved conversations. Do not require all-tree CODEOWNERS.
-- GitHub protection/rulesets are remote settings, not enabled by these files.
-  Once available, require PRs and the three checks, current base checks and resolved
-  conversations; block force pushes/deletions and administrator bypass. Keep a
-  single protection mechanism, and verify the actual rules after configuring it.
-  The private repository returned HTTP 403 during setup; do not claim an enforced
-  merge gate while that limitation remains. Reference: `PR-WORKFLOW-REFERENCE.md`.
+- The public repository's active `Integration PR gates` ruleset protects `dev`:
+  require PRs and resolved conversations, block force pushes/deletions, and leave
+  bypass actors empty. GitHub settings are remote, not enabled by these files.
+  During bootstrap, attach the three required checks with their observed GitHub
+  Actions app IDs after their first successful runs in the new repository. Require
+  an up-to-date base; verify all three requirements by reading the ruleset back.
+  Do not claim a required-check gate from a workflow file alone. Keep one ruleset,
+  not overlapping classic protections. Reference: `PR-WORKFLOW-REFERENCE.md`.
+  When a stable `main` is explicitly established from tested public `dev`, extend
+  this same ruleset to it. Do not create `main` from the old local archive branch.
 - Local automatic post-commit pushing is disabled. The previous hook is retained
   at `.git/hooks/post-commit.autopush-disabled` for recovery, not execution. Hooks
   are local metadata: inspect existing hooks before each first commit in a checkout;
   do not install automatic pushes in clones.
+- The migration checkout has a local `.git/hooks/pre-push` guard requiring the
+  clean public root to be the sole ancestry root. It rejects shallow/grafted
+  ancestry and ignores replacement refs. This prevents accidental old-history
+  pushes, including merges with an unchanged current tree; it does not scan file
+  contents or tag messages and is not enforcement in other clones. Never bypass
+  it to publish archive refs. Review any cherry-picked content independently.
 - Before cleaning historical references, save and verify a local Git bundle.
   Prune only registrations whose worktree directories no longer exist, and
   delete only inactive branches already merged into the current integration
@@ -68,12 +78,20 @@ updater plugin and creates signed update artifacts.
 
 ### Publication boundary
 
-The owner chose MIT and authorized public visibility after checks pass. Current
-source checks did not confirm live credentials, but the existing remote `dev`
-history contains deleted personal documents and browser traces. Publication is
-therefore blocked until the owner chooses an explicit history cleanup strategy;
-do not make the repository public or force-rewrite its history as a side effect
-of setting up PRs. Keep the private history and local recovery bundle protected.
+The owner chose MIT and explicitly approved a new public repository with clean
+history. On 2026-10-08, the predecessor was renamed to
+`shuimo233/AngelBot-private-archive-20261007` and kept private and archived. A
+different repository was created at `shuimo233/AngelBot`; only the verified source
+tree was bootstrapped, with root `913ce8883891c6954a62e5c6c153547a4280587c` and no
+old parent. This is not a force-push followed by publishing the predecessor.
+
+The original history remains in the private archive and a verified local bundle;
+old local branches/stash and the runtime-owned worktree were preserved. Do not
+push `archive/*`, the stash or runtime branches to the public remote, use
+`push --all`/`--mirror`, or merge predecessor history into public branches. A fresh
+public clone contains only the new history. Source checks found no confirmed live
+credential, but a bounded scan is not an exhaustive no-secrets guarantee. Keep
+private recovery material outside published trees and release artifacts.
 
 ## One-time repository setup
 
