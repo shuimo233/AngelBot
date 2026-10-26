@@ -1607,7 +1607,36 @@ describe('first-run desktop experience', () => {
     await attachedRow.$('button[title="编辑消息"]').click();
     await attachedRow.$('textarea[aria-label="编辑后的消息内容"]').setValue('按优先级重新整理这份附件。');
     await attachedRow.$('button=重新发送').click();
-    await browser.$('//*[contains(text(), "已按编辑后的要求重新整理")]').waitForDisplayed({ timeout: 20_000 });
+    try {
+      await browser.$('//*[contains(text(), "已按编辑后的要求重新整理")]').waitForDisplayed({ timeout: 20_000 });
+    } catch (error) {
+      // [DEBUG-e2e-edit] Bounded synthetic-state diagnostics; never print bodies.
+      const diagnostic = await browser.tauri.execute(async ({ core }) => {
+        const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
+        const messages = await core.invoke('get_messages', { sessionId: personal.activeSessionId });
+        const source = messages.find((item) => item.textAttachments?.some((file) => file.name === 'daily-actions.csv'));
+        const editor = document.querySelector('[aria-label="编辑后的消息内容"]');
+        const submit = document.querySelector('.message-inline-editor-submit');
+        return {
+          sourceId: source?.id,
+          edited: source?.content === '按优先级重新整理这份附件。',
+          sourceMarker: source?.textAttachments?.some((file) => file.text.includes('attachment-e2e-marker')),
+          editorPresent: Boolean(editor),
+          editorMatches: editor?.value === '按优先级重新整理这份附件。',
+          submitDisabled: submit?.disabled,
+          streaming: Boolean(document.querySelector('button[title="停止运行"]')),
+          recent: messages.slice(-5).map((item) => ({
+            id: item.id, parentId: item.parentId, role: item.role, status: item.taskRun?.status,
+            expectedReply: item.content.includes('已按编辑后的要求重新整理'),
+            snapshotMarker: item.content.includes('attachment-e2e-marker'),
+            assertionFailures: ['user-data', 'capability'].filter((kind) =>
+              JSON.stringify(item).includes(`desktop E2E ${kind} assertion failed`)),
+          })),
+        };
+      }).catch(() => ({ diagnosticUnavailable: true }));
+      console.error('[DEBUG-e2e-edit]', JSON.stringify(diagnostic));
+      throw error;
+    }
     const editedMessages = await browser.tauri.execute(async ({ core }) => {
       const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
       if (!personal?.activeSessionId) throw new Error('Personal Main conversation identity missing');
