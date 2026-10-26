@@ -1662,8 +1662,9 @@ describe('first-run desktop experience', () => {
     assert.equal(revokedAppApprovals.length, 1);
     await revokedAppApprovals[0].click();
     await browser.waitUntil(async () =>
-      (await browser.$('[aria-label="桌面操作结果"]')).isDisplayed(), { timeout: 10_000 });
-    const failedDesktopReceipt = await browser.$('[aria-label="桌面操作结果"]');
+      (await browser.$('[aria-label="操作结果"]')).isDisplayed(),
+    { timeout: 10_000, timeoutMsg: 'revoked desktop action did not produce a visible operation receipt' });
+    const failedDesktopReceipt = await browser.$('[aria-label="操作结果"]');
     assert.match(await failedDesktopReceipt.getText(), /操作未完成/);
     assert.match(await failedDesktopReceipt.getText(), /重试前请先核对/);
     const failedReceiptMessages = await browser.tauri.execute(async ({ core }) => {
