@@ -455,7 +455,9 @@ class DesktopE2eArtifactTests(unittest.TestCase):
     def test_continue_delivery_retains_main_history_and_refuses_replay(self):
         for failure in (None, 'old-history', 'replay'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                # Exercise a noncanonical spelling even where NTFS 8.3 aliases
+                # are disabled; the existing owned directory still resolves identically.
+                root = Path(directory) / '..' / Path(directory).name
                 previous = root / 'prior'
                 results = previous / 'restored/results'
                 results.mkdir(parents=True)
@@ -501,7 +503,7 @@ class DesktopE2eArtifactTests(unittest.TestCase):
                 def driver(_command, **kwargs):
                     env = kwargs['env']
                     self.assertEqual(env['ANGELBOT_PRIVATE_LIVE_PHASE'], 'browser-continue')
-                    self.assertEqual(Path(env['ANGELBOT_PRIVATE_CONTINUATION_PROFILE']), results.parent)
+                    self.assertEqual(Path(env['ANGELBOT_PRIVATE_CONTINUATION_PROFILE']), results.parent.resolve())
                     owned = Path(env['ANGELBOT_PRIVATE_LIVE_ROOT'])
                     (owned / 'browser-continue.passed').write_text(env['ANGELBOT_PRIVATE_LIVE_RECEIPT'])
                     with contextlib.closing(sqlite3.connect(database)) as conn:

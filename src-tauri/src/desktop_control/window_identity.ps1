@@ -21,6 +21,7 @@ public static class AngelBotCaptureWindows {
   [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
   [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
   [DllImport("kernel32.dll", EntryPoint = "SetLastError", SetLastError = true)] private static extern void ResetLastError(uint error);
   [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)] private static extern int GetWindowLong(IntPtr hwnd, int index);
   private static bool IsAuxiliary(AngelBotControlWindowCandidate candidate) {

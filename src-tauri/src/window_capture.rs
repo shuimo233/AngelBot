@@ -9,10 +9,6 @@ use std::sync::Arc;
 
 #[cfg(windows)]
 mod native;
-#[cfg(windows)]
-mod target;
-#[cfg(windows)]
-pub(crate) use target::select_target;
 
 const HELPER_ARGUMENT: &str = "--angelbot-window-capture-helper-v1";
 const MAX_TARGET_BYTES: usize = 8192;

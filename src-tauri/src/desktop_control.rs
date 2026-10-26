@@ -2036,24 +2036,52 @@ fn control_observation_script(has_region_scope: bool) -> String {
     )
 }
 
-/// Window selection uses scalar Win32 metadata. Only the selected trusted HWND
-/// enters UIA, in a bounded child, without compiling C# on the capture path.
+/// Capture remains limited to top-level HWNDs. Controls can additionally use
+/// the exact trusted process's own HWND inside a separate Windows app host.
 #[cfg(windows)]
-const CAPTURE_WINDOW_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
+const CAPTURE_WINDOW_SELECTION_SCRIPT: &str = r#"
+function Select-CaptureWindow($candidates, $expected) {
+  $matches = @($candidates | Where-Object {
+    $_.visible -and $_.ownerless -and $_.processId -gt 0 -and $_.windowHandle -gt 0 -and
+    [string]$_.executablePath -ieq $expected
+  })
+  if ($matches.Count -eq 0) { throw 'TARGET_NOT_FOUND|The trusted application has no eligible window' }
+  if ($matches.Count -ne 1) { throw 'TARGET_AMBIGUOUS|The trusted application has multiple eligible windows' }
+  return $matches[0]
+}
+"#;
+
+#[cfg(windows)]
+const CAPTURE_WINDOW_SCRIPT: &str = concat!(
+    include_str!("desktop_control/window_identity.ps1"),
+    r#"
 $expected = [IO.Path]::GetFullPath($env:ANGELBOT_TARGET_EXE)
-$expectedProcessId = [uint32]$env:ANGELBOT_CAPTURE_PID
-$windows = @([IntPtr]::new([long]$env:ANGELBOT_CAPTURE_HWND))
+$candidates = @([AngelBotCaptureWindows]::EligibleWindows() | ForEach-Object {
+  $handle = [IntPtr]::new([long]$_)
+  $processId = [uint32]0
+  $threadId = [AngelBotCaptureWindows]::GetWindowThreadProcessId($handle, [ref]$processId)
+  if ($threadId -ne 0 -and $processId -gt 0) {
+    try {
+      $process = Get-Process -Id $processId -ErrorAction Stop
+      $path = [IO.Path]::GetFullPath($process.Path)
+      @{ visible = $true; ownerless = $true; processId = $processId; windowHandle = [long]$_; executablePath = $path }
+    } catch {}
+  }
+})
+$selected = Select-CaptureWindow $candidates $expected
+$windows = @([IntPtr]::new([long]$selected.windowHandle))
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 $root = [Windows.Automation.AutomationElement]::FromHandle($windows[0])
 if ($null -eq $root) { throw 'TARGET_UNAVAILABLE|The trusted application window is unavailable' }
-if ((Get-UiaSafetyState $root).processId -ne $expectedProcessId) { throw 'TARGET_CHANGED|The trusted window identity changed' }
-"#;
+if ((Get-UiaSafetyState $root).processId -ne $selected.processId) { throw 'TARGET_CHANGED|The trusted window identity changed' }
+"#
+);
 
 /// Existing UIA safety metadata, bounded walk. No field values or names exit.
 #[cfg(windows)]
 const CAPTURE_TARGET_SCRIPT: &str = r#"
 $rootState = Get-UiaSafetyState $root
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 if ($rootState.offscreen -or $rootState.password) { throw 'SENSITIVE_SURFACE|The trusted window cannot be captured' }
 $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
 $pending = New-Object System.Collections.Stack
@@ -2076,6 +2104,7 @@ while ($pending.Count -gt 0) {
   }
 }
 $stateAfter = Get-UiaSafetyState $root
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 if ($stateAfter.password -or $stateAfter.offscreen -or $stateAfter.processId -ne $rootState.processId) {
   throw 'TARGET_CHANGED|The trusted application window changed'
 }
@@ -2094,11 +2123,8 @@ pub(crate) fn capture_target_probe(
     timeout: std::time::Duration,
 ) -> Result<crate::window_capture::CaptureTarget, DesktopAdapterError> {
     use std::process::Stdio;
-    let started = std::time::Instant::now();
-    let target = crate::window_capture::select_target(executable_path, is_cancelled, timeout)?;
-    let script =
-        format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{CAPTURE_WINDOW_SCRIPT}\n{CAPTURE_TARGET_SCRIPT}");
-    let mut command = desktop_child_command(WindowsDesktopAdapter::system_powershell()?);
+    let script = format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{CAPTURE_WINDOW_SCRIPT}\n{CAPTURE_TARGET_SCRIPT}");
+    let mut command = WindowsDesktopAdapter::uia_command()?;
     command
         .args([
             "-NoLogo",
@@ -2110,31 +2136,15 @@ pub(crate) fn capture_target_probe(
             &script,
         ])
         .env("ANGELBOT_TARGET_EXE", executable_path)
-        .env("ANGELBOT_CAPTURE_PID", target.process_id.to_string())
-        .env("ANGELBOT_CAPTURE_HWND", target.window_handle.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = crate::window_capture::run_bounded_child(
-        &mut command,
-        None,
-        8192,
-        is_cancelled,
-        timeout.saturating_sub(started.elapsed()),
-    )?;
+    let output =
+        crate::window_capture::run_bounded_child(&mut command, None, 8192, is_cancelled, timeout)?;
     if !output.status.success() {
         return Err(parse_uia_helper_error(&output.stderr));
     }
-    let inspected = crate::window_capture::parse_target(&output.stdout)?;
-    let current = crate::window_capture::select_target(
-        executable_path,
-        is_cancelled,
-        timeout.saturating_sub(started.elapsed()),
-    )?;
-    if !inspected.same_identity(&target) || !current.same_identity(&target) {
-        return Err(crate::window_capture::error("TARGET_CHANGED"));
-    }
-    Ok(target)
+    crate::window_capture::parse_target(&output.stdout)
 }
 
 #[cfg(windows)]
@@ -3474,6 +3484,13 @@ impl WindowsDesktopAdapter {
         Self::system_executable("System32/WindowsPowerShell/v1.0/powershell.exe")
     }
 
+    fn uia_command() -> Result<std::process::Command, DesktopAdapterError> {
+        // UIA clients must not depend on a window-owning STA/message pump.
+        let mut command = desktop_child_command(Self::system_powershell()?);
+        command.arg("-Mta");
+        Ok(command)
+    }
+
     fn system_explorer() -> Result<std::path::PathBuf, DesktopAdapterError> {
         Self::system_executable("explorer.exe")
     }
@@ -3523,7 +3540,7 @@ $stdout.Write($bytes, 0, $bytes.Length)
 $stdout.Flush()
 "#;
         let script = format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{TRUSTED_WINDOW_SCRIPT}\n{SCRIPT}");
-        let mut child = desktop_child_command(Self::system_powershell()?)
+        let mut child = Self::uia_command()?
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -3589,7 +3606,7 @@ $stdout.Flush()
         let process_executable = Self::process_comparison_path(&executable);
         let script =
             format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{TRUSTED_WINDOW_SCRIPT}\n{DRAFT_TARGET_SCRIPT}\n{DRAFT_PREFLIGHT_SCRIPT}");
-        let mut child = desktop_child_command(Self::system_powershell()?)
+        let mut child = Self::uia_command()?
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -3665,7 +3682,7 @@ $stdout.Flush()
             .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let mut child = desktop_child_command(Self::system_powershell()?)
+        let mut child = Self::uia_command()?
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -3737,10 +3754,9 @@ $stdout.Flush()
             .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let mut command = desktop_child_command(Self::system_powershell()?);
+        let mut command = Self::uia_command()?;
         command
             .args([
-                "-Mta",
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
@@ -3998,7 +4014,7 @@ $stdout.Flush()
             .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let mut command = desktop_child_command(Self::system_powershell()?);
+        let mut command = Self::uia_command()?;
         let mut child = command
             .args([
                 "-NoLogo",
@@ -4112,7 +4128,7 @@ $stdout.Flush()
             .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let mut child = desktop_child_command(Self::system_powershell()?)
+        let mut child = Self::uia_command()?
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -4261,7 +4277,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
             .transpose()?;
         let process_executable = Self::process_comparison_path(&executable);
         let script = control_observation_script(scope.is_some());
-        let mut child = desktop_child_command(Self::system_powershell()?)
+        let mut child = Self::uia_command()?
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -4718,13 +4734,30 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn uia_helpers_use_a_windowless_mta_thread() {
+        let mut command = WindowsDesktopAdapter::uia_command().unwrap();
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Threading.Thread]::CurrentThread.GetApartmentState().ToString()",
+        ]);
+        let apartment_args = command.get_args().filter(|arg| *arg == "-Mta").count();
+        let output = run_fixture_commands(vec![command], None).pop().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(std::str::from_utf8(&output.stdout).unwrap().trim(), "MTA");
+        assert_eq!(apartment_args, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn window_selection_uses_exact_hwnd_ownership_without_main_window_heuristics() {
-        assert!(CAPTURE_WINDOW_SCRIPT.contains("$ErrorActionPreference = 'Stop'"));
-        assert!(!CAPTURE_WINDOW_SCRIPT.contains("Add-Type -TypeDefinition"));
-        assert!(!CAPTURE_WINDOW_SCRIPT.contains("RootElement"));
-        assert!(CAPTURE_WINDOW_SCRIPT.contains("::FromHandle($windows[0])"));
-        assert!(CAPTURE_WINDOW_SCRIPT.contains("$env:ANGELBOT_CAPTURE_HWND"));
-        assert!(CAPTURE_WINDOW_SCRIPT.contains(".processId -ne $expectedProcessId"));
+        assert!(CAPTURE_WINDOW_SCRIPT.contains("EnumWindows("));
+        assert!(CAPTURE_WINDOW_SCRIPT.contains("IsWindowVisible(hwnd)"));
+        assert!(CAPTURE_WINDOW_SCRIPT.contains("GetWindow(hwnd, 4) == IntPtr.Zero"));
+        assert!(CAPTURE_WINDOW_SCRIPT.contains("GetWindowThreadProcessId"));
         assert!(!CAPTURE_WINDOW_SCRIPT.contains("MainWindowHandle"));
         assert!(!CAPTURE_WINDOW_SCRIPT.contains("MainWindowTitle"));
         assert!(TRUSTED_WINDOW_SCRIPT.contains("EligibleControlWindows"));
@@ -4737,6 +4770,8 @@ mod tests {
         ] {
             assert!(!script.contains("MainWindowHandle"));
         }
+        assert!(CAPTURE_WINDOW_SELECTION_SCRIPT.contains("$matches.Count -ne 1"));
+        assert!(!CAPTURE_WINDOW_SELECTION_SCRIPT.contains("Select-Object -First"));
     }
 
     #[cfg(windows)]
@@ -4814,9 +4849,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn control_root_selector_preserves_auxiliary_window_boundaries() {
+    fn capture_window_selector_rejects_same_pid_multiple_hwnds_using_synthetic_candidates() {
         let fixture = r#"
 $ErrorActionPreference = 'Stop'
+$trusted = 'C:\fixture\trusted.exe'
+$first = @{ visible = $true; ownerless = $true; processId = 42; windowHandle = 100; executablePath = $trusted }
+$second = @{ visible = $true; ownerless = $true; processId = 42; windowHandle = 200; executablePath = $trusted }
+$other = @{ visible = $true; ownerless = $true; processId = 99; windowHandle = 300; executablePath = 'C:\fixture\other.exe' }
+$hidden = @{ visible = $false; ownerless = $true; processId = 42; windowHandle = 400; executablePath = $trusted }
+$owned = @{ visible = $true; ownerless = $false; processId = 42; windowHandle = 500; executablePath = $trusted }
+function Test-Selection($candidates) {
+  try {
+    $selected = Select-CaptureWindow -candidates $candidates -expected $trusted
+    return [long]$selected.windowHandle
+  } catch { return $_.Exception.Message.Split('|')[0] }
+}
 $normalRoot = [AngelBotControlWindowCandidate]::new(100, 42, 0, $true)
 $auxiliary = [AngelBotControlWindowCandidate]::new(200, 42, 0x08000080, $true)
 $secondRoot = [AngelBotControlWindowCandidate]::new(300, 42, 0, $true)
@@ -4825,6 +4872,9 @@ $interactiveTool = [AngelBotControlWindowCandidate]::new(500, 42, 0x00000080, $t
 $explicitApp = [AngelBotControlWindowCandidate]::new(600, 42, 0x08040080, $true)
 $unknownStyle = [AngelBotControlWindowCandidate]::new(700, 42, 0, $false)
 @{
+  sameProcess = Test-Selection @($first, $second, $other)
+  unique = Test-Selection @($first, $other, $hidden, $owned)
+  otherOnly = Test-Selection @($other, $hidden, $owned)
   rootWithAux = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $auxiliary)))
   reverseOrder = @([AngelBotCaptureWindows]::SelectControlRoots(@($auxiliary, $normalRoot)))
   twoRoots = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $auxiliary, $secondRoot)))
@@ -4836,7 +4886,7 @@ $unknownStyle = [AngelBotControlWindowCandidate]::new(700, 42, 0, $false)
 } | ConvertTo-Json -Compress
 "#;
         let identity = include_str!("desktop_control/window_identity.ps1");
-        let script = format!("{identity}\n{fixture}");
+        let script = format!("{identity}\n{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{fixture}");
         let mut command =
             desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
         command
@@ -4855,6 +4905,9 @@ $unknownStyle = [AngelBotControlWindowCandidate]::new(700, 42, 0, $false)
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["sameProcess"], "TARGET_AMBIGUOUS");
+        assert_eq!(result["unique"], 100);
+        assert_eq!(result["otherOnly"], "TARGET_NOT_FOUND");
         assert_eq!(result["rootWithAux"], serde_json::json!([100]));
         assert_eq!(result["reverseOrder"], serde_json::json!([100]));
         assert_eq!(result["twoRoots"], serde_json::json!([100, 300]));
