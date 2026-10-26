@@ -44,6 +44,9 @@ updater plugin and creates signed update artifacts.
   installers still requires explicit authorization. Do not enable automatic merging.
 - The merge checks are `Windows full verification`, `Windows desktop smoke test`
   and `PR policy`. The latter handles title edits without rerunning Windows builds.
+  Windows jobs also run for draft PRs on open, code update and reopen. Becoming
+  ready for review changes no source input, so only the metadata policy reruns;
+  it does not replace, bypass or remove any required check.
   Setup fetches locked dependencies; test execution is offline and isolated.
   Never use `pull_request_target`, repository secrets or a self-hosted desktop
   runner to execute contributor code.

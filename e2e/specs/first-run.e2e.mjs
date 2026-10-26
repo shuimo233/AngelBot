@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { waitForVisible } from '../helpers/visibility.mjs';
 
 // Windows temp directories may use an 8.3 alias; match the backend's canonical root.
 const projectRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'angelbot-e2e-project-')));
@@ -289,7 +290,7 @@ describe('first-run desktop experience', () => {
     await composer.setValue('帮我设置一个本地提醒，稍后核对今天的安排。');
     await sendButton.waitForEnabled({ timeout: 5_000 });
     await sendButton.click();
-    await browser.$('//*[contains(text(), "本地提醒已设置，你可以在当前对话中回看")]').waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, '//*[contains(text(), "本地提醒已设置，你可以在当前对话中回看")]', { timeout: 20_000 });
     const attachment = await browser.$('.message-text-attachments details');
     await attachment.$('summary').click();
     assert.match(await attachment.getText(), /DOCX 正文文字/);
@@ -1574,7 +1575,7 @@ describe('first-run desktop experience', () => {
     await browser.waitUntil(async () => (await browser.$$('.composer-file-chip')).length === 1, { timeout: 5_000 });
     await browser.$('button[title="发送"]').waitForEnabled({ timeout: 5_000 });
     await browser.$('button[title="发送"]').click();
-    await browser.$('//*[contains(text(), "已读取你选择的日常行动清单")]').waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, '//*[contains(text(), "已读取你选择的日常行动清单")]', { timeout: 20_000 });
     const personalMessages = await browser.tauri.execute(async ({ core }) => {
       const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
       if (!personal?.activeSessionId) throw new Error('Personal Main conversation identity missing');
@@ -1595,7 +1596,7 @@ describe('first-run desktop experience', () => {
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').setValue('继续整理上一份清单。');
     await browser.$('button[title="发送"]').waitForEnabled({ timeout: 5_000 });
     await browser.$('button[title="发送"]').click();
-    await browser.$('//*[contains(text(), "上一轮的文件快照仍在当前日常会话中")]').waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, '//*[contains(text(), "上一轮的文件快照仍在当前日常会话中")]', { timeout: 20_000 });
     // Switching away/back must render the persisted attachment, not a local
     // preview left behind in Composer state.
     await browser.$('//button[contains(@class,"session-item-select")][.//span[text()="Desktop E2E Project"]]').click();
@@ -1607,49 +1608,7 @@ describe('first-run desktop experience', () => {
     await attachedRow.$('button[title="编辑消息"]').click();
     await attachedRow.$('textarea[aria-label="编辑后的消息内容"]').setValue('按优先级重新整理这份附件。');
     await attachedRow.$('button=重新发送').click();
-    try {
-      await browser.$('//*[contains(text(), "已按编辑后的要求重新整理")]').waitForDisplayed({ timeout: 20_000 });
-    } catch (error) {
-      // [DEBUG-e2e-edit] Bounded synthetic-state diagnostics; never print bodies.
-      const diagnostic = await browser.tauri.execute(async ({ core }) => {
-        const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
-        const messages = await core.invoke('get_messages', { sessionId: personal.activeSessionId });
-        const source = messages.find((item) => item.textAttachments?.some((file) => file.name === 'daily-actions.csv'));
-        const editor = document.querySelector('[aria-label="编辑后的消息内容"]');
-        const submit = document.querySelector('.message-inline-editor-submit');
-        const expected = '已按编辑后的要求重新整理';
-        const matches = document.evaluate(`//*[contains(text(), "${expected}")]`, document, null,
-          XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-        return {
-          renderedText: Boolean(document.querySelector('.messages')?.textContent.includes(expected)),
-          renderedEditedUser: Boolean(document.querySelector('.messages')?.textContent.includes('按优先级重新整理这份附件。')),
-          xpathMatches: matches.snapshotLength,
-          xpathState: Array.from({ length: Math.min(matches.snapshotLength, 3) }, (_, index) => {
-            const node = matches.snapshotItem(index);
-            const style = getComputedStyle(node);
-            return { tag: node.tagName, visible: node.checkVisibility?.({ opacityProperty: true, visibilityProperty: true }),
-              display: style.display, visibility: style.visibility, opacity: style.opacity,
-              height: node.getBoundingClientRect().height };
-          }),
-          sourceId: source?.id,
-          edited: source?.content === '按优先级重新整理这份附件。',
-          sourceMarker: source?.textAttachments?.some((file) => file.text.includes('attachment-e2e-marker')),
-          editorPresent: Boolean(editor),
-          editorMatches: editor?.value === '按优先级重新整理这份附件。',
-          submitDisabled: submit?.disabled,
-          streaming: Boolean(document.querySelector('button[title="停止运行"]')),
-          recent: messages.slice(-5).map((item) => ({
-            id: item.id, parentId: item.parentId, role: item.role, status: item.taskRun?.status,
-            expectedReply: item.content.includes('已按编辑后的要求重新整理'),
-            snapshotMarker: item.content.includes('attachment-e2e-marker'),
-            assertionFailures: ['user-data', 'capability'].filter((kind) =>
-              JSON.stringify(item).includes(`desktop E2E ${kind} assertion failed`)),
-          })),
-        };
-      }).catch(() => ({ diagnosticUnavailable: true }));
-      console.error('[DEBUG-e2e-edit]', JSON.stringify(diagnostic));
-      throw error;
-    }
+    await waitForVisible(browser, '//*[contains(text(), "已按编辑后的要求重新整理")]', { timeout: 20_000 });
     const editedMessages = await browser.tauri.execute(async ({ core }) => {
       const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
       if (!personal?.activeSessionId) throw new Error('Personal Main conversation identity missing');
@@ -1691,7 +1650,7 @@ describe('first-run desktop experience', () => {
     // Revoke the isolated fixture before approval so no real app can launch.
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').setValue('打开测试记事本。');
     await browser.$('button[title="发送"]').click();
-    await browser.$('//*[contains(text(), "打开已信任应用：notepad")]').waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, '//*[contains(text(), "打开已信任应用：notepad")]', { timeout: 20_000 });
     await browser.tauri.execute(async ({ core }) => {
       const apps = await core.invoke('get_desktop_trusted_apps');
       const app = apps.find((item) => item.id === 'notepad');
@@ -1815,7 +1774,7 @@ describe('first-run desktop experience', () => {
     await allowImageOnce.click();
     const imageReply = '已看到测试窗口中的两组色块；这是只读观察，没有点击或填写。';
     try {
-      await browser.$(`//*[contains(text(), "${imageReply}")]`).waitForDisplayed({ timeout: 20_000 });
+      await waitForVisible(browser, `//*[contains(text(), "${imageReply}")]`, { timeout: 20_000 });
     } catch (error) {
       await browser.saveScreenshot(join(screenshotDir, 'desktop-window-image-failure.png'));
       const recent = (await readImageJourneyMessages()).slice(-4).map((message) => ({
@@ -1903,7 +1862,7 @@ describe('first-run desktop experience', () => {
     // so a late observation mismatch cannot conceal a wrong/repeated effect.
     await waitForOwnedCheckboxState(false, 1, 1);
     const controlTaskReply = '已按两次确认将 A 区复选框勾选并恢复为未选中；控件状态由操作回读确认，未提交其他操作。';
-    await browser.$(`//*[contains(text(), "${controlTaskReply}")]`).waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, `//*[contains(text(), "${controlTaskReply}")]`, { timeout: 20_000 });
     await browser.waitUntil(async () => !(await browser.$('button[title="停止运行"]').isExisting()),
       { timeout: 10_000, timeoutMsg: 'approved desktop control task did not settle' });
     await waitForOwnedCheckboxState(false, 1, 1);
@@ -1974,7 +1933,7 @@ describe('first-run desktop experience', () => {
     // across a WebView reload. Only an explicit new user message may continue.
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').setValue('请说明今天安排，不操作任何文件或应用。');
     await browser.$('button[title="发送"]').click();
-    await browser.$('//*[contains(text(), "回复达到模型输出长度限制")]').waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, '//*[contains(text(), "回复达到模型输出长度限制")]', { timeout: 20_000 });
     await browser.waitUntil(async () => !(await browser.$('button[title="停止运行"]').isExisting()),
       { timeout: 10_000, timeoutMsg: 'truncated reply did not pause' });
     const partial = (await readImageJourneyMessages()).filter((message) => message.role === 'assistant').at(-1);
@@ -2003,7 +1962,7 @@ describe('first-run desktop experience', () => {
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').setValue('先核对现有结果，只补充说明，不重复操作。');
     await browser.$('button[title="发送"]').click();
     const followupText = '已核对现有回复；本轮只补充说明，没有重复任何操作。';
-    await browser.$(`//*[contains(text(), "${followupText}")]`).waitForDisplayed({ timeout: 20_000 });
+    await waitForVisible(browser, `//*[contains(text(), "${followupText}")]`, { timeout: 20_000 });
     const followup = (await readImageJourneyMessages()).filter((message) => message.role === 'assistant').at(-1);
     assert.equal(followup.content, followupText);
     assert.equal(followup.taskRun?.status, 'completed');

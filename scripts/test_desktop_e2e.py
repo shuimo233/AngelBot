@@ -852,6 +852,47 @@ class DesktopE2eArtifactTests(unittest.TestCase):
             self.assertEqual(env, {"TAURI_WEBDRIVER_PORT": "9254", "UNCHANGED": "value"})
             self.assertTrue(socket_factory.return_value.__exit__.called)
 
+    def test_desktop_visibility_requeries_replaced_streaming_nodes(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node is required by the existing desktop/frontend toolchain")
+        script = """
+          import assert from 'node:assert/strict';
+          const {waitForVisible} = await import(process.argv[1]);
+          let queries = 0, polls = 0;
+          const options = {timeout: 20000, timeoutMsg: 'current reply must be visible'};
+          const retired = {
+            isDisplayed: async () => false,
+            waitForDisplayed: async (supplied) => browser.waitUntil(() => retired.isDisplayed(), supplied),
+          };
+          const browser = {
+            $: async (selector) => {
+              assert.equal(selector, '.reply');
+              return ++queries === 1 ? retired : {isDisplayed: async () => true};
+            },
+            waitUntil: async (condition, supplied) => {
+              assert.deepEqual(supplied, options);
+              for (let index = 0; index < 3; index++) {
+                polls++;
+                if (await condition()) return;
+              }
+              throw new Error('retired streaming element was polled instead of its rendered replacement');
+            },
+          };
+          await waitForVisible(browser, '.reply', options);
+          assert.equal(queries, 2);
+          assert.equal(polls, 2);
+          queries = 0;
+          browser.$ = async () => { queries++; return retired; };
+          await assert.rejects(() => waitForVisible(browser, '.reply', options), /retired streaming element/);
+          assert.equal(queries, 3, 'unseen replacements must still time out');
+        """
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", script,
+             (REPO_ROOT / "e2e/helpers/visibility.mjs").as_uri()],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_wdio_requires_and_reuses_the_explicit_artifact(self):
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node is required by the existing desktop/frontend toolchain")
