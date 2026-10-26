@@ -1854,7 +1854,7 @@ const MAX_FIELD_REFS: usize = 128;
 const DRAFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 #[cfg(windows)]
-const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+pub(crate) const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[cfg(windows)]
 const UIA_SAFETY_HELPERS_SCRIPT: &str = r#"

@@ -7,7 +7,6 @@ use super::{
 };
 use crate::desktop_control::{capture_target_probe, DesktopAdapterError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
@@ -199,7 +198,13 @@ fn valid_session_info(info: &WTSINFOEXW, expected_session: u32) -> bool {
 
 fn complete_guard(target: &CaptureTarget) -> Result<(), DesktopAdapterError> {
     scalar_guard(target)?;
-    let current = capture_target_probe(&target.executable_path, &|| false, Duration::from_secs(2))?;
+    // The parent supervises the whole capture under the same discovery budget.
+    // Do not impose a shorter, independent limit on cold PowerShell startup.
+    let current = capture_target_probe(
+        &target.executable_path,
+        &|| false,
+        crate::desktop_control::DISCOVERY_TIMEOUT,
+    )?;
     if !current.same_identity(target) {
         return Err(error("TARGET_CHANGED"));
     }
