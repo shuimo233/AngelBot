@@ -274,15 +274,34 @@ describe('first-run desktop experience', () => {
     await browser.execute(() => document.documentElement.classList.add('dark'));
     await browser.pause(200);
     await browser.saveScreenshot(join(screenshotDir, 'attachment-preview-dark.png'));
+    const previousViewport = await browser.execute(() => ({ width: innerWidth, height: innerHeight }));
     await browser.setWindowSize(1000, 540);
-    const compactDraft = await browser.execute(() => {
-      const send = document.querySelector('button[title="发送"]').getBoundingClientRect();
-      const input = document.querySelector('.composer-bar textarea').getBoundingClientRect();
-      const strip = document.querySelector('.composer-files-strip').getBoundingClientRect();
-      return { usable: [send, input].every((rect) => rect.top >= 0 && rect.bottom <= innerHeight && rect.height > 0),
-        bounded: strip.height <= innerHeight * 0.3 + 5 };
+    let compactDraft;
+    await browser.waitUntil(async () => {
+      compactDraft = await browser.execute((previous) => {
+        const send = document.querySelector('button[title="发送"]').getBoundingClientRect();
+        const input = document.querySelector('.composer-bar textarea').getBoundingClientRect();
+        const strip = document.querySelector('.composer-files-strip').getBoundingClientRect();
+        return { resized: innerWidth < previous.width && innerHeight < previous.height,
+          compact: innerWidth <= 1000 && innerHeight <= 540,
+          usable: [send, input].every((rect) => rect.top >= 0 && rect.bottom <= innerHeight && rect.height > 0),
+          bounded: strip.height <= innerHeight * 0.3 + 5 };
+      }, previousViewport);
+      return compactDraft.resized && compactDraft.compact && compactDraft.usable && compactDraft.bounded;
+    }, {
+      timeout: 5_000,
+      timeoutMsg: 'compact attachment layout did not settle after the native window resize',
+    }).catch(async (error) => {
+      const geometry = await browser.execute(() => ({
+        width: innerWidth, height: innerHeight, scale: devicePixelRatio,
+        send: document.querySelector('button[title="发送"]')?.getBoundingClientRect().toJSON(),
+        input: document.querySelector('.composer-bar textarea')?.getBoundingClientRect().toJSON(),
+        strip: document.querySelector('.composer-files-strip')?.getBoundingClientRect().toJSON(),
+      })).catch(() => ({ diagnosticUnavailable: true }));
+      console.error('Compact attachment resize layout:', JSON.stringify(geometry));
+      throw error;
     });
-    assert.deepEqual(compactDraft, { usable: true, bounded: true });
+    assert.deepEqual(compactDraft, { resized: true, compact: true, usable: true, bounded: true });
     await browser.saveScreenshot(join(screenshotDir, 'attachment-preview-compact.png'));
     await browser.setWindowSize(1200, 800);
     await browser.execute((restoreDark) => document.documentElement.classList.toggle('dark', restoreDark), previewPreferredDark);
