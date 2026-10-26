@@ -535,19 +535,19 @@ def main() -> int:
                             "type": "text",
                             "text": "已读取你选择的日常行动清单；这是文件快照，不会修改原文件。",
                             "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
-                            "forbiddenToolNames": ["read_file", "write_file"],
+                            "forbiddenToolNames": ["run_project_command"],
                         },
                         {
                             "type": "text",
                             "text": "上一轮的文件快照仍在当前日常会话中，可以继续整理。",
                             "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
-                            "forbiddenToolNames": ["read_file", "write_file"],
+                            "forbiddenToolNames": ["run_project_command"],
                         },
                         {
                             "type": "text",
                             "text": "已按编辑后的要求重新整理，保留了原先选择的文件快照。",
                             "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
-                            "forbiddenToolNames": ["read_file", "write_file"],
+                            "forbiddenToolNames": ["run_project_command"],
                         },
                         {
                             "type": "tool_calls",

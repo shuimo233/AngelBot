@@ -1505,7 +1505,8 @@ describe('first-run desktop experience', () => {
     await browser.$('.right-panel').waitForExist({ reverse: true, timeout: 5_000 });
 
     // User-selected file snapshots must reach the same Main conversation and
-    // survive replay/edit without granting Personal a filesystem root. A real
+    // survive replay/edit without granting Personal a project root. Its owned
+    // results tools remain available, but this snapshot turn must not use them. A real
     // File/change event exercises the production reader; no IPC-only shortcut.
     await browser.$('//button[contains(@class,"session-item-select")][.//span[text()="AngelBot 日常"]]').click();
     await browser.waitUntil(async () => (await browser.$('.session-item-select.active .session-item-title').getText()) === 'AngelBot 日常', {
@@ -1583,6 +1584,12 @@ describe('first-run desktop experience', () => {
     assert.ok(attachmentMessage, 'explicit file-only turn was not persisted');
     assert.equal(attachmentMessage.content, '', 'file snapshot must not be flattened into the visible prompt');
     assert.deepEqual(attachmentMessage.textAttachments, [{ name: 'daily-actions.csv', text: attachmentText }]);
+    const snapshotReply = personalMessages.find((item) => item.role === 'assistant'
+      && item.parentId === attachmentMessage.id && item.content.includes('已读取你选择的日常行动清单'));
+    assert.ok(snapshotReply, 'snapshot reply must belong to the selected file turn');
+    const filesystemCalls = ['read_file', 'write_file', 'run_project_command'];
+    assert.deepEqual((snapshotReply.toolCalls ?? []).filter((call) => filesystemCalls.includes(call.name)), []);
+    assert.deepEqual((snapshotReply.toolResults ?? []).filter((result) => filesystemCalls.includes(result.toolName)), []);
     await browser.saveScreenshot(join(screenshotDir, 'daily-file-snapshot.png'));
 
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').setValue('继续整理上一份清单。');

@@ -738,6 +738,30 @@ class DesktopE2eArtifactTests(unittest.TestCase):
             build.assert_not_called()
             start.assert_not_called()
 
+    def test_daily_attachment_script_allows_results_but_never_project_commands(self):
+        captured = []
+
+        def capture_script(_npx, env, _skip_build):
+            captured.extend(json.loads(env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"]))
+            raise RuntimeError("owned script checkpoint")
+
+        # Capture the real emitted fixture before any build, window or driver.
+        with patch.object(sys, "argv", ["desktop_e2e.py", "--skip-build"]), \
+                patch.object(desktop_e2e, "prepare_desktop_binary", side_effect=capture_script), \
+                patch.object(desktop_e2e, "owned_fixture") as fixture, \
+                patch.object(desktop_e2e, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "owned script checkpoint"):
+                desktop_e2e.main()
+            fixture.assert_not_called()
+            run.assert_not_called()
+        replies = [reply for reply in captured
+                   if "daily-actions.csv" in reply.get("expectUserContentIncludes", [])]
+        self.assertEqual(len(replies), 3, "initial, continued and edited snapshots must all be checked")
+        for reply in replies:
+            self.assertIn("attachment-e2e-marker", reply["expectUserContentIncludes"])
+            self.assertEqual(reply["forbiddenToolNames"], ["run_project_command"],
+                             "Personal owns result-file tools, not project command authority")
+
     def test_build_and_cache_never_use_normal_artifacts(self):
         startup = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
         loader = startup.split("fn load_deployment_environment()", 1)[1].split("fn start_dev_http_server()", 1)[0]
