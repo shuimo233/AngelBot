@@ -1705,13 +1705,6 @@ impl ToolHandler for ObserveTrustedAppWindowHandler {
                         "TARGET_UNAVAILABLE" => "TARGET_UNAVAILABLE: 目标窗口或其安全检查暂不可用；未返回图像。请检查目标应用是否响应，或改用控件结构观察。",
                         _ => "CAPTURE_FAILED: 无法获取已授权应用的单窗口图像；未返回图像，请检查目标窗口。",
                     };
-                    #[cfg(feature = "desktop-e2e")]
-                    if error.message.starts_with("[DEBUG-capture]") {
-                        return ToolResult::error(
-                            self.name(),
-                            format!("{message} {}", error.message),
-                        );
-                    }
                     return ToolResult::error(self.name(), message);
                 }
             };

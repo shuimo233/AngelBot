@@ -15,7 +15,6 @@ use windows_capture::settings::{
     GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 use windows_capture::window::Window;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSActive, WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx,
     WTSINFOEXW, WTS_SESSIONSTATE_UNLOCK,
@@ -23,9 +22,7 @@ use windows_sys::Win32::System::RemoteDesktop::{
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
 };
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowDisplayAffinity, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
     WDA_NONE,
@@ -57,15 +54,6 @@ impl Drop for WinRt {
     }
 }
 
-struct Handle(HANDLE);
-impl Drop for Handle {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.0);
-        }
-    }
-}
-
 fn scalar_guard(target: &CaptureTarget) -> Result<(), DesktopAdapterError> {
     let hwnd = target.window_handle as usize as *mut std::ffi::c_void;
     let mut pid = 0;
@@ -83,20 +71,8 @@ fn scalar_guard(target: &CaptureTarget) -> Result<(), DesktopAdapterError> {
             return Err(error("TARGET_UNAVAILABLE"));
         }
     }
-    let process = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
-    if process.0.is_null() {
-        return Err(error("TARGET_UNAVAILABLE"));
-    }
-    let mut path = [0_u16; 4096];
-    let mut length = path.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(process.0, 0, path.as_mut_ptr(), &mut length) } == 0
-        || length == 0
-        || length as usize > path.len()
-    {
-        return Err(error("TARGET_UNAVAILABLE"));
-    }
-    let path =
-        String::from_utf16(&path[..length as usize]).map_err(|_| error("TARGET_UNAVAILABLE"))?;
+    let process = super::target::ReadOnlyProcess::open(pid)?;
+    let path = process.path()?;
     if !path.eq_ignore_ascii_case(&target.executable_path) {
         return Err(error("TARGET_CHANGED"));
     }
@@ -237,8 +213,6 @@ impl GraphicsCaptureApiHandler for OneFrame {
         frame: &mut Frame,
         control: InternalCaptureControl,
     ) -> Result<(), String> {
-        #[cfg(feature = "desktop-e2e")]
-        eprintln!("[DEBUG-capture] frame-arrived");
         let mut result = self
             .0
             .result
@@ -291,8 +265,6 @@ impl GraphicsCaptureApiHandler for OneFrame {
 
 pub(super) fn capture(target: CaptureTarget) -> Result<Vec<u8>, DesktopAdapterError> {
     target.validate()?;
-    #[cfg(feature = "desktop-e2e")]
-    eprintln!("[DEBUG-capture] pre-guard");
     complete_guard(&target)?;
     let _runtime = WinRt::new()?;
     if !GraphicsCaptureApi::is_supported().map_err(|_| error("UNSUPPORTED_PLATFORM"))? {
@@ -352,19 +324,13 @@ pub(super) fn capture(target: CaptureTarget) -> Result<Vec<u8>, DesktopAdapterEr
     );
     // Library init/message loop/join may block. The parent deadline kills/reaps
     // this helper and its UIA probe descendants; dropping a future is not cleanup.
-    #[cfg(feature = "desktop-e2e")]
-    eprintln!("[DEBUG-capture] wgc-start");
     OneFrame::start(settings).map_err(|_| error("CAPTURE_FAILED"))?;
-    #[cfg(feature = "desktop-e2e")]
-    eprintln!("[DEBUG-capture] wgc-done");
     let pixels = result
         .lock()
         .map_err(|_| error("ADAPTER_FAILED"))?
         .take()
         .ok_or_else(|| error("CAPTURE_FAILED"))??;
     complete_guard(&target)?;
-    #[cfg(feature = "desktop-e2e")]
-    eprintln!("[DEBUG-capture] post-guard-done");
     let png = encode_rgba(pixels.width, pixels.height, pixels.rgba)?;
     scalar_guard(&target)?;
     Ok(png)
