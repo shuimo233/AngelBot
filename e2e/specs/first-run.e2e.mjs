@@ -1617,7 +1617,20 @@ describe('first-run desktop experience', () => {
         const source = messages.find((item) => item.textAttachments?.some((file) => file.name === 'daily-actions.csv'));
         const editor = document.querySelector('[aria-label="编辑后的消息内容"]');
         const submit = document.querySelector('.message-inline-editor-submit');
+        const expected = '已按编辑后的要求重新整理';
+        const matches = document.evaluate(`//*[contains(text(), "${expected}")]`, document, null,
+          XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
         return {
+          renderedText: Boolean(document.querySelector('.messages')?.textContent.includes(expected)),
+          renderedEditedUser: Boolean(document.querySelector('.messages')?.textContent.includes('按优先级重新整理这份附件。')),
+          xpathMatches: matches.snapshotLength,
+          xpathState: Array.from({ length: Math.min(matches.snapshotLength, 3) }, (_, index) => {
+            const node = matches.snapshotItem(index);
+            const style = getComputedStyle(node);
+            return { tag: node.tagName, visible: node.checkVisibility?.({ opacityProperty: true, visibilityProperty: true }),
+              display: style.display, visibility: style.visibility, opacity: style.opacity,
+              height: node.getBoundingClientRect().height };
+          }),
           sourceId: source?.id,
           edited: source?.content === '按优先级重新整理这份附件。',
           sourceMarker: source?.textAttachments?.some((file) => file.text.includes('attachment-e2e-marker')),

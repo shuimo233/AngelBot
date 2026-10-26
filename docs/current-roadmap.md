@@ -39,7 +39,7 @@ AngelBot 是本地优先、面向单一用户的 Windows 通用个人助手；�
 
 PR #3 对齐过时桌面夹具：关闭通知严格要求 `skipped` 与“不自动补发”原因；MCP 停止严格核对后端 `stopped` 和目录仍已准备；附件脚本允许自有结果工具、仍禁止项目命令，并核对原附件回复没有文件操作；撤销应用授权后的失败回执使用当前统一“操作结果”可访问名称，精确失败与已结算断言不变。真实附件内容检查保留，新增发出脚本的离线回归先红后绿，未改动生产权限。两轴增量复核无新阻断项；后续远端已通过附件读取／接续／编辑与 MAA 拒绝。最新本机 full 9/9，记录 `logs/pr-milestone-20261026-operation-receipt-full.log`。前序 `remote-smoke`、`remote-smoke-muted`、`remote-smoke-mcp-stop`、`remote-smoke-attachment` 失败日志均保留在同一 `pr-milestone-20261026-` 日志组。完整远端旅程仍须独立通过，不能用离线证据抵扣。
 
-最新远端在此前通过过的附件编辑关卡再次失败（`logs/pr-milestone-20261026-remote-smoke-operation-receipt.log`）。当前视为未查明的时序／上下文问题，不凭前次通过判定稳定，也不重跑相同输入碰运气；仅在失败处增加不含正文的有界诊断。诊断版本已通过两轴复核与本机 full 9/9（`logs/pr-milestone-20261026-edit-diagnostic-full.log`），不证明问题已修复；定位完成后移除临时诊断。PR 保持草稿，查明与修复前不合并。
+最新远端在此前通过过的附件编辑关卡再次失败（`logs/pr-milestone-20261026-remote-smoke-operation-receipt.log`）。有界诊断随后确认：编辑内容、附件标记和正确 `completed` 回复均已持久化，界面却未定位到正文（`logs/pr-milestone-20261026-remote-smoke-edit-diagnostic.log`）。问题收窄到前端加载／展示或定位，尚不能区分；下一探针只增加 DOM 是否包含正文、XPath 匹配数量及最多三个节点的可见性信息，不输出正文、不改断言。DOM 诊断通过两轴复核与本机 full 9/9（`logs/pr-milestone-20261026-edit-dom-diagnostic-full.log`），不证明问题已修复；定位完成后移除临时诊断。PR 保持草稿，不凭偶然通过判定稳定，查明与修复前不合并。
 
 - **已实现**：生产入口、调用方、存储和必要 UI 已接通；不代表真实任务成功。
 - **离线验证**：确定性测试通过，证明被测契约；不能证明真实模型、第三方应用或系统通知。
