@@ -775,13 +775,16 @@ describe('first-run desktop experience', () => {
     await mcpItem.$('.mcp-runtime-summary').waitForDisplayed({ timeout: 10_000 });
     await mcpItem.$('button=停止').click();
     await browser.waitUntil(
-      async () => (await mcpItem.$('.status-text').getText()) === '未连接',
-      { timeout: 5_000, timeoutMsg: 'MCP status did not return to stopped' },
+      async () => (await mcpItem.$('.status-text').getText()) === '按需连接 · 目录已准备',
+      { timeout: 5_000, timeoutMsg: 'stopped MCP did not retain its prepared discovery' },
     );
     const stoppedMcp = await browser.tauri.execute(({ core }) => core.invoke('get_mcp_server_status', {
       serverId: window.__angelbotE2eMcpId,
     }));
     assert.equal(stoppedMcp.status, 'stopped');
+    const preparedMcp = (await browser.tauri.execute(({ core }) => core.invoke('get_mcp_servers')))
+      .find((server) => server.id === newlyAddedMcp.id);
+    assert.equal(preparedMcp.catalogReady, true);
     await mcpItem.$('button[aria-label="删除 Desktop E2E MCP"]').click();
     await mcpItem.waitForExist({ reverse: true, timeout: 5_000 });
     await browser.tauri.execute(({ core }) => core.invoke('import_encrypted_data', {
