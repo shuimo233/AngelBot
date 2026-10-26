@@ -30,15 +30,17 @@ describe('FileAccessSettings', () => {
     expect(screen.queryByText('执行权限')).not.toBeInTheDocument();
   });
 
-  it('makes clear that personal workspaces have no project file capability', () => {
+  it('shows personal results separately without project or command capability', async () => {
     useWorkspacesStore.setState({
       workspaces: [{ id: 'personal', name: 'AngelBot 日常', kind: 'personal', createdAt: 1, updatedAt: 1, activeSessionId: session.id }],
       activeWorkspaceId: 'personal', loading: false, lastError: null,
     });
 
+    vi.mocked(getSessionFileAccess).mockResolvedValue({ workDir: 'C:/isolated/results', additionalReadDirs: [] });
     render(<FileAccessSettings />);
 
     expect(screen.getByText('AngelBot 日常不连接项目文件')).toBeInTheDocument();
-    expect(getSessionFileAccess).not.toHaveBeenCalled();
+    expect(await screen.findByText('C:/isolated/results')).toBeInTheDocument();
+    expect(getSessionFileAccess).toHaveBeenCalledWith(session.id);
   });
 });

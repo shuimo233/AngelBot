@@ -377,6 +377,21 @@ export async function getMemoryStats(): Promise<MemoryStats> {
 // Evolution Proposal Operations
 // ============================================
 
+export interface LearnedPreference {
+  id: string;
+  content: string;
+  ready: boolean;
+  updatedAt: number;
+}
+
+export async function getLearnedPreferences(): Promise<LearnedPreference[]> {
+  return invoke<LearnedPreference[]>('get_learned_preferences');
+}
+
+export async function dismissLearnedPreference(id: string): Promise<void> {
+  return invoke<void>('dismiss_learned_preference', { id });
+}
+
 export async function runEvolutionReview(
   sessionId?: string,
   messageCount?: number

@@ -11,6 +11,8 @@ vi.mock('../invoke', () => ({
 
 import {
   getMemories,
+  getLearnedPreferences,
+  dismissLearnedPreference,
   saveMemory,
   deleteMemory,
   updateMemoryFrequency,
@@ -39,6 +41,15 @@ describe('Memory Commands', () => {
   });
 
   describe('Basic Operations', () => {
+    it('lists learned habits and dismisses one using the native command contract', async () => {
+      const habits = [{ id: 'habit-1', content: '喜欢简洁的问候', ready: true, updatedAt: 1 }];
+      vi.mocked(invoke).mockResolvedValueOnce(habits).mockResolvedValueOnce(undefined);
+      expect(await getLearnedPreferences()).toEqual(habits);
+      await dismissLearnedPreference('habit-1');
+      expect(invoke).toHaveBeenNthCalledWith(1, 'get_learned_preferences');
+      expect(invoke).toHaveBeenNthCalledWith(2, 'dismiss_learned_preference', { id: 'habit-1' });
+    });
+
     it('should get memories', async () => {
       const mockMemories = [
         {

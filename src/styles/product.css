@@ -417,8 +417,7 @@ body,
   }
 
   .composer-file-chip { min-width: 0; }
-  .composer-file-chip small,
-  .composer-file-chip button { flex-shrink: 0; }
+  .composer-file-chip:has(details[open]) { grid-column: 1 / -1; }
 }
 
 .composer-input { min-height: 72px; font-size: var(--ui-size-base); }

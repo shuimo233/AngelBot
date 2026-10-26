@@ -5,7 +5,7 @@
 //! boundary and again after a tool batch — they observe state but do not
 //! mutate it directly.
 //!
-//! Reference: docs/agent-architecture-v2.md §11 + issues/096-pi-style-soft-terminate-loop.md
+//! Reference: docs/design-philosophy.md (execution authorization and recovery).
 
 #[cfg(test)]
 mod tests {
@@ -21,6 +21,7 @@ mod tests {
             iteration: iter,
             turn_wall_clock_elapsed: Duration::ZERO,
             side_effect_count: 0,
+            full_access: false,
             no_progress_streak: 0,
             last_response_was_progress: false,
         }
@@ -197,6 +198,7 @@ mod tests {
             iteration: 0,
             turn_wall_clock_elapsed: Duration::ZERO,
             side_effect_count: 0,
+            full_access: false,
             no_progress_streak: 0,
             last_response_was_progress: false,
         };
@@ -224,6 +226,7 @@ mod tests {
             iteration: 0,
             turn_wall_clock_elapsed: Duration::from_secs(10), // past budget
             side_effect_count: 0,
+            full_access: false,
             no_progress_streak: 0,
             last_response_was_progress: false,
         };
@@ -244,5 +247,16 @@ mod tests {
             wall.evaluate(&ctx),
         ];
         assert!(matches!(verdicts[0], GuardVerdict::PauseForUser { .. }));
+        ctx.full_access = true;
+        ctx.no_progress_streak = 1;
+        assert_eq!(side.evaluate(&ctx), GuardVerdict::Continue);
+        assert!(matches!(
+            progress.evaluate(&ctx),
+            GuardVerdict::PauseForUser { .. }
+        ));
+        assert!(matches!(
+            wall.evaluate(&ctx),
+            GuardVerdict::Terminate { .. }
+        ));
     }
 }

@@ -10,18 +10,22 @@ export function WorkspaceActivityCapsule({
   onReturnToConversation?: () => void;
 }) {
   const workspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
+  const sessionId = useWorkspacesStore((state) => state.workspaces.find((item) => item.id === workspaceId)?.activeSessionId);
   const projection = useWorkspaceActivityStore((state) => state.projection);
   const refresh = useWorkspaceActivityStore((state) => state.refresh);
-  const isLoading = useWorkspaceActivityStore((state) => state.isLoading);
+  const observe = useWorkspaceActivityStore((state) => state.observe);
+  const scopeMatches = useWorkspaceActivityStore((state) => state.workspaceId === workspaceId && state.sessionId === sessionId);
+  const isLoading = useWorkspaceActivityStore((state) => state.isLoading) && scopeMatches;
   const error = useWorkspaceActivityStore((state) => state.error);
+  const visibleError = scopeMatches ? error : null;
 
   useEffect(() => {
-    if (workspaceId) void refresh(workspaceId);
-  }, [refresh, workspaceId]);
+    if (workspaceId && sessionId) return observe(workspaceId, sessionId);
+  }, [observe, workspaceId, sessionId]);
 
   // Do not project a previous session's child activity while the store is
   // refreshing for the newly selected Workspace.
-  const visibleProjection = projection?.workspaceId === workspaceId ? projection : null;
+  const visibleProjection = scopeMatches && projection?.workspaceId === workspaceId ? projection : null;
   const work = visibleProjection?.work ?? [];
   const pending = visibleProjection?.pendingDecisions.length ?? 0;
   const attention = visibleProjection?.attention ?? null;
@@ -33,24 +37,19 @@ export function WorkspaceActivityCapsule({
   );
   const pendingDecisions = visibleProjection?.pendingDecisions ?? [];
 
-  useEffect(() => {
-    if (!workspaceId || active === 0) return;
-    const timer = window.setInterval(() => void refresh(workspaceId), 3000);
-    return () => window.clearInterval(timer);
-  }, [active, refresh, workspaceId]);
-  if (mode === 'capsule' && (error || isLoading)) {
+  if (mode === 'capsule' && !visibleProjection && (visibleError || isLoading)) {
     return (
       <section
-        className={`workspace-activity-capsule${error ? ' workspace-activity-capsule--error' : ''}`}
-        role={error ? 'alert' : 'status'}
+        className={`workspace-activity-capsule${visibleError ? ' workspace-activity-capsule--error' : ''}`}
+        role={visibleError ? 'alert' : 'status'}
         aria-live="polite"
       >
         <span className="workspace-activity-capsule__dot" aria-hidden="true" />
         <div className="workspace-activity-capsule__body">
-          <strong>{error ? '无法读取任务状态' : '正在同步任务状态'}</strong>
-          {error && <span>{error}</span>}
+          <strong>{visibleError ? '无法读取任务状态' : '正在同步任务状态'}</strong>
+          {visibleError && <span>{visibleError}</span>}
         </div>
-        {error && workspaceId && (
+        {visibleError && workspaceId && (
           <button
             className="workspace-activity-capsule__retry"
             type="button"
@@ -62,7 +61,7 @@ export function WorkspaceActivityCapsule({
       </section>
     );
   }
-  if (mode === 'capsule' && active === 0 && pending === 0 && attentionCount === 0) return null;
+  if (mode === 'capsule' && active === 0 && pending === 0 && attentionCount === 0 && !visibleError) return null;
 
   const label = pending > 0
     ? `AngelBot 有 ${pending} 项需要和你确认`
@@ -71,6 +70,9 @@ export function WorkspaceActivityCapsule({
     : `AngelBot 正在处理 ${active} 项工作`;
 
   if (mode === 'panel') {
+    const shownDetails = new Map(work.slice(0, 8).map((item) => [
+      item.id, workDetailLabel(item.status, item.reviewerStatus, item.activity, item.summary),
+    ]));
     return (
       <section className="workspace-activity-panel" aria-label="任务与委派">
         <div className="workspace-activity-panel__header">
@@ -88,20 +90,20 @@ export function WorkspaceActivityCapsule({
             <span>选择个人空间或项目后查看对应工作。</span>
           </div>
         )}
-        {workspaceId && error && (
+        {workspaceId && visibleError && (
           <div className="workspace-activity-panel__error" role="alert">
             <strong>无法读取任务状态</strong>
-            <span>{error}</span>
+            <span>{visibleError}；以下如有内容，仅为上次记录，不代表任务仍在执行。</span>
             <button type="button" onClick={() => void refresh(workspaceId)}>重新检查</button>
           </div>
         )}
-        {workspaceId && !error && !isLoading && work.length === 0 && pending === 0 && attentionCount === 0 && (
+        {workspaceId && !visibleError && !isLoading && work.length === 0 && pending === 0 && attentionCount === 0 && (
           <div className="workspace-activity-panel__empty">
             <strong>当前没有进行中的工作</strong>
             <span>让主 Agent 处理复杂任务时，委派、审校、待确认和需要继续处理的事项会显示在这里。</span>
           </div>
         )}
-        {workspaceId && !error && attention && (
+        {workspaceId && attention && (
           <div className="workspace-activity-panel__attention" role="status">
             <h3>需要继续处理（{attention.openCount}）</h3>
             <p>{attention.message}</p>
@@ -110,7 +112,7 @@ export function WorkspaceActivityCapsule({
             )}
           </div>
         )}
-        {workspaceId && !error && work.length > 0 && (
+        {workspaceId && work.length > 0 && (
           <ol className="workspace-activity-panel__list">
             {work.slice(0, 8).map((item) => (
               <li key={item.id} className={`is-${item.status}`}>
@@ -130,13 +132,14 @@ export function WorkspaceActivityCapsule({
             ))}
           </ol>
         )}
-        {workspaceId && !error && pendingDecisions.length > 0 && (
+        {workspaceId && pendingDecisions.length > 0 && (
           <div className="workspace-activity-panel__decisions">
             <h3>需要你确认</h3>
             {pendingDecisions.map((decision) => (
               <article key={decision.workId}>
                 <strong>{decision.goal}</strong>
-                {decision.questions.map((question) => <p key={question}>{question}</p>)}
+                {decision.questions.filter((question) => question !== shownDetails.get(decision.workId))
+                  .map((question) => <p key={question}>{question}</p>)}
                 {decision.risks.map((risk) => <p key={risk}>风险：{risk}</p>)}
               </article>
             ))}
@@ -150,13 +153,15 @@ export function WorkspaceActivityCapsule({
     <section className="workspace-activity-capsule" role="status" aria-live="polite">
       <span className="workspace-activity-capsule__dot" aria-hidden="true" />
       <div className="workspace-activity-capsule__body">
-        <span>{label}</span>
+        {visibleError && <strong role="alert">任务状态暂未更新；以下为上次记录，不代表仍在执行。</strong>}
+        <span>{visibleError ? `上次记录：${label}` : label}</span>
+        {visibleError && workspaceId && <button type="button" onClick={() => void refresh(workspaceId)}>重新检查</button>}
         {activeWork.map((item) => (
           <div className="workspace-activity-capsule__item" key={item.id}>
             <span className="workspace-activity-capsule__goal">{item.goal}</span>
             <span className="workspace-activity-capsule__stage">
               {reviewerStatusLabelForActiveWork(item.status, item.reviewerStatus, 'compact')
-                ?? item.activity ?? statusLabel(item.status)}
+                ?? (item.status === 'needsDecision' ? statusLabel(item.status) : item.activity ?? statusLabel(item.status))}
             </span>
           </div>
         ))}
@@ -218,6 +223,7 @@ function workDetailLabel(
   summary: string | null,
 ): string {
   if (isTerminalWorkStatus(status)) return terminalWorkDetail(status);
+  if (status === 'needsDecision' && !reviewerStatus) return summary ?? '执行需要处理，暂无可交付结果';
   return reviewerStatusLabelForActiveWork(status, reviewerStatus) ?? activity ?? summary ?? '等待下一步状态';
 }
 

@@ -7,7 +7,6 @@ use super::{
 };
 use crate::desktop_control::{capture_target_probe, DesktopAdapterError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
@@ -72,12 +71,16 @@ fn scalar_guard(target: &CaptureTarget) -> Result<(), DesktopAdapterError> {
     let mut pid = 0;
     unsafe {
         if IsWindow(hwnd) == 0
-            || IsWindowVisible(hwnd) == 0
-            || IsIconic(hwnd) != 0
             || GetWindowThreadProcessId(hwnd, &mut pid) == 0
             || pid != target.process_id
         {
             return Err(error("TARGET_CHANGED"));
+        }
+        if IsIconic(hwnd) != 0 {
+            return Err(error("TARGET_MINIMIZED"));
+        }
+        if IsWindowVisible(hwnd) == 0 {
+            return Err(error("TARGET_UNAVAILABLE"));
         }
     }
     let process = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
@@ -195,7 +198,13 @@ fn valid_session_info(info: &WTSINFOEXW, expected_session: u32) -> bool {
 
 fn complete_guard(target: &CaptureTarget) -> Result<(), DesktopAdapterError> {
     scalar_guard(target)?;
-    let current = capture_target_probe(&target.executable_path, &|| false, Duration::from_secs(2))?;
+    // The parent supervises the whole capture under the same discovery budget.
+    // Do not impose a shorter, independent limit on cold PowerShell startup.
+    let current = capture_target_probe(
+        &target.executable_path,
+        &|| false,
+        crate::desktop_control::DISCOVERY_TIMEOUT,
+    )?;
     if !current.same_identity(target) {
         return Err(error("TARGET_CHANGED"));
     }
@@ -242,7 +251,7 @@ impl GraphicsCaptureApiHandler for OneFrame {
                 if frame.color_format() != ColorFormat::Rgba8 {
                     return Err(error("TARGET_CHANGED"));
                 }
-                let mut buffer = frame.buffer().map_err(|_| error("TARGET_UNAVAILABLE"))?;
+                let mut buffer = frame.buffer().map_err(|_| error("CAPTURE_FAILED"))?;
                 let pitch = buffer.row_pitch() as usize;
                 if buffer.width() != width
                     || buffer.height() != height
@@ -339,12 +348,12 @@ pub(super) fn capture(target: CaptureTarget) -> Result<Vec<u8>, DesktopAdapterEr
     );
     // Library init/message loop/join may block. The parent deadline kills/reaps
     // this helper and its UIA probe descendants; dropping a future is not cleanup.
-    OneFrame::start(settings).map_err(|_| error("TARGET_UNAVAILABLE"))?;
+    OneFrame::start(settings).map_err(|_| error("CAPTURE_FAILED"))?;
     let pixels = result
         .lock()
         .map_err(|_| error("ADAPTER_FAILED"))?
         .take()
-        .ok_or_else(|| error("TARGET_UNAVAILABLE"))??;
+        .ok_or_else(|| error("CAPTURE_FAILED"))??;
     complete_guard(&target)?;
     let png = encode_rgba(pixels.width, pixels.height, pixels.rgba)?;
     scalar_guard(&target)?;

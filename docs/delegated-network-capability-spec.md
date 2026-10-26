@@ -2,7 +2,7 @@
 
 日期：2026-08-03
 
-状态：**规范及当前实施状态（2026-09-21）。`NetworkGateway`、版本化 `SourcePolicy` 注册表、固定解析地址的单跳 HTTPS transport、Explorer runtime，以及 `delegate_network_exploration` 的通用确认/恢复和持久化签发路径已经接通。运行时现在在每次操作和 transport 返回后验证批准撤销/策略摘要；每次 attempt 的 lease 只取得其 `ExplorerPlan` 所需 host；响应字节与 MIME 上限已随策略进入 transport。项目设置已可查看并撤销当前项目的联网批准。Explorer task 的取消信号会贯穿 gateway、HTTP 请求等待和响应体读取；一经观察到取消，后续重定向和证据投影停止。它们仍不构成更宽泛的端到端完成声明：已发出的远端请求不能撤回、同步 DNS 查询不可中止，且真实桌面长旅程验收仍待完成。**
+状态：网络能力的规范性合同。当前接线、缺口和有效验收只在 [统一路线图](current-roadmap.md) 维护，不以本规范存在作为端到端完成证明。
 
 范围：主 Agent 向后台 worker 授予受控网络探索与依赖获取能力。本文是该主题的唯一规范性来源；其它委派、安全、沙箱和运行时文档只交叉引用本文。
 
@@ -153,28 +153,9 @@ workPackageId + delegationId + attemptId + sourcePolicyDigest + leaseVersion
 6. 网页中要求泄露上下文或扩大权限的文本只作为 `untrusted_web` 证据；不会改变授权或进入主 Agent 长期上下文。
 7. 7 天检疫清理只删除该 attempt 自有的未采纳网络证据/沙箱数据，不能删除已采纳工件或任意外部路径。
 
-## 11. 相关材料
+## 11. 关联入口
 
-- [委派权限与受控执行审计](agent-delegation-permissions-threat-model.md)
-- [主流 Subagent 实现调研](research-mainstream-subagent-safety-usability.md)
-- [FirstMate 与主流机制复核](research-firstmate-safety-usability.md)
-- [子代理能力隔离调研](research-delegated-worker-capability-isolation.md)
-- [沙箱生命周期审计](delegated-sandbox-lifecycle-audit.md)
-- [受控委派运行时边界审计](controlled-delegation-runtime-boundary-report.md)
-- [共享执行循环评估](agent-execution-loop-architecture-evaluation.md)
-
-## 12. 文档对齐矩阵
-
-| 文档 | 对齐状态 | 本次精确更新 |
-| --- | --- | --- |
-| [委派权限与受控执行审计](agent-delegation-permissions-threat-model.md) | 已对齐 | `NetworkPolicy` 明确指向 `NetworkCapability`/`SourcePolicyRef`；保留威胁建模而不重复规范。 |
-| [主流 Subagent 实现调研](research-mainstream-subagent-safety-usability.md) | 已对齐 | 将旧的 Explorer “无网络”实施切片改为已签发能力下的受控搜索/抓取，并保留“尚未实现”。 |
-| [FirstMate 与主流机制复核](research-firstmate-safety-usability.md) | 已对齐 | 明确 FirstMate 的 worktree/脚本不构成 AngelBot 网络权限模型。 |
-| [子代理能力隔离调研](research-delegated-worker-capability-isolation.md) | 已对齐 | 网络 allowlist/秘密隔离术语改为引用本规范，保留研究依据。 |
-| [沙箱生命周期审计](delegated-sandbox-lifecycle-audit.md) | 已对齐 | 将网络证据的撤销、封存与七天保留交叉引用到本规范，不夸大实现状态。 |
-| [受控委派运行时边界审计](controlled-delegation-runtime-boundary-report.md) | 已对齐 | 将租约网络 allowlist 统一为 lease-bound `NetworkCapability`。 |
-| [Real WorkerAdapter integration design](real-worker-adapter-integration-design.md) | 已对齐 | 将通用执行 port 的网络子集定向到本规范，并明确尚未接线。 |
-| [共享执行循环评估](agent-execution-loop-architecture-evaluation.md) | 已对齐 | 标注 network port 属于 gateway 而非 loop，且未实现。 |
-| [AgentRunner 深度拆分设计](agent-runner-decomposition-design.md) | 已对齐 | 标注 kernel 不拥有网络权限，网络属于 lease-bound gateway port。 |
-| [可扩展异步委派运行时调研](research-scalable-async-delegation-architecture.md) | 已对齐 | 标注网络探索属于 worker host/gateway，不属于共享 kernel 或调度器。 |
-| [AngelBot glossary](../CONTEXT.md) | 已对齐 | 新增 `Network Capability`、`Source Policy`、`Network Evidence` 三项最小术语。 |
+- [委派合同](delegated-agent-framework-spec.md)：工作包、worker、候选与审校。
+- [架构决策](architecture-decisions.md#adr-0003)：lease 与 gateway 的授权边界。
+- [术语表](../CONTEXT.md)：Network Capability、Source Policy、Network Evidence。
+- [当前路线图](current-roadmap.md)：唯一实施／验收状态；本文不重复维护文档对齐矩阵。

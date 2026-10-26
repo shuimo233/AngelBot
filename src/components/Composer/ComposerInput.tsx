@@ -19,7 +19,8 @@ import { useSettingsStore } from '$stores/settings';
 import type { AgentExecutionPermission } from '$lib/commands/settings';
 import { useExecutionPermissionStore } from '$stores/executionPermission';
 import type { TextAttachment } from '$types';
-import { loadTextAttachments, TEXT_ATTACHMENT_ACCEPT, textAttachmentBytes, validateTextAttachments } from '$lib/text-attachments';
+import { loadTextAttachments, TEXT_ATTACHMENT_ACCEPT, validateTextAttachments } from '$lib/text-attachments';
+import { TextAttachmentDetails } from '../TextAttachmentDetails';
 import './ComposerInput.css';
 
 // ── Icons ───────────────────────────────────────────────────────────────────────
@@ -90,6 +91,8 @@ export interface ComposerInputProps {
   soundEnabled: boolean;
   onSoundToggle: () => void;
   disabled?: boolean;
+  /** Keep drafting available while history is being checked; block admission only. */
+  sendDisabled?: boolean;
 }
 
 // ── Tool Preset config ──────────────────────────────────────────────────────────
@@ -104,7 +107,7 @@ const TOOL_PRESET_OPTIONS: Array<{ value: ToolPreset; label: string; desc: strin
 const PERMISSION_OPTIONS: Array<{ value: AgentExecutionPermission; label: string; desc: string }> = [
   { value: 'ask', label: '请求批准', desc: '按工具规则逐次确认需要批准的操作' },
   { value: 'workspace_auto', label: '工作区自动', desc: '新建或覆盖项目文件、已启用的 MCP 工具可自动执行；其他文件操作仍按规则确认' },
-  { value: 'full_access', label: '完全访问', desc: '所有工作区中已准入的文件、桌面、MCP 与外部服务工具可自动执行；保护操作仍会询问' },
+  { value: 'full_access', label: '完全访问', desc: '已准入的工具按任务授权连续执行，不按调用次数暂停；已有保护操作仍会询问，范围与停止规则不变' },
 ];
 
 // ── Thinking Effort config ──────────────────────────────────────────────────────
@@ -340,6 +343,7 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
     soundEnabled,
     onSoundToggle,
     disabled,
+    sendDisabled = false,
     scopeKey = '',
   }, ref) {
 
@@ -435,7 +439,7 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
         setFileDraft({ generation: readGeneration, files: combined });
       } catch (error) {
         if (current()) setFileStatus({ generation: readGeneration, reading: readsRef.current > 1,
-          sending: sendingRef.current, error: error instanceof Error ? error.message : '无法读取文件，请重新选择。' });
+          sending: sendingRef.current, error: `${error instanceof Error ? error.message : '无法读取文件，请重新选择。'} 本次选择未添加任何附件，已有附件和输入文字未改变。` });
       } finally {
         if (current()) {
           readsRef.current--;
@@ -498,13 +502,13 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
 
     // ── Send ────────────────────────────────────────────────────────────────
 
-    const canSend = Boolean(value.trim() || attachedFiles.length > 0) && !isStreaming && !disabled && !status.reading && !status.sending;
-    const canQueue = Boolean(value.trim()) && attachedFiles.length === 0 && !status.reading && !disabled;
+    const canSend = Boolean(value.trim() || attachedFiles.length > 0) && !isStreaming && !disabled && !sendDisabled && !status.reading && !status.sending;
+    const canQueue = Boolean(value.trim()) && attachedFiles.length === 0 && !status.reading && !disabled && !sendDisabled;
 
     const handleSend = useCallback(async () => {
       const msg = value.trim();
       const submittedFiles = filesRef.current;
-      if ((!msg && submittedFiles.length === 0) || isStreaming || disabled || readsRef.current || sendingRef.current) return;
+      if ((!msg && submittedFiles.length === 0) || isStreaming || disabled || sendDisabled || readsRef.current || sendingRef.current) return;
       const sendGeneration = scopeRef.current.generation;
       const submittedRevision = valueRevisionRef.current;
       sendingRef.current = true;
@@ -541,7 +545,7 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
           textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 220)}px`;
         }
       });
-    }, [value, isStreaming, disabled, onSend, onChange, restoreFiles]);
+    }, [value, isStreaming, disabled, sendDisabled, onSend, onChange, restoreFiles]);
 
     const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -610,15 +614,16 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
           <div className="composer-files-strip" aria-label="待发送文本附件">
             {attachedFiles.map((file, index) => (
               <div key={index} className="composer-file-chip">
-                <span title={file.name}>{file.name}</span>
-                <small>{textAttachmentBytes(file.text)} B</small>
+                <TextAttachmentDetails file={file} />
                 <button type="button" onClick={() => removeFile(file)} aria-label={`移除附件 ${file.name}`} title="移除附件">×</button>
               </div>
             ))}
           </div>
         )}
         {(attachedFiles.length > 0 || status.reading) && <div className="composer-attachment-note">
-          {status.reading ? '正在读取文本文件… ' : ''}内容将发送给当前配置的模型；附件是只读快照，不授予原文件访问或修改权限。
+          {status.reading ? '正在读取文件文字… ' : ''}点击文件名可核对文字；发送后内容将交给当前配置的模型。附件是只读快照，不授予原文件访问或修改权限。
+          {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.docx')) && ' DOCX 只读取正文和表格文字，不含图片、页眉页脚或版式；复杂域与修订暂不支持。'}
+          {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.xlsx')) && ' XLSX 读取保存的原始单元格值，不按日期、百分比或货币格式换算，不含图表或样式；公式及隐藏内容暂不支持。'}
         </div>}
         {isStreaming && (attachedFiles.length > 0 || status.reading) && <div className="composer-attachment-note">附件已暂存，请等待当前任务结束后发送；引导和排队暂不支持附件。</div>}
         {status.error && <div role="alert" className="composer-attachment-error">{status.error}</div>}
@@ -628,11 +633,11 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
 
           {/* ── LEFT: attachment only; model selection lives in the toolbar ── */}
           <div className="composer-bar-left">
-            {/* Explicit UTF-8 text snapshots, not a general file permission. */}
+            {/* Explicit text snapshots, not a general file permission. */}
             <TooltipPButton
               onClick={() => fileInputRef.current?.click()}
               disabled={disabled}
-              title="添加文本文件（每个 16 KiB，合计 32 KiB，最多 4 个）"
+              title="添加文本、DOCX 或 XLSX（文档原文件最多 4 MiB；文字每个 16 KiB、合计 32 KiB，最多 4 个）"
             >
               <AttachIcon />
             </TooltipPButton>

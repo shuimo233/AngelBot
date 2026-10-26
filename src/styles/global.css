@@ -431,27 +431,6 @@ body,
   align-items: center;
 }
 
-.settings-panel {
-  width: 280px;
-  background: var(--color-surface);
-  border-left: 1px solid var(--color-border);
-  padding: 16px;
-  overflow-y: auto;
-  flex-shrink: 0;
-}
-
-.settings-title {
-  font-size: 15px;
-  font-weight: 600;
-  margin-bottom: 16px;
-}
-
-.settings-block {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
 .field {
   display: flex;
   flex-direction: column;
@@ -1794,6 +1773,10 @@ body,
 
 .desktop-action-receipt--result_unknown {
   border-left-color: #b45309;
+}
+
+.desktop-action-receipt--failed {
+  border-left-color: var(--color-danger);
 }
 
 .desktop-action-receipt-heading {

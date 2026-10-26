@@ -113,6 +113,9 @@ pub enum AgentEvent {
         message_id: String,
         full_text: String,
     },
+    /// Journal-only reservation, committed before a runtime-owned external
+    /// tool dispatch. It proves possible execution, never business completion.
+    ExternalToolDispatchReserved { call_id: String, tool_name: String },
     /// Tool execution started
     ToolExecutionStart {
         call_id: String,
@@ -253,6 +256,8 @@ pub enum AgentEvent {
 pub enum ErrorCode {
     /// LLM API call failed
     LlmError,
+    /// Provider identified an exhausted usage quota, not an inferred rate limit.
+    LlmQuotaExceeded,
     /// Tool execution failed
     ToolError,
     /// Context length exceeded
@@ -271,6 +276,7 @@ impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCode::LlmError => "LLM_ERROR",
+            ErrorCode::LlmQuotaExceeded => "LLM_QUOTA_EXCEEDED",
             ErrorCode::ToolError => "TOOL_ERROR",
             ErrorCode::ContextLengthExceeded => "CONTEXT_LENGTH_EXCEEDED",
             ErrorCode::Timeout => "TIMEOUT",

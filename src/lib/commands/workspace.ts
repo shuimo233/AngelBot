@@ -11,6 +11,7 @@ export interface Workspace {
   createdAt: number;
   updatedAt: number;
   activeSessionId: string;
+  directoryConfirmed?: boolean;
 }
 
 export interface OpenWorkspace {
@@ -24,6 +25,12 @@ export function getWorkspaces(): Promise<Workspace[]> {
 
 export function openWorkspace(id: string): Promise<OpenWorkspace> {
   return invoke<OpenWorkspace>('open_workspace', { id });
+}
+
+export interface DirectoryConfirmation { id: string; expectedPath: string; path: string }
+
+export function confirmRestoredProjectDirectories(directories: DirectoryConfirmation[]): Promise<void> {
+  return invoke<void>('confirm_restored_project_directories', { directories });
 }
 
 export function createProjectWorkspace(path: string, name?: string): Promise<OpenWorkspace> {

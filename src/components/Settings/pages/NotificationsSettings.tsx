@@ -85,8 +85,8 @@ export function NotificationsSettings() {
           onChange={(checked) => updateChannel('reminder', checked)}
         />
         <ToggleField
-          label="任务完成"
-          description="当长时间运行的任务完成时通知你。"
+          label="任务结果"
+          description="任务完成、受控脚本或 MAA 执行结束时通知你，包括失败和停止；运行回执仍保留在原工作区。"
           checked={settings.task_complete}
           onChange={(checked) => updateChannel('task_complete', checked)}
         />

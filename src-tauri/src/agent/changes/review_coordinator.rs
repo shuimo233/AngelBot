@@ -2,7 +2,7 @@
 //!
 //! This coordinator owns review policy and identity checks, while
 //! `ReviewJobStore` owns SQLite.  Model execution is intentionally not here;
-//! a future Pump adapter can claim a job, run a Reviewer Agent, and record the
+//! the Pump adapter claims a job, runs a Reviewer Agent, and records the
 //! bounded outcome through this narrow interface.
 
 use super::{
@@ -112,5 +112,9 @@ impl ReviewCoordinator {
     pub fn recover_runnable(&self, now: i64) -> Result<Vec<ReviewJob>, ReviewStoreError> {
         self.store.requeue_running(now)?;
         self.store.list_queued()
+    }
+
+    pub fn cancel_obsolete(&self, now: i64) -> Result<Vec<String>, ReviewStoreError> {
+        self.store.cancel_obsolete(now)
     }
 }

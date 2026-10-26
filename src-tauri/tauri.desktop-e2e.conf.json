@@ -1,4 +1,8 @@
 {
+  "build": {
+    "frontendDist": "target/desktop-e2e/frontend",
+    "beforeBuildCommand": "npm run build -- --outDir src-tauri/target/desktop-e2e/frontend"
+  },
   "app": {
     "security": {
       "capabilities": [

@@ -130,6 +130,9 @@ pub struct AgentConfig {
     pub preferences: UserPreferences,
     /// Relevant memories to inject as context
     pub relevant_memories: Vec<MemoryContext>,
+    /// Bounded saved global rules, loaded independently of query similarity
+    /// and conversation compaction. JSON data with source IDs and omissions.
+    pub saved_constraint_context: Option<String>,
     /// Background interaction preferences learned from repeated behaviour.
     /// Explicit user settings always take precedence.
     pub adaptive_constraints: Vec<AdaptiveConstraint>,
@@ -192,6 +195,7 @@ impl Default for AgentConfig {
             profile: None,
             preferences: UserPreferences::default(),
             relevant_memories: Vec::new(),
+            saved_constraint_context: None,
             adaptive_constraints: Vec::new(),
             skill_instructions: Vec::new(),
             core_memories: Vec::new(),

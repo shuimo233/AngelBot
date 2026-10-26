@@ -30,6 +30,8 @@ mod tool_image;
 pub use tool_image::{ToolImage, MAX_TOOL_IMAGES, MAX_TOOL_IMAGE_TOTAL_BYTES};
 pub mod protocol;
 pub use openai_compat::OpenAiCompatibleProvider;
+#[cfg(test)]
+pub(crate) use openai_responses::native_context_shape;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use protocol::{ModelAuthMode, ModelProtocol, ProtocolContinuation};
 #[allow(unused_imports)]
@@ -202,6 +204,10 @@ mod thinking_tests {
     #[test]
     fn context_window_comes_from_the_selected_model_not_a_user_setting() {
         assert_eq!(
+            context_window_tokens(&config("openai", "gpt-6-luna", 4096)),
+            1_050_000
+        );
+        assert_eq!(
             context_window_tokens(&config("deepseek", "deepseek-v4-flash", 4096)),
             1_000_000
         );
@@ -217,6 +223,15 @@ mod thinking_tests {
             context_window_tokens(&config("custom", "internal-model", 4096)),
             FALLBACK_CONTEXT_WINDOW_TOKENS
         );
+        for (provider, model) in [
+            ("custom", "gpt-6-luna"),
+            ("openai", "gpt-6-luna-unverified"),
+        ] {
+            assert_eq!(
+                context_window_tokens(&config(provider, model, 4096)),
+                FALLBACK_CONTEXT_WINDOW_TOKENS
+            );
+        }
     }
 }
 
@@ -432,6 +447,44 @@ pub fn resolve_thinking_settings(
     }
 }
 
+/// Closed, non-secret recovery categories supplied by a provider adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmFailureKind {
+    Unclassified,
+    QuotaExceeded,
+}
+
+impl LlmFailureKind {
+    pub fn visible_notice(&self) -> Option<&'static str> {
+        match self {
+            Self::Unclassified => None,
+            Self::QuotaExceeded => Some("当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。"),
+        }
+    }
+}
+
+/// Diagnostics remain private; only the closed kind can select a visible notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmFailure {
+    pub kind: LlmFailureKind,
+    pub diagnostic: String,
+}
+
+impl From<String> for LlmFailure {
+    fn from(diagnostic: String) -> Self {
+        Self {
+            kind: LlmFailureKind::Unclassified,
+            diagnostic,
+        }
+    }
+}
+
+impl From<&str> for LlmFailure {
+    fn from(diagnostic: &str) -> Self {
+        diagnostic.to_owned().into()
+    }
+}
+
 /// Trait for LLM providers
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -466,6 +519,30 @@ pub trait LlmProvider: Send + Sync {
         _delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<LlmResponse, String> {
         self.chat(messages, tools, thinking).await
+    }
+
+    /// Preserve compatibility for providers without a machine-code classifier.
+    async fn chat_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+    ) -> Result<LlmResponse, LlmFailure> {
+        self.chat(messages, tools, thinking)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn chat_stream_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<LlmResponse, LlmFailure> {
+        self.chat_stream(messages, tools, thinking, delta_sender)
+            .await
+            .map_err(Into::into)
     }
 
     /// Issue #092 / G2: Refresh the API key at runtime without requiring a
@@ -543,6 +620,9 @@ pub fn context_window_tokens(config: &ProviderConfig) -> usize {
     let model = config.model.trim().to_ascii_lowercase();
 
     match (provider.as_str(), model.as_str()) {
+        // https://developers.openai.com/api/docs/models/gpt-6-luna
+        // Only this verified provider/model pair changes the fallback.
+        ("openai", "gpt-6-luna") => 1_050_000,
         // DeepSeek V4 Pro/Flash expose a 1M-token context window. The legacy
         // `deepseek-chat` / `deepseek-reasoner` names are kept here only so
         // users still on pre-V4 config keep correct context sizing — the API

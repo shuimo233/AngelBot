@@ -2,10 +2,11 @@ name: Verify
 
 on:
   pull_request:
-    branches: [dev, main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    # Drafts already run the source gates. Becoming ready changes no test input.
+    types: [opened, synchronize, reopened]
   push:
-    branches: [dev, main]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

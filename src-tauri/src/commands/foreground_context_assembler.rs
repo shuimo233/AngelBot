@@ -46,6 +46,8 @@ pub struct ForegroundContextRequest<'a> {
     pub request: &'a SendMessageRequest,
     pub history_before_created_at: i64,
     pub budget: ForegroundContextBudget,
+    /// Trusted queue binding, never parsed from model/user text.
+    pub summary_delivery_id: Option<&'a str>,
 }
 
 /// Inputs ready for `AgentRunner`; provider, events, terminal state and raw
@@ -112,8 +114,12 @@ impl ForegroundContextAssembler {
                 &ContractLimits::default(),
             )
             .map_err(|error| error.to_string())?;
-            let (pending_delivery_ids, delegation_context) =
-                bounded_delegation_context(&conn, &pending)?;
+            let (pending_delivery_ids, delegation_context) = bounded_delegation_context(
+                &conn,
+                &request.request.session_id,
+                &pending,
+                request.summary_delivery_id,
+            )?;
             let project_catalog =
                 personal_workspace_project_catalog(&conn, &request.request.session_id)?;
             let (task_understanding_record_ids, task_understanding_context) =
@@ -177,12 +183,40 @@ const MAX_PENDING_CONTEXT_BYTES: usize = 12_000;
 /// Raw payloads, logs, and worker reasoning never cross this seam.
 fn bounded_delegation_context(
     conn: &Connection,
+    session_id: &str,
     pending: &[InboxDelivery],
+    summary_delivery_id: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>), String> {
     let mut ids = Vec::new();
     let mut entries = Vec::new();
-    let mut bytes = 0usize;
-    for item in pending.iter().take(MAX_PENDING_DELIVERIES) {
+    // Reserve both possible section wrappers and line separators inside the
+    // same byte limit, rather than expanding the prompt budget for failures.
+    let mut bytes = "<delegated_deliveries>\n\n</delegated_deliveries>\n<delegation_failures>\n\n</delegation_failures>".len()
+        + MAX_PENDING_DELIVERIES;
+    let mut failures = Vec::new();
+    if summary_delivery_id.is_none() {
+        // Share the existing count and byte budget. At most half the slots
+        // report host failures, leaving room for actual reviewed deliveries.
+        for failure in
+            crate::agent::supervision::delegation_activity_adapter::runtime_failures_for_session(
+                conn, session_id,
+            )?
+            .into_iter()
+            .take(MAX_PENDING_DELIVERIES / 2)
+        {
+            let encoded = serde_json::to_string(&failure).map_err(|error| error.to_string())?;
+            if bytes + encoded.len() > MAX_PENDING_CONTEXT_BYTES {
+                break;
+            }
+            bytes += encoded.len();
+            failures.push(encoded);
+        }
+    }
+    for item in pending
+        .iter()
+        .filter(|item| summary_delivery_id.is_none_or(|id| item.delivery.delivery_id == id))
+        .take(MAX_PENDING_DELIVERIES - failures.len())
+    {
         let context = &item.context;
         let review = review_projection(
             conn,
@@ -227,15 +261,24 @@ fn bounded_delegation_context(
         entries.push(encoded);
     }
     if entries.is_empty() {
-        return Ok((ids, None));
+        if summary_delivery_id.is_some() {
+            return Err("the scoped delegated result is no longer available for summary".into());
+        }
     }
-    Ok((
-        ids,
-        Some(format!(
+    let mut sections = Vec::new();
+    if !entries.is_empty() {
+        sections.push(format!(
             "<delegated_deliveries>\n{}\n</delegated_deliveries>",
             entries.join("\n")
-        )),
-    ))
+        ));
+    }
+    if !failures.is_empty() {
+        sections.push(format!(
+            "<delegation_failures>\n{}\n</delegation_failures>",
+            failures.join("\n")
+        ));
+    }
+    Ok((ids, (!sections.is_empty()).then(|| sections.join("\n"))))
 }
 
 /// Review output enters Main-Agent context only through this compact,
@@ -258,7 +301,7 @@ fn review_projection(
         .optional()
         .map_err(|error| error.to_string())?;
     let Some((status, outcome_json, change_handoff)) = row else {
-        return Ok(json!({"status":"pending"}));
+        return Ok(json!({"status":"pending", "workspace_write":"not_applied"}));
     };
     let outcome = outcome_json.as_deref().and_then(|value| {
         serde_json::from_str::<crate::agent::review_contract::ReviewOutcome>(value).ok()
@@ -266,11 +309,22 @@ fn review_projection(
     Ok(json!({
         "status": status,
         "change_handoff": change_handoff,
+        "workspace_write": workspace_write_projection(change_handoff.as_deref()),
         "summary": outcome.as_ref().map(|value| value.summary.as_str()),
         "findings": outcome.as_ref().map(|value| value.findings.iter().take(8).collect::<Vec<_>>()),
         "missing_evidence": outcome.as_ref().map(|value| value.missing_evidence.iter().take(8).collect::<Vec<_>>()),
         "evidence_refs": outcome.as_ref().map(|value| value.evidence_refs.iter().take(12).collect::<Vec<_>>()),
     }))
+}
+
+fn workspace_write_projection(handoff: Option<&str>) -> &'static str {
+    match handoff {
+        Some("materialized") => "applied",
+        None | Some("preparing" | "ready") => "not_applied",
+        // Once confirmation begins, an interrupted/failed materialization
+        // may have effects. Absence of a success is not proof of no write.
+        _ => "unknown",
+    }
 }
 
 fn merge_context_sections(attention: Option<String>, delegation: Option<String>) -> Option<String> {
@@ -464,6 +518,47 @@ mod tests {
     }
 
     #[test]
+    fn automatic_summary_focuses_its_bound_delivery_before_the_context_cap() {
+        use crate::agent::{
+            delegation_contract::{DelegationDelivery, ParentContext},
+            delivery_inbox::InboxAcceptanceStatus,
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let pending:Vec<_>=(0..=MAX_PENDING_DELIVERIES).map(|index| {
+            let delivery:DelegationDelivery=serde_json::from_value(json!({
+                "schema_version":1,"delivery_id":format!("delivery-{index}"),"delivery_revision":1,
+                "identity":{"session_id":"s","message_id":"m","parent_run_id":"r","delegation_id":"d","attempt_id":"a"},
+                "status":"blocked","executive_summary":format!("Candidate summary {index}"),
+                "key_facts":[],"milestones":[],"verifications":[],"candidate_artifacts":[],
+                "open_questions":[],"risks":[],"evidence_refs":[],
+                "usage":{"context_truncated":false,"output_truncated":false,"budget_exhausted":false},
+            })).unwrap();
+            let context=ParentContext {identity:delivery.identity.clone(),status:delivery.status,
+                summary:delivery.executive_summary.clone(),facts:vec![],milestones:vec![],verifications:vec![],
+                artifacts:vec![],open_questions:vec![],risks:vec![],evidence_refs:vec![],usage:delivery.usage.clone()};
+            InboxDelivery {delivery,context,acceptance_status:InboxAcceptanceStatus::Submitted,state_version:0}
+        }).collect();
+        let last = format!("delivery-{MAX_PENDING_DELIVERIES}");
+        let ordinary = bounded_delegation_context(&conn, "s", &pending, None).unwrap();
+        assert!(!ordinary.0.contains(&last));
+        let focused = bounded_delegation_context(&conn, "s", &pending, Some(&last)).unwrap();
+        assert_eq!(focused.0, vec![last]);
+        assert!(focused
+            .1
+            .as_ref()
+            .unwrap()
+            .contains(&format!("Candidate summary {MAX_PENDING_DELIVERIES}")));
+        assert!(focused
+            .1
+            .unwrap()
+            .contains("\"workspace_write\":\"not_applied\""));
+        assert!(
+            bounded_delegation_context(&conn, "s", &pending, Some("missing-delivery")).is_err()
+        );
+    }
+
+    #[test]
     fn main_agent_projection_includes_only_bounded_review_outcome() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
@@ -493,6 +588,8 @@ mod tests {
             milestones: vec![],
             verifications: vec![],
             artifact_refs: vec![],
+            candidate_artifacts: vec![],
+            file_read_evidence: vec![],
             risks: vec![],
             open_questions: vec![],
         };
@@ -520,7 +617,38 @@ mod tests {
             .unwrap();
         assert_eq!(projection["status"], "passed");
         assert_eq!(projection["summary"], "checked independently");
+        assert_eq!(projection["workspace_write"], "not_applied");
+        assert_eq!(workspace_write_projection(Some("materialized")), "applied");
+        for status in [
+            "confirmation_pending",
+            "needs_decision",
+            "cancelled",
+            "future_state",
+        ] {
+            assert_eq!(workspace_write_projection(Some(status)), "unknown");
+        }
         assert!(projection.to_string().contains("evidence://review/1"));
         assert!(!projection.to_string().contains("sandbox://a"));
+        db.with_conn_mut(|conn| {
+            conn.execute_batch("UPDATE delegations SET status='needs_decision',updated_at=4 WHERE id='d';
+                INSERT INTO delegation_attempts(id,delegation_id,attempt_number,status,sandbox_ref,created_at,ended_at)
+                VALUES ('a2','d',2,'sealed','sandbox://a2',4,4);
+                INSERT INTO delegation_attempt_events(attempt_id,sequence,event_type,payload_json,created_at)
+                VALUES ('a2',1,'worker_failed','{\"raw\":\"PRIVATE_CANARY\"}',4);").unwrap();
+            let (_, context) = bounded_delegation_context(conn, "s", &[], None).unwrap();
+            let context = context.unwrap();
+            assert!(context.contains("<delegation_failures>"));
+            assert!(context.contains("execution_ended"));
+            assert!(context.contains("没有自动重试"));
+            assert!(!context.contains("PRIVATE_CANARY"));
+            assert!(!context.contains("sandbox://"));
+            assert!(context.len() <= MAX_PENDING_CONTEXT_BYTES);
+            assert!(bounded_delegation_context(conn, "other-session", &[], None).unwrap().1.is_none());
+            assert!(bounded_delegation_context(conn, "s", &[], Some("missing")).is_err());
+            let projection=crate::agent::supervision::delegation_activity_adapter::get_for_session(conn,"s").unwrap();
+            assert!(projection.delegations[0].reviewer_status.is_none());
+            assert_eq!(projection.delegations[0].summary.as_deref(),
+                Some("委派执行在提交结果前结束，目前没有可交付结论；任务完成情况尚未核验。"));
+        }).unwrap();
     }
 }

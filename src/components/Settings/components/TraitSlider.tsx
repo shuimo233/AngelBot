@@ -22,6 +22,7 @@ export function TraitSlider({ name, value, onChange }: TraitSliderProps) {
       <div className="trait-slider-track-wrapper">
         <input
           type="range"
+          aria-label={`${labels.left} — ${labels.right}`}
           min="-5"
           max="5"
           step="1"

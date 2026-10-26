@@ -11,6 +11,53 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+const MAX_CONTEXT_CONSTRAINTS: usize = 10;
+const MAX_CONTEXT_BYTES: usize = 8_192;
+
+/// One bounded projection shared by foreground preparation and explicit checks.
+/// Only attributable global records are eligible; an unbound session record
+/// cannot become a global rule. Preserve whole rules rather than truncating a
+/// qualifier/negation, and report omissions instead of implying completeness.
+pub(crate) fn saved_constraint_context(db: &Connection) -> Result<Option<String>, String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT id,
+                    CASE WHEN length(CAST(content AS BLOB)) <= ?2 THEN content END,
+                    COUNT(*) OVER () FROM memories
+             WHERE scope='global' AND category='constraint'
+               AND forget_stage='active' AND superseded_by IS NULL
+             ORDER BY importance DESC, updated_at DESC, id LIMIT ?1",
+        )
+        .map_err(|error| format!("约束读取失败: {error}"))?;
+    let rows = stmt
+        .query_map(
+            [MAX_CONTEXT_CONSTRAINTS as i64, MAX_CONTEXT_BYTES as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, usize>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("约束读取失败: {error}"))?;
+    let mut items = Vec::new();
+    let mut total = 0;
+    for row in rows {
+        let (id, content, count) = row.map_err(|error| format!("约束读取失败: {error}"))?;
+        total = count;
+        let Some(content) = content else { continue };
+        items.push(serde_json::json!({ "id": id, "content": content }));
+        // `total` reserves the largest possible omission counter as well.
+        let projection = serde_json::json!({"items": items, "omitted": total});
+        if projection.to_string().len() > MAX_CONTEXT_BYTES {
+            items.pop();
+        }
+    }
+    Ok((total > 0)
+        .then(|| serde_json::json!({"items": items, "omitted": total - items.len()}).to_string()))
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 pub struct ExtractConstraintsHandler {
@@ -49,7 +96,7 @@ impl ToolHandler for ExtractConstraintsHandler {
              VALUES (?1, 'global', 'constraint', ?2, 9, 'agent', 0, 1, 'active', ?3, ?4, ?4)",
             params![id, args.content, ctype, now],
         ) {
-            Ok(_) => ToolResult::success("extract_constraints", format!("约束已提取并存储为永久记忆: {}", args.content)),
+            Ok(_) => ToolResult::success("extract_constraints", format!("已保存用于日常和所有项目的全局约束: {}", args.content)),
             Err(e) => ToolResult::error("extract_constraints", format!("存储失败: {}", e)),
         }
     }
@@ -72,53 +119,22 @@ impl ToolHandler for CheckConstraintHandler {
             Ok(d) => d,
             Err(e) => return ToolResult::error("check_constraint", e),
         };
-        let action = arguments
+        let Some(action) = arguments
             .get("action")
             .and_then(|a| a.as_str())
-            .unwrap_or("");
-        let mut stmt = match db.prepare(
-            "SELECT id, content FROM memories WHERE category = 'constraint' AND forget_stage = 'active' AND deleted = 0 ORDER BY priority DESC LIMIT 10",
-        ) {
-            Ok(s) => s,
-            Err(_) => return ToolResult::success("check_constraint", "未发现冲突约束。"),
+            .filter(|action| !action.trim().is_empty())
+        else {
+            return ToolResult::error(self.name(), "需要非空的 action 操作描述");
         };
-        let conflicts: Vec<String> = stmt
-            .query_map([], |r| {
-                Ok(format!(
-                    "- [{}] {}",
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?
-                ))
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        let action_lower = action.to_lowercase();
-        let violations: Vec<&String> = conflicts
-            .iter()
-            .filter(|c| {
-                let c_lower = c.to_lowercase();
-                (c_lower.contains("never")
-                    || c_lower.contains("always")
-                    || c_lower.contains("must"))
-                    && action_lower.split_whitespace().any(|w| c_lower.contains(w))
-            })
-            .collect();
-        if violations.is_empty() {
-            ToolResult::success("check_constraint", "无冲突: 操作符合所有已知约束。")
-        } else {
-            ToolResult::success(
-                "check_constraint",
+        match saved_constraint_context(&db) {
+            Err(error) => ToolResult::error(self.name(), error),
+            Ok(None) => ToolResult::success(self.name(), "未查到有效全局约束；这不代表已获操作授权。"),
+            Ok(Some(constraints)) => ToolResult::success(
+                self.name(),
                 format!(
-                    "发现 {} 个潜在冲突:\n{}",
-                    violations.len(),
-                    violations
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    "请将已保存的全局约束与操作“{action}”逐项核对；这不是权限判定。omitted 大于0表示清单不完整，需按当前任务通过 recall_memories 补查或向用户澄清，不能假定不存在其他约束：\n{constraints}"
                 ),
-            )
+            ),
         }
     }
 }
@@ -129,7 +145,7 @@ pub fn register(registry: &mut ToolRegistry, db: Arc<Mutex<Connection>>) {
     registry.register(
         Tool::new(
             "extract_constraints",
-            "从对话内容中提取持久化约束。当用户表达 'always/never/must/prefer' 等偏好时使用。约束会被存储为永久记忆。",
+            "保存适用于日常和所有项目的全局长期约束。仅在用户明确要求跨任务记住时使用；当前任务或单个项目的条件留在其任务上下文中，不要提升为全局规则。需确认。",
             serde_json::json!({"type":"object","properties":{"content":{"type":"string","description":"约束内容"},"constraint_type":{"type":"string","description":"类型: constraint/preference/rule"}},"required":["content"]}),
         )
         .with_category(ToolCategory::Extension)
@@ -139,9 +155,63 @@ pub fn register(registry: &mut ToolRegistry, db: Arc<Mutex<Connection>>) {
     registry.register(
         Tool::new(
             "check_constraint",
-            "检查一个操作是否符合所有已知约束。在执行重要操作前使用，避免违反用户偏好。",
+            "读取至多10条、8192字节的有效全局用户约束，带来源ID及遗漏数量，供结合操作逐项核对；只提供依据，不代替权限校验。",
             serde_json::json!({"type":"object","properties":{"action":{"type":"string","description":"要检查的操作描述"}},"required":["action"]}),
         ).with_category(ToolCategory::Extension),
         Arc::new(CheckConstraintHandler { db: Some(db.clone()) }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_rules_preserve_whole_entries_and_report_count_and_byte_limits() {
+        let db = crate::db::init(Path::new(":memory:")).unwrap();
+        crate::db::migrate(&db).unwrap();
+        assert!(saved_constraint_context(&db).unwrap().is_none());
+        for index in 0..12 {
+            db.execute(
+                "INSERT INTO memories (id,scope,category,content,importance,forget_stage,created_at,updated_at)
+                 VALUES (?1,'global','constraint',?2,9,'active',1,?3)",
+                params![format!("rule-{index}"), format!("完整规则 {index}"), index],
+            )
+            .unwrap();
+        }
+        let context = saved_constraint_context(&db).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(
+            value["items"].as_array().unwrap().len(),
+            MAX_CONTEXT_CONSTRAINTS
+        );
+        assert_eq!(value["items"][0]["id"], "rule-11");
+        assert_eq!(value["omitted"], 2);
+        assert!(context.len() <= MAX_CONTEXT_BYTES);
+
+        let long_rule = format!(
+            "{}，但允许用户明确批准的例外",
+            "禁止删除".repeat(MAX_CONTEXT_BYTES)
+        );
+        db.execute(
+            "UPDATE memories SET content=?1,updated_at=100 WHERE id='rule-11'",
+            [&long_rule],
+        )
+        .unwrap();
+        let context = saved_constraint_context(&db).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(value["items"].as_array().unwrap().len(), 9);
+        assert_eq!(value["omitted"], 3);
+        assert!(!context.contains("允许用户明确批准的例外"));
+        assert!(context.len() <= MAX_CONTEXT_BYTES);
+        assert_eq!(
+            db.query_row(
+                "SELECT content FROM memories WHERE id='rule-11'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            long_rule
+        );
+    }
 }

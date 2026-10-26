@@ -109,6 +109,11 @@
   font: inherit;
 }
 
+.content-block-tool-confirmation-preview pre:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 2px;
+}
+
 .content-block-tool-btn {
   display: inline-flex;
   align-items: center;

@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import type { Message, ToolResult } from '$types';
 import { useSessionsStore } from './sessions';
 import { agentEventManager } from '$lib/commands/agent-event';
+import { isResultUnknown } from '$lib/tool-action-result';
+import { useWorkspaceActivityStore } from './workspaceActivity';
 
 export type LiveToolStep = {
   callId: string;
@@ -71,7 +73,8 @@ function updateTaskRunFromToolResults(message: Message, toolResults: ToolResult[
       ...message.taskRun,
       status,
       confirmationState,
-      resumable: hasPendingConfirmation || hasFailure || hasApprovedConfirmation,
+      resumable: !toolResults.some(isResultUnknown)
+        && (hasPendingConfirmation || hasFailure || hasApprovedConfirmation),
       completedStepCount,
     },
   };
@@ -80,6 +83,10 @@ function updateTaskRunFromToolResults(message: Message, toolResults: ToolResult[
 interface MessagesState {
   messages: Message[];
   input: string;
+  /** Unsent text stays in memory only, keyed by its original Main session. */
+  inputSessionId: string | null;
+  inputToken: object;
+  draftInputs: Record<string, { text: string; token: object }>;
   /** 工具正在执行中（用于显示加载指示器） */
   toolExecuting: boolean;
   /** 当前正在执行的工具名称 */
@@ -101,6 +108,8 @@ interface MessagesState {
   removeMessage: (messageId: string) => void;
   updateMessageContent: (messageId: string, content: string) => void;
   setInput: (input: string) => void;
+  activateInput: (sessionId: string | null) => void;
+  clearSubmittedInput: (sessionId: string, submitted: string, token?: object) => void;
   clearMessages: () => void;
   setToolExecuting: (executing: boolean, tool?: string) => void;
   addToolResult: (messageId: string, result: ToolResult) => void;
@@ -123,6 +132,9 @@ interface MessagesState {
 export const useMessagesStore = create<MessagesState>((set, get) => ({
   messages: [],
   input: '',
+  inputSessionId: null,
+  inputToken: {},
+  draftInputs: {},
   toolExecuting: false,
   executingTool: null,
   streamingText: '',
@@ -142,7 +154,29 @@ export const useMessagesStore = create<MessagesState>((set, get) => ({
       m.id === messageId ? { ...m, content } : m
     ),
   })),
-  setInput: (input) => set({ input }),
+  setInput: (input) => set((state) => state.input === input ? state : { input, inputToken: {} }),
+  activateInput: (sessionId) => set((state) => {
+    if (state.inputSessionId === sessionId) return state;
+    const draftInputs = { ...state.draftInputs };
+    if (state.inputSessionId) {
+      if (state.input) draftInputs[state.inputSessionId] = { text: state.input, token: state.inputToken };
+      else delete draftInputs[state.inputSessionId];
+    }
+    const draft = sessionId ? draftInputs[sessionId] : undefined;
+    if (sessionId) delete draftInputs[sessionId];
+    return { input: draft?.text ?? '', inputToken: draft?.token ?? {}, inputSessionId: sessionId, draftInputs };
+  }),
+  clearSubmittedInput: (sessionId, submitted, token) => set((state) => {
+    if (state.inputSessionId === sessionId) {
+      return state.input.trim() === submitted.trim() && (!token || token === state.inputToken)
+        ? { input: '', inputToken: {} } : state;
+    }
+    const draft = state.draftInputs[sessionId];
+    if (!draft || draft.text.trim() !== submitted.trim() || (token && token !== draft.token)) return state;
+    const draftInputs = { ...state.draftInputs };
+    delete draftInputs[sessionId];
+    return { draftInputs };
+  }),
   clearMessages: () => set({ messages: [], streamingText: '', liveStatus: '', liveBlocks: [], liveMessageId: null }),
 
   setToolExecuting: (executing, tool) =>
@@ -221,6 +255,7 @@ export const useMessagesStore = create<MessagesState>((set, get) => ({
 
     agentEventManager.on('AgentStart', () => {
       setLiveStatus('正在理解你的请求');
+      useWorkspaceActivityStore.getState().invalidate(sessionId);
     });
 
     // Do not expose hidden model reasoning. This is a concise, user-visible
@@ -230,7 +265,18 @@ export const useMessagesStore = create<MessagesState>((set, get) => ({
     });
 
     agentEventManager.on('MessageStart', (data) => {
-      set({ liveMessageId: data.message_id });
+      // A confirmation can start another durable reply before its IPC returns.
+      // Its block indexes restart at zero; never carry the prior approval into
+      // that new message. Repeated starts within one reply are model iterations.
+      set((state) => state.liveMessageId === data.message_id ? state : {
+        liveMessageId: data.message_id,
+        liveBlocks: [],
+        streamingText: '',
+        liveToolSteps: {},
+        toolProgress: {},
+        toolExecuting: false,
+        executingTool: null,
+      });
       setLiveStatus('正在规划下一步');
     });
 
@@ -271,6 +317,7 @@ export const useMessagesStore = create<MessagesState>((set, get) => ({
     });
 
     agentEventManager.on('ToolExecutionEnd', (data) => {
+      useWorkspaceActivityStore.getState().invalidate(sessionId);
       clearToolProgress(data.call_id);
       setLiveStatus(data.success ? `${data.tool_name} 已完成` : `${data.tool_name} 需要处理`);
       set((state) => ({
@@ -401,6 +448,10 @@ export const useMessagesStore = create<MessagesState>((set, get) => ({
     agentEventManager.on('MessageEnd', (data) => {
       set({ streamingText: data.full_text, liveStatus: '正在整理结果' });
     });
+
+    const refreshActivity = () => useWorkspaceActivityStore.getState().invalidate(sessionId);
+    agentEventManager.on('AgentEnd', refreshActivity);
+    agentEventManager.on('Error', refreshActivity);
 
     // Start listening to session events
     await agentEventManager.subscribeToSession(sessionId);

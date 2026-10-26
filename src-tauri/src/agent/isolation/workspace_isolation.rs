@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     fs,
     fs::OpenOptions,
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -1078,16 +1078,30 @@ impl<R: GitCommandRunner> GitWorktreeProvider<R> {
     }
 }
 
-/// Controlled file-operation seam for change workers.  The caller supplies an
-/// opaque, manifest-backed access token and a relative path; the provider owns
-/// path resolution, symlink checks, size limits, and lease/capability checks.
-/// No canonical workspace path crosses this interface.
+/// Bounded metadata, never a canonical workspace path or file contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeDirectoryListing {
+    /// Worktree-relative references. Directories end with `/`; links and Git
+    /// metadata are omitted, never followed or exposed as readable entries.
+    pub entries: Vec<String>,
+    pub truncated: bool,
+}
+
+/// Controlled file-operation seam for change workers. The provider owns path
+/// resolution, links, size limits, and manifest/capability checks.
 pub trait WorktreeFileProvider: Send + Sync {
     fn open_file_access(
         &self,
         identity: &WorktreeManifestIdentity,
         capability: WorktreeCapability,
     ) -> Result<WorktreeAccess, WorkspaceError>;
+
+    /// Non-recursive metadata read using exactly the existing read capability.
+    fn list_directory(
+        &self,
+        access: &WorktreeAccess,
+        relative_path: &str,
+    ) -> Result<WorktreeDirectoryListing, WorkspaceError>;
 
     fn read_file(
         &self,
@@ -1115,6 +1129,14 @@ where
         capability: WorktreeCapability,
     ) -> Result<WorktreeAccess, WorkspaceError> {
         (**self).open_file_access(identity, capability)
+    }
+
+    fn list_directory(
+        &self,
+        access: &WorktreeAccess,
+        relative_path: &str,
+    ) -> Result<WorktreeDirectoryListing, WorkspaceError> {
+        (**self).list_directory(access, relative_path)
     }
 
     fn read_file(
@@ -1582,6 +1604,103 @@ impl<R: GitCommandRunner> WorktreeFileProvider for GitWorktreeProvider<R> {
         })
     }
 
+    fn list_directory(
+        &self,
+        access: &WorktreeAccess,
+        relative_path: &str,
+    ) -> Result<WorktreeDirectoryListing, WorkspaceError> {
+        const MAX_ENTRIES: usize = 128;
+        const MAX_SCANNED: usize = 1024;
+        const MAX_BYTES: usize = 32 * 1024;
+        if relative_path.len() > 512
+            || relative_path.split(['/', '\\']).any(|part| {
+                part.trim_end_matches([' ', '.'])
+                    .eq_ignore_ascii_case(".git")
+            })
+        {
+            return Err(WorkspaceError::PathNotAllowed);
+        }
+        let (handle, checked) =
+            self.resolve_file_access(access, relative_path, WorktreeOperation::Read)?;
+        self.authorize(&handle, access, WorktreeOperation::Read)?;
+        let path = checked.ok_or(WorkspaceError::PathNotAllowed)?;
+        // Check the original spelling too: canonicalize alone would follow an
+        // in-tree junction or link into a different granted/ungranted directory.
+        let mut component_path = handle.worktree_path.clone();
+        for component in Path::new(relative_path).components() {
+            component_path.push(component);
+            let metadata = fs::symlink_metadata(&component_path)
+                .map_err(|_| WorkspaceError::PathNotAllowed)?;
+            if is_link_or_reparse(&metadata) {
+                return Err(WorkspaceError::PathNotAllowed);
+            }
+        }
+        if !path.is_dir() {
+            return Err(WorkspaceError::PathNotAllowed);
+        }
+        let root = fs::canonicalize(&handle.worktree_path)
+            .map_err(|_| WorkspaceError::WorktreeNotFound)?;
+        let prefix = path
+            .strip_prefix(&root)
+            .map_err(|_| WorkspaceError::PathNotAllowed)?;
+        let children = fs::read_dir(&path).map_err(|_| WorkspaceError::ProviderUnavailable)?;
+        let mut listing = WorktreeDirectoryListing {
+            entries: Vec::new(),
+            truncated: false,
+        };
+        let mut bytes = 2; // Include the JSON array brackets in the byte budget.
+        for (scanned, child) in children.enumerate() {
+            if scanned >= MAX_SCANNED {
+                listing.truncated = true;
+                break;
+            }
+            let child = child.map_err(|_| WorkspaceError::ProviderUnavailable)?;
+            let name = child.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name
+                .trim_end_matches([' ', '.'])
+                .eq_ignore_ascii_case(".git")
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(child.path())
+                .map_err(|_| WorkspaceError::ProviderUnavailable)?;
+            if is_link_or_reparse(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
+                continue;
+            }
+            let mut reference = prefix
+                .join(name)
+                .to_str()
+                .ok_or(WorkspaceError::PathNotAllowed)?
+                .replace('\\', "/");
+            if reference.contains(['\0', '\r', '\n', ':']) {
+                continue;
+            }
+            if metadata.is_dir() {
+                reference.push('/');
+            }
+            if reference.len() > 512 {
+                listing.truncated = true;
+                continue;
+            }
+            let encoded_bytes = serde_json::to_vec(&reference)
+                .map_err(|_| WorkspaceError::InvalidRequest)?
+                .len()
+                + 1;
+            if listing.entries.len() >= MAX_ENTRIES || bytes + encoded_bytes > MAX_BYTES {
+                listing.truncated = true;
+                break;
+            }
+            bytes += encoded_bytes;
+            listing.entries.push(reference);
+        }
+        listing.entries.sort();
+        self.authorize(&handle, access, WorktreeOperation::Read)?;
+        Ok(listing)
+    }
+
     fn read_file(
         &self,
         access: &WorktreeAccess,
@@ -1597,7 +1716,16 @@ impl<R: GitCommandRunner> WorktreeFileProvider for GitWorktreeProvider<R> {
             return Err(WorkspaceError::PathNotAllowed);
         }
         let limit = max_bytes.min(4 * 1024 * 1024);
-        let bytes = fs::read(&path).map_err(|_| WorkspaceError::ProviderUnavailable)?;
+        if metadata.len() > limit as u64 {
+            return Err(WorkspaceError::InvalidRequest);
+        }
+        // A size check after fs::read is not a memory bound. Also cap the read
+        // itself so a growing file cannot defeat the metadata preflight.
+        let file = fs::File::open(&path).map_err(|_| WorkspaceError::ProviderUnavailable)?;
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| WorkspaceError::ProviderUnavailable)?;
         if bytes.len() > limit {
             return Err(WorkspaceError::InvalidRequest);
         }
@@ -2020,6 +2148,21 @@ fn within(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
 }
 
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2374,8 +2517,99 @@ mod tests {
         let restarted = GitWorktreeProvider::with_runner(storage.path(), fake).unwrap();
         let verified = restarted.resolve_manifest(&identity).unwrap().unwrap();
         assert_eq!(verified.identity(), &identity);
+        let source = handle.worktree_path.join("src");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(source.join("many")).unwrap();
+        fs::create_dir_all(source.join("long-names")).unwrap();
+        fs::write(source.join("note.txt"), "bounded project text").unwrap();
+        fs::write(source.join(".git"), "gitdir: private host path").unwrap();
+        fs::write(handle.worktree_path.join("private.txt"), "not granted").unwrap();
+        for index in 0..130 {
+            fs::write(source.join("many").join(format!("{index:03}.txt")), "").unwrap();
+            fs::write(
+                source
+                    .join("long-names")
+                    .join(format!("{}-{index:03}.txt", "长".repeat(100))),
+                "",
+            )
+            .unwrap();
+        }
+        let outside = tempdir().unwrap();
+        let inside = source.join("nested");
+        for (name, target) in [
+            ("outside-link", outside.path()),
+            ("inside-link", inside.as_path()),
+        ] {
+            let link = source.join(name);
+            #[cfg(windows)]
+            assert!(Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(target)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        }
+        let access = restarted
+            .open_file_access(&identity, reviewer_capability())
+            .unwrap();
+        let listing = restarted.list_directory(&access, "src").unwrap();
+        assert_eq!(
+            listing.entries,
+            vec![
+                "src/long-names/",
+                "src/many/",
+                "src/nested/",
+                "src/note.txt"
+            ]
+        );
+        assert!(!listing.truncated);
+        assert_eq!(
+            restarted.read_file(&access, "src/note.txt", 1024).unwrap(),
+            b"bounded project text"
+        );
+        assert_eq!(
+            restarted.read_file(&access, "src/note.txt", 1),
+            Err(WorkspaceError::InvalidRequest)
+        );
+        for denied in [
+            ".",
+            "..",
+            "src/../private.txt",
+            "src/.git",
+            "src/note.txt",
+            "src/outside-link",
+            "src/inside-link",
+            "src/missing",
+        ] {
+            assert!(
+                restarted.list_directory(&access, denied).is_err(),
+                "must reject {denied}"
+            );
+        }
+        for directory in ["src/many", "src/long-names"] {
+            let listing = restarted.list_directory(&access, directory).unwrap();
+            assert!(listing.truncated);
+            assert!(!listing.entries.is_empty());
+            assert!(listing.entries.len() <= 128);
+            assert!(serde_json::to_vec(&listing.entries).unwrap().len() <= 32 * 1024);
+        }
+        assert!(restarted
+            .write_candidate(&access, "src/note.txt", b"not permitted", 1024)
+            .is_err());
+        let mut widened = access.clone();
+        widened.capability.read_roots = vec![".".into()];
+        assert!(restarted.list_directory(&widened, ".").is_err());
         let receipt = restarted.release_verified(&verified).unwrap();
         assert!(!receipt.already_released);
+        assert!(
+            restarted.list_directory(&access, "src").is_err(),
+            "released worktree must not remain discoverable"
+        );
         assert!(
             restarted
                 .release_verified(&verified)

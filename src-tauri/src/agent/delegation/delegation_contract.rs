@@ -116,6 +116,10 @@ pub struct UsageFlags {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationDelivery {
+    /// Host observations, never model-authored business output. No file text
+    /// or tool logs are stored; legacy deliveries default to no observations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_read_evidence: Vec<FileReadEvidence>,
     pub schema_version: u16,
     /// Stable client-generated ID. It is the idempotency key component used by
     /// persistence when the parent accepts this particular delivery revision.
@@ -132,6 +136,15 @@ pub struct DelegationDelivery {
     pub risks: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub usage: UsageFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileReadEvidence {
+    pub evidence_ref: String,
+    pub relative_ref: String,
+    pub content_bytes: u64,
+    pub sha256: String,
 }
 
 /// Every operational size/count threshold is supplied by policy.  This keeps
@@ -369,14 +382,15 @@ pub fn validate_delivery(
         reference(&v.evidence_ref, limits)?;
     }
     for a in &delivery.candidate_artifacts {
-        text("artifact.kind", &a.kind, limits.max_text_bytes)?;
-        text(
-            "artifact.description",
-            &a.description,
-            limits.max_text_bytes,
-        )?;
-        relative_ref(&a.relative_ref)?;
-        optional_ref(&a.evidence_ref, limits)?;
+        validate_candidate_artifact(a, limits)?;
+    }
+    count(
+        "file_read_evidence",
+        delivery.file_read_evidence.len(),
+        limits.max_verifications,
+    )?;
+    for evidence in &delivery.file_read_evidence {
+        validate_file_read_evidence(evidence)?;
     }
     for q in &delivery.open_questions {
         text("question", &q.question, limits.max_text_bytes)?;
@@ -404,6 +418,38 @@ pub fn validate_delivery(
                     .any(|v| v.status == VerificationStatus::Passed)))
     {
         return Err(ContractError::IncompleteCompletedDelivery);
+    }
+    Ok(())
+}
+
+/// Shared candidate metadata validation for delivery and Reviewer projection.
+pub(crate) fn validate_candidate_artifact(
+    artifact: &CandidateArtifact,
+    limits: &ContractLimits,
+) -> Result<(), ContractError> {
+    text("artifact.kind", &artifact.kind, limits.max_text_bytes)?;
+    text(
+        "artifact.description",
+        &artifact.description,
+        limits.max_text_bytes,
+    )?;
+    relative_ref(&artifact.relative_ref)?;
+    optional_ref(&artifact.evidence_ref, limits)
+}
+
+pub(crate) fn validate_file_read_evidence(
+    evidence: &FileReadEvidence,
+) -> Result<(), ContractError> {
+    relative_ref(&evidence.relative_ref)?;
+    let valid_id = evidence
+        .evidence_ref
+        .strip_prefix("evidence://file-read/")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+    if !valid_id
+        || evidence.sha256.len() != 64
+        || !evidence.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ContractError::InvalidReference("file_read_evidence".into()));
     }
     Ok(())
 }
@@ -619,6 +665,7 @@ mod tests {
     }
     fn delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery1".into(),
             delivery_revision: 1,
@@ -716,6 +763,7 @@ mod tests {
         );
         let limits = ContractLimits::default();
         let old = DelegationDelivery {
+            file_read_evidence: vec![],
             status: DeliveryStatus::Completed,
             ..delivery()
         };

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { chatgptPlanStatus, chatgptPlanSignIn, chatgptPlanChangeAccount, chatgptPlanCancelSignIn, chatgptPlanDisconnect, chatgptPlanModels, testModelConnection, type ChatgptPlanStatus, type ChatgptPlanModel } from '$lib/commands/settings';
+import { chatgptPlanStatus, chatgptPlanSignIn, chatgptPlanChangeAccount, chatgptPlanCancelSignIn, chatgptPlanDisconnect, chatgptPlanModels, testModelConnection, type ChatgptPlanStatus, type ChatgptPlanModel, type ToolRoundTrip } from '$lib/commands/settings';
 import {
   ALL_PROVIDERS,
   getModelsForProvider,
@@ -11,6 +11,15 @@ import type { ApiConfig, ApiProvider } from '$types';
 import { Button, Dialog, Input, Select } from '../../../ui';
 
 type TestState = 'idle' | 'testing' | 'success' | 'error';
+
+const TOOL_CHECK_DETAIL: Record<ToolRoundTrip, string> = {
+  verified: '对话和工具往返均通过验证。实际操作仍需授权，不代表复杂任务已经完成。',
+  notObserved: '模型未返回原生工具调用；这不等于模型不支持工具。可以继续对话，请核对协议或模型后重试。',
+  invalidCall: '工具调用格式或参数未通过校验。可以继续对话，请核对协议或换用支持工具调用的模型。',
+  invalidResult: '模型未正确接收工具结果并完成回答。可以继续对话，操作任务的可靠性尚未验证。',
+  requestFailed: '工具验证请求失败；对话连接已通过。请检查服务状态或协议后重试，未操作文件或应用。',
+  timedOut: '工具验证在总计 60 秒内未完成；对话连接已通过。请稍后重试，未操作文件或应用。',
+};
 
 function credentialSummary(config: ApiConfig, requiresKey: boolean): string {
   if (config.authMode === 'chatgpt_plan') return config.planEnabled ? 'ChatGPT 套餐授权（无 API Key）' : '尚未授权 ChatGPT 套餐用量';
@@ -27,6 +36,7 @@ export function ApiSettings() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [testState, setTestState] = useState<TestState>('idle');
   const [testError, setTestError] = useState('');
+  const [toolRoundTrip, setToolRoundTrip] = useState<ToolRoundTrip | null>(null);
   const [planStatus, setPlanStatus] = useState<ChatgptPlanStatus | null>(null);
   const [planModels, setPlanModels] = useState<ChatgptPlanModel[]>([]);
   const [planBusy, setPlanBusy] = useState<'idle' | 'checking' | 'signing-in' | 'disconnecting'>('idle');
@@ -142,6 +152,7 @@ export function ApiSettings() {
     testOperation.current += 1;
     setTestState('idle');
     setTestError('');
+    setToolRoundTrip(null);
   };
 
   const updateConnection = (partial: Partial<ApiConfig>) => {
@@ -172,11 +183,12 @@ export function ApiSettings() {
     const isCurrent = () => operation === testOperation.current && useSettingsStore.getState().apiConfig === testedConfig;
     setTestState('testing');
     setTestError('');
+    setToolRoundTrip(null);
     try {
-      const success = await testModelConnection(toRustConfig({ ...apiConfig, baseUrl: apiConfig.baseUrl || meta.defaultBaseUrl }));
+      const report = await testModelConnection(toRustConfig({ ...apiConfig, baseUrl: apiConfig.baseUrl || meta.defaultBaseUrl }));
       if (!isCurrent()) { if (operation === testOperation.current) resetTest(); return; }
-      setTestState(success ? 'success' : 'error');
-      if (!success) setTestError('服务拒绝了连接，请核对模型、API 地址和凭据。');
+      setTestState('success');
+      setToolRoundTrip(report.toolRoundTrip);
     } catch (error) {
       if (!isCurrent()) { if (operation === testOperation.current) resetTest(); return; }
       setTestState('error');
@@ -188,7 +200,7 @@ export function ApiSettings() {
   const statusText = testState === 'testing'
     ? '正在测试连接'
     : testState === 'success'
-      ? '连接测试通过'
+      ? toolRoundTrip === 'verified' ? '连接测试通过' : '对话连接正常，工具往返未验证'
       : testState === 'error'
         ? '连接测试失败'
         : missingCredentials
@@ -214,7 +226,7 @@ export function ApiSettings() {
           </div>
           <div>
             <dt>连接状态</dt>
-            <dd data-state={testState}>{statusText}</dd>
+            <dd data-state={testState === 'success' && toolRoundTrip !== 'verified' ? 'partial' : testState}>{statusText}</dd>
           </div>
           <div>
             <dt>接入方式</dt>
@@ -412,7 +424,7 @@ export function ApiSettings() {
       <section className="model-connection-test" aria-label="连接测试">
         <div aria-live="polite">
           <strong>{statusText}</strong>
-          <span>{testState === 'success' ? '当前表单可以连接到模型服务。' : '测试会发送一条最小验证请求，可能消耗少量额度；不发送历史对话，也不保存配置。'}</span>
+          <span>{testState === 'success' && toolRoundTrip ? TOOL_CHECK_DETAIL[toolRoundTrip] : '测试最多发送三条小型请求，验证对话和无副作用的工具往返，可能消耗少量额度；不发送历史对话、不操作文件或应用，也不保存配置。'}</span>
         </div>
         <Button
           type="button"

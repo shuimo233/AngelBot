@@ -1,6 +1,6 @@
 //! Capability-scoped file host for local delegated attempts.
 //!
-//! The host deliberately exposes only relative file reads and candidate-tree
+//! The host deliberately exposes only relative directory/file reads and candidate-tree
 //! writes through `WorktreeFileProvider`.  It does not expose a canonical
 //! path, a `ToolRegistry`, arbitrary shell execution, or network clients.  A
 //! future build/test adapter can be added beside this host without weakening
@@ -183,6 +183,16 @@ where
         }
         self.validate_request(&request)?;
         match request.operation() {
+            WorkerHostOperation::List { reference } => {
+                let listing = self
+                    .provider
+                    .list_directory(&self.file_access, reference)
+                    .map_err(|_| WorkerHostError::CapabilityDenied)?;
+                Ok(WorkerHostResult::Directory {
+                    entries: listing.entries,
+                    truncated: listing.truncated,
+                })
+            }
             WorkerHostOperation::Read { reference } => {
                 let bytes = self
                     .provider

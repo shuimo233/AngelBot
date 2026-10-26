@@ -13,11 +13,14 @@ use crate::commands::foreground_history::{
     private_transcript_metadata, refresh_private_transcript_tool_result, summarize_task_run,
     table_exists,
 };
-use crate::commands::foreground_message_contracts::{Message, ToolCallInfo, ToolResultInfo};
+use crate::commands::foreground_message_contracts::{
+    AgentTaskRun, Message, ToolCallInfo, ToolResultInfo,
+};
 use crate::commands::foreground_response_projector::PersistedTurnOutcome;
 use crate::commands::foreground_text_attachments::{self, TextAttachment};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -33,8 +36,15 @@ pub(crate) struct BeginForegroundTurn {
     pub role: String,
     pub content: String,
     pub text_attachments: Vec<TextAttachment>,
-    pub persist_user_message: bool,
+    pub user_turn: ForegroundUserTurn,
     pub now: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForegroundUserTurn {
+    Append,
+    Replace,
+    Preserve,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +56,8 @@ pub(crate) struct ForegroundRun {
     pub parent_message_id: Option<String>,
     pub reply_id: String,
     pub now: i64,
+    pub history_before_created_at: i64,
+    pub text_attachments: Vec<TextAttachment>,
 }
 
 /// A caller-owned admission decision made while the foreground reservation
@@ -54,6 +66,8 @@ pub(crate) struct ForegroundRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForegroundRunAdmission {
     Start,
+    /// Extend the current assistant's task rather than start a background task.
+    Continue,
     Skip,
 }
 
@@ -95,20 +109,46 @@ impl ForegroundRunStore {
     /// true no-op for messages, `task_runs`, and the session leaf.
     pub(crate) fn begin_with_admission<F>(
         &self,
-        input: BeginForegroundTurn,
+        mut input: BeginForegroundTurn,
         admission: F,
     ) -> Result<ForegroundRunBeginResult, String>
     where
         F: FnOnce(&Transaction<'_>) -> Result<ForegroundRunAdmission, String>,
     {
-        // Direct storage callers cannot bypass foreground admission validation.
+        let conn = self.db.lock().map_err(|e| e.to_string())?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        // Replacing a user turn is one durable operation, not a destructive
+        // preparation step before run admission. Recover its exact selected
+        // snapshots here; callers cannot substitute attachment contents.
+        let edited: Option<(Option<String>, i64)> = if input.user_turn
+            == ForegroundUserTurn::Replace
+        {
+            if input.role != "user" {
+                return Err("Only a user message can be edited and resent".into());
+            }
+            let (parent, created_at, metadata): (Option<String>, i64, Option<String>) = tx
+                .query_row(
+                    "SELECT parent_id, created_at, metadata FROM messages
+                     WHERE id=?1 AND session_id=?2 AND role='user' AND is_provisional=0",
+                    params![&input.user_message_id, &input.session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|_| {
+                    "Only a user message in the active session can be edited and resent".to_string()
+                })?;
+            input.text_attachments =
+                foreground_text_attachments::from_metadata(metadata.as_deref())?;
+            Some((parent, created_at))
+        } else {
+            None
+        };
+        // Direct storage callers cannot bypass foreground admission validation,
+        // including attachment-only edits. Nothing has been mutated yet.
         foreground_text_attachments::validate_turn(
             &input.role,
             &input.content,
             &input.text_attachments,
         )?;
-        let conn = self.db.lock().map_err(|e| e.to_string())?;
-        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let last_created_at = tx
             .query_row(
                 "SELECT MAX(created_at) FROM messages WHERE session_id = ?1",
@@ -123,7 +163,7 @@ impl ForegroundRunStore {
             .map(|last| input.now.max(last.saturating_add(1)))
             .unwrap_or(input.now);
 
-        let previous_leaf_id: Option<String> = tx
+        let mut previous_leaf_id: Option<String> = tx
             .query_row(
                 "SELECT leaf_message_id FROM sessions WHERE id = ?1",
                 params![&input.session_id],
@@ -131,21 +171,41 @@ impl ForegroundRunStore {
             )
             .unwrap_or(None);
 
-        match admission(&tx)? {
-            ForegroundRunAdmission::Start => {}
+        let continuation_metadata = match admission(&tx)? {
+            ForegroundRunAdmission::Start => None,
+            ForegroundRunAdmission::Continue => {
+                if input.user_turn != ForegroundUserTurn::Preserve {
+                    return Err("A continuation cannot insert a new user message".into());
+                }
+                let parent = previous_leaf_id
+                    .as_deref()
+                    .ok_or("A continuation requires an assistant parent")?;
+                let assistant: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM messages WHERE id=?1 AND session_id=?2 AND role='assistant')",
+                    params![parent, &input.session_id], |row| row.get(0),
+                ).map_err(|error| error.to_string())?;
+                if !assistant {
+                    return Err("A continuation requires an assistant parent".into());
+                }
+                Some(
+                    serde_json::json!({"angelbotContinuation": {"parentMessageId": parent}})
+                        .to_string(),
+                )
+            }
             ForegroundRunAdmission::Skip => {
                 tx.commit().map_err(|e| e.to_string())?;
                 return Ok(ForegroundRunBeginResult::Skipped);
             }
-        }
+        };
 
         // A normal user turn replaces the future of the current conversation
-        // leaf.  If that leaf is waiting for approval, make the unapproved
-        // operation terminal before the new user message becomes visible.  This
-        // is deliberately part of the same transaction: hiding the old card in
+        // leaf. Internal continuations can leave approvals on older ancestors,
+        // so make every pending operation on this branch terminal before the
+        // new user message becomes visible. This is deliberately part of the
+        // same transaction: hiding the old card in
         // the UI alone must never leave a delayed confirmation able to execute.
-        if input.persist_user_message {
-            supersede_pending_leaf_confirmation(
+        if input.user_turn != ForegroundUserTurn::Preserve {
+            supersede_pending_branch_confirmations(
                 &tx,
                 &input.session_id,
                 previous_leaf_id.as_deref(),
@@ -153,7 +213,17 @@ impl ForegroundRunStore {
             )?;
         }
 
-        if input.persist_user_message {
+        let history_before_created_at = if let Some((parent, created_at)) = edited {
+            // Update the leaf before deletion to respect its foreign key. Any
+            // later insert/reservation error rolls back this entire branch edit.
+            prune_message_branch_in_tx(&tx, &input.session_id, &input.user_message_id, true)?;
+            previous_leaf_id = parent;
+            created_at
+        } else {
+            now
+        };
+
+        if input.user_turn != ForegroundUserTurn::Preserve {
             tx.execute(
                 "INSERT INTO messages (id, session_id, role, content, parent_id, created_at, metadata)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -175,19 +245,20 @@ impl ForegroundRunStore {
             .map_err(|e| e.to_string())?;
         }
 
-        let assistant_parent = if input.persist_user_message {
+        let assistant_parent = if input.user_turn != ForegroundUserTurn::Preserve {
             Some(input.user_message_id.clone())
         } else {
             previous_leaf_id
         };
         tx.execute(
-            "INSERT INTO messages (id, session_id, role, content, parent_id, is_provisional, created_at)
-             VALUES (?1, ?2, 'assistant', '', ?3, 1, ?4)",
+            "INSERT INTO messages (id, session_id, role, content, parent_id, is_provisional, created_at, metadata)
+             VALUES (?1, ?2, 'assistant', '', ?3, 1, ?4, ?5)",
             params![
                 &input.reply_id,
                 &input.session_id,
                 assistant_parent.as_deref(),
                 now,
+                continuation_metadata,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -204,6 +275,8 @@ impl ForegroundRunStore {
             parent_message_id: assistant_parent,
             reply_id: input.reply_id,
             now,
+            history_before_created_at,
+            text_attachments: input.text_attachments,
         }))
     }
 
@@ -231,7 +304,42 @@ impl ForegroundRunStore {
         outcome: PersistedTurnOutcome,
         mcp_tool_revisions: &crate::agent::handlers::McpToolRevisionCatalog,
     ) -> Result<Message, String> {
-        let protocol_metadata = outcome
+        self.complete_turn(run, outcome, mcp_tool_revisions, false)
+    }
+
+    /// Model preparation failed before a tool surface existed. Promote the
+    /// admitted reply with its non-resumable failure state in the same commit,
+    /// without inventing an agent_loop tool result or a completed text task.
+    pub(crate) fn complete_model_unavailable(
+        &self,
+        run: &ForegroundRun,
+        goal: &str,
+        content: &str,
+    ) -> Result<Message, String> {
+        self.complete_turn(
+            run,
+            PersistedTurnOutcome {
+                content: content.into(),
+                private_diagnostic: None,
+                goal: goal.into(),
+                tool_calls: None,
+                tool_results: None,
+                task_facts: None,
+                protocol_transcript: None,
+            },
+            &crate::agent::handlers::McpToolRevisionCatalog::new(),
+            true,
+        )
+    }
+
+    fn complete_turn(
+        &self,
+        run: &ForegroundRun,
+        outcome: PersistedTurnOutcome,
+        mcp_tool_revisions: &crate::agent::handlers::McpToolRevisionCatalog,
+        model_unavailable: bool,
+    ) -> Result<Message, String> {
+        let mut protocol_metadata = outcome
             .protocol_transcript
             .as_deref()
             .map(private_transcript_metadata)
@@ -253,6 +361,20 @@ impl ForegroundRunStore {
         };
         let goal = outcome.goal;
         reply.task_run = summarize_task_run(&reply, goal.clone());
+        if model_unavailable {
+            reply.task_run = Some(AgentTaskRun {
+                id: reply.id.clone(),
+                goal: goal.clone(),
+                status: crate::agent::AgentRunStatus::ProviderUnavailable
+                    .as_str()
+                    .into(),
+                plan: Vec::new(),
+                confirmation_state: crate::agent::ConfirmationState::None.as_str().into(),
+                resumable: false,
+                step_count: 0,
+                completed_step_count: 0,
+            });
+        }
         let tool_calls_json = reply
             .tool_calls
             .as_ref()
@@ -277,6 +399,33 @@ impl ForegroundRunStore {
 
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let stored_metadata: Option<String> = tx.query_row(
+            "SELECT metadata FROM messages WHERE id=?1 AND session_id=?2 AND role='assistant' AND is_provisional=1",
+            params![&run.reply_id, &run.session_id], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?.flatten();
+        if let Some(stored_metadata) = stored_metadata {
+            let stored: serde_json::Value = serde_json::from_str(&stored_metadata)
+                .map_err(|_| "Invalid foreground metadata")?;
+            if let Some(continuation) = stored.get("angelbotContinuation") {
+                let parent = continuation
+                    .get("parentMessageId")
+                    .and_then(serde_json::Value::as_str);
+                if parent.is_none() || parent != run.parent_message_id.as_deref() {
+                    return Err("Invalid foreground continuation parent".into());
+                }
+                // Model-private protocol output replaces its own ledger, never
+                // the runtime provenance committed by admission.
+                let mut metadata: serde_json::Value =
+                    serde_json::from_str(protocol_metadata.as_deref().unwrap_or("{}"))
+                        .map_err(|_| "Invalid foreground protocol metadata")?;
+                metadata["angelbotContinuation"] = continuation.clone();
+                let encoded = metadata.to_string();
+                if encoded.len() > 16 * 1024 * 1024 {
+                    return Err("Private protocol transcript exceeded storage limit".into());
+                }
+                protocol_metadata = Some(encoded);
+            }
+        }
         let finalized = tx.execute(
             "UPDATE messages SET content=?1, parent_id=?2, tool_calls=?3, is_provisional=0, created_at=?4, metadata=?7
              WHERE id=?5 AND session_id=?6 AND role='assistant' AND is_provisional=1",
@@ -343,6 +492,15 @@ impl ForegroundRunStore {
                 reply.created_at,
             )?;
         }
+        if let Some(diagnostic) = outcome.private_diagnostic.as_deref() {
+            crate::agent::attention::record_recoverable_runtime_failure(
+                &tx,
+                &run.session_id,
+                &format!("message:{}", run.reply_id),
+                &run.reply_id,
+                diagnostic,
+            )?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(reply)
     }
@@ -350,13 +508,17 @@ impl ForegroundRunStore {
     /// A failed foreground run becomes one visible, resumable Main-Agent
     /// state. Leaving a hidden provisional reply behind makes the active
     /// branch look terminal even though the task requires user attention.
-    pub(crate) fn mark_needs_attention(&self, run: &ForegroundRun) -> Result<(), String> {
+    pub(crate) fn mark_needs_attention(&self, run: &ForegroundRun) -> Result<String, String> {
         if !self.recover_interrupted_run(run, Utc::now().timestamp())? {
             return Err(
                 "foreground task run is missing while recording recoverable failure".to_string(),
             );
         }
-        Ok(())
+        self.db.lock().map_err(|e| e.to_string())?.query_row(
+            "SELECT content FROM messages WHERE id=?1 AND session_id=?2 AND role='assistant' AND is_provisional=0",
+            params![run.reply_id,run.session_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
     }
 
     /// Promote one known provisional reply without sweeping other concurrent
@@ -395,6 +557,109 @@ impl ForegroundRunStore {
     }
 }
 
+/// Remove one branch, including old inline tool rows without parent FKs. A
+/// replacement selects its source's parent; ordinary deletion only moves a
+/// leaf that belongs to the removed subtree, preserving unrelated branches.
+pub(crate) fn prune_message_branch_in_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    message_id: &str,
+    select_parent: bool,
+) -> Result<(), String> {
+    let parent: Option<String> = tx
+        .query_row(
+            "SELECT parent_id FROM messages WHERE id=?1 AND session_id=?2",
+            params![message_id, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "Message not found".to_string())?;
+    const SUBTREE: &str = "WITH RECURSIVE removed(id) AS (
+        SELECT id FROM messages WHERE id=?1 AND session_id=?2
+        UNION SELECT m.id FROM messages m JOIN removed r ON (m.parent_id=r.id OR (m.role='tool' AND m.tool_call_id=r.id))
+        WHERE m.session_id=?2
+    )";
+    tx.execute(
+        &format!(
+            "{SUBTREE} UPDATE sessions SET leaf_message_id=?3, updated_at=?4
+        WHERE id=?2 AND (?5 OR leaf_message_id IN (SELECT id FROM removed))"
+        ),
+        params![
+            message_id,
+            session_id,
+            parent,
+            Utc::now().timestamp(),
+            select_parent
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        &format!(
+            "{SUBTREE} DELETE FROM messages WHERE session_id=?2 AND id IN (SELECT id FROM removed)"
+        ),
+        params![message_id, session_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Prove task continuity along explicitly admitted assistant edges only. A
+/// shared goal or a background turn's parent link is not continuation evidence.
+pub(crate) fn is_continuation_chain_in_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    leaf_id: &str,
+    source_id: &str,
+) -> Result<bool, String> {
+    let supports_provenance: bool = tx
+        .query_row(
+            "SELECT COUNT(*) = 2 FROM pragma_table_info('messages') WHERE name IN ('parent_id','metadata')",
+            [], |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !supports_provenance {
+        return Ok(false);
+    }
+    let mut current = leaf_id.to_owned();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return Ok(false);
+        }
+        let message: Option<(String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT role, parent_id, metadata FROM messages WHERE id=?1 AND session_id=?2",
+                params![&current, session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((role, parent, metadata)) = message else {
+            return Ok(false);
+        };
+        if role != "assistant" {
+            return Ok(false);
+        }
+        if current == source_id {
+            return Ok(true);
+        }
+        let Some(parent) = parent else {
+            return Ok(false);
+        };
+        let metadata =
+            metadata.and_then(|encoded| serde_json::from_str::<serde_json::Value>(&encoded).ok());
+        if metadata
+            .as_ref()
+            .and_then(|value| value.get("angelbotContinuation"))
+            .and_then(|value| value.get("parentMessageId"))
+            .and_then(serde_json::Value::as_str)
+            != Some(parent.as_str())
+        {
+            return Ok(false);
+        }
+        current = parent;
+    }
+}
+
 const SUPERSEDED_CONFIRMATION_OUTPUT: &str =
     "Confirmation cancelled: a newer user message superseded this action. The operation was not run.";
 
@@ -419,9 +684,10 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
         .query_row(
             "SELECT task_runs.id, messages.created_at
              FROM task_runs
-             JOIN messages ON messages.id = task_runs.message_id
+             JOIN messages ON messages.id = task_runs.message_id AND messages.session_id = task_runs.session_id
              WHERE task_runs.session_id = ?1
                AND task_runs.message_id = ?2
+               AND messages.role = 'assistant'
                AND task_runs.status = 'awaiting_confirmation'",
             params![session_id, message_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -431,6 +697,42 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
     let Some((task_run_id, message_created_at)) = pending_run else {
         return Ok(false);
     };
+
+    let has_inline_calls: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messages') WHERE name = 'tool_calls')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let inline_calls: Option<String> = if has_inline_calls {
+        tx.query_row(
+            "SELECT tool_calls FROM messages WHERE id = ?1 AND session_id = ?2",
+            params![message_id, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    let owned_calls = inline_calls
+        .as_deref()
+        .map(|json| {
+            parse_inline_tool_calls(Some(json))
+                .ok_or("Pending confirmation has invalid stored calls".to_string())
+        })
+        .transpose()?;
+    if owned_calls.is_none() {
+        // Old records can lack inline calls. Timestamp attribution is safe only
+        // when exactly one assistant owns that logical time in this session.
+        let owners: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND created_at = ?2 AND role = 'assistant'",
+            params![session_id, message_created_at], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if owners != 1 {
+            return Err("Pending confirmation ownership is ambiguous".into());
+        }
+    }
 
     let mut statement = tx
         .prepare(
@@ -442,7 +744,7 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
                AND COALESCE(tool_output, '') LIKE '%Confirmation required%'",
         )
         .map_err(|e| e.to_string())?;
-    let superseded_call_ids = statement
+    let mut superseded_call_ids = statement
         .query_map(params![session_id, message_created_at], |row| {
             row.get::<_, String>(0)
         })
@@ -450,37 +752,53 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     drop(statement);
-
-    tx.execute(
-        "UPDATE agent_steps
-         SET tool_output = ?1, success = 0
-         WHERE session_id = ?2
-           AND created_at = ?3
-           AND success != 1
-           AND COALESCE(tool_output, '') LIKE '%Confirmation required%'",
-        params![cancellation_output, session_id, message_created_at],
-    )
-    .map_err(|e| e.to_string())?;
-    // The foreground model rehydrates its conversation from durable `tool`
-    // messages, not from the task projection.  Keep that source in sync so a
-    // redirected turn cannot inherit a stale "Confirmation required" result.
-    tx.execute(
-        "UPDATE messages
-         SET content = ?1
-         WHERE session_id = ?2
-           AND role = 'tool'
-           AND created_at = ?3
-           AND tool_call_id IN (
-                SELECT COALESCE(call_id, id)
-                FROM agent_steps
-                WHERE session_id = ?2
-                  AND created_at = ?3
-                  AND tool_output = ?1
-           )",
-        params![cancellation_output, session_id, message_created_at],
-    )
-    .map_err(|e| e.to_string())?;
+    if let Some(owned_calls) = &owned_calls {
+        superseded_call_ids.retain(|id| owned_calls.iter().any(|call| &call.id == id));
+    }
     for call_id in &superseded_call_ids {
+        // Provider call IDs are not globally unique. Same-second legacy forks
+        // can reuse one, so reject ambiguous native or replay receipts before
+        // changing any part of the confirmation.
+        let unique: bool = tx
+            .query_row(
+                "SELECT
+                (SELECT COUNT(*) FROM agent_steps WHERE session_id = ?1 AND created_at = ?2
+                    AND COALESCE(call_id, id) = ?3) = 1
+                AND (SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND created_at = ?2
+                    AND role = 'tool' AND tool_call_id = ?3) <= 1",
+                params![session_id, message_created_at, call_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !unique {
+            return Err("Pending confirmation ownership is ambiguous".into());
+        }
+    }
+    for call_id in &superseded_call_ids {
+        tx.execute(
+            "UPDATE agent_steps
+             SET tool_output = ?1, success = 0
+             WHERE session_id = ?2
+               AND created_at = ?3
+               AND COALESCE(call_id, id) = ?4
+               AND success != 1
+               AND COALESCE(tool_output, '') LIKE '%Confirmation required%'",
+            params![cancellation_output, session_id, message_created_at, call_id],
+        )
+        .map_err(|e| e.to_string())?;
+        // The foreground model rehydrates its conversation from durable `tool`
+        // messages, not from the task projection.  Keep that source in sync so a
+        // redirected turn cannot inherit a stale "Confirmation required" result.
+        tx.execute(
+            "UPDATE messages
+             SET content = ?1
+             WHERE session_id = ?2
+               AND role = 'tool'
+               AND created_at = ?3
+               AND tool_call_id = ?4",
+            params![cancellation_output, session_id, message_created_at, call_id],
+        )
+        .map_err(|e| e.to_string())?;
         refresh_private_transcript_tool_result(
             tx,
             session_id,
@@ -523,10 +841,9 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
     Ok(true)
 }
 
-/// Stop an unapproved side effect attached to the leaf that a new user turn is
-/// about to replace.  A redirect must make the old action non-executable, not
-/// merely hide its confirmation card.
-fn supersede_pending_leaf_confirmation(
+/// Stop pending side effects on the active branch, including ancestors left
+/// behind by internal continuations. Other branches and sessions are untouched.
+fn supersede_pending_branch_confirmations(
     tx: &Transaction<'_>,
     session_id: &str,
     leaf_message_id: Option<&str>,
@@ -535,16 +852,45 @@ fn supersede_pending_leaf_confirmation(
     let Some(message_id) = leaf_message_id else {
         return Ok(());
     };
-    terminalize_pending_confirmation_in_tx(
-        tx,
-        session_id,
-        message_id,
-        now,
-        SUPERSEDED_CONFIRMATION_OUTPUT,
-    )?;
+    if !table_exists(tx, "task_runs")? {
+        return Ok(());
+    }
+    let pending_messages = {
+        let mut statement = tx
+            .prepare(
+                "WITH RECURSIVE branch AS (
+                SELECT id, parent_id FROM messages WHERE id = ?1 AND session_id = ?2
+                UNION
+                SELECT m.id, m.parent_id FROM messages m JOIN branch b ON m.id = b.parent_id
+                WHERE m.session_id = ?2
+             )
+             SELECT r.message_id FROM task_runs r JOIN branch b ON r.message_id = b.id
+             WHERE r.session_id = ?2 AND r.status = 'awaiting_confirmation'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![message_id, session_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for pending_message_id in pending_messages {
+        terminalize_pending_confirmation_in_tx(
+            tx,
+            session_id,
+            &pending_message_id,
+            now,
+            SUPERSEDED_CONFIRMATION_OUTPUT,
+        )?;
+    }
     Ok(())
 }
 
+/// Startup only: no foreground executor may be alive when running rows are
+/// classified as interrupted. Older visible replies must be settled too,
+/// without replacing their transcript or enabling an unproven replay.
 pub(crate) fn recover_interrupted_runs_in_conn(
     conn: &mut Connection,
     now: i64,
@@ -553,12 +899,12 @@ pub(crate) fn recover_interrupted_runs_in_conn(
     let interrupted = {
         let mut statement = tx
             .prepare(
-                "SELECT r.id, r.session_id, m.parent_id
+                "SELECT r.id, r.session_id,
+                        CASE WHEN m.is_provisional = 1 THEN m.parent_id END
                      FROM task_runs r
                      JOIN messages m ON m.id = r.message_id AND m.session_id = r.session_id
                      WHERE r.status = 'running'
-                       AND m.role = 'assistant'
-                       AND m.is_provisional = 1",
+                       AND m.role = 'assistant'",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
@@ -623,37 +969,76 @@ fn promote_interrupted_run(
     parent_id: Option<&str>,
     now: i64,
 ) -> Result<(), String> {
+    // Reservation is recorded by the foreground tool hook only after normal
+    // argument/confirmation gating, before external execution. Until the reply
+    // and its protocol commit, replaying the original goal is not safe even if
+    // some best-effort tool receipts reached the journal.
+    let external_reserved = if table_exists(tx, "agent_run_events")? {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_events
+             WHERE run_id=?1 AND session_id=?2 AND event_type='ExternalToolDispatchReserved'
+               AND CASE WHEN json_valid(payload) THEN
+                 json_extract(payload, '$.type')='ExternalToolDispatchReserved'
+                 AND json_type(payload, '$.data.call_id')='text'
+                 AND length(json_extract(payload, '$.data.call_id'))>0
+                 AND substr(json_extract(payload, '$.data.tool_name'), 1, 4)='mcp_'
+               ELSE 0 END)",
+            params![run_id, session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        false
+    };
     // Project only the trusted event kind/code, never its diagnostic message.
     // Older databases without a journal retain the interruption fallback.
-    let model_failed = if table_exists(tx, "agent_run_events")? {
+    let model_failure = if table_exists(tx, "agent_run_events")? {
         tx.query_row(
             "SELECT CASE WHEN json_valid(payload) THEN
                  CASE WHEN json_extract(payload, '$.type') = 'Error'
-                       AND json_extract(payload, '$.data.code') = 'LlmError'
-                      THEN 1 ELSE 0 END
+                      THEN CASE json_extract(payload, '$.data.code')
+                        WHEN 'LlmError' THEN 1
+                        WHEN 'LlmQuotaExceeded' THEN 2
+                        ELSE 0 END
+                      ELSE 0 END
                  ELSE 0 END
              FROM agent_run_events
              WHERE run_id = ?1 AND session_id = ?2 AND event_type = 'Error'
              ORDER BY sequence DESC LIMIT 1",
             params![run_id, session_id],
-            |row| row.get::<_, bool>(0),
+            |row| row.get::<_, i64>(0),
         )
         .optional()
         .map_err(|error| error.to_string())?
-        .unwrap_or(false)
+        .unwrap_or(0)
     } else {
-        false
+        0
     };
-    let content = if model_failed {
+    let content = if external_reserved {
+        "此前已准备派发外部工具，目标可能已经改变。任务状态已安全保留，请先检查实际结果，再发起新的请求；不会自动重试。"
+    } else if model_failure == 2 {
+        crate::llm::LlmFailureKind::QuotaExceeded
+            .visible_notice()
+            .expect("quota category has a fixed notice")
+    } else if model_failure == 1 {
         "模型请求未能完成。任务状态已安全保留，请检查模型连接后继续。"
     } else {
         "主 Agent 本轮未能完成。任务状态已安全保留，你可以继续此会话。"
     };
     tx.execute(
         "UPDATE task_runs
-             SET status = 'needs_attention', resumable = 1, updated_at = ?1
+             SET status = 'needs_attention',
+                 resumable = CASE WHEN EXISTS(
+                     SELECT 1 FROM messages WHERE id=?2 AND session_id=?3 AND is_provisional=1
+                 ) THEN ?4 ELSE 0 END,
+                 updated_at = ?1
              WHERE id = ?2 AND session_id = ?3",
-        params![now, run_id, session_id],
+        params![
+            now,
+            run_id,
+            session_id,
+            if external_reserved { 0 } else { 1 }
+        ],
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
@@ -712,17 +1097,20 @@ fn project_session_from_conn(conn: &Connection, session_id: &str) -> Result<Vec<
     } else {
         ""
     };
+    // This is the unpaged UI history, not the model's bounded context window.
+    // Causality is the parent chain, never a wall-clock/UUID tie-breaker. A
+    // chronological LIMIT here silently drops the newest replies of a long Main.
     let mut stmt = conn.prepare(&format!(
         "WITH RECURSIVE ancestors AS (
-            SELECT id, session_id, role, content, parent_id, created_at, tool_calls, tool_call_id, tool_name, metadata
+            SELECT id, session_id, role, content, parent_id, created_at, tool_calls, tool_call_id, tool_name, metadata, 0 AS ancestry_depth
             FROM messages WHERE id = ?1 AND role != 'tool'{visible}
             UNION ALL
-            SELECT m.id, m.session_id, m.role, m.content, m.parent_id, m.created_at, m.tool_calls, m.tool_call_id, m.tool_name, m.metadata
+            SELECT m.id, m.session_id, m.role, m.content, m.parent_id, m.created_at, m.tool_calls, m.tool_call_id, m.tool_name, m.metadata, a.ancestry_depth + 1
             FROM messages m JOIN ancestors a ON m.id = a.parent_id
             WHERE m.role != 'tool'{visible_m}
         )
         SELECT id, session_id, role, content, created_at, parent_id, tool_calls, metadata
-        FROM ancestors ORDER BY created_at ASC, id ASC LIMIT 500"
+        FROM ancestors ORDER BY ancestry_depth DESC"
     )).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![leaf_id], |r| {
@@ -834,7 +1222,7 @@ mod tests {
                 role: "user".into(),
                 content: "inspect".into(),
                 text_attachments: vec![],
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -843,6 +1231,7 @@ mod tests {
                 &run,
                 PersistedTurnOutcome {
                     content: "done".into(),
+                    private_diagnostic: None,
                     goal: "inspect".into(),
                     // UI is a lossy projection deliberately unrelated to native calls.
                     tool_calls: None,
@@ -898,6 +1287,118 @@ mod tests {
         assert!(cutoff
             .iter()
             .all(|message| message.protocol_state.is_none()));
+
+        // The protocol ledger can fit its budget while runtime provenance makes
+        // the merged metadata too large. Reject before any durable promotion.
+        let store = ForegroundRunStore::new(Arc::new(Mutex::new(conn)));
+        let ForegroundRunBeginResult::Started(oversized) = store
+            .begin_with_admission(
+                BeginForegroundTurn {
+                    session_id: "s".into(),
+                    user_message_id: "unused".into(),
+                    reply_id: "oversized-continuation".into(),
+                    role: "user".into(),
+                    content: "inspect".into(),
+                    text_attachments: vec![],
+                    user_turn: ForegroundUserTurn::Preserve,
+                    now: 30,
+                },
+                |_| Ok(ForegroundRunAdmission::Continue),
+            )
+            .unwrap()
+        else {
+            panic!("continuation must start")
+        };
+        let original_metadata: String = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT metadata FROM messages WHERE id='oversized-continuation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut transcript = private_messages();
+        let encoded_len = private_transcript_metadata(&transcript)
+            .unwrap()
+            .unwrap()
+            .len();
+        transcript[1].content =
+            "x".repeat(16 * 1024 * 1024 - encoded_len + transcript[1].content.len());
+        assert_eq!(
+            private_transcript_metadata(&transcript)
+                .unwrap()
+                .unwrap()
+                .len(),
+            16 * 1024 * 1024
+        );
+        let error = store
+            .complete(
+                &oversized,
+                PersistedTurnOutcome {
+                    content: "oversized result".into(),
+                    private_diagnostic: None,
+                    goal: "inspect".into(),
+                    tool_calls: None,
+                    tool_results: None,
+                    task_facts: None,
+                    protocol_transcript: Some(transcript),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, "Private protocol transcript exceeded storage limit");
+        let conn = store.db.lock().unwrap();
+        let unchanged: (String, i64, String, String, String) = conn
+            .query_row(
+                "SELECT m.content, m.is_provisional, m.metadata, r.status, s.leaf_message_id
+             FROM messages m JOIN task_runs r ON r.message_id=m.id AND r.session_id=m.session_id
+             JOIN sessions s ON s.id=m.session_id WHERE m.id='oversized-continuation'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged,
+            (
+                String::new(),
+                1,
+                original_metadata,
+                "running".into(),
+                "a".into()
+            )
+        );
+        // Loading efficiently must not cap a private branch at the legacy
+        // 100-row window or return a partial success on a late malformed row.
+        for index in 0..105 {
+            conn.execute("INSERT INTO messages (id,session_id,role,content,created_at) VALUES(?1,'s','user',?2,?3)",
+                params![format!("tail-{index}"), format!("tail-content-{index}"), 100 + index]).unwrap();
+        }
+        let long =
+            crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 1000).unwrap();
+        assert_eq!(long.len(), 109);
+        assert_eq!(
+            long[1].protocol_state.as_ref().unwrap().output_items[0]["encrypted_content"],
+            "encrypted-marker"
+        );
+        assert_eq!(long.last().unwrap().content, "tail-content-104");
+        conn.execute(
+            "UPDATE messages SET role='assistant',metadata='{' WHERE id='tail-104'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 1000).is_err(),
+            "do not return a valid prefix when a later row is corrupt"
+        );
     }
 
     fn store() -> ForegroundRunStore {
@@ -914,8 +1415,121 @@ mod tests {
     }
 
     #[test]
+    fn stopped_turn_preserves_receipts_and_promotes_without_failure_or_resume() {
+        for has_receipt in [false, true] {
+            let store = store();
+            let run = store
+                .begin(BeginForegroundTurn {
+                    session_id: "s".into(),
+                    user_message_id: "u".into(),
+                    reply_id: "a".into(),
+                    role: "user".into(),
+                    content: "owned goal".into(),
+                    text_attachments: vec![],
+                    user_turn: ForegroundUserTurn::Append,
+                    now: 10,
+                })
+                .unwrap();
+            let steps = if has_receipt {
+                vec![crate::agent::AgentStep {
+                    call_id: "known-call".into(),
+                    tool_name: "owned_effect".into(),
+                    success: true,
+                    output: "durable-receipt".into(),
+                    ..Default::default()
+                }]
+            } else {
+                vec![]
+            };
+            let outcome = crate::commands::foreground_response_projector::project_slice_outcome(
+                "owned goal",
+                crate::agent::AgentSliceOutcome::Stopped(
+                    crate::agent::AgentResponse::TextWithToolCalls {
+                        text: "must not claim completion".into(),
+                        steps,
+                    },
+                ),
+            )
+            .unwrap();
+            let reply = store.complete(&run, outcome.clone()).unwrap();
+            let task = reply.task_run.as_ref().unwrap();
+            assert_eq!(task.status, "stopped");
+            assert!(!task.resumable);
+            assert_eq!(task.confirmation_state, "none");
+            assert_eq!(task.step_count, usize::from(has_receipt));
+            assert_eq!(task.completed_step_count, usize::from(has_receipt));
+            assert_eq!(reply.content, crate::agent::STOPPED_RUN_NOTICE);
+            assert_eq!(
+                reply.task_facts.as_ref().unwrap().terminal_reason,
+                Some(TaskTerminalReason::Stopped)
+            );
+            assert_eq!(
+                store
+                    .project_session("s")
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .task_run
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                "stopped"
+            );
+            assert!(
+                store.complete(&run, outcome).is_err(),
+                "promotion remains exactly once"
+            );
+            let conn = store.db.lock().unwrap();
+            let (status, provisional, count): (String, i64, i64) = conn.query_row(
+                "SELECT r.status,m.is_provisional,(SELECT count(*) FROM agent_steps) FROM task_runs r JOIN messages m ON m.id=r.message_id WHERE r.id='a'", [],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+            ).unwrap();
+            assert_eq!(
+                (status, provisional, count),
+                ("stopped".into(), 0, i64::from(has_receipt))
+            );
+            let history =
+                crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 1000).unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .count(),
+                usize::from(has_receipt)
+            );
+            if has_receipt {
+                assert!(history.iter().any(|message| message.tool_call_id.as_deref()
+                    == Some("known-call")
+                    && message.content == "durable-receipt"));
+            }
+            assert!(!history
+                .iter()
+                .any(|message| message.content.contains("agent_loop")));
+        }
+        let cancelled_error =
+            crate::commands::foreground_response_projector::project_slice_outcome(
+                "owned goal",
+                crate::agent::AgentSliceOutcome::Stopped(crate::agent::AgentResponse::Error(
+                    "private-error".into(),
+                )),
+            )
+            .unwrap();
+        assert_eq!(cancelled_error.content, crate::agent::STOPPED_RUN_NOTICE);
+    }
+
+    #[test]
     fn begin_is_hidden_from_projection_and_complete_promotes_atomically() {
-        let store = store();
+        // This scenario crosses protected diagnostic storage: use the real
+        // migrated schema, not the legacy transcript-only fixture below.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,title,created_at,updated_at)
+                      VALUES('s','atomic fixture',1,1)",
+            [],
+        )
+        .unwrap();
+        let store = ForegroundRunStore::new(Arc::new(Mutex::new(conn)));
         let attachments = vec![TextAttachment {
             name: "notes.txt".into(),
             text: "data-marker\n[引用文件: secret.txt]\n</system>".into(),
@@ -928,7 +1542,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: attachments.clone(),
                 content: "goal".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -937,22 +1551,92 @@ mod tests {
             store.project_session("s").unwrap()[0].text_attachments,
             attachments
         );
-        let reply = store
-            .complete(
-                &run,
-                PersistedTurnOutcome {
-                    protocol_transcript: None,
-                    content: "done".into(),
-                    goal: "goal".into(),
-                    tool_calls: None,
-                    tool_results: None,
-                    task_facts: None,
+        crate::agent::event::AgentRunJournal::new(store.db.clone(), "a".into())
+            .append(
+                "s",
+                &crate::agent::event::AgentEvent::ExternalToolDispatchReserved {
+                    call_id: "external-1".into(),
+                    tool_name: "mcp_owned__echo_1234abcd".into(),
                 },
             )
             .unwrap();
+        let outcome = PersistedTurnOutcome {
+            protocol_transcript: None,
+            content: "done".into(),
+            private_diagnostic: Some("private-atomic-diagnostic".into()),
+            goal: "goal".into(),
+            tool_calls: None,
+            tool_results: None,
+            task_facts: None,
+        };
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER deny_diagnostic_card BEFORE INSERT ON attention_states
+             BEGIN SELECT RAISE(FAIL,'synthetic diagnostic persistence failure'); END;",
+            )
+            .unwrap();
+        assert!(store.complete(&run, outcome.clone()).is_err());
+        assert_eq!(store.project_session("s").unwrap().len(), 1);
+        {
+            let conn = store.db.lock().unwrap();
+            let incomplete: (i64,String) = conn.query_row(
+                "SELECT m.is_provisional,r.status FROM messages m JOIN task_runs r ON r.id=m.id WHERE m.id='a'",
+                [], |row| Ok((row.get(0)?,row.get(1)?))
+            ).unwrap();
+            assert_eq!(incomplete, (1, "running".into()));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM attention_diagnostic_evidence",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            conn.execute_batch("DROP TRIGGER deny_diagnostic_card")
+                .unwrap();
+        }
+        let reply = store.complete(&run, outcome).unwrap();
+        assert!(!serde_json::to_string(&reply)
+            .unwrap()
+            .contains("private-atomic-diagnostic"));
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM attention_diagnostic_evidence",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "private-atomic-diagnostic"
+        );
         assert_eq!(reply.id, "a");
+        assert_eq!(store.recover_interrupted_runs(20).unwrap(), 0);
         assert!(reply.text_attachments.is_empty());
         assert_eq!(store.project_session("s").unwrap().len(), 2);
+        // Immediate failure/completion can share a timestamp with its user
+        // turn. IDs deliberately sort the reply before its parent.
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE messages SET created_at = 10 WHERE id = 'a'", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .project_session("s")
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["u", "a"]
+        );
         let conn = store.db.lock().unwrap();
         let history =
             crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 20).unwrap();
@@ -996,7 +1680,7 @@ mod tests {
                     role: "user".into(),
                     text_attachments: Vec::new(),
                     content: "must not start".into(),
-                    persist_user_message: false,
+                    user_turn: ForegroundUserTurn::Preserve,
                     now: 10,
                 },
                 |_| Ok(ForegroundRunAdmission::Skip),
@@ -1012,6 +1696,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(task_count, 0);
+        drop(conn);
+
+        for (case, parent_role, parent_session, persist_user_message) in [
+            ("missing", None, "s", false),
+            ("user-parent", Some("user"), "s", false),
+            ("foreign-parent", Some("assistant"), "foreign", false),
+            ("new-user", Some("assistant"), "s", true),
+        ] {
+            let store = self::store();
+            if let Some(role) = parent_role {
+                let conn = store.db.lock().unwrap();
+                conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES('parent',?1,?2,'',1)",
+                    params![parent_session, role]).unwrap();
+                conn.execute(
+                    "UPDATE sessions SET leaf_message_id='parent' WHERE id='s'",
+                    [],
+                )
+                .unwrap();
+            }
+            assert!(
+                store
+                    .begin_with_admission(
+                        BeginForegroundTurn {
+                            session_id: "s".into(),
+                            user_message_id: "unexpected-user".into(),
+                            reply_id: "unexpected-reply".into(),
+                            role: "user".into(),
+                            content: "must not continue".into(),
+                            text_attachments: vec![],
+                            user_turn: if persist_user_message {
+                                ForegroundUserTurn::Append
+                            } else {
+                                ForegroundUserTurn::Preserve
+                            },
+                            now: 10,
+                        },
+                        |_| Ok(ForegroundRunAdmission::Continue)
+                    )
+                    .is_err(),
+                "{case}"
+            );
+            let conn = store.db.lock().unwrap();
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM messages WHERE id IN ('unexpected-user','unexpected-reply')", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "{case}");
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM task_runs", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -1033,7 +1768,7 @@ mod tests {
                         Vec::new()
                     },
                     content: goal.into(),
-                    persist_user_message: true,
+                    user_turn: ForegroundUserTurn::Append,
                     now: 10,
                 })
                 .unwrap();
@@ -1054,6 +1789,7 @@ mod tests {
                     PersistedTurnOutcome {
                         protocol_transcript: None,
                         content: format!("{goal} done"),
+                        private_diagnostic: None,
                         goal: goal.into(),
                         tool_calls: None,
                         tool_results: None,
@@ -1087,7 +1823,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "initial request".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -1097,6 +1833,7 @@ mod tests {
                 PersistedTurnOutcome {
                     protocol_transcript: None,
                     content: "initial response".into(),
+                    private_diagnostic: None,
                     goal: "initial request".into(),
                     tool_calls: None,
                     tool_results: None,
@@ -1113,7 +1850,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "scheduled follow-up".into(),
-                persist_user_message: false,
+                user_turn: ForegroundUserTurn::Preserve,
                 now: 20,
             })
             .unwrap();
@@ -1123,6 +1860,7 @@ mod tests {
                 PersistedTurnOutcome {
                     protocol_transcript: None,
                     content: "automation response".into(),
+                    private_diagnostic: None,
                     goal: "scheduled follow-up".into(),
                     tool_calls: None,
                     tool_results: None,
@@ -1140,6 +1878,272 @@ mod tests {
             vec!["u", "a", "auto"]
         );
         assert_eq!(messages.last().unwrap().parent_id.as_deref(), Some("a"));
+
+        // A background task can extend the conversation without continuing the
+        // previous user's task. Only an admitted continuation proves that edge.
+        for (reply_id, admission, source_id, expected) in [
+            ("continued", ForegroundRunAdmission::Continue, "auto", true),
+            (
+                "continued-again",
+                ForegroundRunAdmission::Continue,
+                "auto",
+                true,
+            ),
+            ("background", ForegroundRunAdmission::Start, "auto", false),
+            (
+                "after-background",
+                ForegroundRunAdmission::Continue,
+                "auto",
+                false,
+            ),
+        ] {
+            let ForegroundRunBeginResult::Started(next) = store
+                .begin_with_admission(
+                    BeginForegroundTurn {
+                        session_id: "s".into(),
+                        user_message_id: "unused".into(),
+                        reply_id: reply_id.into(),
+                        role: "user".into(),
+                        content: "same goal is not provenance".into(),
+                        text_attachments: vec![],
+                        user_turn: ForegroundUserTurn::Preserve,
+                        now: 30,
+                    },
+                    |_| Ok(admission),
+                )
+                .unwrap()
+            else {
+                panic!("continuation must start")
+            };
+            if admission == ForegroundRunAdmission::Continue {
+                let conn = store.db.lock().unwrap();
+                let metadata: Option<String> = conn
+                    .query_row(
+                        "SELECT metadata FROM messages WHERE id=?1",
+                        [reply_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let metadata: serde_json::Value =
+                    serde_json::from_str(metadata.as_deref().unwrap_or("{}")).unwrap();
+                assert_eq!(
+                    metadata["angelbotContinuation"]["parentMessageId"].as_str(),
+                    next.parent_message_id.as_deref()
+                );
+            }
+            store
+                .complete(
+                    &next,
+                    PersistedTurnOutcome {
+                        protocol_transcript: (reply_id == "continued").then(private_messages),
+                        content: "continued response".into(),
+                        private_diagnostic: None,
+                        goal: "same goal is not provenance".into(),
+                        tool_calls: None,
+                        tool_results: None,
+                        task_facts: None,
+                    },
+                )
+                .unwrap();
+            let conn = store.db.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            if reply_id == "continued" {
+                refresh_private_transcript_tool_result(
+                    &tx,
+                    "s",
+                    reply_id,
+                    "call-1",
+                    "approved-result",
+                )
+                .unwrap();
+                let history =
+                    crate::commands::foreground_history::hydrate_llm_history(&tx, "s", 1000)
+                        .unwrap();
+                assert!(history
+                    .iter()
+                    .any(|message| message.tool_call_id.as_deref() == Some("call-1")
+                        && message.content == "approved-result"));
+            }
+            assert_eq!(
+                is_continuation_chain_in_tx(&tx, "s", reply_id, source_id).unwrap(),
+                expected
+            );
+            assert!(!is_continuation_chain_in_tx(&tx, "s", reply_id, "u").unwrap());
+            assert!(
+                !is_continuation_chain_in_tx(&tx, "other-session", reply_id, source_id).unwrap()
+            );
+        }
+        assert!(!serde_json::to_string(&store.project_session("s").unwrap())
+            .unwrap()
+            .contains("angelbotContinuation"));
+
+        let ForegroundRunBeginResult::Started(interrupted) = store
+            .begin_with_admission(
+                BeginForegroundTurn {
+                    session_id: "s".into(),
+                    user_message_id: "unused".into(),
+                    reply_id: "interrupted-continuation".into(),
+                    role: "user".into(),
+                    content: "continue after restart".into(),
+                    text_attachments: vec![],
+                    user_turn: ForegroundUserTurn::Preserve,
+                    now: 50,
+                },
+                |_| Ok(ForegroundRunAdmission::Continue),
+            )
+            .unwrap()
+        else {
+            panic!("continuation must start")
+        };
+        assert!(store.recover_interrupted_run(&interrupted, 60).unwrap());
+        let conn = store.db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            is_continuation_chain_in_tx(&tx, "s", &interrupted.reply_id, "after-background")
+                .unwrap()
+        );
+        assert!(
+            is_continuation_chain_in_tx(&tx, "s", &interrupted.reply_id, "background").unwrap()
+        );
+        assert!(!is_continuation_chain_in_tx(&tx, "s", &interrupted.reply_id, "auto").unwrap());
+
+        for rename in [
+            "ALTER TABLE messages RENAME COLUMN metadata TO legacy_metadata",
+            "ALTER TABLE messages RENAME COLUMN parent_id TO legacy_parent_id",
+        ] {
+            let legacy = self::store();
+            let conn = legacy.db.lock().unwrap();
+            conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES('legacy','s','assistant','',1)", []).unwrap();
+            conn.execute(rename, []).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            assert!(!is_continuation_chain_in_tx(&tx, "s", "legacy", "legacy").unwrap());
+        }
+    }
+
+    #[test]
+    fn long_main_projection_survives_reopen_without_losing_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.db");
+        let mut conn = crate::db::init(&path).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','Main',1,1)",
+                [],
+            )
+            .unwrap();
+            for index in 0..500 {
+                tx.execute(
+                    "INSERT INTO messages(id,session_id,role,content,parent_id,created_at)
+                     VALUES(?1,'s',?2,?1,?3,1)",
+                    params![
+                        format!("m{index}"),
+                        if index % 2 == 0 { "user" } else { "assistant" },
+                        (index > 0).then(|| format!("m{}", index - 1))
+                    ],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "UPDATE sessions SET leaf_message_id='m499' WHERE id='s'",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let store = ForegroundRunStore::new(Arc::new(Mutex::new(conn)));
+        let ForegroundRunBeginResult::Started(run) = store
+            .begin_with_admission(
+                BeginForegroundTurn {
+                    session_id: "s".into(),
+                    user_message_id: "unused".into(),
+                    reply_id: "delivery".into(),
+                    role: "user".into(),
+                    content: "continue delivery".into(),
+                    text_attachments: vec![],
+                    user_turn: ForegroundUserTurn::Preserve,
+                    now: 10,
+                },
+                |_| Ok(ForegroundRunAdmission::Continue),
+            )
+            .unwrap()
+        else {
+            panic!("Main must continue")
+        };
+        let reply = store
+            .complete(
+                &run,
+                PersistedTurnOutcome {
+                    content: "[Report](angelbot-file:report.json)".into(),
+                    goal: "deliver saved report".into(),
+                    private_diagnostic: None,
+                    tool_calls: None,
+                    tool_results: None,
+                    task_facts: None,
+                    protocol_transcript: None,
+                },
+            )
+            .unwrap();
+        assert!(reply.task_run.is_none());
+        drop(store);
+
+        let mut conn = crate::db::init(&path).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        assert_eq!(recover_interrupted_runs_in_conn(&mut conn, 20).unwrap(), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "delivery"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM task_runs WHERE message_id='delivery'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "completed"
+        );
+        let store = ForegroundRunStore::new(Arc::new(Mutex::new(conn)));
+        let history = store.project_session("s").unwrap();
+        assert_eq!(
+            history.last().map(|m| m.id.as_str()),
+            Some("delivery"),
+            "reopening a long Main must retain its actual completed leaf"
+        );
+        assert_eq!(
+            history.len(),
+            501,
+            "the unpaged history contract must not silently truncate"
+        );
+        for (index, message) in history[..500].iter().enumerate() {
+            assert_eq!(message.id, format!("m{index}"));
+            assert_eq!(message.content, message.id);
+        }
+        let task = history.last().unwrap().task_run.as_ref().unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.goal, "deliver saved report");
+        assert!(!task.resumable);
+        assert!(history
+            .last()
+            .unwrap()
+            .content
+            .contains("angelbot-file:report.json"));
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM agent_steps", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1153,16 +2157,17 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "say hello".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
-        store
+        let reply = store
             .complete(
                 &run,
                 PersistedTurnOutcome {
                     protocol_transcript: None,
                     content: "hello".into(),
+                    private_diagnostic: None,
                     goal: "say hello".into(),
                     tool_calls: None,
                     tool_results: None,
@@ -1170,6 +2175,10 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            reply.task_run.is_none(),
+            "text replies need no UI task card"
+        );
 
         let conn = store.db.lock().unwrap();
         let state: (String, i64, i64) = conn
@@ -1193,7 +2202,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "goal".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -1212,6 +2221,7 @@ mod tests {
                 PersistedTurnOutcome {
                     protocol_transcript: None,
                     content: "done".into(),
+                    private_diagnostic: None,
                     goal: "goal".into(),
                     tool_calls: None,
                     tool_results: None,
@@ -1232,60 +2242,21 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_provisional_run_becomes_visible_and_resumable_on_restart() {
-        let store = store();
-        store
-            .begin(BeginForegroundTurn {
-                session_id: "s".into(),
-                user_message_id: "u".into(),
-                reply_id: "a".into(),
-                role: "user".into(),
-                text_attachments: Vec::new(),
-                content: "inspect the project".into(),
-                persist_user_message: true,
-                now: 10,
-            })
-            .unwrap();
-
-        assert_eq!(store.recover_interrupted_runs(20).unwrap(), 1);
-        let messages = store.project_session("s").unwrap();
-        assert_eq!(
-            messages.last().map(|message| message.id.as_str()),
-            Some("a")
-        );
-        assert!(messages
-            .last()
-            .unwrap()
-            .content
-            .contains("任务状态已安全保留"));
-        let conn = store.db.lock().unwrap();
-        let state: (String, i64) = conn
-            .query_row(
-                "SELECT status, resumable FROM task_runs WHERE id = 'a'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, ("needs_attention".into(), 1));
-    }
-
-    #[test]
-    fn persisted_model_failure_remains_visible_after_recovery() {
-        for persist_user_message in [true, false] {
+    fn interrupted_run_preserves_visible_replies_and_external_dispatch_review_on_restart() {
+        for (case, visible) in [
+            "none",
+            "reserved",
+            "other-run",
+            "other-session",
+            "malformed",
+            "pending-only",
+        ]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|visible| (case, visible)))
+        {
+            let external_reserved = case == "reserved";
             let store = store();
-            if !persist_user_message {
-                store
-                    .db
-                    .lock()
-                    .unwrap()
-                    .execute_batch(
-                        "INSERT INTO messages (id, session_id, role, content, created_at)
-                     VALUES ('u', 's', 'user', 'existing request', 1);
-                     UPDATE sessions SET leaf_message_id = 'u' WHERE id = 's';",
-                    )
-                    .unwrap();
-            }
-            let run = store
+            store
                 .begin(BeginForegroundTurn {
                     session_id: "s".into(),
                     user_message_id: "u".into(),
@@ -1293,61 +2264,253 @@ mod tests {
                     role: "user".into(),
                     text_attachments: Vec::new(),
                     content: "inspect the project".into(),
-                    persist_user_message,
+                    user_turn: ForegroundUserTurn::Append,
                     now: 10,
                 })
                 .unwrap();
-            let journal =
-                crate::agent::event::AgentRunJournal::new(store.db.clone(), run.reply_id.clone());
-            journal
-                .append(
-                    &run.session_id,
-                    &crate::agent::event::AgentEvent::Error {
-                        code: crate::agent::event::ErrorCode::LlmError,
-                        message: "Bearer private-test-key https://private.example/?input=secret"
-                            .into(),
-                        recoverable: true,
-                        turn_id: None,
-                    },
-                )
-                .unwrap();
 
-            if persist_user_message {
-                store.mark_needs_attention(&run).unwrap();
-            } else {
-                assert_eq!(store.recover_interrupted_runs(20).unwrap(), 1);
+            if case != "none" {
+                let payload = if case == "malformed" {
+                    "invalid-json".to_string()
+                } else {
+                    serde_json::json!({"type":"ExternalToolDispatchReserved", "data":{
+                        "call_id":"external-1", "tool_name":"mcp_test__echo_1234abcd"
+                    }})
+                    .to_string()
+                };
+                store
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO agent_run_events
+                 (id, run_id, session_id, sequence, event_type, payload, created_at)
+                 VALUES ('reserved', ?1, ?2, 0, ?3, ?4, 11)",
+                        params![
+                            if case == "other-run" { "other" } else { "a" },
+                            if case == "other-session" {
+                                "other"
+                            } else {
+                                "s"
+                            },
+                            if case == "pending-only" {
+                                "ToolExecutionStart"
+                            } else {
+                                "ExternalToolDispatchReserved"
+                            },
+                            payload
+                        ],
+                    )
+                    .unwrap();
             }
-            let messages = store.project_session("s").unwrap();
-            assert_eq!(messages.len(), 2);
-            let reply = messages.last().unwrap();
-            assert_eq!(
-                reply.content,
-                "模型请求未能完成。任务状态已安全保留，请检查模型连接后继续。"
-            );
-            assert!(!reply.content.contains("private-test-key"));
-            assert!(!reply.content.contains("private.example"));
-            let task = reply.task_run.as_ref().unwrap();
-            assert_eq!(task.status, "needs_attention");
-            assert!(task.resumable);
-            assert_eq!(task.step_count, 0);
-
-            // Repeated catch/restart recovery cannot replace an already visible reason.
-            journal
-                .append(
-                    &run.session_id,
-                    &crate::agent::event::AgentEvent::Error {
-                        code: crate::agent::event::ErrorCode::Unknown,
-                        message: "must not replace the saved projection".into(),
-                        recoverable: true,
-                        turn_id: None,
-                    },
+            if visible {
+                let conn = store.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE messages SET is_provisional=0, content='already visible reply',
+                     metadata='{\"retained\":true}', created_at=13 WHERE id='a'",
+                    [],
                 )
                 .unwrap();
-            assert!(!store.recover_interrupted_run(&run, 21).unwrap());
-            assert_eq!(store.recover_interrupted_runs(22).unwrap(), 0);
-            let recovered = store.project_session("s").unwrap();
-            assert_eq!(recovered.last().unwrap().content, reply.content);
-            assert_eq!(recovered.last().unwrap().created_at, reply.created_at);
+                conn.execute(
+                    "UPDATE sessions SET leaf_message_id=?1 WHERE id='s'",
+                    [if case == "other-session" { "u" } else { "a" }],
+                )
+                .unwrap();
+                conn.execute("UPDATE task_runs SET resumable=1 WHERE id='a'", [])
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO agent_steps(id,session_id,tool_name,tool_input,tool_output,success,seq,created_at)
+                     VALUES('step','s','read_file','{}','durable receipt',1,0,12)",
+                    [],
+                )
+                .unwrap();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("recovery.db");
+            {
+                let mut conn = store.db.lock().unwrap();
+                conn.execute("VACUUM INTO ?1", params![db_path.to_string_lossy()])
+                    .unwrap();
+                *conn = Connection::open(&db_path).unwrap();
+            }
+
+            assert_eq!(store.recover_interrupted_runs(20).unwrap(), 1);
+            let messages = store.project_session("s").unwrap();
+            assert_eq!(
+                messages.last().map(|message| message.id.as_str()),
+                Some(if visible && case == "other-session" {
+                    "u"
+                } else {
+                    "a"
+                })
+            );
+            if visible {
+                let stored: (String, i64) = store
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT content,created_at FROM messages WHERE id='a'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(stored, ("already visible reply".into(), 13));
+            } else {
+                assert!(messages
+                    .last()
+                    .unwrap()
+                    .content
+                    .contains("任务状态已安全保留"));
+            }
+            let conn = store.db.lock().unwrap();
+            let state: (String, i64) = conn
+                .query_row(
+                    "SELECT status, resumable FROM task_runs WHERE id = 'a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                (
+                    "needs_attention".into(),
+                    if visible || external_reserved { 0 } else { 1 }
+                )
+            );
+            if visible {
+                assert_eq!(
+                    conn.query_row("SELECT metadata FROM messages WHERE id='a'", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                    "{\"retained\":true}"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT tool_output FROM agent_steps WHERE id='step'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    "durable receipt"
+                );
+            } else if external_reserved {
+                assert!(messages.last().unwrap().content.contains("不会自动重试"));
+            }
+            drop(conn);
+            assert_eq!(store.recover_interrupted_runs(21).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn persisted_model_failure_remains_visible_after_recovery() {
+        let generic = "模型请求未能完成。任务状态已安全保留，请检查模型连接后继续。";
+        let quota = "当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。";
+        for (code, expected) in [
+            (crate::agent::event::ErrorCode::LlmError, generic),
+            (crate::agent::event::ErrorCode::LlmQuotaExceeded, quota),
+        ] {
+            for persist_user_message in [true, false] {
+                for external_reserved in [false, true] {
+                    let expected = if external_reserved {
+                        "此前已准备派发外部工具，目标可能已经改变。任务状态已安全保留，请先检查实际结果，再发起新的请求；不会自动重试。"
+                    } else {
+                        expected
+                    };
+                    let store = store();
+                    if !persist_user_message {
+                        store
+                            .db
+                            .lock()
+                            .unwrap()
+                            .execute_batch(
+                                "INSERT INTO messages (id, session_id, role, content, created_at)
+                     VALUES ('u', 's', 'user', 'existing request', 1);
+                     UPDATE sessions SET leaf_message_id = 'u' WHERE id = 's';",
+                            )
+                            .unwrap();
+                    }
+                    let run = store
+                        .begin(BeginForegroundTurn {
+                            session_id: "s".into(),
+                            user_message_id: "u".into(),
+                            reply_id: "a".into(),
+                            role: "user".into(),
+                            text_attachments: Vec::new(),
+                            content: "inspect the project".into(),
+                            user_turn: if persist_user_message {
+                                ForegroundUserTurn::Append
+                            } else {
+                                ForegroundUserTurn::Preserve
+                            },
+                            now: 10,
+                        })
+                        .unwrap();
+                    let journal = crate::agent::event::AgentRunJournal::new(
+                        store.db.clone(),
+                        run.reply_id.clone(),
+                    );
+                    journal
+                        .append(
+                            &run.session_id,
+                            &crate::agent::event::AgentEvent::Error {
+                                code: code.clone(),
+                                message:
+                                    "Bearer private-test-key https://private.example/?input=secret"
+                                        .into(),
+                                recoverable: true,
+                                turn_id: None,
+                            },
+                        )
+                        .unwrap();
+
+                    if external_reserved {
+                        journal
+                            .append(
+                                &run.session_id,
+                                &crate::agent::event::AgentEvent::ExternalToolDispatchReserved {
+                                    call_id: "uncertain-external-call".into(),
+                                    tool_name: "mcp_owned_write".into(),
+                                },
+                            )
+                            .unwrap();
+                    }
+                    if persist_user_message {
+                        assert_eq!(store.mark_needs_attention(&run).unwrap(), expected);
+                    } else {
+                        assert_eq!(store.recover_interrupted_runs(20).unwrap(), 1);
+                    }
+                    let messages = store.project_session("s").unwrap();
+                    assert_eq!(messages.len(), 2);
+                    let reply = messages.last().unwrap();
+                    assert_eq!(reply.content, expected);
+                    assert!(!reply.content.contains("private-test-key"));
+                    assert!(!reply.content.contains("private.example"));
+                    let task = reply.task_run.as_ref().unwrap();
+                    assert_eq!(task.status, "needs_attention");
+                    assert_eq!(task.resumable, !external_reserved);
+                    assert_eq!(task.step_count, 0);
+
+                    // Repeated catch/restart recovery cannot replace an already visible reason.
+                    journal
+                        .append(
+                            &run.session_id,
+                            &crate::agent::event::AgentEvent::Error {
+                                code: crate::agent::event::ErrorCode::Unknown,
+                                message: "must not replace the saved projection".into(),
+                                recoverable: true,
+                                turn_id: None,
+                            },
+                        )
+                        .unwrap();
+                    assert!(!store.recover_interrupted_run(&run, 21).unwrap());
+                    assert_eq!(store.recover_interrupted_runs(22).unwrap(), 0);
+                    let recovered = store.project_session("s").unwrap();
+                    assert_eq!(recovered.last().unwrap().content, reply.content);
+                    assert_eq!(recovered.last().unwrap().created_at, reply.created_at);
+                }
+            }
         }
     }
 
@@ -1355,9 +2518,12 @@ mod tests {
     fn recovery_never_uses_another_run_or_untrusted_error_detail() {
         let llm_error =
             r#"{"type":"Error","data":{"code":"LlmError","message":"Bearer private-test-key"}}"#;
+        let quota_error = r#"{"type":"Error","data":{"code":"LlmQuotaExceeded","message":"Bearer private-test-key"}}"#;
         for (event_run, event_session, event_type, payload) in [
             ("another-run", "s", "Error", llm_error),
             ("a", "another-session", "Error", llm_error),
+            ("another-run", "s", "Error", quota_error),
+            ("a", "another-session", "Error", quota_error),
             ("a", "s", "MessageEnd", llm_error),
             (
                 "a",
@@ -1394,7 +2560,7 @@ mod tests {
                     role: "user".into(),
                     text_attachments: Vec::new(),
                     content: "inspect the project".into(),
-                    persist_user_message: true,
+                    user_turn: ForegroundUserTurn::Append,
                     now: 10,
                 })
                 .unwrap();
@@ -1436,7 +2602,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "first".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -1448,7 +2614,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "second".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -1470,27 +2636,36 @@ mod tests {
     }
 
     #[test]
-    fn new_user_turn_supersedes_the_pending_confirmation_on_its_leaf() {
+    fn new_user_turn_supersedes_pending_confirmations_on_its_active_branch() {
         use crate::agent::task_facts::{PendingConfirmationFact, PlanStepFact};
 
-        let store = store();
-        let mut facts = TaskFacts::new("open sound settings");
-        facts.plan = vec![PlanStepFact {
-            id: "call-1".into(),
-            description: "open_windows_setting".into(),
-            depends_on: Vec::new(),
-            status: PlanStepStatus::Pending,
-        }];
-        facts.pending_confirmation = Some(PendingConfirmationFact {
-            call_id: "call-1".into(),
-            tool_name: "open_windows_setting".into(),
-            arguments: serde_json::json!({"page": "sound"}),
-            requested_at: 2,
-        });
-        facts.terminal_reason = Some(TaskTerminalReason::AwaitingConfirmation);
-        {
-            let conn = store.db.lock().unwrap();
-            conn.execute_batch(
+        for (advance_leaf, private_protocol, ambiguous_legacy, duplicate_call_id) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+            (true, true, false, true),
+        ] {
+            let store = store();
+            let mut facts = TaskFacts::new("open sound settings");
+            facts.plan = vec![PlanStepFact {
+                id: "call-1".into(),
+                description: "open_windows_setting".into(),
+                depends_on: Vec::new(),
+                status: PlanStepStatus::Pending,
+            }];
+            facts.pending_confirmation = Some(PendingConfirmationFact {
+                call_id: "call-1".into(),
+                tool_name: "open_windows_setting".into(),
+                arguments: serde_json::json!({"page": "sound"}),
+                requested_at: 2,
+            });
+            facts.terminal_reason = Some(TaskTerminalReason::AwaitingConfirmation);
+            {
+                let conn = store.db.lock().unwrap();
+                conn.execute_batch(
                 "INSERT INTO messages (id, session_id, role, content, is_provisional, created_at)
                  VALUES ('u1', 's', 'user', 'open sound settings', 0, 1);
                  INSERT INTO messages (id, session_id, role, content, parent_id, is_provisional, created_at)
@@ -1513,110 +2688,264 @@ mod tests {
                  );",
             )
             .unwrap();
-            conn.execute(
-                "UPDATE messages SET tool_calls = ?1 WHERE id = 'a1'",
-                params![serde_json::json!([{
-                    "id": "call-1",
-                    "name": "open_windows_setting",
-                    "arguments": { "page": "sound" },
-                }])
-                .to_string()],
-            )
-            .unwrap();
-            conn.execute(
+                conn.execute(
+                    "UPDATE messages SET tool_calls = ?1 WHERE id = 'a1'",
+                    params![serde_json::json!([{
+                        "id": "call-1",
+                        "name": "open_windows_setting",
+                        "arguments": { "page": "sound" },
+                    }])
+                    .to_string()],
+                )
+                .unwrap();
+                conn.execute(
                 "INSERT INTO task_run_facts (task_run_id, session_id, message_id, facts_json, created_at)
                  VALUES ('a1', 's', 'a1', ?1, 2)",
                 params![serde_json::to_string(&facts).unwrap()],
             )
             .unwrap();
-        }
+                conn.execute_batch(
+                "INSERT INTO sessions (id, updated_at) VALUES ('other', 0);
+                 INSERT INTO messages (id, session_id, role, content, parent_id, created_at)
+                 VALUES ('sibling', 's', 'assistant', 'inactive branch', 'u1', 2),
+                        ('sibling-tool', 's', 'tool', 'Confirmation required for inactive branch.', NULL, 2),
+                        ('foreign', 'other', 'assistant', 'other session', NULL, 2);
+                 UPDATE messages SET tool_call_id = 'sibling-call' WHERE id = 'sibling-tool';
+                 INSERT INTO agent_steps (id, call_id, session_id, tool_name, tool_input, tool_output, success, seq, created_at)
+                 VALUES ('sibling-call', 'sibling-call', 's', 'open_windows_setting', '{\"page\":\"display\"}',
+                    'Confirmation required for inactive branch.', 0, 1, 2);
+                 INSERT INTO task_runs (id, session_id, message_id, goal, status, plan,
+                    confirmation_state, resumable, created_at, updated_at)
+                 VALUES ('sibling', 's', 'sibling', 'unrelated', 'awaiting_confirmation', '[]', 'pending', 1, 2, 2),
+                        ('foreign', 'other', 'foreign', 'unrelated', 'awaiting_confirmation', '[]', 'pending', 1, 2, 2);",
+            ).unwrap();
+                if private_protocol {
+                    let mut transcript = private_messages();
+                    transcript.truncate(2);
+                    let call = &mut transcript[0].tool_calls.as_mut().unwrap()[0];
+                    call.name = "open_windows_setting".into();
+                    call.arguments = serde_json::json!({"page": "sound"});
+                    transcript[0].protocol_state.as_mut().unwrap().output_items[1] = serde_json::json!({
+                        "type": "function_call", "id": "fc_1", "call_id": "call-1",
+                        "name": "open_windows_setting", "arguments": "{\"page\":\"sound\"}"
+                    });
+                    transcript[1].content =
+                        "Confirmation required before executing side-effect tool.".into();
+                    conn.execute(
+                        "UPDATE messages SET metadata = ?1 WHERE id = 'a1'",
+                        params![private_transcript_metadata(&transcript).unwrap()],
+                    )
+                    .unwrap();
+                }
+                if ambiguous_legacy {
+                    conn.execute("UPDATE messages SET tool_calls = NULL WHERE id = 'a1'", [])
+                        .unwrap();
+                }
+                if duplicate_call_id {
+                    conn.execute_batch(
+                        "UPDATE agent_steps SET call_id = 'call-1' WHERE id = 'sibling-call';
+                         UPDATE messages SET tool_call_id = 'call-1' WHERE id = 'sibling-tool';",
+                    )
+                    .unwrap();
+                }
+            }
 
-        let redirected = store
-            .begin(BeginForegroundTurn {
+            if advance_leaf {
+                let follow_up = store
+                    .begin(BeginForegroundTurn {
+                        session_id: "s".into(),
+                        user_message_id: "internal".into(),
+                        reply_id: "follow-up".into(),
+                        role: "user".into(),
+                        text_attachments: Vec::new(),
+                        content: "read-only follow-up".into(),
+                        user_turn: ForegroundUserTurn::Preserve,
+                        now: 3,
+                    })
+                    .unwrap();
+                store
+                    .complete(
+                        &follow_up,
+                        PersistedTurnOutcome {
+                            content: "read-only follow-up finished".into(),
+                            private_diagnostic: None,
+                            goal: "read-only follow-up".into(),
+                            tool_calls: None,
+                            tool_results: None,
+                            task_facts: None,
+                            protocol_transcript: None,
+                        },
+                    )
+                    .unwrap();
+            }
+
+            let redirected = store.begin(BeginForegroundTurn {
                 session_id: "s".into(),
                 user_message_id: "u2".into(),
                 reply_id: "a2".into(),
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "do not open settings; summarize the next step instead".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 3,
-            })
-            .unwrap();
-        assert_eq!(redirected.parent_message_id.as_deref(), Some("u2"));
+            });
+            if ambiguous_legacy || duplicate_call_id {
+                assert!(redirected.unwrap_err().contains("ownership is ambiguous"));
+                let conn = store.db.lock().unwrap();
+                let inserted: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages WHERE id IN ('u2', 'a2')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(inserted, 0);
+                let pending: String = conn
+                    .query_row(
+                        "SELECT tool_output FROM agent_steps WHERE id = 'call-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(pending.contains("Confirmation required"));
+                continue;
+            }
+            let redirected = redirected.unwrap();
+            assert_eq!(redirected.parent_message_id.as_deref(), Some("u2"));
 
-        let conn = store.db.lock().unwrap();
-        let state: (String, String, i64) = conn
-            .query_row(
-                "SELECT status, confirmation_state, resumable FROM task_runs WHERE id = 'a1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(state, ("stopped".into(), "none".into(), 0));
-        let output: String = conn
-            .query_row(
-                "SELECT tool_output FROM agent_steps WHERE id = 'call-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(output, SUPERSEDED_CONFIRMATION_OUTPUT);
-        let history_output: String = conn
-            .query_row(
-                "SELECT content FROM messages WHERE id = 'tool-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(history_output, SUPERSEDED_CONFIRMATION_OUTPUT);
-        let model_history =
-            crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 4).unwrap();
-        let tool_history = model_history
-            .iter()
-            .find(|message| message.role == "tool")
-            .expect("the original tool result remains part of model history");
-        assert_eq!(tool_history.content, SUPERSEDED_CONFIRMATION_OUTPUT);
-        assert!(!tool_history.content.contains("Confirmation required"));
-        let stored_facts: TaskFacts = conn
-            .query_row(
-                "SELECT facts_json FROM task_run_facts WHERE task_run_id = 'a1'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|json| serde_json::from_str(&json).unwrap())
-            .unwrap();
-        assert!(stored_facts.pending_confirmation.is_none());
-        assert_eq!(
-            stored_facts.terminal_reason,
-            Some(TaskTerminalReason::Stopped)
-        );
-        assert_eq!(stored_facts.plan[0].status, PlanStepStatus::Skipped);
+            let conn = store.db.lock().unwrap();
+            let state: (String, String, i64) = conn
+                .query_row(
+                    "SELECT status, confirmation_state, resumable FROM task_runs WHERE id = 'a1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("stopped".into(), "none".into(), 0));
+            let output: String = conn
+                .query_row(
+                    "SELECT tool_output FROM agent_steps WHERE id = 'call-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(output, SUPERSEDED_CONFIRMATION_OUTPUT);
+            let history_output: String = conn
+                .query_row(
+                    "SELECT content FROM messages WHERE id = 'tool-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(history_output, SUPERSEDED_CONFIRMATION_OUTPUT);
+            let model_history =
+                crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 4).unwrap();
+            let tool_history = model_history
+                .iter()
+                .find(|message| message.role == "tool")
+                .expect("the original tool result remains part of model history");
+            assert_eq!(tool_history.content, SUPERSEDED_CONFIRMATION_OUTPUT);
+            assert!(!tool_history.content.contains("Confirmation required"));
+            let stored_facts: TaskFacts = conn
+                .query_row(
+                    "SELECT facts_json FROM task_run_facts WHERE task_run_id = 'a1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|json| serde_json::from_str(&json).unwrap())
+                .unwrap();
+            assert!(stored_facts.pending_confirmation.is_none());
+            assert_eq!(
+                stored_facts.terminal_reason,
+                Some(TaskTerminalReason::Stopped)
+            );
+            assert_eq!(stored_facts.plan[0].status, PlanStepStatus::Skipped);
+            let untouched: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE id IN ('sibling', 'foreign')
+             AND status = 'awaiting_confirmation' AND confirmation_state = 'pending' AND resumable = 1",
+            [], |row| row.get(0),
+        ).unwrap();
+            assert_eq!(untouched, 2);
+            let untouched_outputs: (String, String) = conn
+                .query_row(
+                    "SELECT tool_output, (SELECT content FROM messages WHERE id = 'sibling-tool')
+                 FROM agent_steps WHERE id = 'sibling-call'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                untouched_outputs,
+                (
+                    "Confirmation required for inactive branch.".into(),
+                    "Confirmation required for inactive branch.".into(),
+                )
+            );
+        }
     }
 
     #[test]
     fn failed_run_is_not_left_running() {
-        let store = store();
-        let run = store
-            .begin(BeginForegroundTurn {
-                session_id: "s".into(),
-                user_message_id: "u".into(),
-                reply_id: "a".into(),
-                role: "user".into(),
-                text_attachments: Vec::new(),
-                content: "goal".into(),
-                persist_user_message: true,
-                now: 10,
-            })
-            .unwrap();
-        store.mark_needs_attention(&run).unwrap();
-        let conn = store.db.lock().unwrap();
-        let status: String = conn
-            .query_row("SELECT status FROM task_runs WHERE id='a'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(status, "needs_attention");
+        for model_unavailable in [false, true] {
+            let store = store();
+            let run = store
+                .begin(BeginForegroundTurn {
+                    session_id: "s".into(),
+                    user_message_id: "u".into(),
+                    reply_id: "a".into(),
+                    role: "user".into(),
+                    text_attachments: Vec::new(),
+                    content: "goal".into(),
+                    user_turn: ForegroundUserTurn::Append,
+                    now: 10,
+                })
+                .unwrap();
+            if model_unavailable {
+                let reply = store
+                    .complete_model_unavailable(&run, "goal", "Check model settings")
+                    .unwrap();
+                assert_eq!(
+                    reply.task_run.as_ref().unwrap().status,
+                    "provider_unavailable"
+                );
+                assert!(reply.tool_calls.is_none());
+                assert!(reply.tool_results.is_none());
+                assert!(store
+                    .complete_model_unavailable(&run, "goal", "must not replace the first reply")
+                    .is_err());
+            } else {
+                store.mark_needs_attention(&run).unwrap();
+            }
+            let messages = store.project_session("s").unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[1].id, "a");
+            let task = messages[1].task_run.as_ref().unwrap();
+            assert_eq!(
+                task.status,
+                if model_unavailable {
+                    "provider_unavailable"
+                } else {
+                    "needs_attention"
+                }
+            );
+            assert_eq!(task.resumable, !model_unavailable);
+            assert_eq!(task.step_count, 0);
+            assert_eq!(task.completed_step_count, 0);
+            if model_unavailable {
+                assert_eq!(messages[1].content, "Check model settings");
+            }
+            assert_eq!(store.recover_interrupted_runs(20).unwrap(), 0);
+            assert_eq!(
+                store
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM agent_steps", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -1630,7 +2959,7 @@ mod tests {
                 role: "user".into(),
                 text_attachments: Vec::new(),
                 content: "goal".into(),
-                persist_user_message: true,
+                user_turn: ForegroundUserTurn::Append,
                 now: 10,
             })
             .unwrap();
@@ -1640,6 +2969,7 @@ mod tests {
                 PersistedTurnOutcome {
                     protocol_transcript: None,
                     content: "must not appear".into(),
+                    private_diagnostic: None,
                     goal: "goal".into(),
                     tool_calls: None,
                     tool_results: Some(vec![ToolResultInfo {

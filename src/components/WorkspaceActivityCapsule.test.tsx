@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorkspaceActivityCapsule } from '$components/WorkspaceActivityCapsule';
 import { useWorkspaceActivityStore } from '$stores/workspaceActivity';
@@ -14,6 +14,7 @@ describe('WorkspaceActivityCapsule', () => {
     });
     useWorkspaceActivityStore.setState({
       workspaceId: 'workspace-1',
+      sessionId: 'internal-1',
       isLoading: false,
       error: null,
       projection: {
@@ -38,6 +39,7 @@ describe('WorkspaceActivityCapsule', () => {
         }],
       },
       refresh: vi.fn().mockResolvedValue(undefined),
+      observe: vi.fn().mockReturnValue(() => {}),
     });
   });
 
@@ -48,7 +50,7 @@ describe('WorkspaceActivityCapsule', () => {
     expect(screen.getByText('正在执行')).toBeInTheDocument();
     expect(screen.queryByText(/\d+%/)).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(useWorkspaceActivityStore.getState().refresh).toHaveBeenCalledWith('workspace-1');
+      expect(useWorkspaceActivityStore.getState().observe).toHaveBeenCalledWith('workspace-1', 'internal-1');
     });
   });
 
@@ -150,7 +152,8 @@ describe('WorkspaceActivityCapsule', () => {
     ['completed', '已完成'],
     ['failed', '未完成'],
     ['cancelled', '已取消'],
-  ] as const)('shows terminal status %s instead of an earlier reviewer stage', (status, label) => {
+    ['needsDecision', '需要处理'],
+  ] as const)('shows settled or blocked status %s instead of an earlier execution stage', (status, label) => {
     useWorkspaceActivityStore.setState((state) => ({
       projection: state.projection && {
         ...state.projection,
@@ -158,17 +161,31 @@ describe('WorkspaceActivityCapsule', () => {
           ...state.projection.work[0],
           status,
           activity: '正在整理结果',
-          reviewerStatus: 'passed',
+          reviewerStatus: status === 'needsDecision' ? null : 'passed',
+          summary: status === 'needsDecision' ? '委派未能启动：此次任务的模型连接不可用，尚未形成可交付结果。' : null,
         }],
+        pendingDecisions: status === 'needsDecision' ? [{
+          workId: 'delegation-1', goal: '检查委派运行时',
+          questions: ['委派未能启动：此次任务的模型连接不可用，尚未形成可交付结果。', '核对配置后再决定是否重新派发；没有自动重试。'],
+          risks: [], updatedAt: 2,
+        }] : [],
       },
     }));
 
-    render(<WorkspaceActivityCapsule mode="panel" />);
+    const view = render(<WorkspaceActivityCapsule mode="panel" />);
 
     expect(screen.getByText(label)).toBeInTheDocument();
     expect(screen.queryByText('独立审校已通过')).not.toBeInTheDocument();
     expect(screen.queryByText('独立审校已通过，等待主 Agent 处理')).not.toBeInTheDocument();
     expect(screen.queryByText('正在整理结果')).not.toBeInTheDocument();
+    if (status === 'needsDecision') {
+      expect(screen.getByText('委派未能启动：此次任务的模型连接不可用，尚未形成可交付结果。')).toBeInTheDocument();
+      view.unmount();
+      render(<WorkspaceActivityCapsule />);
+      expect(screen.getByText('委派未能启动：此次任务的模型连接不可用，尚未形成可交付结果。')).toBeInTheDocument();
+      expect(screen.getByText(/没有自动重试/)).toBeInTheDocument();
+      expect(screen.queryByText('正在整理结果')).not.toBeInTheDocument();
+    }
   });
 
   it('keeps the workbench useful when the workspace has no delegated work', () => {
@@ -180,6 +197,19 @@ describe('WorkspaceActivityCapsule', () => {
 
     expect(screen.getByText('当前没有进行中的工作')).toBeInTheDocument();
     expect(screen.getByText(/委派、审校、待确认和需要继续处理/)).toBeInTheDocument();
+  });
+
+  it('keeps known work visible during a background refresh and labels stale results on failure', () => {
+    useWorkspaceActivityStore.setState({ isLoading: true });
+    const view = render(<WorkspaceActivityCapsule />);
+    expect(screen.getByText('检查委派运行时')).toBeInTheDocument();
+    expect(screen.queryByText('正在同步任务状态')).not.toBeInTheDocument();
+    act(() => { useWorkspaceActivityStore.setState({ isLoading: false, error: '临时不可用' }); });
+    view.rerender(<WorkspaceActivityCapsule mode="panel" />);
+    expect(screen.getByText('检查委派运行时')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('上次记录，不代表任务仍在执行');
+    view.rerender(<WorkspaceActivityCapsule />);
+    expect(screen.getByText(/上次记录：AngelBot/)).toBeInTheDocument();
   });
 
   it('surfaces recoverable Main-Agent work without exposing a retry control', () => {

@@ -365,7 +365,7 @@ where
         )
         .map_err(WorkerLaunchError::Launcher)?;
         let (event_tx, event_rx) = mpsc::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = ToolCancellation::new();
         let terminal_sent = Arc::new(AtomicBool::new(false));
         let worker = ChangeWorkerTask {
             attempt_id: context.attempt.attempt_id.clone(),
@@ -375,7 +375,7 @@ where
             finished: false,
         };
         let adapter = DelegatedWorkerAdapter::new(
-            ExecutionKernel::new(ToolCancellation::new(), MODEL_TIMEOUT, MAX_MODEL_ATTEMPTS),
+            ExecutionKernel::new(cancelled.clone(), MODEL_TIMEOUT, MAX_MODEL_ATTEMPTS),
             self.limits.clone(),
         );
         tauri::async_runtime::spawn(run_change_host(
@@ -396,7 +396,7 @@ struct ChangeWorkerTask {
     attempt_id: String,
     lease_epoch: u64,
     event_rx: Receiver<WorkerTaskEvent>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: ToolCancellation,
     finished: bool,
 }
 
@@ -418,7 +418,7 @@ impl PollableWorkerTask for ChangeWorkerTask {
     }
 
     fn cancel(&mut self, _: StopReason) -> Result<(), WorkerLaunchError> {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.cancel();
         Ok(())
     }
 
@@ -483,7 +483,7 @@ async fn run_change_host<T>(
     brief: DelegationBrief,
     adapter: DelegatedWorkerAdapter,
     tx: Sender<WorkerTaskEvent>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: ToolCancellation,
     terminal_sent: Arc<AtomicBool>,
     limits: ContractLimits,
 ) where
@@ -494,14 +494,16 @@ async fn run_change_host<T>(
         attempt_id: attempt.attempt_id.clone(),
         epoch: attempt.epoch,
     };
-    let result = if cancelled.load(Ordering::Acquire) {
-        Err("change worker cancelled".to_string())
-    } else {
-        adapter
-            .run(&attempt, &brief, &mut host, &mut sink, |_| {})
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("delegated worker failed: {:?}", error.kind))
+    // Cancellation is attempt-local and one-way. Dropping the run future also
+    // drops an in-flight provider request/retry wait, before another tool can
+    // execute; a separate atomic flag checked only at startup cannot do that.
+    let result = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err("change worker cancelled".to_string()),
+        result = adapter.run(&attempt, &brief, &mut host, &mut sink, |_| {}) => {
+            result.map(|_| ())
+                .map_err(|error| format!("delegated worker failed: {:?}", error.kind))
+        }
     };
     if terminal_sent.swap(true, Ordering::AcqRel) {
         return;

@@ -49,6 +49,8 @@ jsonwebtoken = { version = "9.3", default-features = false }
 oauth2 = { version = "5", default-features = false }
 fs2 = "0.4"
 subtle = "2.6"
+quick-xml = "=0.39.4"
+zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "=2.0.1"
@@ -56,7 +58,7 @@ image = { version = "=0.25.8", default-features = false }
 # Delegated-network scope keys must distinguish a replacement directory at the
 # same path. `FileIdInfo` provides the filesystem's stable directory identity;
 # timestamps are user-mutable and therefore are not a security boundary.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_StationsAndDesktops", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm", "Win32_System_ProcessStatus", "Win32_UI_Accessibility", "Win32_System_Com"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_StationsAndDesktops", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_ProcessStatus", "Win32_UI_Accessibility", "Win32_System_Com"] }
 
 [features]
 desktop-e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]

@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSessionsStore } from '$stores/sessions';
 import { useWorkspacesStore } from '$stores/workspaces';
-import { listWorkDir, readSessionFile, type WorkDirEntry } from '$lib/commands/file';
+import { listWorkDir, readSessionFile, saveSessionFile, type WorkDirEntry } from '$lib/commands/file';
 import { WorkspaceActivityCapsule } from '../WorkspaceActivityCapsule';
 import './RightPanel.css';
 
@@ -19,10 +19,12 @@ function FileTypeIcon({ entry }: { entry: WorkDirEntry }) {
   return <span className={`file-type-icon ext-${extension || 'plain'}`} aria-label={`${extension || '文本'} 文件`}>{labels[extension] ?? '·'}</span>;
 }
 
-function FileTreeNode({ entry, sessionId, onOpenFile, onError, selectedPath }: {
+function FileTreeNode({ entry, sessionId, onOpenFile, onSaveFile, savingFile, onError, selectedPath }: {
   entry: WorkDirEntry;
   sessionId: string;
   onOpenFile: (entry: WorkDirEntry) => void;
+  onSaveFile: (path: string) => void;
+  savingFile: boolean;
   onError: (message: string) => void;
   selectedPath?: string;
 }) {
@@ -45,18 +47,21 @@ function FileTreeNode({ entry, sessionId, onOpenFile, onError, selectedPath }: {
     <li className="file-tree-node">
       <button
         className={`file-item${entry.path === selectedPath ? ' selected' : ''}`}
+        aria-label={`${entry.isDirectory ? (expanded ? '收起' : '展开') : '打开'} ${entry.name}`}
         onClick={() => entry.isDirectory ? setExpanded((value) => !value) : onOpenFile(entry)}
         aria-expanded={entry.isDirectory ? expanded : undefined}
         aria-current={!entry.isDirectory && entry.path === selectedPath ? 'true' : undefined}
+        title={entry.temporary ? `${entry.path} · 浏览器临时文件，不随备份；需要保留请另存或让 AngelBot 复制到结果区。` : entry.path}
       >
         <span className="file-tree-caret">{entry.isDirectory ? (expanded ? '⌄' : '›') : ''}</span>
         <FileTypeIcon entry={entry} />
-        <span className="file-name">{entry.name}</span>
+        <span className="file-name">{entry.temporary && entry.isDirectory && !entry.path.includes('/') ? '浏览器临时文件（不随备份）' : entry.name}</span>
       </button>
+      {!entry.isDirectory && <button type="button" className="file-save-as" disabled={savingFile} aria-label={`另存 ${entry.name}`} onClick={() => onSaveFile(entry.path)}>另存</button>}
       {expanded && (
         <ul className="file-tree-children">
           {loading ? <li className="context-loading">加载中…</li> : children.map((child) => (
-            <FileTreeNode key={child.path} entry={child} sessionId={sessionId} onOpenFile={onOpenFile} onError={onError} selectedPath={selectedPath} />
+            <FileTreeNode key={child.path} entry={child} sessionId={sessionId} onOpenFile={onOpenFile} onSaveFile={onSaveFile} savingFile={savingFile} onError={onError} selectedPath={selectedPath} />
           ))}
         </ul>
       )}
@@ -71,7 +76,7 @@ export function RightPanel({
 }: {
   onClose?: () => void;
   workspaceView?: WorkspaceView | null;
-  locateRequest?: { path: string; revision: number } | null;
+  locateRequest?: { path: string; revision: number; sessionId: string } | null;
 }) {
   const session = useSessionsStore((state) => state.activeSession);
   const workspaces = useWorkspacesStore((state) => state.workspaces);
@@ -80,9 +85,15 @@ export function RightPanel({
   const [view, setView] = useState<PanelView>('home');
   const [rootEntries, setRootEntries] = useState<WorkDirEntry[]>([]);
   const [loadingFiles, setLoadingFiles] = useState(false);
+  const [fileRevision, setFileRevision] = useState(0);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ path: string; content: string } | null>(null);
+  const [savingFile, setSavingFile] = useState(false);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const previewRequest = useRef(0);
+
+  useEffect(() => { previewRequest.current += 1; setPreview(null); setLoadingPreview(false); setSaveNotice(null); }, [session?.id, workspace?.rootPath, workspace?.directoryConfirmed]);
   const [browserUrl, setBrowserUrl] = useState('');
   const [browserPage, setBrowserPage] = useState<string | null>(null);
   const [browserMessage, setBrowserMessage] = useState<string | null>(null);
@@ -95,7 +106,8 @@ export function RightPanel({
   }, [workspaceView]);
 
   useEffect(() => {
-    if (!locateRequest || !session) return;
+    if (!locateRequest || !session || locateRequest.sessionId !== session.id) return;
+    const revision = ++previewRequest.current;
     let cancelled = false;
     setView('files');
     setLoadingPreview(true);
@@ -103,7 +115,7 @@ export function RightPanel({
     setPreview(null);
     readSessionFile(session.id, locateRequest.path)
       .then((result) => {
-        if (cancelled) return;
+        if (cancelled || previewRequest.current !== revision) return;
         if (result.success) {
           setPreview({ path: locateRequest.path, content: (result.content ?? '').slice(0, 500_000) });
         } else {
@@ -111,24 +123,24 @@ export function RightPanel({
         }
       })
       .catch((error) => {
-        if (!cancelled) setFileError(error instanceof Error ? error.message : String(error));
+        if (!cancelled && previewRequest.current === revision) setFileError(error instanceof Error ? error.message : String(error));
       })
-      .finally(() => { if (!cancelled) setLoadingPreview(false); });
+      .finally(() => { if (!cancelled && previewRequest.current === revision) setLoadingPreview(false); });
     return () => { cancelled = true; };
-  }, [locateRequest?.path, locateRequest?.revision, session?.id]);
+  }, [locateRequest?.path, locateRequest?.revision, locateRequest?.sessionId, session?.id]);
 
   useEffect(() => {
     if (view !== 'files' || !session) return;
     let cancelled = false;
     setLoadingFiles(true);
+    setRootEntries([]);
     setFileError(null);
-    setPreview(null);
     listWorkDir(session.id)
       .then((items) => { if (!cancelled) setRootEntries(items); })
       .catch((error) => { if (!cancelled) setFileError(error instanceof Error ? error.message : String(error)); })
       .finally(() => { if (!cancelled) setLoadingFiles(false); });
     return () => { cancelled = true; };
-  }, [session?.id, view]);
+  }, [session?.id, workspace?.rootPath, workspace?.directoryConfirmed, view, fileRevision]);
 
   const openView = (next: Exclude<PanelView, 'home'>) => {
     setView(next);
@@ -163,11 +175,13 @@ export function RightPanel({
 
   const openEntry = async (entry: WorkDirEntry) => {
     if (!session) return;
+    const revision = ++previewRequest.current;
     setLoadingPreview(true);
     setFileError(null);
     setPreview(null);
     try {
       const result = await readSessionFile(session.id, entry.path);
+      if (previewRequest.current !== revision || useSessionsStore.getState().activeSessionId !== session.id) return;
       if (result.success) {
         const content = (result.content ?? '').slice(0, 500_000);
         setPreview({ path: entry.path, content });
@@ -175,9 +189,9 @@ export function RightPanel({
         setFileError(result.error ?? '无法读取该文件');
       }
     } catch (error) {
-      setFileError(error instanceof Error ? error.message : String(error));
+      if (previewRequest.current === revision && useSessionsStore.getState().activeSessionId === session.id) setFileError(error instanceof Error ? error.message : String(error));
     } finally {
-      setLoadingPreview(false);
+      if (previewRequest.current === revision && useSessionsStore.getState().activeSessionId === session.id) setLoadingPreview(false);
     }
   };
 
@@ -186,6 +200,23 @@ export function RightPanel({
     window.dispatchEvent(new CustomEvent('angelbot:reference-file', {
       detail: workspace ? { path: preview.path, workspaceId: workspace.id } : { path: preview.path },
     }));
+  };
+
+  const saveFile = async (path: string) => {
+    if (!session || savingFile) return;
+    const sessionId = session.id;
+    setSavingFile(true);
+    setSaveNotice(null);
+    try {
+      const result = await saveSessionFile(sessionId, path);
+      if (useSessionsStore.getState().activeSessionId === sessionId && result.status === 'saved') {
+        setSaveNotice(`已另存 ${result.name}（${result.bytes} 字节），原文件保留。`);
+      }
+    } catch (error) {
+      if (useSessionsStore.getState().activeSessionId === sessionId) setSaveNotice(String(error));
+    } finally {
+      setSavingFile(false);
+    }
   };
 
   const popOutBrowser = () => {
@@ -271,19 +302,22 @@ export function RightPanel({
 
         {view === 'files' && (
           <section className={`workbench-files workbench-files--workspace${preview ? ' workbench-files--has-preview' : ''}`}>
-            <div className="workbench-section-title">项目文件</div>
+            <div className="workbench-section-title"><span>{workspace?.kind === 'personal' ? '日常结果' : '项目文件'}</span><button type="button" disabled={loadingFiles || !session} onClick={() => setFileRevision((value) => value + 1)}>刷新目录</button></div>
             {!session ? (
               <div className="workbench-empty"><FileIcon /><p>先选择一个项目工作区，再浏览其文件。</p></div>
             ) : (
               <>
-                <p className="workbench-hint">{workspace?.rootPath || session.workDir || '项目目录'} · 定位、预览或引用文件给主 Agent</p>
+                <p className="workbench-hint">{workspace?.kind === 'personal'
+                  ? 'AngelBot 生成的文件默认保留在这里，不会访问其它目录。可预览、引用和另存；数据备份包含这些文件。'
+                  : `${workspace?.rootPath || session.workDir || '项目目录'} · 定位、预览或引用文件给主 Agent`}</p>
                 {loadingFiles && <div className="context-loading">加载中…</div>}
                 {loadingPreview && <div className="context-loading">正在读取文件…</div>}
                 {fileError && <div className="workbench-error">{fileError}</div>}
-                {!loadingFiles && !fileError && (
+                {saveNotice && <p className="workbench-hint" role="status">{saveNotice}</p>}
+                {!loadingFiles && (
                   <ul className="file-tree">
-                    {rootEntries.length === 0 ? <li className="context-empty-hint">目录为空</li> : rootEntries.map((entry) => (
-                      <FileTreeNode key={entry.path} entry={entry} sessionId={session.id} onOpenFile={(file) => void openEntry(file)} onError={setFileError} selectedPath={preview?.path} />
+                    {rootEntries.length === 0 ? !fileError && <li className="context-empty-hint">目录为空</li> : rootEntries.map((entry) => (
+                      <FileTreeNode key={`${session.id}:${fileRevision}:${entry.path}`} entry={entry} sessionId={session.id} onOpenFile={(file) => void openEntry(file)} onSaveFile={(path) => void saveFile(path)} savingFile={savingFile} onError={setFileError} selectedPath={preview?.path} />
                     ))}
                   </ul>
                 )}
@@ -295,6 +329,7 @@ export function RightPanel({
                         <span className="workbench-read-only">只读预览</span>
                         <button type="button" onClick={() => setPreview(null)}>关闭</button>
                         <button type="button" className="file-reference-btn" onClick={referencePreviewedFile}>引用文件</button>
+                        <button type="button" disabled={savingFile} onClick={() => void saveFile(preview.path)}>{savingFile ? '另存中…' : '另存为…'}</button>
                       </div>
                     </div>
                     <pre className="file-preview-content"><code>{preview.content}</code></pre>

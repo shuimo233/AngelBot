@@ -135,7 +135,7 @@ where
     /// is not accepted here; the runtime durably revokes and seals the attempt.
     pub fn report_failure(&mut self, attempt_id: &str) -> Result<(), DelegatedSchedulerError> {
         self.runtime
-            .needs_decision(attempt_id)
+            .worker_failed(attempt_id)
             .map_err(runtime_error)
     }
 

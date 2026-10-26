@@ -20,7 +20,9 @@ use crate::agent::task_facts::{
     persist_task_facts, PlanStepFact, PlanStepStatus, TaskFacts, TaskTerminalReason,
 };
 use crate::agent::AgentRunner;
-use crate::agent::{derive_run_state, RunStateInput, ToolCall, ToolExecutionContext};
+use crate::agent::{
+    derive_run_state, RunStateInput, ToolCall, ToolCancellation, ToolExecutionContext,
+};
 use crate::commands::foreground_history::{
     hydrate_agent_steps, hydrate_llm_history, hydrate_task_facts_from_db, hydrate_task_runs,
     hydrate_task_runs_from_db, parse_inline_tool_calls, persist_task_run, persist_tool_results,
@@ -33,7 +35,7 @@ pub use crate::commands::foreground_message_contracts::{
 };
 use crate::commands::foreground_run_store::{
     terminalize_pending_confirmation_in_tx, BeginForegroundTurn, ForegroundRunAdmission,
-    ForegroundRunAdmissionGuard, ForegroundRunBeginResult, ForegroundRunStore,
+    ForegroundRunAdmissionGuard, ForegroundRunBeginResult, ForegroundRunStore, ForegroundUserTurn,
 };
 use crate::commands::foreground_text_attachments;
 use crate::commands::foreground_tool_surface::normalize_agent_execution_permission;
@@ -52,17 +54,9 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-/// Generate a short Chinese title (5–15 chars) from the first user message content.
-async fn generate_title_from_content(
-    content: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let prompt = format!(
-        "请根据以下用户提问，用 5 到 15 个汉字生成一个简短的中文会话标题，只需返回标题，不要任何解释或标点符号。\n\n用户提问：{}",
-        content.trim()
-    );
-    let title = crate::commands::call_deepseek(&[], &prompt).await?;
-    Ok(title.trim().chars().take(20).collect::<String>())
-}
+#[cfg(all(test, windows, not(feature = "desktop-e2e")))]
+#[path = "message_live_tests.rs"]
+mod live_tests;
 
 /// Estimate token count for mixed Chinese/English text.
 /// Claude: English ~3.3 chars/token, CJK ~1.3 chars/token
@@ -144,7 +138,7 @@ fn get_setting(state: &AppState, key: &str, default: &str) -> String {
 /// join was fragile (it relied on `agent_steps.created_at = messages.created_at`
 /// which fails whenever the assistant message is regenerated, e.g. after
 /// `handleRegenerateMessage`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ResolveAgentConfirmationRequest {
     #[serde(rename = "sessionId")]
     pub session_id: String,
@@ -153,8 +147,8 @@ pub struct ResolveAgentConfirmationRequest {
     #[serde(rename = "callId")]
     pub call_id: String,
     pub decision: String,
-    /// Opaque backend-issued binding for a live desktop target. Required for
-    /// every external-app write or control invocation.
+    /// Opaque backend-issued binding for a desktop target or image scope.
+    /// Required for every external-app write, control invocation or image approval.
     #[serde(default, rename = "previewId")]
     pub preview_id: Option<String>,
 }
@@ -193,17 +187,23 @@ struct PendingConfirmation {
 }
 
 const DESKTOP_ACTION_PREVIEW_TTL: Duration = Duration::from_secs(60);
-const DESKTOP_ACTION_INTERRUPTED: &str = r#"{"code":"RESULT_UNKNOWN","message":"Desktop action may have been interrupted. Inspect the target application before retrying."}"#;
+const CONFIRMED_ACTION_INTERRUPTED: &str = r#"{"code":"RESULT_UNKNOWN","message":"The external operation may have been interrupted before its receipt was saved. Inspect the target before starting a new attempt; do not approve this call again."}"#;
+
+enum DesktopActionPreviewTarget {
+    Action(crate::desktop_control::DesktopDraftTargetIdentity),
+    ImageScope,
+    ImageClick(crate::desktop_control::DesktopImageClickTarget),
+}
 
 /// Ephemeral, runtime-owned preview binding. A restart intentionally invalidates
-/// it, so a stale confirmation must inspect the live window again.
+/// it, so a stale confirmation must prepare a fresh trusted preview.
 struct DesktopActionPreviewLease {
     session_id: String,
     message_id: String,
     call_id: String,
     pending: PendingConfirmation,
     app: crate::commands::desktop::TrustedDesktopApp,
-    target: crate::desktop_control::DesktopDraftTargetIdentity,
+    target: DesktopActionPreviewTarget,
     expires_at: Instant,
 }
 
@@ -270,8 +270,12 @@ pub struct DesktopActionConfirmationPreview {
     app_display_name: String,
     executable_name: String,
     window_title: Option<String>,
-    control_name: String,
+    control_name: Option<String>,
     text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    option: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<crate::desktop_control::DesktopImageClickDisplay>,
     /// Unix milliseconds, only for the confirmation UI countdown.
     expires_at: i64,
 }
@@ -291,12 +295,13 @@ struct StoredFieldArguments {
     text: String,
 }
 
+type StoredControlArguments = crate::desktop_control::DesktopControlRequest;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredControlArguments {
+struct StoredImageArguments {
     app_id: String,
-    control_ref: String,
-    action: crate::desktop_control::DesktopControlOperation,
+    mode: String,
 }
 
 pub(crate) fn preflight_pending_desktop_action_impl(
@@ -309,8 +314,26 @@ pub(crate) fn preflight_pending_desktop_action_impl(
         let conn = state.db.lock().map_err(|error| error.to_string())?;
         load_pending_confirmation(&conn, session_id, message_id, call_id)?
     };
+    let mut option = None;
+    let mut image_click = None;
     let (app_id, text, target_ref, operation, required_capability, control_operation) =
         match pending.tool_name.as_str() {
+            "click_trusted_app_image" => {
+                let args: crate::desktop_control::DesktopImageClickRequest =
+                    serde_json::from_str(&pending.tool_input)
+                        .map_err(|_| "Stored visual click is invalid")?;
+                args.validate().map_err(|error| error.to_string())?;
+                let app_id = args.app_id.clone();
+                image_click = Some(args);
+                (
+                    app_id,
+                    None,
+                    None,
+                    "imageclick",
+                    crate::commands::desktop::CAPABILITY_INTERACT,
+                    None,
+                )
+            }
             "prepare_message_draft" => {
                 let args: StoredDraftArguments = serde_json::from_str(&pending.tool_input)
                     .map_err(|error| format!("Stored draft arguments are invalid: {error}"))?;
@@ -341,9 +364,8 @@ pub(crate) fn preflight_pending_desktop_action_impl(
             "operate_trusted_app_control" => {
                 let args: StoredControlArguments = serde_json::from_str(&pending.tool_input)
                     .map_err(|error| format!("Stored control arguments are invalid: {error}"))?;
-                if args.control_ref.is_empty() || args.control_ref.len() > 128 {
-                    return Err("Stored control reference is invalid".to_string());
-                }
+                args.validate().map_err(|error| error.to_string())?;
+                option = args.option;
                 (
                     args.app_id,
                     None,
@@ -353,19 +375,40 @@ pub(crate) fn preflight_pending_desktop_action_impl(
                     Some(args.action),
                 )
             }
+            "observe_trusted_app_window" => {
+                let args: StoredImageArguments = serde_json::from_str(&pending.tool_input)
+                    .map_err(|error| format!("Stored image arguments are invalid: {error}"))?;
+                if args.mode != "image" {
+                    return Err(
+                        "Only image observation uses an application scope preview".to_string()
+                    );
+                }
+                (
+                    args.app_id,
+                    None,
+                    None,
+                    "image",
+                    crate::commands::desktop::CAPABILITY_OBSERVE_IMAGE,
+                    None,
+                )
+            }
             _ => {
                 return Err("This pending action does not use a desktop target preview".to_string())
             }
         };
-    if text
-        .as_ref()
-        .is_some_and(|value| value.is_empty() || value.len() > 20_000 || value.contains('\0'))
-    {
+    if text.as_ref().is_some_and(|value| {
+        (operation == "draft" && value.is_empty()) || value.len() > 20_000 || value.contains('\0')
+    }) {
         return Err("Stored text is invalid".to_string());
     }
     let app = crate::commands::desktop::get_trusted_desktop_app_from_db(&state.db, &app_id)?
         .ok_or_else(|| "The target application is no longer trusted".to_string())?;
     if !app.enabled
+        || (operation == "imageclick"
+            && !app
+                .capabilities
+                .iter()
+                .any(|v| v == crate::commands::desktop::CAPABILITY_OBSERVE_IMAGE))
         || !app
             .capabilities
             .iter()
@@ -379,56 +422,81 @@ pub(crate) fn preflight_pending_desktop_action_impl(
     {
         return Err("The application needs an enabled, available trusted-app entry with the requested action and observation scope".to_string());
     }
-    let (target_app_id, window_title, control_name, identity) = if let Some(target_ref) = target_ref
-    {
-        let target = if let Some(control_operation) = control_operation {
-            state.desktop_adapter.preflight_control_ref(
-                &app.id,
-                &app.executable_path,
-                &target_ref,
-                control_operation,
-                Duration::from_secs(8),
+    let mut image = None;
+    let (target_app_id, window_title, control_name, target) =
+        if let Some(args) = image_click.as_ref() {
+            let preview = state
+                .desktop_adapter
+                .preflight_image_click(args, &app.executable_path, Duration::from_secs(8))
+                .map_err(|e| e.to_string())?;
+            if !preview.target.matches(args) {
+                return Err("The visual preview does not match the proposed click".into());
+            }
+            image = Some(preview.image);
+            (
+                app.id.clone(),
+                None,
+                None,
+                DesktopActionPreviewTarget::ImageClick(preview.target),
+            )
+        } else if operation == "image" {
+            // Consent is for this DB-attested application scope, not a window read.
+            // Do not inspect UIA or capture any pixels before the user approves.
+            (
+                app.id.clone(),
+                None,
+                None,
+                DesktopActionPreviewTarget::ImageScope,
+            )
+        } else if let Some(target_ref) = target_ref {
+            let target = if let Some(control_operation) = control_operation {
+                state.desktop_adapter.preflight_control_ref(
+                    &app.id,
+                    &app.executable_path,
+                    &target_ref,
+                    control_operation,
+                    Duration::from_secs(8),
+                )
+            } else {
+                state.desktop_adapter.preflight_text_ref(
+                    &app.id,
+                    &app.executable_path,
+                    &target_ref,
+                    Duration::from_secs(8),
+                )
+            }
+            .map_err(|error| error.to_string())?;
+            (
+                target.app_id,
+                target.window_title,
+                Some(target.control_label),
+                DesktopActionPreviewTarget::Action(target.identity),
             )
         } else {
-            state.desktop_adapter.preflight_text_ref(
-                &app.id,
-                &app.executable_path,
-                &target_ref,
-                Duration::from_secs(8),
+            let selector = app
+                .draft_selector
+                .as_deref()
+                .ok_or_else(|| "The trusted draft target is missing".to_string())?;
+            let target = state
+                .desktop_adapter
+                .preflight_draft(
+                    &app.id,
+                    &app.executable_path,
+                    selector,
+                    Duration::from_secs(8),
+                )
+                .map_err(|error| error.to_string())?;
+            (
+                target.app_id,
+                target.window_title,
+                Some(target.control_name),
+                DesktopActionPreviewTarget::Action(target.identity),
             )
-        }
-        .map_err(|error| error.to_string())?;
-        (
-            target.app_id,
-            target.window_title,
-            target.control_label,
-            target.identity,
-        )
-    } else {
-        let selector = app
-            .draft_selector
-            .as_deref()
-            .ok_or_else(|| "The trusted draft target is missing".to_string())?;
-        let target = state
-            .desktop_adapter
-            .preflight_draft(
-                &app.id,
-                &app.executable_path,
-                selector,
-                Duration::from_secs(8),
-            )
-            .map_err(|error| error.to_string())?;
-        (
-            target.app_id,
-            target.window_title,
-            target.control_name,
-            target.identity,
-        )
-    };
+        };
     if target_app_id != app.id {
         return Err("Desktop target does not match the trusted application".to_string());
     }
-    // The OS inspection may block. Recheck the durable pending step and app
+    // A live target inspection may block. Recheck the durable pending step and app
     // configuration before offering a confirmation for what was just observed.
     // Keep this short critical section through insertion. Configuration
     // deletion uses the same DB -> preview order, so an in-flight old check
@@ -439,6 +507,15 @@ pub(crate) fn preflight_pending_desktop_action_impl(
     if current != pending || current_app.as_ref() != Some(&app) {
         return Err("Desktop target changed during inspection; retry".to_string());
     }
+    let ttl = match &target {
+        DesktopActionPreviewTarget::ImageClick(target) => {
+            DESKTOP_ACTION_PREVIEW_TTL.min(target.remaining())
+        }
+        _ => DESKTOP_ACTION_PREVIEW_TTL,
+    };
+    if ttl.is_zero() {
+        return Err("Desktop preview expired; observe a fresh image".into());
+    }
     let preview_id = state
         .desktop_action_previews
         .insert(DesktopActionPreviewLease {
@@ -447,8 +524,8 @@ pub(crate) fn preflight_pending_desktop_action_impl(
             call_id: call_id.to_string(),
             pending,
             app: app.clone(),
-            target: identity,
-            expires_at: Instant::now() + DESKTOP_ACTION_PREVIEW_TTL,
+            target,
+            expires_at: Instant::now() + ttl,
         })?;
     drop(conn);
     Ok(DesktopActionConfirmationPreview {
@@ -463,9 +540,10 @@ pub(crate) fn preflight_pending_desktop_action_impl(
         window_title,
         control_name,
         text,
+        option,
+        image,
         expires_at: (Utc::now()
-            + chrono::Duration::from_std(DESKTOP_ACTION_PREVIEW_TTL)
-                .map_err(|error| error.to_string())?)
+            + chrono::Duration::from_std(ttl).map_err(|error| error.to_string())?)
         .timestamp_millis(),
     })
 }
@@ -493,6 +571,9 @@ fn load_pending_confirmation(
     message_id: &str,
     call_id: &str,
 ) -> Result<PendingConfirmation, String> {
+    // An unknown sibling disables Continue/Approve, but must still allow
+    // Reject. Preserve the existing resumability gate in all other cases;
+    // approval callers reject unknown outcomes before reaching this lookup.
     conn.query_row(
         "SELECT steps.id, messages.created_at, steps.tool_name,
                 COALESCE(steps.tool_input, ''), steps.mcp_schema_version
@@ -512,7 +593,13 @@ fn load_pending_confirmation(
                   AND task_runs.message_id = ?1
                   AND task_runs.status = 'awaiting_confirmation'
                   AND task_runs.confirmation_state = 'pending'
-                  AND task_runs.resumable = 1
+                  AND (task_runs.resumable = 1 OR EXISTS (
+                      SELECT 1 FROM agent_steps unknown_step
+                      WHERE unknown_step.session_id = ?2
+                        AND unknown_step.created_at = messages.created_at
+                        AND unknown_step.success != 1
+                        AND COALESCE(unknown_step.tool_output, '') LIKE '%RESULT_UNKNOWN%'
+                  ))
            )",
         params![message_id, session_id, call_id],
         |row| {
@@ -556,7 +643,13 @@ fn settle_pending_confirmation_in_tx(
                       AND task_runs.message_id = ?7
                       AND task_runs.status = 'awaiting_confirmation'
                       AND task_runs.confirmation_state = 'pending'
-                      AND task_runs.resumable = 1
+                      AND (task_runs.resumable = 1 OR EXISTS (
+                          SELECT 1 FROM agent_steps unknown_step
+                          WHERE unknown_step.session_id = ?4
+                            AND unknown_step.created_at = ?5
+                            AND unknown_step.success != 1
+                            AND COALESCE(unknown_step.tool_output, '') LIKE '%RESULT_UNKNOWN%'
+                      ))
                )",
             params![
                 output,
@@ -584,10 +677,10 @@ fn settle_pending_confirmation_in_tx(
     refresh_task_facts_after_confirmation(tx, session_id, message_id, call_id, success)
 }
 
-/// Commit this fail-closed outcome before crossing the OS side-effect boundary.
+/// Commit this fail-closed outcome before dispatching a confirmed external action.
 /// If the process dies after this transaction, the step is no longer pending
 /// and cannot be approved again without a new model/user turn.
-fn arm_desktop_action_in_tx(
+fn arm_confirmed_action_in_tx(
     tx: &Transaction<'_>,
     session_id: &str,
     message_id: &str,
@@ -601,7 +694,7 @@ fn arm_desktop_action_in_tx(
         call_id,
         pending,
         false,
-        DESKTOP_ACTION_INTERRUPTED,
+        CONFIRMED_ACTION_INTERRUPTED,
     )?;
     let changed = tx
         .execute(
@@ -609,7 +702,7 @@ fn arm_desktop_action_in_tx(
          WHERE session_id = ?2 AND role = 'tool' AND created_at = ?3
            AND tool_call_id = ?4",
             params![
-                DESKTOP_ACTION_INTERRUPTED,
+                CONFIRMED_ACTION_INTERRUPTED,
                 session_id,
                 pending.message_created_at,
                 call_id
@@ -618,7 +711,7 @@ fn arm_desktop_action_in_tx(
         .map_err(|error| error.to_string())?;
     if changed != 1 {
         return Err(
-            "Desktop action has no unique durable tool result; nothing was executed".to_string(),
+            "Confirmed action has no unique durable tool result; nothing was executed".to_string(),
         );
     }
     Ok(())
@@ -626,7 +719,7 @@ fn arm_desktop_action_in_tx(
 
 /// Replace only the exact armed outcome. A failed settlement leaves the
 /// durable RESULT_UNKNOWN in place instead of re-opening the confirmation.
-fn finish_desktop_action_in_tx(
+fn finish_confirmed_action_in_tx(
     tx: &Transaction<'_>,
     session_id: &str,
     message_id: &str,
@@ -648,13 +741,13 @@ fn finish_desktop_action_in_tx(
                 session_id,
                 pending.message_created_at,
                 call_id,
-                DESKTOP_ACTION_INTERRUPTED,
+                CONFIRMED_ACTION_INTERRUPTED,
             ],
         )
         .map_err(|error| error.to_string())?;
     if changed != 1 {
         return Err(
-            "Desktop action outcome can no longer be settled; inspect the target application"
+            "Confirmed action outcome can no longer be settled; inspect the target application"
                 .to_string(),
         );
     }
@@ -668,13 +761,13 @@ fn finish_desktop_action_in_tx(
                 session_id,
                 pending.message_created_at,
                 call_id,
-                DESKTOP_ACTION_INTERRUPTED,
+                CONFIRMED_ACTION_INTERRUPTED,
             ],
         )
         .map_err(|error| error.to_string())?;
     if changed != 1 {
         return Err(
-            "Desktop action tool result changed; inspect the target application".to_string(),
+            "Confirmed action tool result changed; inspect the target application".to_string(),
         );
     }
     refresh_private_transcript_tool_result(tx, session_id, message_id, call_id, output)?;
@@ -719,27 +812,17 @@ pub(crate) fn cancel_agent_task_impl(
     Ok(())
 }
 
-pub(crate) fn build_task_continuation_prompt(
-    state: &AppState,
+#[derive(Debug)]
+struct TaskContinuation {
+    goal: String,
+    content: String,
+}
+
+fn ensure_task_outcome_known(
+    conn: &Connection,
     session_id: &str,
     message_id: &str,
-) -> Result<String, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    if !table_exists(&conn, "task_runs")? {
-        return Err(
-            "This task cannot be continued because task history is unavailable".to_string(),
-        );
-    }
-    let (goal, status, resumable, continuation_context): (String, String, i32, String) = conn
-        .query_row(
-            "SELECT goal, status, resumable, continuation_context
-             FROM task_runs WHERE session_id = ?1 AND message_id = ?2",
-            params![session_id, message_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Task run not found".to_string())?;
+) -> Result<(), String> {
     let has_unknown_result: bool = conn
         .query_row(
             "SELECT EXISTS(
@@ -761,6 +844,33 @@ pub(crate) fn build_task_continuation_prompt(
                 .to_string(),
         );
     }
+    Ok(())
+}
+
+// The durable goal and model-only continuation instructions have different
+// lifetimes. Never persist the latter as the next slice's original goal.
+fn prepare_task_continuation(
+    state: &AppState,
+    session_id: &str,
+    message_id: &str,
+) -> Result<TaskContinuation, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    if !table_exists(&conn, "task_runs")? {
+        return Err(
+            "This task cannot be continued because task history is unavailable".to_string(),
+        );
+    }
+    let (goal, status, resumable, continuation_context): (String, String, i32, String) = conn
+        .query_row(
+            "SELECT goal, status, resumable, continuation_context
+             FROM task_runs WHERE session_id = ?1 AND message_id = ?2",
+            params![session_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Task run not found".to_string())?;
+    ensure_task_outcome_known(&conn, session_id, message_id)?;
     if resumable == 0 {
         return Err(format!(
             "Task is not resumable in its current state: {status}"
@@ -802,9 +912,106 @@ pub(crate) fn build_task_continuation_prompt(
         continuation_context
     };
 
-    Ok(format!(
-        "继续以下开发任务，使用工具前先阅读已完成事实；不要重复已成功或已批准的副作用。\\n\\n原始目标：{goal}\\n\\n已知事实：\\n{facts}\\n\\n请判断下一步：如果目标已经满足，先给出验证证据；如果仍需工作，执行下一个最小步骤，并按既有确认规则请求副作用操作。"
-    ))
+    let content = format!(
+        "继续以下任务，使用工具前先阅读已完成事实；不要重复已成功或已批准的副作用。\n\n原始目标：{goal}\n\n已知事实：\n{facts}\n\n请判断下一步：如果目标已经满足，先给出验证证据；如果仍需工作，执行下一个最小步骤，并按既有确认规则请求副作用操作。"
+    );
+    Ok(TaskContinuation { goal, content })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskContinuationKind {
+    Explicit,
+    Confirmed,
+    Image,
+}
+
+// Validate the source and move any automation receipt at the same seam that
+// reserves its next slice. Neither a UI refresh nor a matching goal is authority.
+fn task_continuation_admission(
+    state: &AppState,
+    session_id: &str,
+    source_id: &str,
+    reply_id: &str,
+    kind: TaskContinuationKind,
+    cancellation: Option<ToolCancellation>,
+) -> Result<ForegroundRunAdmissionGuard, String> {
+    let session_id = session_id.to_string();
+    let source_id = source_id.to_string();
+    let reply_id = reply_id.to_string();
+    let expected_leaf: Option<String> = state
+        .db
+        .lock()
+        .map_err(|error| error.to_string())?
+        .query_row(
+            "SELECT leaf_message_id FROM sessions WHERE id=?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    Ok(Box::new(move |tx| {
+        let refuse = || {
+            if kind == TaskContinuationKind::Confirmed {
+                Ok(ForegroundRunAdmission::Skip)
+            } else {
+                Err("任务状态已改变或不在当前分支，请重新检查后继续。".to_string())
+            }
+        };
+        if cancellation
+            .as_ref()
+            .is_some_and(ToolCancellation::is_cancelled)
+        {
+            return refuse();
+        }
+        let leaf: Option<String> = tx
+            .query_row(
+                "SELECT leaf_message_id FROM sessions WHERE id=?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if leaf.is_none() || leaf != expected_leaf {
+            return refuse();
+        }
+        if kind == TaskContinuationKind::Explicit {
+            if leaf.as_deref() != Some(source_id.as_str()) {
+                return refuse();
+            }
+        } else if !crate::commands::foreground_run_store::is_continuation_chain_in_tx(
+            tx,
+            &session_id,
+            leaf.as_deref().unwrap(),
+            &source_id,
+        )? {
+            return refuse();
+        }
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM task_runs r JOIN messages m ON m.id=r.message_id AND m.session_id=r.session_id
+               WHERE r.session_id=?1 AND r.message_id=?2 AND m.role='assistant' AND r.resumable!=0
+                 AND (?3=0 OR r.status='continue_suggested')
+                 AND NOT EXISTS(SELECT 1 FROM agent_steps s WHERE s.session_id=r.session_id
+                   AND s.created_at=m.created_at AND s.success!=1
+                   AND (COALESCE(s.tool_output,'') LIKE '%RESULT_UNKNOWN%'
+                     OR (?4=0 AND COALESCE(s.tool_output,'') LIKE '%Confirmation required%')))
+             )",
+            params![session_id, source_id, kind == TaskContinuationKind::Confirmed, kind == TaskContinuationKind::Image],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !eligible {
+            return refuse();
+        }
+        crate::commands::automation::handoff_agent_automation_dispatch_in_tx(
+            tx,
+            &session_id,
+            leaf.as_deref().unwrap(),
+            &reply_id,
+        )?;
+        Ok(ForegroundRunAdmission::Continue)
+    }))
 }
 
 fn confirmation_status_from_output(output: &str, success: bool) -> (bool, Option<String>) {
@@ -885,11 +1092,249 @@ fn refresh_task_facts_after_confirmation(
     )
 }
 
+/// One owner for confirmation release, including preflight failures and unwind.
+/// The raw session slot must be free before a deferred follow-up is scheduled.
+struct ConfirmationRunPermit {
+    permit: Option<crate::commands::steering::AgentRunPermit>,
+    on_release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for ConfirmationRunPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        if let Some(on_release) = self.on_release.take() {
+            on_release();
+        }
+    }
+}
+
+struct ConfirmationExecution {
+    receipt: ToolResultInfo,
+    output: Option<crate::commands::foreground_turn_coordinator::ConfirmedToolOutput>,
+    cancellation: ToolCancellation,
+    permit: ConfirmationRunPermit,
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_agent_confirmation_impl(
     state: &AppState,
     req: ResolveAgentConfirmationRequest,
 ) -> Result<ToolResultInfo, String> {
-    let _run_permit = state.steering.try_start_run(&req.session_id)?;
+    resolve_confirmation_execution(state, req, || {}).map(|execution| execution.receipt)
+}
+
+/// Compose a successful approval with its next bounded slice while retaining
+/// the session slot. Task execution never belongs to the selected UI page.
+pub(crate) async fn resolve_agent_confirmation_and_continue(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    req: ResolveAgentConfirmationRequest,
+) -> Result<ToolResultInfo, String> {
+    let pump = state.foreground_automation_pump.clone();
+    let release_app = app.cloned();
+    let session_id = req.session_id.clone();
+    let execution = resolve_confirmation_execution_with_app(state, app, req.clone(), move || {
+        if let Some(app) = release_app {
+            pump.wake_after_session_release(app, &session_id);
+        }
+    })?;
+    complete_confirmation_execution(state, app, req, execution).await
+}
+
+async fn complete_confirmation_execution(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    req: ResolveAgentConfirmationRequest,
+    execution: ConfirmationExecution,
+) -> Result<ToolResultInfo, String> {
+    let ConfirmationExecution {
+        mut receipt,
+        output,
+        cancellation,
+        permit,
+    } = execution;
+    let mut persistence_error = None;
+    let image_handoff = output.is_some();
+    if image_handoff || (receipt.success && !cancellation.is_cancelled()) {
+        let continued = async {
+            if cancellation.is_cancelled()
+                || output
+                    .as_ref()
+                    .is_some_and(|output| output.context.is_expired())
+            {
+                return Err("运行已取消或已超过截止时间；图像未发送。".to_string());
+            }
+            let continuation = prepare_task_continuation(state, &req.session_id, &req.message_id)?;
+            let reply_id = Uuid::new_v4().to_string();
+            let admission = task_continuation_admission(
+                state,
+                &req.session_id,
+                &req.message_id,
+                &reply_id,
+                if image_handoff {
+                    TaskContinuationKind::Image
+                } else {
+                    TaskContinuationKind::Confirmed
+                },
+                Some(cancellation.clone()),
+            )?;
+            send_message_after_run_admission(
+                state,
+                app,
+                SendMessageRequest {
+                    session_id: req.session_id.clone(),
+                    role: "user".into(),
+                    content: continuation.content,
+                    text_attachments: Vec::new(),
+                    personality: None,
+                    preferences: None,
+                    thinking_effort: None,
+                    client_message_id: None,
+                    web_search_setup: None,
+                },
+                Some(continuation.goal),
+                ForegroundUserTurn::Preserve,
+                None, // Use the run store's logical cutoff, which may be ahead of wall time.
+                None,
+                Some(reply_id),
+                Some(admission),
+                crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard,
+                output,
+                cancellation.clone(),
+            )
+            .await
+            .map(|_| ())
+        }
+        .await;
+        if continued.is_err() && image_handoff {
+            // The external call has already completed. A failed image handoff
+            // must never turn its successful durable receipt into a replay.
+            let notice = format!(
+                "{}\n[操作结果已记录，但图像交接未完成。不要声称已经查看图像，也不要重复执行已完成的操作；请检查设置后明确继续。]",
+                receipt.output
+            );
+            if let Err(error) = persist_image_handoff_notice(state, &req, &notice) {
+                persistence_error = Some(error);
+            }
+            receipt.success = false;
+            receipt.output = notice.clone();
+            receipt.error = Some(notice);
+        }
+    }
+    // No new slice is reserved for rejection, Stop or an unknown outcome.
+    // Settle the original binding as well; after a handoff it no longer matches.
+    if super::automation::sync_agent_automation_continuation(
+        state,
+        &req.session_id,
+        &req.message_id,
+        Utc::now().timestamp(),
+    )
+    .is_err()
+        && persistence_error.is_none()
+    {
+        persistence_error =
+            Some("操作结果已记录，但自动化回执未同步；请刷新状态，不要重复执行操作。".into());
+    }
+    if let Some(app) = app {
+        let _ = app.emit("angelbot:automations-updated", ());
+    }
+    drop(permit);
+    match persistence_error {
+        Some(error) => Err(error),
+        None => Ok(receipt),
+    }
+}
+
+fn persist_image_handoff_notice(
+    state: &AppState,
+    req: &ResolveAgentConfirmationRequest,
+    notice: &str,
+) -> Result<(), String> {
+    let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let created_at: i64 = tx
+        .query_row(
+            "SELECT created_at FROM messages WHERE id=?1 AND session_id=?2 AND role='assistant'",
+            params![req.message_id, req.session_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "The confirmed image source is no longer in this conversation")?;
+    tx.execute(
+        "UPDATE agent_steps SET tool_output=?1 WHERE session_id=?2 AND created_at=?3
+         AND COALESCE(call_id,id)=?4 AND success=1",
+        params![notice, req.session_id, created_at, req.call_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE messages SET content=?1 WHERE session_id=?2 AND role='tool'
+         AND created_at=?3 AND tool_call_id=?4",
+        params![notice, req.session_id, created_at, req.call_id],
+    )
+    .map_err(|error| error.to_string())?;
+    refresh_private_transcript_tool_result(
+        &tx,
+        &req.session_id,
+        &req.message_id,
+        &req.call_id,
+        notice,
+    )?;
+    refresh_persisted_task_run_from_steps(&tx, &req.session_id, &req.message_id, created_at)?;
+    tx.execute(
+        "UPDATE task_runs SET status='needs_attention', updated_at=?1
+         WHERE session_id=?2 AND message_id=?3",
+        params![Utc::now().timestamp(), req.session_id, req.message_id],
+    )
+    .map_err(|error| error.to_string())?;
+    if table_exists(&tx, "task_run_facts")? {
+        let stored: Option<(String, String)> = tx.query_row(
+            "SELECT task_run_id,facts_json FROM task_run_facts WHERE session_id=?1 AND message_id=?2",
+            params![req.session_id, req.message_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        if let Some((run_id, encoded)) = stored {
+            let mut facts: TaskFacts =
+                serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
+            facts.terminal_reason = Some(TaskTerminalReason::NeedsAttention);
+            persist_task_facts(
+                &tx,
+                &run_id,
+                &req.session_id,
+                &req.message_id,
+                &facts,
+                Utc::now().timestamp(),
+            )?;
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn resolve_confirmation_execution(
+    state: &AppState,
+    req: ResolveAgentConfirmationRequest,
+    on_release: impl FnOnce() + Send + 'static,
+) -> Result<ConfirmationExecution, String> {
+    resolve_confirmation_execution_with_app(state, None, req, on_release)
+}
+
+fn resolve_confirmation_execution_with_app(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    req: ResolveAgentConfirmationRequest,
+    on_release: impl FnOnce() + Send + 'static,
+) -> Result<ConfirmationExecution, String> {
+    let (permit, cancellation) = if req.decision.eq_ignore_ascii_case("approved") {
+        state.steering.try_start_running_run(&req.session_id)?
+    } else {
+        (
+            state.steering.try_start_run(&req.session_id)?,
+            state.steering.cancellation(&req.session_id),
+        )
+    };
+    let permit = ConfirmationRunPermit {
+        permit: Some(permit),
+        on_release: Some(Box::new(on_release)),
+    };
     let decision = req.decision.to_lowercase();
     if decision != "approved" && decision != "rejected" {
         return Err("decision must be 'approved' or 'rejected'".to_string());
@@ -897,19 +1342,25 @@ pub(crate) fn resolve_agent_confirmation_impl(
 
     let pending = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
+        if decision == "approved" {
+            // An earlier call in this batch may already have changed its target.
+            // Rejection/Stop remain available, but no more actions may execute.
+            ensure_task_outcome_known(&conn, &req.session_id, &req.message_id)?;
+        }
         load_pending_confirmation(&conn, &req.session_id, &req.message_id, &req.call_id)?
     };
     let tool_name = pending.tool_name.clone();
     let tool_input = pending.tool_input.clone();
     let mcp_schema_version = pending.mcp_schema_version.clone();
-    let mut desktop_action_armed = false;
+    let mut external_action_armed = false;
+    let mut output = None;
 
     let (new_success, new_output): (bool, String) = if decision == "rejected" {
         if tool_name == "materialize_delegated_change" {
             let arguments: serde_json::Value = serde_json::from_str(&tool_input)
                 .map_err(|e| format!("stored materialization arguments are invalid JSON: {e}"))?;
             match crate::commands::foreground_delegation_control::reject_materialize_change_confirmation(
-                state.delegation_pump.as_ref(),
+                state.delegation_pump.as_ref().map(|host| host.service()),
                 &req.session_id,
                 &arguments,
             ) {
@@ -934,15 +1385,27 @@ pub(crate) fn resolve_agent_confirmation_impl(
             )
         }
     } else {
+        let arguments: serde_json::Value = serde_json::from_str(&tool_input)
+            .map_err(|e| format!("stored tool arguments are invalid JSON: {e}"))?;
         let registry =
-            crate::commands::foreground_tool_surface::ForegroundToolSurface::new(state, None)
-                .build_for_confirmation(&req.session_id, &req.message_id, &req.call_id, &tool_name);
+            crate::commands::foreground_tool_surface::ForegroundToolSurface::new(state, app)
+                .build_for_confirmation(
+                    &req.session_id,
+                    &req.message_id,
+                    &req.call_id,
+                    &tool_name,
+                )?;
         let unavailable = match registry.get(&tool_name) {
             None => Some(format!(
                 "Confirmation could not execute '{}': the capability is no longer available in the current workspace. The operation was not run.",
                 tool_name
             )),
-            Some(tool) if !tool.requires_confirmation => Some(format!(
+            Some(tool)
+                if !tool.requires_confirmation
+                    && !crate::agent::requires_argument_confirmation(
+                        &tool_name,
+                        &arguments,
+                    ) => Some(format!(
                 "Confirmation could not execute '{}': this tool does not use the confirmation flow. The operation was not run.",
                 tool_name
             )),
@@ -951,15 +1414,17 @@ pub(crate) fn resolve_agent_confirmation_impl(
         if let Some(error) = unavailable {
             (false, error)
         } else {
-            let arguments: serde_json::Value = serde_json::from_str(&tool_input)
-                .map_err(|e| format!("stored tool arguments are invalid JSON: {}", e))?;
-
-            // Tools that need workspace files are absent from personal space. The
-            // remaining handlers do not use this argument, so a neutral existing
-            // directory lets reminders, goals and desktop actions be approved
-            // without silently granting Documents access.
+            // File handlers must never inherit a fallback directory if their
+            // host-owned root became unavailable after registry assembly.
+            // Root-less desktop/reminder handlers still receive a neutral cwd.
             let work_dir = crate::commands::file::resolve_work_dir(state, Some(&req.session_id))
-                .unwrap_or_else(|_| std::env::temp_dir());
+                .or_else(|error| {
+                    if registry.contains("read_file") {
+                        Err(error)
+                    } else {
+                        Ok(std::env::temp_dir())
+                    }
+                })?;
             match registry.validate_arguments(&tool_name, &arguments) {
                 Ok(()) => {
                     // The run permit serializes normal resolution and explicit
@@ -978,9 +1443,10 @@ pub(crate) fn resolve_agent_confirmation_impl(
                     if current.step_id != pending.step_id {
                         return Err("confirmation step is no longer pending".to_string());
                     }
-                    let desktop_target = if matches!(
+                    let image_approval = crate::agent::requires_argument_confirmation(&tool_name, &arguments);
+                    let (desktop_target, desktop_scope, desktop_image_click) = if image_approval || matches!(
                         tool_name.as_str(),
-                        "prepare_message_draft" | "set_trusted_app_text" | "operate_trusted_app_control"
+                        "prepare_message_draft" | "set_trusted_app_text" | "operate_trusted_app_control" | "click_trusted_app_image"
                     ) {
                         let preview_id = req.preview_id.as_deref().ok_or_else(|| {
                             "Inspect the live desktop target before approving".to_string()
@@ -995,14 +1461,25 @@ pub(crate) fn resolve_agent_confirmation_impl(
                         if current_app.as_ref() != Some(&lease.app) {
                             return Err("Trusted application changed; inspect the target again".to_string());
                         }
-                        Some(lease.target)
+                        match (lease.target, image_approval) {
+                            (DesktopActionPreviewTarget::Action(target), false) => (Some(target), None, None),
+                            (DesktopActionPreviewTarget::ImageScope, true) => (None, Some(lease.app), None),
+                            (DesktopActionPreviewTarget::ImageClick(target), false) if tool_name=="click_trusted_app_image" => (None,Some(lease.app),Some(target)),
+                            _ => return Err("Desktop preview does not match this operation".to_string()),
+                        }
                     } else {
-                        None
+                        (None, None, None)
                     };
-                    if desktop_target.is_some() {
+                    if cancellation.is_cancelled() {
+                        return Err("Confirmation stopped before executing the operation".to_string());
+                    }
+                    let execution_permission = if desktop_scope.is_some() || tool_name.starts_with("mcp_") {
+                        agent_execution_permission(state)?
+                    } else { String::new() };
+                    if desktop_target.is_some() || desktop_image_click.is_some() || tool_name.starts_with("mcp_") {
                         let mut conn = state.db.lock().map_err(|error| error.to_string())?;
                         let tx = conn.unchecked_transaction().map_err(|error| error.to_string())?;
-                        arm_desktop_action_in_tx(
+                        arm_confirmed_action_in_tx(
                             &tx,
                             &req.session_id,
                             &req.message_id,
@@ -1010,10 +1487,9 @@ pub(crate) fn resolve_agent_confirmation_impl(
                             &pending,
                         )?;
                         tx.commit().map_err(|error| error.to_string())?;
-                        desktop_action_armed = true;
+                        external_action_armed = true;
                     }
-                    state.steering.mark_running(&req.session_id);
-                    let tool_call = ToolCall::new(tool_name.clone(), arguments);
+                    let tool_call = ToolCall::new(tool_name.clone(), arguments.clone());
                     let _ = AgentRunJournal::new(state.db.clone(), req.message_id.clone()).append(
                         &req.session_id,
                         &AgentEvent::ToolExecutionStart {
@@ -1024,19 +1500,58 @@ pub(crate) fn resolve_agent_confirmation_impl(
                     );
                     let mut context = ToolExecutionContext::new(
                         &req.call_id,
-                        state.steering.cancellation(&req.session_id),
+                        cancellation.clone(),
                     )
                     .with_run_id(&req.message_id)
-                    .for_confirmation(mcp_schema_version);
+                    .for_confirmation(mcp_schema_version.clone());
                     if let Some(target) = desktop_target {
                         context = context.with_desktop_expected_target(target);
                     }
+                    if let Some(scope) = desktop_scope.as_ref() {
+                        context = context.with_desktop_expected_image_scope(scope.clone());
+                    }
+                    if let Some(target)=desktop_image_click {context=context.with_desktop_expected_image_click(target);}
                     let exec = registry.execute_with_context(
                         &tool_call,
                         &req.call_id,
                         &work_dir,
                         &context,
                     );
+                    // Only the native gate's structured busy refusal proves
+                    // no dispatch. Keep this call pending, but the consumed
+                    // preview must be replaced by an explicit fresh preflight.
+                    // Never grant this treatment to MCP/text errors or unknown
+                    // results that may already have changed the application.
+                    if matches!(tool_name.as_str(), "prepare_message_draft" | "set_trusted_app_text" | "operate_trusted_app_control" | "click_trusted_app_image")
+                        && !exec.result.success && !exec.result.terminate_batch
+                    {
+                        let content = exec.result.content.strip_prefix("Error: ").unwrap_or(&exec.result.content);
+                        if let Ok(error) = serde_json::from_str::<crate::desktop_control::DesktopAdapterError>(content) {
+                            if error.code == "TARGET_BUSY" {
+                                // Approval was already durably armed. Only
+                                // this proven no-dispatch refusal may undo
+                                // that marker; reuse its exact-state CAS and
+                                // refresh transcript/task facts atomically.
+                                let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+                                let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+                                finish_confirmed_action_in_tx(
+                                    &tx, &req.session_id, &req.message_id, &req.call_id, &pending,
+                                    false, &format!("Confirmation required before executing side-effect tool '{}'. Native gate was busy; no action was dispatched. Inspect a fresh preview before approving.", tool_name),
+                                )?;
+                                tx.commit().map_err(|e| e.to_string())?;
+                                drop(conn);
+                                let _ = AgentRunJournal::new(state.db.clone(), req.message_id.clone()).append(
+                                    &req.session_id,
+                                    &AgentEvent::ToolExecutionEnd {
+                                        call_id: req.call_id.clone(), tool_name: tool_name.clone(),
+                                        success: false, output: exec.result.content.clone(),
+                                        error: Some(exec.result.content.clone()),
+                                    },
+                                );
+                                return Err(error.to_string());
+                            }
+                        }
+                    }
                     if exec.result.requires_user_review() {
                         // Preserve the structured code for the confirmation
                         // response and durable history. A free-form wrapper
@@ -1044,6 +1559,18 @@ pub(crate) fn resolve_agent_confirmation_impl(
                         // cause an automatic continuation after approval.
                         (false, exec.result.content.clone())
                     } else if exec.result.success {
+                        if !exec.result.images.is_empty() {
+                            output = Some(crate::commands::foreground_turn_coordinator::ConfirmedToolOutput {
+                                message_id: req.message_id.clone(),
+                                call_id: req.call_id.clone(),
+                                arguments,
+                                result: exec.result.clone(),
+                                desktop_scope,
+                                mcp_revision: mcp_schema_version.clone(),
+                                execution_permission,
+                                context,
+                            });
+                        }
                         (
                             true,
                             format!("Confirmation approved: {}", exec.result.content),
@@ -1072,8 +1599,8 @@ pub(crate) fn resolve_agent_confirmation_impl(
     {
         let mut conn = state.db.lock().map_err(|e| e.to_string())?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        if desktop_action_armed {
-            finish_desktop_action_in_tx(
+        if external_action_armed {
+            finish_confirmed_action_in_tx(
                 &tx,
                 &req.session_id,
                 &req.message_id,
@@ -1111,14 +1638,19 @@ pub(crate) fn resolve_agent_confirmation_impl(
             error: (!new_success).then(|| new_output.clone()),
         },
     );
-    Ok(ToolResultInfo {
-        call_id: req.call_id,
-        tool_name,
-        success: new_success,
-        output: new_output.clone(),
-        error: if new_success { None } else { Some(new_output) },
-        confirmation_required,
-        confirmation_status,
+    Ok(ConfirmationExecution {
+        receipt: ToolResultInfo {
+            call_id: req.call_id,
+            tool_name,
+            success: new_success,
+            output: new_output.clone(),
+            error: if new_success { None } else { Some(new_output) },
+            confirmation_required,
+            confirmation_status,
+        },
+        output,
+        cancellation,
+        permit,
     })
 }
 
@@ -1307,6 +1839,26 @@ fn task_facts_compression_context(
     )))
 }
 
+fn persisted_checkpoint_prompt(
+    agent_config: &crate::agent::AgentConfig,
+    conversation: &str,
+    task_facts: Option<&str>,
+) -> String {
+    match agent_config
+        .context_summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        Some(previous) => checkpoint_prompt(
+            &format!(
+                "<previous-checkpoint>\n{previous}\n</previous-checkpoint>\n\n<new-transcript>\n{conversation}\n</new-transcript>"
+            ),
+            task_facts,
+        ),
+        None => checkpoint_prompt(conversation, task_facts),
+    }
+}
+
 pub(crate) async fn auto_compress_if_needed(
     state: &AppState,
     app: Option<&AppHandle>,
@@ -1401,7 +1953,8 @@ pub(crate) async fn auto_compress_if_needed(
     // structured checkpoint contract. Keeping one prompt prevents automatic
     // foreground compression from discarding decisions or marking pending work
     // as completed in a free-form summary.
-    let compression_prompt = checkpoint_prompt(&conversation_text, facts_context.as_deref());
+    let compression_prompt =
+        persisted_checkpoint_prompt(agent_config, &conversation_text, facts_context.as_deref());
 
     // Call the LLM for compression
     let model_config = crate::commands::foreground_model_factory::resolve_model_config(app)
@@ -1543,7 +2096,17 @@ pub async fn send_message(
         .client_message_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    send_message_impl(&state, Some(&app), req, true, None, Some(id.clone()), None).await
+    send_message_impl(
+        &state,
+        Some(&app),
+        req,
+        None,
+        ForegroundUserTurn::Append,
+        None,
+        Some(id.clone()),
+        None,
+    )
+    .await
 }
 
 /// Dev HTTP is an adapter, not a second agent runtime.  It deliberately uses
@@ -1557,7 +2120,17 @@ pub(crate) async fn send_message_from_dev_http(
         .client_message_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    send_message_impl(state, None, req, true, None, Some(id), None).await
+    send_message_impl(
+        state,
+        None,
+        req,
+        None,
+        ForegroundUserTurn::Append,
+        None,
+        Some(id),
+        None,
+    )
+    .await
 }
 
 /// Deliver one durable automation follow-up through the same Main-Agent turn
@@ -1586,7 +2159,8 @@ pub(crate) async fn run_supervised_follow_up(
             client_message_id: None,
             web_search_setup: None,
         },
-        false,
+        None,
+        ForegroundUserTurn::Preserve,
         None,
         None,
         Some(reply_id),
@@ -1678,7 +2252,8 @@ async fn run_supervised_follow_up_with_tool_mode(
             client_message_id: None,
             web_search_setup: None,
         },
-        false,
+        None,
+        ForegroundUserTurn::Preserve,
         None,
         None,
         Some(reply_id),
@@ -1747,7 +2322,8 @@ async fn send_message_impl(
     state: &AppState,
     app: Option<&AppHandle>,
     req: SendMessageRequest,
-    persist_user_message: bool,
+    continuation_goal: Option<String>,
+    user_turn: ForegroundUserTurn,
     history_before_created_at: Option<i64>,
     // `user_message_id`: the ID of the user message being replied to.
     // Normal send: the auto-inserted user message's ID (`id` above).
@@ -1761,7 +2337,8 @@ async fn send_message_impl(
         state,
         app,
         req,
-        persist_user_message,
+        continuation_goal,
+        user_turn,
         history_before_created_at,
         user_message_id,
         reply_id,
@@ -1781,14 +2358,17 @@ async fn send_message_impl_with_admission(
     state: &AppState,
     app: Option<&AppHandle>,
     req: SendMessageRequest,
-    persist_user_message: bool,
+    continuation_goal: Option<String>,
+    user_turn: ForegroundUserTurn,
     history_before_created_at: Option<i64>,
     user_message_id: Option<String>,
     reply_id: Option<String>,
     admission: Option<ForegroundRunAdmissionGuard>,
     tool_mode: crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode,
 ) -> Result<ForegroundMessageDispatch, String> {
-    foreground_text_attachments::validate_turn(&req.role, &req.content, &req.text_attachments)?;
+    if user_turn != ForegroundUserTurn::Replace {
+        foreground_text_attachments::validate_turn(&req.role, &req.content, &req.text_attachments)?;
+    }
     // The chat parser can carry a short-lived Web Search setup envelope so a
     // user never has to paste a credential into the actual conversation.  It
     // must be handled before the turn starts: neither the key nor the setup
@@ -1806,18 +2386,21 @@ async fn send_message_impl_with_admission(
         )?;
     }
 
-    let run_permit = state.steering.try_start_run(&req.session_id)?;
+    let (run_permit, cancellation) = state.steering.try_start_running_run(&req.session_id)?;
     let session_id = req.session_id.clone();
     let dispatch = send_message_after_run_admission(
         state,
         app,
         req,
-        persist_user_message,
+        continuation_goal,
+        user_turn,
         history_before_created_at,
         user_message_id,
         reply_id,
         admission,
         tool_mode,
+        None,
+        cancellation,
     )
     .await;
     // The foreground permit is the session's mutual-exclusion boundary. Drop
@@ -1838,13 +2421,16 @@ async fn send_message_impl_with_admission(
 async fn send_message_after_run_admission(
     state: &AppState,
     app: Option<&AppHandle>,
-    req: SendMessageRequest,
-    persist_user_message: bool,
+    mut req: SendMessageRequest,
+    continuation_goal: Option<String>,
+    user_turn: ForegroundUserTurn,
     history_before_created_at: Option<i64>,
     user_message_id: Option<String>,
     reply_id: Option<String>,
     admission: Option<ForegroundRunAdmissionGuard>,
     tool_mode: crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode,
+    confirmed_output: Option<crate::commands::foreground_turn_coordinator::ConfirmedToolOutput>,
+    cancellation: ToolCancellation,
 ) -> Result<ForegroundMessageDispatch, String> {
     let now = Utc::now().timestamp();
     // Normal send: caller (send_message) supplies `user_message_id`, which becomes
@@ -1879,15 +2465,17 @@ async fn send_message_after_run_admission(
     let run_store = ForegroundRunStore::new(state.db.clone());
     let admission = admission
         .unwrap_or_else(|| Box::new(always_admit_foreground_run) as ForegroundRunAdmissionGuard);
+    let is_task_continuation = continuation_goal.is_some();
+    let goal = continuation_goal.unwrap_or_else(|| req.content.clone());
     let foreground_run = match run_store.begin_with_admission(
         BeginForegroundTurn {
             session_id: session_id.clone(),
             user_message_id: id.clone(),
             reply_id: reply_id.clone(),
             role: req.role.clone(),
-            content: req.content.clone(),
+            content: goal.clone(),
             text_attachments: req.text_attachments.clone(),
-            persist_user_message,
+            user_turn,
             now,
         },
         admission,
@@ -1895,7 +2483,14 @@ async fn send_message_after_run_admission(
         ForegroundRunBeginResult::Started(run) => run,
         ForegroundRunBeginResult::Skipped => return Ok(ForegroundMessageDispatch::Skipped),
     };
-    state.steering.mark_running(&session_id);
+    // The admitted transaction is authoritative for edit attachments, not a
+    // pre-admission read or any new data supplied by the caller.
+    req.text_attachments = foreground_run.text_attachments.clone();
+    if is_task_continuation {
+        if let Some(app) = app {
+            let _ = app.emit("angelbot:automations-updated", ());
+        }
+    }
     // The durable reservation is intentionally created before context/model
     // preparation. Any later error must promote that one known provisional
     // reply rather than leaving a hidden "running" turn in the active branch.
@@ -1903,29 +2498,8 @@ async fn send_message_after_run_admission(
     let recovery_run = foreground_run.clone();
     let result = async {
 
-    // 1.5. Auto-generate session title from first user message if session is untitled
-    if persist_user_message {
-        let req_content = req.content.clone();
-        let req_session_id = req.session_id.clone();
-        let db_for_title = state.db.clone();
-        tokio::spawn(async move {
-            let title = match generate_title_from_content(&req_content).await {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("[AutoTitle] failed to generate title: {}", e);
-                    return;
-                }
-            };
-            let now = Utc::now().timestamp();
-            if let Ok(conn) = db_for_title.lock() {
-                let _ = conn.execute(
-                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3 AND (title = '' OR title IS NULL)",
-                params![title, now, req_session_id],
-            );
-            }
-        });
-    }
-
+    // Workspace creation owns the stable Main-conversation title. Never send
+    // user content to an unrelated provider for background title generation.
     // 1.6. Prepare the complete foreground context through one deep seam.
     // This preserves compaction, native history filtering, workspace expansion,
     // skill guidance, and bounded Attention projection in a single module.
@@ -1935,7 +2509,11 @@ async fn send_message_after_run_admission(
                 state: &state,
                 app,
                 request: &req,
-                history_before_created_at: history_before_created_at.unwrap_or(foreground_run.now),
+                summary_delivery_id: match &tool_mode {
+                    crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard => None,
+                    crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::ReviewedDeliverySummary {delivery_id} => Some(delivery_id.as_str()),
+                },
+                history_before_created_at: history_before_created_at.unwrap_or(foreground_run.history_before_created_at),
                 budget: crate::commands::foreground_context_assembler::ForegroundContextBudget {
                     estimated_tool_count: match &tool_mode {
                         crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard => ESTIMATED_TOOL_COUNT,
@@ -1948,7 +2526,7 @@ async fn send_message_after_run_admission(
     let effective_thinking_effort = req.thinking_effort.as_deref();
     // 4. Run the agent with personalized system prompt. Provider/keychain
     // fallback and session binding live behind one reusable factory seam.
-    let resolved_model =
+    let resolved_model = match
         crate::commands::foreground_model_factory::ForegroundModelFactory::new(app, state)
             .resolve(
                 crate::commands::foreground_model_factory::ForegroundModelRequest {
@@ -1956,8 +2534,20 @@ async fn send_message_after_run_admission(
                     requested_thinking_effort: effective_thinking_effort,
                     now,
                 },
-            )
-            .map_err(|error| error.to_string())?;
+            ) {
+        Ok(model) => model,
+        Err(error) => {
+            let Some(content) = error.provider_unavailable_message() else {
+                return Err(error.to_string());
+            };
+            // This is a settled failure, not an interrupted agent or a failed
+            // IPC request. One durable reply owns both the explanation and
+            // task state, so the UI does not append a second local error.
+            let reply = run_store.complete_model_unavailable(&foreground_run, &goal, content)?;
+            lifecycle_control.commit_terminal()?;
+            return Ok(reply);
+        }
+    };
     // Only an interactive user turn receives an issuance identity and
     // app-managed sandbox capability. A reviewed delivery summary gets its
     // own one-tool surface later and must never prepare these credentials or
@@ -1982,7 +2572,7 @@ async fn send_message_after_run_admission(
             // provider's opaque capability; cleanup resolves this root through
             // its manifest.
             let sandbox_root =
-                crate::commands::foreground_tool_surface::delegated_sandbox_root()?;
+                crate::commands::foreground_tool_surface::delegated_sandbox_root(state)?;
             let model = resolved_model.identity.model.clone();
             let delegated_model_binding =
                 crate::agent::delegated_model_binding::DelegatedModelBindingRequest::new(
@@ -2002,23 +2592,16 @@ async fn send_message_after_run_admission(
             (None, None, None)
         }
     };
-    let trigger_kepa = {
+    let trigger_evolution = {
         let conn = state.db.lock().map_err(|error| error.to_string())?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
-                params![req.session_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
         matches!(
             &tool_mode,
             crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard
         ) && prepared_context.agent_config.preferences.evolution_enabled
-            && count > 0
-            && count % 20 == 0
+            && prepared_context.agent_config.preferences.use_long_term_memory
+            && crate::commands::memory::automatic_evolution_due(&conn, &req.session_id)
     };
-    let before_persist: Option<Box<dyn FnOnce() + Send + 'static>> = trigger_kepa.then(|| {
+    let after_completion: Option<Box<dyn FnOnce() + Send + 'static>> = trigger_evolution.then(|| {
         let config = crate::commands::foreground_model_factory::resolve_model_config(app).ok()?;
         // Optional evolution must use the same configured identity as this turn.
         // If settings changed during context preparation, defer it to a later turn.
@@ -2029,15 +2612,19 @@ async fn send_message_after_run_admission(
             return None;
         }
         let provider = crate::llm::create_provider_for_app(&config, app).ok()?;
+        // Optional short preference extraction must not inherit an expensive
+        // service-default reasoning budget. Reuse the provider/model resolver;
+        // unsupported models still receive no private reasoning fields.
+        let review_thinking = crate::llm::resolve_thinking_settings(&config, Some("low")).ok()?;
         let db = state.db.clone();
         let session_id = req.session_id.clone();
         Some(Box::new(move || {
-            eprintln!("[KEPA] Auto evolution for session {}", session_id);
             tokio::spawn(async move {
                 let _ = crate::commands::memory::run_evolution_review_impl(
                     db,
                     &session_id,
                     provider,
+                    review_thinking,
                 )
                 .await;
             });
@@ -2053,6 +2640,7 @@ async fn send_message_after_run_admission(
     .run(
         crate::commands::foreground_turn_coordinator::ForegroundTurnInput {
             request: req,
+            goal,
             session_id: session_id.clone(),
             message_id: reply_id.clone(),
             reply_id: reply_id.clone(),
@@ -2063,19 +2651,38 @@ async fn send_message_after_run_admission(
             sandbox_root,
             delegated_model_binding,
             tool_mode,
-            before_persist,
+            after_completion,
+            confirmed_output,
+            cancellation,
         },
     )
     .await
     }
     .await;
-    match result {
+    let dispatch = match result {
         Ok(message) => Ok(ForegroundMessageDispatch::Completed(message)),
         Err(error) => {
             let _ = recovery_store.recover_interrupted_run(&recovery_run, Utc::now().timestamp());
             Err(error)
         }
+    };
+    if is_task_continuation {
+        let synced = crate::commands::automation::sync_agent_automation_continuation(
+            state,
+            &session_id,
+            &reply_id,
+            Utc::now().timestamp(),
+        );
+        if let Some(app) = app {
+            let _ = app.emit("angelbot:automations-updated", ());
+        }
+        if synced.is_err() && dispatch.is_ok() {
+            return Err(
+                "执行结果已记录，但自动化回执未同步。请刷新检查，不要重复执行已完成操作。".into(),
+            );
+        }
     }
+    dispatch
 }
 
 /// Return the active persisted execution policy for the Settings UI.
@@ -2154,14 +2761,28 @@ pub async fn resolve_agent_confirmation(
 ) -> Result<ToolResultInfo, String> {
     // Approval may call a slow UIA provider or external tool. Reuse the same
     // blocking-task boundary as preflight rather than freezing Tauri's UI.
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        resolve_agent_confirmation_impl(&state, req)
+    let blocking_app = app.clone();
+    let blocking_req = req.clone();
+    let execution = tauri::async_runtime::spawn_blocking(move || {
+        let state = blocking_app.state::<AppState>();
+        let pump = state.foreground_automation_pump.clone();
+        let release_app = blocking_app.clone();
+        let session_id = blocking_req.session_id.clone();
+        resolve_confirmation_execution_with_app(
+            &state,
+            Some(&blocking_app),
+            blocking_req,
+            move || {
+                pump.wake_after_session_release(release_app, &session_id);
+            },
+        )
     })
     .await
     .map_err(|_| {
         "Confirmation task was interrupted; inspect the target before continuing".to_string()
-    })?
+    })??;
+    let state = app.state::<AppState>();
+    complete_confirmation_execution(&state, Some(&app), req, execution).await
 }
 
 /// Resolve file references inserted by the workspace panel into the actual
@@ -2199,14 +2820,31 @@ pub async fn continue_agent_task(
     app: AppHandle,
     req: ContinueAgentTaskRequest,
 ) -> Result<Message, String> {
-    let content = build_task_continuation_prompt(&state, &req.session_id, &req.message_id)?;
-    send_message_impl(
-        &state,
-        Some(&app),
+    continue_agent_task_impl(&state, Some(&app), req).await
+}
+
+pub(crate) async fn continue_agent_task_impl(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    req: ContinueAgentTaskRequest,
+) -> Result<Message, String> {
+    let continuation = prepare_task_continuation(state, &req.session_id, &req.message_id)?;
+    let reply_id = Uuid::new_v4().to_string();
+    let admission = task_continuation_admission(
+        state,
+        &req.session_id,
+        &req.message_id,
+        &reply_id,
+        TaskContinuationKind::Explicit,
+        None,
+    )?;
+    match send_message_impl_with_admission(
+        state,
+        app,
         SendMessageRequest {
             session_id: req.session_id,
             role: "user".to_string(),
-            content,
+            content: continuation.content,
             text_attachments: Vec::new(),
             personality: None,
             preferences: None,
@@ -2214,12 +2852,19 @@ pub async fn continue_agent_task(
             client_message_id: None,
             web_search_setup: None,
         },
-        false,
+        Some(continuation.goal),
+        ForegroundUserTurn::Preserve,
         None,
         None,
-        None,
+        Some(reply_id),
+        Some(admission),
+        crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard,
     )
-    .await
+    .await?
+    {
+        ForegroundMessageDispatch::Completed(message) => Ok(message),
+        ForegroundMessageDispatch::Skipped => Err("任务未继续，请重新检查当前状态。".into()),
+    }
 }
 
 #[tauri::command]
@@ -2238,103 +2883,94 @@ pub fn get_messages(state: State<AppState>, session_id: String) -> Result<Vec<Me
 }
 
 #[tauri::command]
-pub fn delete_message(state: State<AppState>, message_id: String) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    // Cascade: if we delete an assistant message, also drop its inline tool
-    // messages. The hydrated history depends on this pairing — leaving orphan
-    // tool rows would corrupt the LLM protocol on the next replay.
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
-        .map_err(|e| e.to_string())?;
-    tx.execute(
-        "DELETE FROM messages WHERE tool_call_id = ?1",
-        params![message_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
+pub fn delete_message(
+    state: State<AppState>,
+    app: AppHandle,
+    message_id: String,
+) -> Result<(), String> {
+    delete_message_impl(&state, Some(&app), &message_id)
+}
+
+// UI disabling is only a convenience. Hold the existing session slot across
+// each history mutation so another transport cannot alter an active run's input.
+fn mutate_idle_message(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    message_id: &str,
+    mutation: impl FnOnce(&Transaction<'_>, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let session_id: String = state
+        .db
+        .lock()
+        .map_err(|e| e.to_string())?
+        .query_row(
+            "SELECT session_id FROM messages WHERE id=?1",
+            [message_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "Message not found".to_string())?;
+    let permit = state.steering.try_start_run(&session_id)?;
+    let result = (|| {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1 AND session_id=?2)",
+                params![message_id, &session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err("Message not found".into());
+        }
+        mutation(&tx, &session_id)?;
+        tx.commit().map_err(|e| e.to_string())
+    })();
+    drop(permit);
+    if let Some(app) = app {
+        state
+            .foreground_automation_pump
+            .wake_after_session_release(app.clone(), &session_id);
+    }
+    result
+}
+
+pub(crate) fn delete_message_impl(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    message_id: &str,
+) -> Result<(), String> {
+    mutate_idle_message(state, app, message_id, |tx, session_id| {
+        crate::commands::foreground_run_store::prune_message_branch_in_tx(
+            tx, session_id, message_id, false,
+        )
+    })
 }
 
 #[tauri::command]
 pub fn update_message_content(
     state: State<AppState>,
+    app: AppHandle,
     message_id: String,
     content: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let rows = conn
-        .execute(
-            "UPDATE messages SET content = ?1 WHERE id = ?2",
-            params![content, message_id],
-        )
-        .map_err(|e| e.to_string())?;
-    if rows == 0 {
-        return Err("Message not found".to_string());
-    }
-    Ok(())
+    update_message_content_impl(&state, Some(&app), &message_id, &content)
 }
 
-/// Prune an edited user message and its descendants before inserting the
-/// replacement turn. The caller may immediately reuse `message_id`; this is
-/// intentional so optimistic UI rows retain their durable identity across
-/// repeated edits.
-fn prune_edit_and_resend_branch(
-    conn: &Connection,
-    session_id: &str,
-    message_id: &str,
-) -> Result<i64, String> {
-    let (stored_session_id, role, created_at, parent_id): (String, String, i64, Option<String>) =
-        conn.query_row(
-            "SELECT session_id, role, created_at, parent_id FROM messages WHERE id = ?1",
-            params![message_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .map_err(|_| "Message not found".to_string())?;
-
-    if stored_session_id != session_id || role != "user" {
-        return Err(
-            "Only a user message in the active session can be edited and resent".to_string(),
-        );
-    }
-
-    let now = Utc::now().timestamp();
-    conn.execute(
-        "UPDATE sessions SET leaf_message_id = ?1, updated_at = ?2 WHERE id = ?3",
-        params![parent_id.as_deref(), now, session_id],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
-        .map_err(|e| e.to_string())?;
-
-    Ok(created_at)
-}
-
-/// Recover the exact user-selected data before replacing a turn. Validation
-/// runs before the destructive prune, and both reads and prune share one
-/// transaction so a malformed snapshot never deletes the original branch.
-fn prepare_edit_and_resend_branch(
-    conn: &Connection,
-    session_id: &str,
+pub(crate) fn update_message_content_impl(
+    state: &AppState,
+    app: Option<&AppHandle>,
     message_id: &str,
     content: &str,
-) -> Result<(i64, Vec<foreground_text_attachments::TextAttachment>), String> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    let metadata: Option<String> = tx
-        .query_row(
-            "SELECT metadata FROM messages WHERE id = ?1 AND session_id = ?2 AND role = 'user'",
-            params![message_id, session_id],
-            |row| row.get(0),
+) -> Result<(), String> {
+    mutate_idle_message(state, app, message_id, |tx, session_id| {
+        tx.execute(
+            "UPDATE messages SET content=?1 WHERE id=?2 AND session_id=?3",
+            params![content, message_id, session_id],
         )
-        .map_err(|_| {
-            "Only a user message in the active session can be edited and resent".to_string()
-        })?;
-    let attachments = foreground_text_attachments::from_metadata(metadata.as_deref())?;
-    foreground_text_attachments::validate_turn("user", content, &attachments)?;
-    let before = prune_edit_and_resend_branch(&tx, session_id, message_id)?;
-    tx.commit().map_err(|error| error.to_string())?;
-    Ok((before, attachments))
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
 /// Edit a user message and resend — discards all messages after it permanently.
@@ -2351,31 +2987,34 @@ pub async fn edit_and_resend_message(
     app: AppHandle,
     req: EditAndResendMessageRequest,
 ) -> Result<Message, String> {
-    let content = req.content.trim().to_string();
-    // Phase 1: verify message exists, then hard-delete its subtree, update leaf.
-    // All DB writes happen here under the mutex — no concurrent edits possible.
-    let (history_before_created_at, text_attachments) = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        prepare_edit_and_resend_branch(&conn, &req.session_id, &req.message_id, &content)?
-    }; // db lock released here
+    edit_and_resend_message_impl(&state, Some(&app), req).await
+}
 
-    // Phase 2: persist the replacement user turn and generate its reply.
+pub(crate) async fn edit_and_resend_message_impl(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    req: EditAndResendMessageRequest,
+) -> Result<Message, String> {
+    let content = req.content.trim().to_string();
+    // Session admission precedes all mutations. The run store replaces the
+    // original branch and reserves its reply in one SQLite transaction.
     send_message_impl(
-        &state,
-        Some(&app),
+        state,
+        app,
         SendMessageRequest {
             session_id: req.session_id,
             role: "user".to_string(),
             content,
-            text_attachments,
+            text_attachments: Vec::new(),
             personality: req.personality,
             preferences: req.preferences,
             thinking_effort: req.thinking_effort,
             client_message_id: None,
             web_search_setup: None,
         },
-        true,
-        Some(history_before_created_at),
+        None,
+        ForegroundUserTurn::Replace,
+        None,
         // The frontend has already rendered this user turn optimistically.
         // Reinsert it under the same durable ID after pruning its old branch;
         // otherwise a refresh replaces the visible row with a different ID and
@@ -2454,9 +3093,25 @@ pub(crate) fn build_agent_config(
     } else {
         UserPreferences::default()
     };
+    (
+        preferences.use_long_term_memory,
+        preferences.evolution_enabled,
+    ) = crate::commands::memory::resolve_reply_memory_controls(
+        &conn,
+        &req.session_id,
+        req.preferences
+            .as_ref()
+            .and_then(|p| p.use_long_term_memory),
+        req.preferences.as_ref().and_then(|p| p.evolution_enabled),
+    )?;
 
     // ── Fetch relevant memories (Phase 5: Memory Recall) ─────────────────────
     let memory_enabled = preferences.use_long_term_memory;
+    let saved_constraint_context = if memory_enabled {
+        crate::agent::extensions::constraint::saved_constraint_context(&conn)?
+    } else {
+        None
+    };
     let relevant_memories = if memory_enabled {
         fetch_relevant_memories(&conn, &req.content)
     } else {
@@ -2475,11 +3130,21 @@ pub(crate) fn build_agent_config(
     let workspace_context = workspace_context_for_session(&conn, &req.session_id)?;
 
     // ── Fetch knowledge graph context (Issue #37 Phase 4) ──────────────────
-    let graph_ctx = crate::knowledge_graph::get_graph_context(&conn, &req.content, 2);
+    let graph_ctx = if memory_enabled {
+        crate::knowledge_graph::get_graph_context(&conn, &req.content, 2)
+    } else {
+        String::new()
+    };
     let knowledge_graph_context = if graph_ctx.is_empty() {
         None
     } else {
         Some(graph_ctx)
+    };
+
+    let adaptive_constraints = if memory_enabled && preferences.evolution_enabled {
+        crate::agent::adaptive_constraints::active_for_session(&conn, &req.session_id)
+    } else {
+        Vec::new()
     };
 
     Ok(AgentConfig {
@@ -2490,10 +3155,8 @@ pub(crate) fn build_agent_config(
         profile,
         preferences,
         relevant_memories,
-        adaptive_constraints: crate::agent::adaptive_constraints::active_for_session(
-            &conn,
-            &req.session_id,
-        ),
+        saved_constraint_context,
+        adaptive_constraints,
         skill_instructions: Vec::new(),
         core_memories,
         knowledge_graph_context,
@@ -2510,15 +3173,17 @@ fn workspace_context_for_session(
     session_id: &str,
 ) -> Result<Option<String>, String> {
     let workspace = conn.query_row(
-        "SELECT p.kind, p.name, p.path FROM sessions s JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
+        "SELECT p.kind, p.name, p.path, p.directory_confirmed FROM sessions s JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
         params![session_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,row.get::<_, bool>(3)?)),
     )
     .optional()
     .map_err(|error| error.to_string())?;
-    Ok(workspace.map(|(kind, name, path)| {
+    Ok(workspace.map(|(kind, name, path, confirmed)| {
         if kind == "personal" {
-            "## 当前工作区\n{\"kind\":\"personal\",\"name\":\"AngelBot 日常\",\"rule\":\"仅使用日常对话与全局长期记忆；不得假定任何项目文件或项目历史。\"}".to_owned()
+            "## 当前工作区\n{\"kind\":\"personal\",\"name\":\"AngelBot 日常\",\"rule\":\"当前文件根目录仅为 AngelBot 自有的日常结果区。可用现有文件工具生成 Markdown、TXT、CSV、JSON 等文本结果，读回核验后用 [文件名](angelbot-file:相对路径) 交付。文件默认保留，可在工作台预览、另存及备份。不能将文本伪装为二进制文件；没有下载证据不能声称已下载。不得访问结果区之外的项目或用户目录，不得执行项目命令或委派项目任务；不得假定任何项目文件或项目历史。\"}".to_owned()
+        } else if !confirmed {
+            format!("## 当前工作区\n{{\"kind\":\"project\",\"name\":{},\"directoryAccess\":\"unconfirmed\",\"rule\":\"仅可讨论已恢复的会话；项目目录尚未由用户确认，不得访问其文件、执行项目命令或派发项目工作。请引导用户在设置的数据备份页批量确认目录。旧任务不会自动继续。\"}}", serde_json::to_string(&name).unwrap_or_default())
         } else {
             format!("## 当前工作区\n{{\"kind\":\"project\",\"name\":{},\"root\":{},\"rule\":\"仅使用本项目的会话、文件和委派结果；不得引用其他项目上下文。\"}}", serde_json::to_string(&name).unwrap_or_default(), serde_json::to_string(&path).unwrap_or_default())
         }
@@ -2624,7 +3289,8 @@ fn fetch_relevant_memories(
                         .map(|(i, _)| format!("?{}", i + 1))
                         .collect();
                     let sql = format!(
-                        "SELECT category, content, importance FROM memories WHERE id IN ({}) AND forget_stage = 'active'",
+                        "SELECT category, content, importance FROM memories WHERE id IN ({})
+                         AND forget_stage = 'active' AND superseded_by IS NULL AND category != 'constraint'",
                         placeholders.join(",")
                     );
                     if let Ok(mut stmt) = conn.prepare(&sql) {
@@ -2662,6 +3328,7 @@ fn fetch_relevant_memories(
                 frequency, last_mentioned
          FROM memories
          WHERE forget_stage = 'active'
+         AND superseded_by IS NULL AND category != 'constraint'
          AND (content LIKE '%' || ?1 || '%' OR category LIKE '%' || ?1 || '%')
          ORDER BY is_permanent DESC, importance DESC, frequency DESC
          LIMIT 5",
@@ -2715,6 +3382,106 @@ fn fetch_relevant_memories(
 mod tests {
     use super::*;
     use crate::db::migrate;
+
+    #[test]
+    fn disabling_memory_or_evolution_omits_learned_defaults_from_main_context() {
+        let conn = private_protocol_edit_fixture();
+        conn.execute(
+            "INSERT INTO memories (id,scope,category,content,importance,source,forget_stage,created_at,updated_at)
+             VALUES ('saved-rule','global','constraint','不要自行删除原始文件',9,'manual','active',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO memories (id,scope,category,content,importance,forget_stage,created_at,updated_at,superseded_by)
+            VALUES ('superseded-rule','global','constraint','stale saved rule',9,'active',1,1,'saved-rule'),
+                   ('unbound-rule','session','constraint','another session rule',9,'active',1,1,NULL),
+                   ('forgotten-rule','global','constraint','forgotten saved rule',9,'forgotten',1,1,NULL),
+                   ('old-preference','global','preference','继续用旧偏好',9,'active',1,1,'saved-rule');").unwrap();
+        let memories = vec![crate::agent::evolution::NewMemory {
+            category: "preference".into(),
+            content: "先总结，再解释".into(),
+            importance: 8,
+        }];
+        for session in ["s", "independent-observation"] {
+            crate::agent::adaptive_constraints::record_preferences(
+                &conn,
+                Some(session),
+                &memories,
+                "auto_evolution",
+            )
+            .unwrap();
+        }
+        let state = app_state_from_connection(conn);
+        for (memory, evolution) in [(false, true), (true, false), (true, true)] {
+            let request = serde_json::from_value::<SendMessageRequest>(serde_json::json!({
+                "sessionId":"s", "role":"user", "content":"你好",
+                "preferences":{"useLongTermMemory":memory,"evolutionEnabled":evolution}
+            }))
+            .unwrap();
+            let config = build_agent_config(&state, &request).unwrap();
+            let prompt = crate::agent::prompt::build_agent_system_prompt(&config, &[], &[]);
+            assert_eq!(
+                prompt.contains("不要自行删除原始文件"),
+                memory,
+                "saved constraints must not depend on query similarity or learning"
+            );
+            assert_eq!(
+                config.adaptive_constraints.len(),
+                usize::from(memory && evolution)
+            );
+            if !memory {
+                assert!(config.relevant_memories.is_empty());
+                assert!(config.core_memories.is_empty());
+                assert!(config.knowledge_graph_context.is_none());
+            }
+            let continuation: SendMessageRequest = serde_json::from_value(serde_json::json!({
+                "sessionId":"s", "role":"user", "content":"继续"
+            }))
+            .unwrap();
+            let continued = build_agent_config(&state, &continuation).unwrap();
+            let continued_prompt =
+                crate::agent::prompt::build_agent_system_prompt(&continued, &[], &[]);
+            assert_eq!(continued_prompt.contains("不要自行删除原始文件"), memory);
+            for excluded in [
+                "stale saved rule",
+                "another session rule",
+                "forgotten saved rule",
+                "继续用旧偏好",
+            ] {
+                assert!(!continued_prompt.contains(excluded));
+            }
+            assert!(continued
+                .relevant_memories
+                .iter()
+                .all(|memory| memory.category != "constraint"));
+            if memory {
+                assert_eq!(
+                    continued.saved_constraint_context,
+                    config.saved_constraint_context
+                );
+            }
+            assert_eq!(continued.preferences.use_long_term_memory, memory);
+            assert_eq!(continued.preferences.evolution_enabled, evolution);
+            assert_eq!(
+                continued.adaptive_constraints.len(),
+                usize::from(memory && evolution)
+            );
+        }
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("ALTER TABLE memories RENAME TO unavailable_memories", [])
+            .unwrap();
+        let request: SendMessageRequest = serde_json::from_value(serde_json::json!({
+            "sessionId":"s", "role":"user", "content":"继续",
+            "preferences":{"useLongTermMemory":true}
+        }))
+        .unwrap();
+        assert!(build_agent_config(&state, &request)
+            .unwrap_err()
+            .contains("约束读取失败"));
+    }
 
     fn private_protocol_edit_fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -2882,18 +3649,18 @@ mod tests {
         {
             let mut conn = state.db.lock().unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            arm_desktop_action_in_tx(&tx, "s1", "msg-1", "call-1", &pending).unwrap();
+            arm_confirmed_action_in_tx(&tx, "s1", "msg-1", "call-1", &pending).unwrap();
             tx.commit().unwrap();
             let replay = hydrate_llm_history(&conn, "s1", 100).unwrap();
-            assert_eq!(replay[1].content, DESKTOP_ACTION_INTERRUPTED);
+            assert_eq!(replay[1].content, CONFIRMED_ACTION_INTERRUPTED);
         }
-        assert!(build_task_continuation_prompt(&state, "s1", "msg-1")
+        assert!(prepare_task_continuation(&state, "s1", "msg-1")
             .unwrap_err()
             .contains("unknown result"));
         {
             let mut conn = state.db.lock().unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            finish_desktop_action_in_tx(
+            finish_confirmed_action_in_tx(
                 &tx,
                 "s1",
                 "msg-1",
@@ -2911,8 +3678,9 @@ mod tests {
                 "approval-marker"
             );
         }
-        assert!(build_task_continuation_prompt(&state, "s1", "msg-1")
+        assert!(prepare_task_continuation(&state, "s1", "msg-1")
             .unwrap()
+            .content
             .contains("verified"));
         let cancelled = private_protocol_confirmation_fixture(dir.path());
         cancel_agent_task_impl(&cancelled, "s1", "msg-1").unwrap();
@@ -2934,21 +3702,53 @@ mod tests {
             cutoff[1].protocol_state.as_ref().unwrap().output_items[0]["encrypted_content"],
             "retained-marker"
         );
-        assert_eq!(prune_edit_and_resend_branch(&conn, "s", "u2").unwrap(), 30);
-        let replay = hydrate_llm_history(&conn, "s", i64::MAX).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let run = ForegroundRunStore::new(db.clone())
+            .begin(replacement_turn())
+            .unwrap();
+        assert_eq!(run.history_before_created_at, 30);
+        let conn = db.lock().unwrap();
+        let replay = hydrate_llm_history(&conn, "s", run.history_before_created_at).unwrap();
         assert_eq!(replay.len(), 2);
         assert_eq!(
             replay[1].protocol_state.as_ref().unwrap().output_items[0]["encrypted_content"],
             "retained-marker"
         );
         assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE id IN ('u2','a2')",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
+            conn.query_row("SELECT COUNT(*) FROM messages WHERE id = 'a2'", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn persisted_checkpoint_keeps_previous_summary_inside_untrusted_transcript() {
+        let conn = private_protocol_edit_fixture();
+        conn.execute(
+            "INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger) VALUES('previous','s',?1,1,12,2,'auto_token_threshold')",
+            ["earlier-checkpoint: user requires drafts only; report still pending"],
+        ).unwrap();
+        let config = AgentConfig {
+            context_summary: fetch_latest_summary(&conn, "s"),
+            ..AgentConfig::default()
+        };
+        let transcript = "user: report has now been verified; next check is read-only";
+        let facts = Some("completed_steps: report readback");
+        let prompt = persisted_checkpoint_prompt(&config, transcript, facts);
+        let conversation = prompt.split_once("<conversation>\n").unwrap().1;
+        assert!(
+            conversation.contains(config.context_summary.as_deref().unwrap()),
+            "a second checkpoint must carry the persisted earlier context"
+        );
+        assert!(conversation.contains(transcript));
+        assert!(!conversation.contains("<verified-task-facts>"));
+        assert!(prompt.contains("<verified-task-facts>\ncompleted_steps: report readback"));
+        assert_eq!(
+            persisted_checkpoint_prompt(&AgentConfig::default(), transcript, facts),
+            checkpoint_prompt(transcript, facts),
+            "the first checkpoint keeps the existing prompt contract"
         );
     }
 
@@ -2992,7 +3792,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_text_snapshots_fail_at_the_shared_entry_without_transcript_or_run_effects() {
+    fn invalid_or_busy_turns_fail_without_transcript_or_run_effects() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let state = app_state_from_connection(conn);
@@ -3031,29 +3831,23 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "invalid attachments must not write {table}");
         }
-    }
-
-    #[test]
-    fn edit_resend_preserves_the_original_snapshot_and_validates_before_pruning() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;
-            CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, parent_id TEXT REFERENCES messages(id) ON DELETE CASCADE, created_at INTEGER, metadata TEXT);
-            CREATE TABLE sessions (id TEXT PRIMARY KEY, leaf_message_id TEXT REFERENCES messages(id), updated_at INTEGER);
-            INSERT INTO sessions VALUES ('s', NULL, 1);
-            INSERT INTO messages VALUES ('u', 's', 'user', '', NULL, 10, NULL);
-            INSERT INTO messages VALUES ('a', 's', 'assistant', 'summary', 'u', 11, NULL);
+        conn.execute_batch("INSERT INTO sessions (id, title, created_at, updated_at) VALUES ('s', 'test', 1, 1);
+            INSERT INTO messages (id, session_id, role, content, created_at) VALUES ('u', 's', 'user', 'original', 1);
+            INSERT INTO messages (id, session_id, role, content, parent_id, created_at) VALUES ('a', 's', 'assistant', 'original reply', 'u', 2);
             UPDATE sessions SET leaf_message_id = 'a' WHERE id = 's';").unwrap();
-        let files = vec![foreground_text_attachments::TextAttachment {
-            name: "notes.txt".into(),
-            text: "original snapshot".into(),
-        }];
-        let original = foreground_text_attachments::metadata(&files).unwrap();
-        conn.execute(
-            "UPDATE messages SET metadata = ?1 WHERE id = 'u'",
-            params![r#"{"textAttachments":[{"name":"photo.png","text":"invalid"}]}"#],
-        )
+        drop(conn);
+        let occupied = state.steering.try_start_run("s").unwrap();
+        let req = serde_json::from_value(serde_json::json!({
+            "sessionId": "s", "messageId": "u", "content": "replacement",
+        }))
         .unwrap();
-        assert!(prepare_edit_and_resend_branch(&conn, "s", "u", "replacement").is_err());
+        assert!(runtime
+            .block_on(edit_and_resend_message_impl(&state, None, req))
+            .is_err());
+        assert!(delete_message_impl(&state, None, "u").is_err());
+        assert!(update_message_content_impl(&state, None, "u", "changed").is_err());
+        assert!(state.steering.try_start_run("s").is_err());
+        let conn = state.db.lock().unwrap();
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
                 .get::<_, i64>(0))
@@ -3062,100 +3856,303 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
-                "SELECT leaf_message_id FROM sessions WHERE id = 's'",
+                "SELECT leaf_message_id FROM sessions WHERE id='s'",
                 [],
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
             "a"
         );
+        assert_eq!(
+            conn.query_row("SELECT content FROM messages WHERE id='u'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "original"
+        );
+        conn.execute_batch("INSERT INTO sessions (id,title,created_at,updated_at) VALUES ('other','Other',1,1);
+            INSERT INTO messages (id,session_id,role,content,created_at) VALUES ('other-user','other','user','other',1);").unwrap();
+        drop(conn);
+        // A busy session must not freeze another workspace's idle history.
+        update_message_content_impl(&state, None, "other-user", "updated").unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_delete BEFORE DELETE ON messages
+            WHEN OLD.id='other-user' BEGIN SELECT RAISE(ABORT,'forced delete failure'); END;",
+            )
+            .unwrap();
+        assert!(delete_message_impl(&state, None, "other-user").is_err());
+        assert!(
+            state.steering.try_start_run("other").is_ok(),
+            "failed mutation must release the session slot"
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_delete")
+            .unwrap();
+        delete_message_impl(&state, None, "other-user").unwrap();
+        assert!(update_message_content_impl(&state, None, "other-user", "missing").is_err());
+        drop(occupied);
+        state.db.lock().unwrap().execute_batch("INSERT INTO messages (id,session_id,role,content,created_at) VALUES ('off-branch','s','assistant','other branch',3);
+            INSERT INTO messages (id,session_id,role,content,tool_call_id,created_at) VALUES ('off-tool','s','tool','legacy tool','off-branch',4);").unwrap();
+        delete_message_impl(&state, None, "off-branch").unwrap();
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE id IN ('off-branch','off-tool')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        delete_message_impl(&state, None, "u").unwrap();
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id='s'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                [],
+                |row| row.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    fn replacement_turn() -> BeginForegroundTurn {
+        BeginForegroundTurn {
+            session_id: "s".into(),
+            user_message_id: "u2".into(),
+            reply_id: "edit-reply".into(),
+            role: "user".into(),
+            content: "replacement".into(),
+            text_attachments: Vec::new(),
+            user_turn: ForegroundUserTurn::Replace,
+            now: 100,
+        }
+    }
+
+    fn edit_transcript(db: &Arc<Mutex<Connection>>) -> Vec<serde_json::Value> {
+        let conn = db.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,session_id,role,content,parent_id,metadata,created_at,is_provisional FROM messages ORDER BY id").unwrap();
+        stmt.query_map([], |row| {
+            Ok(serde_json::json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ]))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn edit_resend_preserves_the_original_snapshot_and_validates_before_pruning() {
+        let conn = private_protocol_edit_fixture();
         conn.execute(
-            "UPDATE messages SET metadata = ?1 WHERE id = 'u'",
-            params![foreground_text_attachments::compressed_metadata(Some(
-                &original
-            ))],
+            "UPDATE messages SET metadata=?1 WHERE id='u2'",
+            [r#"{"textAttachments":[{"name":"photo.png","text":"invalid"}]}"#],
         )
         .unwrap();
-        assert!(prepare_edit_and_resend_branch(&conn, "other", "u", "replacement").is_err());
-        let (before, recovered) = prepare_edit_and_resend_branch(&conn, "s", "u", "").unwrap();
-        assert_eq!(before, 10);
-        assert_eq!(recovered, files);
+        let db = Arc::new(Mutex::new(conn));
+        let store = ForegroundRunStore::new(db.clone());
+        let before = edit_transcript(&db);
+        assert!(store.begin(replacement_turn()).is_err());
+        assert_eq!(edit_transcript(&db), before);
+
+        let files = vec![foreground_text_attachments::TextAttachment {
+            name: "notes.txt".into(),
+            text: "original snapshot".into(),
+        }];
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET metadata=?1 WHERE id='u2'",
+                [foreground_text_attachments::compressed_metadata(
+                    foreground_text_attachments::metadata(&files).as_deref(),
+                )],
+            )
+            .unwrap();
+        let before = edit_transcript(&db);
+        for (session, message, role) in [
+            ("other", "u2", "user"),
+            ("s", "a2", "user"),
+            ("s", "missing", "user"),
+            ("s", "u2", "assistant"),
+        ] {
+            let mut input = replacement_turn();
+            input.session_id = session.into();
+            input.user_message_id = message.into();
+            input.role = role.into();
+            assert!(store.begin(input).is_err());
+            assert_eq!(edit_transcript(&db), before);
+        }
+        // A declined admission is still a true no-op for a valid replacement.
+        assert!(matches!(
+            store
+                .begin_with_admission(replacement_turn(), |_| Ok(ForegroundRunAdmission::Skip))
+                .unwrap(),
+            ForegroundRunBeginResult::Skipped
+        ));
+        assert_eq!(edit_transcript(&db), before);
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "a2"
+        );
+
+        let mut input = replacement_turn();
+        input.content.clear(); // Attachment-only edits use the original snapshots.
+        input.text_attachments = vec![foreground_text_attachments::TextAttachment {
+            name: "forged.txt".into(),
+            text: "not the original".into(),
+        }];
+        let run = store.begin(input).unwrap();
+        assert_eq!(run.history_before_created_at, 30);
+        assert_eq!(run.text_attachments, files);
+        let conn = db.lock().unwrap();
+        let (body, parent, metadata): (String, String, String) = conn
+            .query_row(
+                "SELECT content,parent_id,metadata FROM messages WHERE id='u2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "");
+        assert_eq!(parent, "a1");
+        assert_eq!(
+            foreground_text_attachments::from_metadata(Some(&metadata)).unwrap(),
+            files
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM messages WHERE id='a2'", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "u2"
         );
     }
 
     #[test]
     fn edit_resend_can_reuse_the_same_user_message_id_repeatedly() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE messages (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                parent_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
-                created_at INTEGER NOT NULL
+        let conn = private_protocol_edit_fixture();
+        conn.execute("INSERT INTO messages (id,session_id,role,content,tool_call_id,created_at) VALUES ('legacy-tool','s','tool','legacy result','a2',32)", []).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let store = ForegroundRunStore::new(db.clone());
+        let before = edit_transcript(&db);
+        for table in ["messages", "task_runs"] {
+            db.lock().unwrap().execute_batch(&format!("CREATE TRIGGER reject_edit BEFORE INSERT ON {table}
+                WHEN NEW.id='edit-reply' BEGIN SELECT RAISE(ABORT,'forced reservation failure'); END;")).unwrap();
+            assert!(store.begin(replacement_turn()).is_err());
+            assert_eq!(
+                edit_transcript(&db),
+                before,
+                "failed {table} insert must restore the original branch"
             );
-            CREATE TABLE sessions (
-                id TEXT PRIMARY KEY,
-                leaf_message_id TEXT REFERENCES messages(id),
-                updated_at INTEGER NOT NULL
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "a2"
             );
-            INSERT INTO sessions (id, leaf_message_id, updated_at) VALUES ('s1', NULL, 0);
-            INSERT INTO messages VALUES ('u1', 's1', 'user', 'first version', NULL, 1);
-            INSERT INTO messages VALUES ('a1', 's1', 'assistant', 'first reply', 'u1', 2);
-            UPDATE sessions SET leaf_message_id = 'a1' WHERE id = 's1';
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(prune_edit_and_resend_branch(&conn, "s1", "u1").unwrap(), 1);
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
-                .get::<_, i64>(0))
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM task_runs", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            conn.execute_batch("DROP TRIGGER reject_edit").unwrap();
+        }
+        for (now, reply, cutoff) in [(100, "edit-1", 30), (200, "edit-2", 100)] {
+            let mut input = replacement_turn();
+            input.now = now;
+            input.reply_id = reply.into();
+            let run = store.begin(input).unwrap();
+            assert_eq!(run.history_before_created_at, cutoff);
+            assert!(store.recover_interrupted_run(&run, now + 1).unwrap());
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE id='u2' AND parent_id='a1'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
                 .unwrap(),
-            0
-        );
-
-        // This mirrors send_message_impl: the replacement intentionally keeps
-        // the edited user's durable identity, then receives a fresh reply.
-        conn.execute(
-            "INSERT INTO messages VALUES ('u1', 's1', 'user', 'second version', NULL, 3)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES ('a2', 's1', 'assistant', 'second reply', 'u1', 4)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE sessions SET leaf_message_id = 'a2' WHERE id = 's1'",
-            [],
-        )
-        .unwrap();
-
-        assert_eq!(prune_edit_and_resend_branch(&conn, "s1", "u1").unwrap(), 3);
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
-                .get::<_, i64>(0))
+                1
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
                 .unwrap(),
-            0
-        );
-        let leaf: Option<String> = conn
-            .query_row(
-                "SELECT leaf_message_id FROM sessions WHERE id = 's1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(leaf, None);
+                reply
+            );
+            assert!(!conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap());
+        }
     }
 
     #[test]
@@ -3213,6 +4210,26 @@ mod tests {
             agent_execution_permission_from_conn(&conn).unwrap(),
             "full_access"
         );
+        conn.execute("DELETE FROM agent_permission_grants", [])
+            .unwrap();
+        assert_eq!(
+            agent_execution_permission_from_conn(&conn).unwrap(),
+            "ask",
+            "a current grants table must never resurrect legacy full access"
+        );
+        conn.execute("DROP TABLE agent_permission_grants", [])
+            .unwrap();
+        assert_eq!(
+            agent_execution_permission_from_conn(&conn).unwrap(),
+            "full_access",
+            "legacy settings apply only when the grants table is absent"
+        );
+        conn.execute(
+            "UPDATE settings SET value='invalid' WHERE key=?1",
+            [AGENT_EXECUTION_PERMISSION_KEY],
+        )
+        .unwrap();
+        assert_eq!(agent_execution_permission_from_conn(&conn).unwrap(), "ask");
     }
 
     #[test]
@@ -4063,12 +5080,20 @@ mod tests {
         conn.execute_batch(
             r#"
             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('project', 'personal')),
+                directory_confirmed INTEGER NOT NULL DEFAULT 1
+            );
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                work_dir TEXT
+                work_dir TEXT,
+                project_id TEXT
             );
             CREATE TABLE messages (
                 id TEXT PRIMARY KEY,
@@ -4238,17 +5263,107 @@ mod tests {
         (state, mock)
     }
 
-    /// Real UIA stays outside offline `verify.py full`; its Python runner owns
-    /// the only trusted process/window and supplies this explicit opt-in.
-    #[cfg(windows)]
     #[test]
-    #[ignore = "requires scripts/native_uia_smoke.py and its owned interactive WPF fixture"]
-    fn native_uia_fixture_confirmation() {
-        let executable = std::fs::canonicalize(
+    fn visual_click_uses_one_exact_preview_without_persisting_pixels_or_replaying() {
+        for case in ["approve", "reject", "changed", "missing"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut state, _) = setup_draft_confirmation_state(dir.path());
+            let adapter = Arc::new(
+                crate::agent::handlers::desktop_handler_tests::ImageObservationAdapter::new(),
+            );
+            state.desktop_adapter = adapter.clone();
+            {
+                let db = state.db.lock().unwrap();
+                db.execute("UPDATE desktop_trusted_apps SET capabilities='[\"observe\",\"observeImage\",\"interact\"]' WHERE id='draft-app'",[]).unwrap();
+                db.execute("UPDATE agent_steps SET tool_name='click_trusted_app_image', tool_input=?1, tool_output='Confirmation required before executing side-effect tool' WHERE id='call-1'",
+                    [serde_json::json!({"app_id":"draft-app","image_ref":"source","x":0,"y":0}).to_string()]).unwrap();
+            }
+            let preview =
+                preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+            assert_eq!(preview.operation, "imageclick");
+            assert!(preview
+                .image
+                .as_ref()
+                .unwrap()
+                .image_data_url
+                .starts_with("data:image/png;base64,"));
+            if case == "changed" {
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE desktop_trusted_apps SET updated_at=2", [])
+                    .unwrap();
+            }
+            let request = ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: if case == "reject" {
+                    "rejected"
+                } else {
+                    "approved"
+                }
+                .into(),
+                preview_id: if case == "missing" {
+                    None
+                } else {
+                    Some(preview.preview_id.clone())
+                },
+            };
+            let result = resolve_agent_confirmation_impl(&state, request);
+            if case == "approve" {
+                let receipt = result.unwrap();
+                assert!(receipt.success, "{}", receipt.output);
+                assert!(receipt.output.contains("dispatched"));
+                assert!(resolve_agent_confirmation_impl(
+                    &state,
+                    ResolveAgentConfirmationRequest {
+                        session_id: "s1".into(),
+                        message_id: "msg-1".into(),
+                        call_id: "call-1".into(),
+                        decision: "approved".into(),
+                        preview_id: Some(preview.preview_id)
+                    }
+                )
+                .is_err());
+            } else if case != "reject" {
+                assert!(result.is_err(), "{case}");
+            }
+            assert_eq!(
+                adapter
+                    .click_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(case == "approve"),
+                "{case}"
+            );
+            let db = state.db.lock().unwrap();
+            for sql in [
+                "SELECT content FROM messages",
+                "SELECT COALESCE(tool_output,'') FROM agent_steps",
+            ] {
+                let mut query = db.prepare(sql).unwrap();
+                for row in query.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+                    assert!(!row.unwrap().contains("iVBOR"), "pixels persisted: {case}");
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_uia_fixture_parameters() -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        u32,
+        String,
+    ) {
+        let runner_executable = std::path::PathBuf::from(
             std::env::var_os("ANGELBOT_NATIVE_UIA_SMOKE_EXE")
                 .expect("run via scripts/native_uia_smoke.py"),
-        )
-        .unwrap();
+        );
+        assert!(runner_executable.is_absolute());
+        let executable = std::fs::canonicalize(&runner_executable).unwrap();
         let snapshot = std::path::PathBuf::from(
             std::env::var_os("ANGELBOT_NATIVE_UIA_SMOKE_SNAPSHOT").unwrap(),
         );
@@ -4257,7 +5372,6 @@ mod tests {
             .parse()
             .unwrap();
         let title = std::env::var("ANGELBOT_NATIVE_UIA_SMOKE_TITLE").unwrap();
-        let text = std::env::var("ANGELBOT_NATIVE_UIA_SMOKE_TEXT").unwrap();
         assert_eq!(
             executable.file_name().unwrap(),
             "AngelBotNativeUiaFixture.exe"
@@ -4273,6 +5387,42 @@ mod tests {
             fixture_directory
         );
         assert_eq!(snapshot.file_name().unwrap(), "fixture-state.json");
+        (runner_executable, executable, snapshot, process_id, title)
+    }
+
+    #[cfg(windows)]
+    fn read_native_uia_fixture(
+        snapshot: &std::path::Path,
+        process_id: u32,
+        title: &str,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = std::fs::read(snapshot)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            {
+                assert_eq!(value["processId"].as_u64(), Some(u64::from(process_id)));
+                assert_eq!(value["windowTitle"].as_str(), Some(title));
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned fixture snapshot unavailable"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Real UIA stays outside offline `verify.py full`; its Python runner owns
+    /// the only trusted process/window and supplies this explicit opt-in.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires scripts/native_uia_smoke.py and its owned interactive WPF fixture"]
+    fn native_uia_fixture_confirmation() {
+        let (_, executable, snapshot, process_id, title) = native_uia_fixture_parameters();
+        let fixture_directory = executable.parent().unwrap();
+        let text = std::env::var("ANGELBOT_NATIVE_UIA_SMOKE_TEXT").unwrap();
 
         let wait_for_fixture = |read_only: bool, expected_text: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -4319,6 +5469,71 @@ mod tests {
             ).unwrap();
             state
         };
+        // The fixture creates real unowned HWNDs, not synthetic window records.
+        // An auxiliary surface must not displace the primary window, while a
+        // second independent window must still require target disambiguation.
+        {
+            let wait_windows = |auxiliary: bool, second: bool| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(value) = std::fs::read(&snapshot)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    {
+                        assert_eq!(value["processId"].as_u64(), Some(u64::from(process_id)));
+                        if value["auxiliaryOpen"].as_bool() == Some(auxiliary)
+                            && value["secondWindowOpen"].as_bool() == Some(second)
+                        {
+                            break;
+                        }
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "owned extra-window state was not published"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            };
+            let window_state = make_state();
+            std::fs::write(snapshot.with_extension("command"), "auxiliary").unwrap();
+            wait_windows(true, false);
+            let primary = window_state
+                .desktop_adapter
+                .observe_trusted_window("draft-app", executable.to_str().unwrap())
+                .expect("non-activating auxiliary HWND must not displace the primary window");
+            assert!(primary
+                .controls
+                .iter()
+                .any(|control| control.automation_id.as_deref() == Some("ordinaryField")));
+            std::fs::write(snapshot.with_extension("command"), "second-window").unwrap();
+            wait_windows(true, true);
+            assert_eq!(
+                window_state
+                    .desktop_adapter
+                    .observe_trusted_window("draft-app", executable.to_str().unwrap())
+                    .unwrap_err()
+                    .code,
+                "TARGET_AMBIGUOUS"
+            );
+            std::fs::write(snapshot.with_extension("command"), "extras-close").unwrap();
+            wait_windows(false, false);
+            let untouched = read_native_uia_fixture(&snapshot, process_id, &title);
+            assert_eq!(untouched["ordinaryValue"], "ordinary-seed");
+            for key in [
+                "invocationCount",
+                "selectionCount",
+                "checkedCount",
+                "uncheckedCount",
+                "expansionCount",
+                "collapseCount",
+                "scrollCount",
+            ] {
+                assert_eq!(
+                    untouched[key], 0,
+                    "window discovery must not apply control operations: {key}"
+                );
+            }
+        }
         let observe_and_bind = |state: &AppState| {
             let observed = state
                 .desktop_adapter
@@ -4402,14 +5617,12 @@ mod tests {
         let preview =
             preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
         assert_eq!(preview.window_title.as_deref(), Some(title.as_str()));
-        assert_eq!(preview.control_name, "ordinaryField");
+        assert_eq!(preview.control_name.as_deref(), Some("ordinaryField"));
         assert_eq!(preview.text.as_deref(), Some(text.as_str()));
-        assert_eq!(
-            state.desktop_action_previews.leases.lock().unwrap()[&preview.preview_id]
-                .target
-                .process_id,
-            process_id
-        );
+        assert!(matches!(
+            &state.desktop_action_previews.leases.lock().unwrap()[&preview.preview_id].target,
+            DesktopActionPreviewTarget::Action(target) if target.process_id == process_id
+        ));
         wait_for_fixture(false, "ordinary-seed");
 
         // The approved identity must not bypass a safety change after preview.
@@ -4474,7 +5687,7 @@ mod tests {
         let preview =
             preflight_pending_desktop_action_impl(&invoke_state, "s1", "msg-1", "call-1").unwrap();
         assert_eq!(preview.operation, "invoke");
-        assert_eq!(preview.control_name, "Apply action");
+        assert_eq!(preview.control_name.as_deref(), Some("Apply action"));
         assert!(preview.text.is_none());
         let receipt = resolve_agent_confirmation_impl(
             &invoke_state,
@@ -4534,28 +5747,17 @@ mod tests {
         // starts with a fresh observation. Repeating an already-desired state
         // must be a verified no-op, not a second fixture event.
         use crate::desktop_control::DesktopControlOperation;
-        let read_owned_fixture = || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Some(value) = std::fs::read(&snapshot)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                {
-                    assert_eq!(value["processId"].as_u64(), Some(u64::from(process_id)));
-                    assert_eq!(value["windowTitle"].as_str(), Some(title.as_str()));
-                    return value;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "owned fixture snapshot unavailable"
-                );
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        };
+        let read_owned_fixture = || read_native_uia_fixture(&snapshot, process_id, &title);
         let mut expected_scroll_count = 0;
+        let mut expected_checked_count = 0;
+        let mut expected_unchecked_count = 0;
         for operation in [
             DesktopControlOperation::Select,
             DesktopControlOperation::Select,
+            DesktopControlOperation::Check,
+            DesktopControlOperation::Check,
+            DesktopControlOperation::Uncheck,
+            DesktopControlOperation::Uncheck,
             DesktopControlOperation::Expand,
             DesktopControlOperation::Expand,
             DesktopControlOperation::Collapse,
@@ -4566,15 +5768,58 @@ mod tests {
             DesktopControlOperation::ScrollUp,
         ] {
             let control_state = make_state();
-            let observation = control_state
+            let mut observation = control_state
                 .desktop_adapter
                 .observe_trusted_window("draft-app", executable.to_str().unwrap())
                 .unwrap();
             assert!(!observation.truncated);
+            let scoped_scroll_root =
+                operation == DesktopControlOperation::ScrollDown && expected_scroll_count == 0;
+            if scoped_scroll_root {
+                let region_ref = observation
+                    .regions
+                    .iter()
+                    .find(|region| region.name == "Fixture scroll area")
+                    .and_then(|region| region.region_ref.clone())
+                    .expect("named fixture ScrollViewer must offer a read-only region ref");
+                observation = control_state
+                    .desktop_adapter
+                    .observe_trusted_window_with_control(
+                        "draft-app",
+                        executable.to_str().unwrap(),
+                        Some(&region_ref),
+                        false,
+                        &|| false,
+                        Duration::from_secs(8),
+                    )
+                    .unwrap();
+                assert!(!observation.truncated);
+                assert_eq!(observation.region_ref.as_deref(), Some(region_ref.as_str()));
+                let scroll_root = observation
+                    .controls
+                    .iter()
+                    .find(|control| control.automation_id.as_deref() == Some("fixtureScroll"))
+                    .expect("selected scroll region root must remain an observed control");
+                assert_eq!(scroll_root.depth, 1);
+                assert_eq!(scroll_root.role, "pane");
+                assert!(scroll_root.control_ref.is_some());
+            }
             let (id, label, snapshot_key, desired) = match operation {
                 DesktopControlOperation::Select => {
                     ("fixtureOption", "Fixture option", "selected", true)
                 }
+                DesktopControlOperation::Check => (
+                    "fixtureCheckbox",
+                    "Fixture checkbox",
+                    "checkboxChecked",
+                    true,
+                ),
+                DesktopControlOperation::Uncheck => (
+                    "fixtureCheckbox",
+                    "Fixture checkbox",
+                    "checkboxChecked",
+                    false,
+                ),
                 DesktopControlOperation::Expand => {
                     ("fixtureMenu", "More actions", "menuExpanded", true)
                 }
@@ -4590,12 +5835,30 @@ mod tests {
                 DesktopControlOperation::ScrollUp => {
                     ("fixtureScroll", "Fixture scroll area", "scrollAtTop", true)
                 }
-                DesktopControlOperation::Invoke => unreachable!(),
+                DesktopControlOperation::Invoke | DesktopControlOperation::Choose => unreachable!(),
             };
             let before_preview = read_owned_fixture();
             assert!(before_preview["scrollableHeight"].as_f64().unwrap() > 0.0);
             assert!(before_preview["scrollViewportHeight"].as_f64().unwrap() > 0.0);
-            assert_eq!(before_preview["scrollCount"], expected_scroll_count);
+            assert_eq!(
+                before_preview["scrollCount"],
+                expected_scroll_count,
+                "{} unexpected prior scroll event",
+                operation.as_str()
+            );
+            assert_eq!(
+                before_preview["checkedCount"],
+                expected_checked_count,
+                "{} unexpected prior check event",
+                operation.as_str()
+            );
+            assert_eq!(
+                before_preview["uncheckedCount"],
+                expected_unchecked_count,
+                "{} unexpected prior uncheck event",
+                operation.as_str()
+            );
+            assert_eq!(before_preview["indeterminateCount"], 0);
             assert_eq!(before_preview["scrollHorizontalOffset"].as_f64(), Some(0.0));
             let reference = observation
                 .controls
@@ -4614,25 +5877,48 @@ mod tests {
                 preflight_pending_desktop_action_impl(&control_state, "s1", "msg-1", "call-1")
                     .unwrap();
             assert_eq!(preview.operation, operation.as_str());
-            assert_eq!(preview.control_name, label);
+            if scoped_scroll_root {
+                assert_eq!(preview.control_name, Some(format!("{label} / {label}")));
+            } else {
+                assert_eq!(preview.control_name.as_deref(), Some(label));
+            }
             assert!(preview.text.is_none());
             let after_preview = read_owned_fixture();
-            for key in ["scrollCount", "scrollOffset", "scrollHorizontalOffset"] {
+            for key in [
+                "scrollCount",
+                "scrollOffset",
+                "scrollHorizontalOffset",
+                "checkboxChecked",
+                "checkboxState",
+                "checkedCount",
+                "uncheckedCount",
+                "indeterminateCount",
+            ] {
                 assert_eq!(
                     after_preview[key], before_preview[key],
-                    "observation/preflight must not scroll"
+                    "observation/preflight must not change fixture controls"
                 );
             }
             if matches!(
                 operation,
-                DesktopControlOperation::ScrollDown | DesktopControlOperation::ScrollUp
+                DesktopControlOperation::ScrollDown
+                    | DesktopControlOperation::ScrollUp
+                    | DesktopControlOperation::Check
+                    | DesktopControlOperation::Uncheck
             ) {
                 assert!(resolve_agent_confirmation_impl(&control_state, approve(None)).is_err());
                 assert_eq!(read_owned_fixture()["scrollCount"], expected_scroll_count);
+                assert_eq!(read_owned_fixture()["checkedCount"], expected_checked_count);
+                assert_eq!(
+                    read_owned_fixture()["uncheckedCount"],
+                    expected_unchecked_count
+                );
             }
-            let receipt =
-                resolve_agent_confirmation_impl(&control_state, approve(Some(preview.preview_id)))
-                    .unwrap();
+            let receipt = resolve_agent_confirmation_impl(
+                &control_state,
+                approve(Some(preview.preview_id.clone())),
+            )
+            .unwrap();
             assert!(
                 receipt.success,
                 "{}: {}",
@@ -4648,6 +5934,16 @@ mod tests {
             .unwrap();
             assert_eq!(output["status"], "verified");
             assert_eq!(output["action"], operation.as_str());
+            if operation == DesktopControlOperation::Check
+                && before_preview["checkboxChecked"].as_bool() == Some(false)
+            {
+                expected_checked_count += 1;
+            }
+            if operation == DesktopControlOperation::Uncheck
+                && before_preview["checkboxChecked"].as_bool() == Some(true)
+            {
+                expected_unchecked_count += 1;
+            }
             if (operation == DesktopControlOperation::ScrollDown && expected_scroll_count == 0)
                 || (operation == DesktopControlOperation::ScrollUp && expected_scroll_count == 1)
             {
@@ -4661,13 +5957,39 @@ mod tests {
                 {
                     assert_eq!(value["processId"].as_u64(), Some(u64::from(process_id)));
                     if value[snapshot_key].as_bool() == Some(desired) {
-                        assert_eq!(value["scrollCount"], expected_scroll_count);
+                        assert_eq!(
+                            value["scrollCount"],
+                            expected_scroll_count,
+                            "{} scroll event count",
+                            operation.as_str()
+                        );
+                        assert_eq!(
+                            value["checkedCount"],
+                            expected_checked_count,
+                            "{} check event count",
+                            operation.as_str()
+                        );
+                        assert_eq!(
+                            value["uncheckedCount"],
+                            expected_unchecked_count,
+                            "{} uncheck event count",
+                            operation.as_str()
+                        );
+                        assert_eq!(
+                            value["indeterminateCount"],
+                            0,
+                            "{} indeterminate event count",
+                            operation.as_str()
+                        );
                         assert_eq!(value["scrollHorizontalOffset"].as_f64(), Some(0.0));
                         assert_eq!(value["selectionCount"], 1);
                         assert_eq!(value["invocationCount"], 1);
                         if operation == DesktopControlOperation::Collapse {
-                            assert_eq!(value["expansionCount"], 1);
-                            assert_eq!(value["collapseCount"], 1);
+                            assert_eq!(
+                                value["expansionCount"], 1,
+                                "collapse expansion event count"
+                            );
+                            assert_eq!(value["collapseCount"], 1, "collapse event count");
                         }
                         break;
                     }
@@ -4692,8 +6014,871 @@ mod tests {
                     .is_err(),
                 "all refs must be renewed after an operation"
             );
+            assert!(
+                resolve_agent_confirmation_impl(&control_state, approve(Some(preview.preview_id)))
+                    .is_err(),
+                "a settled control approval must not replay"
+            );
+        }
+        assert_eq!(expected_checked_count, 1);
+        assert_eq!(expected_unchecked_count, 1);
+
+        // Change only this owned checkbox into a tri-state control. Both
+        // desired-state actions must refuse its live indeterminate state;
+        // preflight must not advance it through another Toggle cycle.
+        std::fs::write(&command_path, "checkbox-indeterminate").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let value = read_owned_fixture();
+            if value["checkboxState"] == "indeterminate" {
+                assert!(value["checkboxChecked"].is_null());
+                assert_eq!(value["checkedCount"], 1);
+                assert_eq!(value["uncheckedCount"], 1);
+                assert_eq!(value["indeterminateCount"], 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture tri-state change not observed"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        for operation in [
+            DesktopControlOperation::Check,
+            DesktopControlOperation::Uncheck,
+        ] {
+            let control_state = make_state();
+            let observation = control_state
+                .desktop_adapter
+                .observe_trusted_window("draft-app", executable.to_str().unwrap())
+                .unwrap();
+            assert!(!observation.truncated);
+            let reference = observation
+                .controls
+                .iter()
+                .find(|control| control.automation_id.as_deref() == Some("fixtureCheckbox"))
+                .unwrap()
+                .control_ref
+                .as_ref()
+                .expect("named enabled checkbox must retain its observed identity");
+            control_state.db.lock().unwrap().execute(
+                "UPDATE agent_steps SET tool_name = 'operate_trusted_app_control', tool_input = ?1,
+                 tool_output = 'Confirmation required before executing side-effect tool ''operate_trusted_app_control''.' WHERE id = 'call-1'",
+                params![serde_json::json!({"app_id":"draft-app","control_ref":reference,"action":operation}).to_string()],
+            ).unwrap();
+            assert!(
+                preflight_pending_desktop_action_impl(&control_state, "s1", "msg-1", "call-1")
+                    .is_err()
+            );
+            assert!(resolve_agent_confirmation_impl(&control_state, approve(None)).is_err());
+            let value = read_owned_fixture();
+            assert_eq!(value["checkboxState"], "indeterminate");
+            assert!(value["checkboxChecked"].is_null());
+            assert_eq!(value["checkedCount"], 1);
+            assert_eq!(value["uncheckedCount"], 1);
+            assert_eq!(value["indeterminateCount"], 1);
         }
         wait_for_fixture(false, &text);
+
+        // A dense window cannot issue action refs from a partial root scan.
+        // A complete bounded region can, even with the same IDs elsewhere.
+        let legacy = read_owned_fixture();
+        assert_eq!(legacy["scrollCount"], 2);
+        assert_eq!(legacy["scrollOffset"].as_f64(), Some(0.0));
+        assert_eq!(legacy["scrollHorizontalOffset"].as_f64(), Some(0.0));
+        assert!(legacy["scrollableHeight"].as_f64().unwrap() > 0.0);
+        // Reuse this owned fixture and the production approval path for common
+        // dropdown/list patterns. No additional application grant is introduced.
+        std::fs::write(&command_path, "choices").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_owned_fixture()["choicesReady"] != true {
+            assert!(Instant::now() < deadline, "choice controls not ready");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        for (operation, label) in [
+            (DesktopControlOperation::Expand, "Fixture choices"),
+            (DesktopControlOperation::Expand, "Fixture choices"),
+            (DesktopControlOperation::Collapse, "Fixture choices"),
+            (DesktopControlOperation::Collapse, "Fixture choices"),
+            (DesktopControlOperation::Select, "Fixture second option"),
+            (DesktopControlOperation::Select, "Fixture second option"),
+            (DesktopControlOperation::Choose, "Fixture choices"),
+            (DesktopControlOperation::Choose, "Fixture choices"),
+        ] {
+            let choice_state = make_state();
+            let observe = |labels| {
+                choice_state
+                    .desktop_adapter
+                    .observe_trusted_window_with_control(
+                        "draft-app",
+                        executable.to_str().unwrap(),
+                        None,
+                        labels,
+                        &|| false,
+                        Duration::from_secs(8),
+                    )
+                    .unwrap()
+            };
+            let hidden = observe(false);
+            assert!(!hidden.truncated);
+            for control in hidden
+                .controls
+                .iter()
+                .filter(|control| matches!(control.role.as_str(), "comboBox" | "listItem"))
+            {
+                assert!(control.name.is_none());
+                assert!(control.control_ref.is_none());
+                assert!(control
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.selection_container_role.as_deref())
+                    .is_none());
+            }
+            let observed = observe(true);
+            assert!(!observed.truncated);
+            assert!(
+                observed.controls.iter().any(|control| {
+                    control.name.as_deref() == Some("Combo option two")
+                        && control
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.selection_container_role.as_deref())
+                            == Some("list")
+                }),
+                "the same-name ListBox item must not be mistaken for this ComboBox's option"
+            );
+            // A provider may expose a metadata-only alias with the same Name.
+            // Use the public operation capability and fresh reference, never
+            // the first matching label; ambiguous actionable items still fail.
+            let capability = if operation == DesktopControlOperation::Choose {
+                "selectOption"
+            } else if operation == DesktopControlOperation::Select {
+                "select"
+            } else {
+                "expandCollapse"
+            };
+            let candidates = observed
+                .controls
+                .iter()
+                .filter(|control| {
+                    control.name.as_deref() == Some(label)
+                        && control.control_ref.is_some()
+                        && control.capabilities.iter().any(|c| c == capability)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "expected one actionable choice {label:?}: {observed:?}"
+            );
+            let control = candidates[0];
+            assert_eq!(
+                control.role,
+                if operation == DesktopControlOperation::Select {
+                    "listItem"
+                } else {
+                    "comboBox"
+                }
+            );
+            let reference = control
+                .control_ref
+                .as_ref()
+                .expect("fresh named choice ref");
+            let mut choice_arguments = serde_json::json!({"app_id":"draft-app","control_ref":reference,"action":operation});
+            if operation == DesktopControlOperation::Choose {
+                choice_arguments["option"] = serde_json::json!("Combo option two");
+            }
+            choice_state.db.lock().unwrap().execute(
+                "UPDATE agent_steps SET tool_name='operate_trusted_app_control',tool_input=?1,
+                    tool_output='Confirmation required before executing side-effect tool ''operate_trusted_app_control''.' WHERE id='call-1'",
+                params![choice_arguments.to_string()],
+            ).unwrap();
+            let preview =
+                preflight_pending_desktop_action_impl(&choice_state, "s1", "msg-1", "call-1")
+                    .unwrap();
+            assert_eq!(preview.control_name.as_deref(), Some(label));
+            assert_eq!(preview.operation, operation.as_str());
+            if operation == DesktopControlOperation::Choose {
+                assert_eq!(preview.option.as_deref(), Some("Combo option two"));
+            }
+            let result = resolve_agent_confirmation_impl(
+                &choice_state,
+                approve(Some(preview.preview_id.clone())),
+            )
+            .unwrap();
+            assert!(result.success, "{}", result.output);
+            let receipt: serde_json::Value = serde_json::from_str(
+                result
+                    .output
+                    .strip_prefix("Confirmation approved: ")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["status"], "verified");
+            let after = read_owned_fixture();
+            // Selection may close a provider's dropdown; an explicit collapse
+            // below verifies its final state without assuming that behaviour.
+            if operation != DesktopControlOperation::Choose {
+                assert_eq!(
+                    after["choicesExpanded"],
+                    operation == DesktopControlOperation::Expand
+                );
+            }
+            if matches!(
+                operation,
+                DesktopControlOperation::Select | DesktopControlOperation::Choose
+            ) {
+                assert_eq!(after["choicesSelected"], true);
+                if operation == DesktopControlOperation::Choose {
+                    assert_eq!(
+                        receipt["choice"],
+                        serde_json::json!({"controlName":"Fixture choices","option":"Combo option two","expanded":false})
+                    );
+                    assert_eq!(after["choicesComboSelected"], true);
+                    assert_eq!(after["choicesComboSelectionCount"], 1);
+                    assert_eq!(after["choicesExpanded"], false);
+                }
+            }
+            assert!(resolve_agent_confirmation_impl(
+                &choice_state,
+                approve(Some(preview.preview_id))
+            )
+            .is_err());
+            assert!(choice_state
+                .desktop_adapter
+                .preflight_control_ref(
+                    "draft-app",
+                    executable.to_str().unwrap(),
+                    reference,
+                    operation,
+                    Duration::from_secs(8)
+                )
+                .is_err());
+        }
+        let choices = read_owned_fixture();
+        assert_eq!(choices["choicesExpansionCount"], 3);
+        assert_eq!(choices["choicesCollapseCount"], 3);
+        assert_eq!(choices["choicesSelectionCount"], 1);
+        assert_eq!(choices["choicesComboSelected"], true);
+        assert_eq!(choices["choicesComboSelectionCount"], 1);
+        std::fs::write(&command_path, "dense").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_owned_fixture()["denseMode"] != true {
+            assert!(
+                Instant::now() < deadline,
+                "fixture dense regions not observed"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let observe_region_a = |state: &AppState| {
+            let root = state
+                .desktop_adapter
+                .observe_trusted_window("draft-app", executable.to_str().unwrap())
+                .unwrap();
+            assert!(
+                root.truncated,
+                "48 dense controls must exceed the unchanged root budget"
+            );
+            assert!(root.region_ref.is_none());
+            assert!(root
+                .controls
+                .iter()
+                .all(|control| control.field_ref.is_none() && control.control_ref.is_none()));
+            assert_eq!(root.regions.len(), 4);
+            for suffix in ["A", "B", "C", "D"] {
+                assert!(root
+                    .regions
+                    .iter()
+                    .any(|region| region.name == format!("Fixture region {suffix}")
+                        && region.region_ref.is_some()));
+            }
+            let region_ref = root
+                .regions
+                .iter()
+                .find(|region| region.name == "Fixture region A")
+                .unwrap()
+                .region_ref
+                .as_deref()
+                .unwrap();
+            let scoped = state
+                .desktop_adapter
+                .observe_trusted_window_with_control(
+                    "draft-app",
+                    executable.to_str().unwrap(),
+                    Some(region_ref),
+                    false,
+                    &|| false,
+                    Duration::from_secs(8),
+                )
+                .unwrap();
+            assert!(
+                !scoped.truncated,
+                "one dense group must fit the unchanged scope budget: {} controls, {} regions, {:?}",
+                scoped.controls.len(), scoped.regions.len(), scoped.diagnostics
+            );
+            assert_eq!(scoped.region_ref.as_deref(), Some(region_ref));
+            assert_eq!(
+                scoped
+                    .controls
+                    .iter()
+                    .filter(|control| control.automation_id.as_deref() == Some("regionField"))
+                    .count(),
+                1
+            );
+            let serialized = serde_json::to_string(&scoped).unwrap();
+            for private_value in [
+                "region-A-seed",
+                "region-B-seed",
+                "region-C-seed",
+                "region-D-seed",
+            ] {
+                assert!(
+                    !serialized.contains(private_value),
+                    "scoped observation leaked a field value"
+                );
+            }
+            scoped
+        };
+        let wait_for_dense = |expected_text: &str, changes: u64, checked: bool, swapped: bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let value = read_owned_fixture();
+                if value["denseFieldValues"][0].as_str() == Some(expected_text)
+                    && value["denseFieldChangeCounts"][0].as_u64() == Some(changes)
+                    && value["denseChecked"][0].as_bool() == Some(checked)
+                    && value["denseSwapped"].as_bool() == Some(swapped)
+                {
+                    assert_eq!(
+                        value["denseFieldValues"],
+                        serde_json::json!([
+                            expected_text,
+                            "region-B-seed",
+                            "region-C-seed",
+                            "region-D-seed"
+                        ])
+                    );
+                    assert_eq!(
+                        value["denseFieldChangeCounts"],
+                        serde_json::json!([changes, 0, 0, 0])
+                    );
+                    assert_eq!(
+                        value["denseChecked"],
+                        serde_json::json!([checked, false, false, false])
+                    );
+                    assert_eq!(
+                        value["denseCheckedCounts"],
+                        serde_json::json!([if checked { 1 } else { 0 }, 0, 0, 0])
+                    );
+                    assert_eq!(
+                        value["denseUncheckedCounts"],
+                        serde_json::json!([0, 0, 0, 0])
+                    );
+                    assert_eq!(
+                        value["denseButtonInvocationCounts"],
+                        serde_json::json!([0, 0, 0, 0])
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned dense region readback timed out"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        wait_for_dense("region-A-seed", 0, false, false);
+        for (index, pending_text) in [
+            "Region A confirmed — 中文",
+            "Region A moved — 中文",
+            "Region A moved — 中文",
+            "",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let state = make_state();
+            let scoped = observe_region_a(&state);
+            let field_ref = scoped
+                .controls
+                .iter()
+                .find(|control| control.automation_id.as_deref() == Some("regionField"))
+                .unwrap()
+                .field_ref
+                .as_deref()
+                .expect("complete region must issue a field ref");
+            state.db.lock().unwrap().execute(
+                "UPDATE agent_steps SET tool_name = 'set_trusted_app_text', tool_input = ?1,
+                 tool_output = 'Confirmation required before executing side-effect tool ''set_trusted_app_text''.' WHERE id = 'call-1'",
+                params![serde_json::json!({"app_id":"draft-app","field_ref":field_ref,"text":pending_text}).to_string()],
+            ).unwrap();
+            let preview =
+                preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+            assert_eq!(preview.text.as_deref(), Some(pending_text));
+            assert!(preview
+                .control_name
+                .as_deref()
+                .unwrap()
+                .contains("Fixture region A"));
+            assert!(preview
+                .control_name
+                .as_deref()
+                .unwrap()
+                .contains("regionField"));
+            if index == 1 {
+                std::fs::write(&command_path, "dense-swap").unwrap();
+                wait_for_dense("Region A confirmed — 中文", 1, true, true);
+            }
+            let receipt =
+                resolve_agent_confirmation_impl(&state, approve(Some(preview.preview_id))).unwrap();
+            if index == 1 {
+                assert!(!receipt.success);
+                assert!(
+                    receipt.output.contains("TARGET_CHANGED"),
+                    "{}",
+                    receipt.output
+                );
+                wait_for_dense("Region A confirmed — 中文", 1, true, true);
+                continue;
+            }
+            assert!(receipt.success, "{}", receipt.output);
+            let output: serde_json::Value = serde_json::from_str(
+                receipt
+                    .output
+                    .strip_prefix("Confirmation approved: ")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output["status"], "verified");
+            wait_for_dense(
+                pending_text,
+                if index == 0 {
+                    1
+                } else if index == 3 {
+                    3
+                } else {
+                    2
+                },
+                index != 0,
+                index != 0,
+            );
+            assert!(state
+                .desktop_adapter
+                .preflight_text_ref(
+                    "draft-app",
+                    executable.to_str().unwrap(),
+                    field_ref,
+                    Duration::from_secs(8)
+                )
+                .is_err());
+            if index == 0 {
+                let state = make_state();
+                let scoped = observe_region_a(&state);
+                let control_ref = scoped
+                    .controls
+                    .iter()
+                    .find(|control| control.automation_id.as_deref() == Some("regionCheckbox"))
+                    .unwrap()
+                    .control_ref
+                    .as_deref()
+                    .expect("complete region must issue a checkbox ref");
+                state.db.lock().unwrap().execute(
+                    "UPDATE agent_steps SET tool_name = 'operate_trusted_app_control', tool_input = ?1,
+                     tool_output = 'Confirmation required before executing side-effect tool ''operate_trusted_app_control''.' WHERE id = 'call-1'",
+                    params![serde_json::json!({"app_id":"draft-app","control_ref":control_ref,"action":"check"}).to_string()],
+                ).unwrap();
+                let preview =
+                    preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+                assert_eq!(preview.operation, "check");
+                assert!(preview
+                    .control_name
+                    .as_deref()
+                    .unwrap()
+                    .contains("Fixture region A"));
+                assert!(preview
+                    .control_name
+                    .as_deref()
+                    .unwrap()
+                    .contains("Region checkbox"));
+                let receipt =
+                    resolve_agent_confirmation_impl(&state, approve(Some(preview.preview_id)))
+                        .unwrap();
+                assert!(receipt.success, "{}", receipt.output);
+                wait_for_dense(pending_text, 1, true, false);
+            }
+        }
+        // A verified desired-state receipt must agree with a fresh observation
+        // of the same region, even after its duplicate-ID sibling moved.
+        let state = make_state();
+        let scoped = observe_region_a(&state);
+        let checkbox = scoped
+            .controls
+            .iter()
+            .find(|control| control.automation_id.as_deref() == Some("regionCheckbox"))
+            .unwrap();
+        assert_eq!(
+            checkbox.state.as_ref().and_then(|state| state.toggle),
+            Some(crate::desktop_control::DesktopToggleState::On)
+        );
+        state.db.lock().unwrap().execute(
+            "UPDATE agent_steps SET tool_name = 'operate_trusted_app_control', tool_input = ?1,
+             tool_output = 'Confirmation required before executing side-effect tool ''operate_trusted_app_control''.' WHERE id = 'call-1'",
+            params![serde_json::json!({"app_id":"draft-app","control_ref":checkbox.control_ref.as_deref().unwrap(),"action":"uncheck"}).to_string()],
+        ).unwrap();
+        let preview =
+            preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+        assert_eq!(preview.operation, "uncheck");
+        let receipt =
+            resolve_agent_confirmation_impl(&state, approve(Some(preview.preview_id))).unwrap();
+        assert!(receipt.success, "{}", receipt.output);
+        let output: serde_json::Value = serde_json::from_str(
+            receipt
+                .output
+                .strip_prefix("Confirmation approved: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["status"], "verified");
+        assert_eq!(output["action"], "uncheck");
+        let value = read_owned_fixture();
+        assert_eq!(
+            value["denseChecked"],
+            serde_json::json!([false, false, false, false])
+        );
+        assert_eq!(value["denseCheckedCounts"], serde_json::json!([1, 0, 0, 0]));
+        assert_eq!(
+            value["denseUncheckedCounts"],
+            serde_json::json!([1, 0, 0, 0])
+        );
+        let observed = observe_region_a(&state);
+        let checkbox = observed
+            .controls
+            .iter()
+            .find(|control| control.automation_id.as_deref() == Some("regionCheckbox"))
+            .unwrap();
+        assert_eq!(
+            checkbox.state.as_ref().and_then(|state| state.toggle),
+            Some(crate::desktop_control::DesktopToggleState::Off),
+            "fresh scoped observation disagrees with the verified uncheck receipt"
+        );
+        wait_for_fixture(false, &text);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit owned pixel click; scripts/native_uia_smoke.py --visual-click and foreground time required"]
+    fn native_visual_click_fixture_confirmation() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let (runner, executable, snapshot, pid, title) = native_uia_fixture_parameters();
+        let target = crate::desktop_control::capture_target_probe(
+            runner.to_str().unwrap(),
+            &|| false,
+            Duration::from_secs(8),
+        )
+        .unwrap();
+        assert_eq!(target.process_id, pid);
+        println!("Waiting for user activation of the owned visual-click fixture; no input is sent while another app is foreground.");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while unsafe { GetForegroundWindow() } != target.window_handle as _ {
+            assert!(
+                Instant::now() < deadline,
+                "Owned fixture was not activated; no visual input sent"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let baseline = read_native_uia_fixture(&snapshot, pid, &title);
+        let adapter = crate::desktop_control::create_runtime_adapter();
+        let source = adapter
+            .capture_trusted_window_with_control(
+                "draft-app",
+                executable.to_str().unwrap(),
+                &|| false,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let reference = source
+            .image_ref()
+            .expect("Current unscaled capture must have an exact image reference");
+        let mut reader = png::Decoder::new(source.png_bytes()).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let frame = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(frame.color_type, png::ColorType::Rgba);
+        let (mut left, mut top, mut right, mut bottom) = (frame.width, frame.height, 0, 0);
+        let mut count = 0;
+        for (index, pixel) in pixels[..frame.buffer_size()].chunks_exact(4).enumerate() {
+            if pixel[3] == 255
+                && pixel[..3]
+                    .iter()
+                    .zip([7u8, 59, 173])
+                    .all(|(v, expected)| v.abs_diff(expected) <= 1)
+            {
+                let x = index as u32 % frame.width;
+                let y = index as u32 / frame.width;
+                left = left.min(x);
+                right = right.max(x);
+                top = top.min(y);
+                bottom = bottom.max(y);
+                count += 1;
+            }
+        }
+        assert!(
+            count >= 16 && right - left < 100 && bottom - top < 100,
+            "Owned pixel canary must be unique and bounded"
+        );
+        let (x, y) = ((left + right) / 2, (top + bottom) / 2);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _) = setup_draft_confirmation_state(dir.path());
+        state.desktop_adapter = adapter;
+        let input =
+            serde_json::json!({"app_id":"draft-app","image_ref":reference.image_ref,"x":x,"y":y});
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("UPDATE desktop_trusted_apps SET executable_path=?1, capabilities='[\"observe\",\"observeImage\",\"interact\"]' WHERE id='draft-app'",[executable.to_str().unwrap()]).unwrap();
+            db.execute("UPDATE agent_steps SET tool_name='click_trusted_app_image',tool_input=?1,tool_output='Confirmation required before executing side-effect tool' WHERE id='call-1'",[input.to_string()]).unwrap();
+        }
+        let preview =
+            preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+        assert_eq!(preview.operation, "imageclick");
+        assert!(preview.image.is_some());
+        let preview_id = preview.preview_id.clone();
+        let receipt = resolve_agent_confirmation_impl(
+            &state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: "approved".into(),
+                preview_id: Some(preview_id.clone()),
+            },
+        )
+        .unwrap();
+        assert!(receipt.success, "{}", receipt.output);
+        assert!(receipt.output.contains("dispatched"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let observed = read_native_uia_fixture(&snapshot, pid, &title);
+            if observed["visualClickCount"].as_u64()
+                == Some(baseline["visualClickCount"].as_u64().unwrap() + 1)
+            {
+                assert_eq!(
+                    observed["visualClickAtCenter"], true,
+                    "Input did not reach the pixel canary's center"
+                );
+                for key in [
+                    "invocationCount",
+                    "selectionCount",
+                    "checkedCount",
+                    "keyDownCount",
+                    "mouseWheelCount",
+                    "denseButtonInvocationCounts",
+                    "denseFieldChangeCounts",
+                ] {
+                    assert_eq!(observed[key], baseline[key], "unrequested effect: {key}");
+                }
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "No independent pixel click receipt"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(resolve_agent_confirmation_impl(
+            &state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: "approved".into(),
+                preview_id: Some(preview_id)
+            }
+        )
+        .is_err());
+        let report = serde_json::json!({"status":"passed","provider":"synthetic-no-model","clicks":1,"centerVerified":true,"sameConfirmationReplayDenied":true,"width":frame.width,"height":frame.height});
+        std::fs::write(
+            snapshot.parent().unwrap().join("visual-click-report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires scripts/native_uia_smoke.py and its owned interactive WPF fixture"]
+    fn native_uia_fixture_capture() {
+        let (runner_executable, executable, snapshot, process_id, title) =
+            native_uia_fixture_parameters();
+        let read_owned_fixture = || read_native_uia_fixture(&snapshot, process_id, &title);
+        assert_eq!(read_owned_fixture()["denseMode"], true);
+
+        // The libtest executable cannot enter the production helper's main.
+        // The runner builds an isolated capture helper before this owned
+        // fixture starts; only this opt-in test reads its explicit path.
+        let capture_binary = std::fs::canonicalize(
+            std::env::var_os("ANGELBOT_NATIVE_UIA_CAPTURE_EXE")
+                .expect("run via scripts/native_uia_smoke.py"),
+        )
+        .unwrap();
+        assert_eq!(capture_binary.file_name().unwrap(), "angelbot.exe");
+        assert_ne!(capture_binary, std::env::current_exe().unwrap());
+        // The private probe expects a process-comparison path, not Rust's
+        // verbatim canonical Windows spelling. The production adapter already
+        // performs this conversion; the runner supplies the original spelling.
+        assert_eq!(
+            std::fs::canonicalize(&runner_executable).unwrap(),
+            executable
+        );
+        let target = crate::desktop_control::capture_target_probe(
+            runner_executable.to_str().unwrap(),
+            &|| false,
+            Duration::from_secs(8),
+        )
+        .unwrap();
+        assert_eq!(target.process_id, process_id);
+        assert_eq!(
+            std::fs::canonicalize(&target.executable_path).unwrap(),
+            executable
+        );
+        let before_capture = read_owned_fixture();
+        let run_capture_helper = |target: &crate::window_capture::CaptureTarget| {
+            use std::process::{Command, Stdio};
+            let mut command = Command::new(&capture_binary);
+            crate::child_process_env::apply_minimal_child_environment(&mut command);
+            command
+                .arg("--angelbot-window-capture-helper-v1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // This existing host creates a hidden, bounded process-tree job,
+            // drains pipes and reaps the helper and descendants on every exit.
+            crate::window_capture::run_bounded_child(
+                &mut command,
+                Some(serde_json::to_vec(target).unwrap()),
+                crate::window_capture::MAX_PNG_BYTES,
+                &|| false,
+                Duration::from_secs(8),
+            )
+            .unwrap()
+        };
+        let captured = run_capture_helper(&target);
+        let failure_code = crate::window_capture::helper_failure(&captured.stderr).code;
+        assert!(
+            captured.status.success(),
+            "owned native WGC helper did not return a PNG: {failure_code}"
+        );
+        assert!(captured.stderr.is_empty());
+        assert!(!captured.stdout.is_empty());
+        assert!(captured.stdout.len() <= crate::window_capture::MAX_PNG_BYTES);
+        let mut reader = png::Decoder::new(std::io::Cursor::new(&captured.stdout))
+            .read_info()
+            .unwrap();
+        let (width, height) = (reader.info().width, reader.info().height);
+        assert!(width > 0 && height > 0 && width <= 2048 && height <= 2048);
+        assert!(u64::from(width) * u64::from(height) <= 4 * 1024 * 1024);
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        assert_eq!(reader.info().bit_depth, png::BitDepth::Eight);
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let frame = reader.next_frame(&mut pixels).unwrap();
+        let pixels = &pixels[..frame.buffer_size()];
+        crate::window_capture::validate_visible_pixels(pixels).unwrap();
+        let marker_counts = [[17_u8, 201, 221], [239_u8, 31, 177]].map(|marker| {
+            pixels
+                .chunks_exact(4)
+                .filter(|pixel| {
+                    pixel[3] == 255
+                        && pixel[..3]
+                            .iter()
+                            .zip(marker.iter())
+                            .all(|(channel, expected)| channel.abs_diff(*expected) <= 3)
+                })
+                .count()
+        });
+        assert!(
+            marker_counts.iter().all(|count| *count >= 32),
+            "both owned opaque group colors must be captured; counts={marker_counts:?}"
+        );
+
+        let mut wrong_pid = target.clone();
+        wrong_pid.process_id = if target.process_id == u32::MAX {
+            1
+        } else {
+            target.process_id + 1
+        };
+        let rejected = run_capture_helper(&wrong_pid);
+        assert!(!rejected.status.success());
+        assert!(
+            rejected.stdout.is_empty(),
+            "wrong-PID capture must return no pixels"
+        );
+        assert_eq!(
+            std::str::from_utf8(&rejected.stderr).unwrap().trim(),
+            "TARGET_CHANGED"
+        );
+        // Only the fixture itself changes its window state. Capture must not
+        // restore a minimized window or misreport it as an identity change.
+        let command_path = snapshot.with_extension("command");
+        let set_window_state = |command: &str, expected: &str| {
+            std::fs::write(&command_path, command).unwrap();
+            let started = Instant::now();
+            while read_owned_fixture()["windowState"] != expected {
+                assert!(started.elapsed() < Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        set_window_state("minimize", "Minimized");
+        let minimized = run_capture_helper(&target);
+        assert!(!minimized.status.success());
+        assert!(minimized.stdout.is_empty());
+        assert_eq!(
+            std::str::from_utf8(&minimized.stderr).unwrap().trim(),
+            "TARGET_MINIMIZED"
+        );
+        assert_eq!(read_owned_fixture()["windowState"], "Minimized");
+        let probe_failure = crate::desktop_control::capture_target_probe(
+            runner_executable.to_str().unwrap(),
+            &|| false,
+            Duration::from_secs(8),
+        )
+        .err()
+        .expect("the production target probe must also reject minimized windows");
+        assert_eq!(probe_failure.code, "TARGET_MINIMIZED");
+        set_window_state("restore", "Normal");
+        let restored = run_capture_helper(&target);
+        assert!(restored.status.success());
+        assert!(restored.stderr.is_empty());
+        let restored = png::Decoder::new(std::io::Cursor::new(restored.stdout))
+            .read_info()
+            .unwrap();
+        assert_eq!(
+            (restored.info().width, restored.info().height),
+            (width, height)
+        );
+        let after_capture = read_owned_fixture();
+        for key in [
+            "ordinaryValue",
+            "ordinaryReadOnly",
+            "readOnlyValue",
+            "duplicateOneValue",
+            "duplicateTwoValue",
+            "passwordUnchanged",
+            "denseFieldValues",
+            "denseFieldChangeCounts",
+            "denseChecked",
+            "denseCheckedCounts",
+            "denseUncheckedCounts",
+            "denseButtonInvocationCounts",
+            "invocationCount",
+            "selectionCount",
+            "checkedCount",
+            "uncheckedCount",
+            "indeterminateCount",
+            "expansionCount",
+            "collapseCount",
+        ] {
+            assert_eq!(
+                after_capture[key], before_capture[key],
+                "capture must not change owned controls"
+            );
+        }
     }
 
     #[test]
@@ -4717,7 +6902,7 @@ mod tests {
             preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
         assert_eq!(preview.text.as_deref(), Some("exact pending draft"));
         assert_eq!(preview.app_display_name, "Draft App");
-        assert_eq!(preview.control_name, "Message editor");
+        assert_eq!(preview.control_name.as_deref(), Some("Message editor"));
         assert!(mock.actions().is_empty(), "preflight must not write");
 
         let result = resolve_agent_confirmation_impl(
@@ -4860,6 +7045,21 @@ mod tests {
                 "mockOption",
             ),
             (
+                DesktopControlOperation::Choose,
+                "mock-choice-ref",
+                "mockChoice",
+            ),
+            (
+                DesktopControlOperation::Check,
+                "mock-toggle-ref",
+                "Test checkbox",
+            ),
+            (
+                DesktopControlOperation::Uncheck,
+                "mock-toggle-ref",
+                "Test checkbox",
+            ),
+            (
                 DesktopControlOperation::Expand,
                 "mock-expand-ref",
                 "mockMenu",
@@ -4884,7 +7084,9 @@ mod tests {
             let (state, mock) = setup_control_confirmation_state(dir.path());
             if matches!(
                 operation,
-                DesktopControlOperation::ScrollDown | DesktopControlOperation::ScrollUp
+                DesktopControlOperation::ScrollDown
+                    | DesktopControlOperation::ScrollUp
+                    | DesktopControlOperation::Choose
             ) {
                 let conn = state.db.lock().unwrap();
                 conn.execute_batch(
@@ -4901,10 +7103,19 @@ mod tests {
                     "full_access"
                 );
             }
-            state.db.lock().unwrap().execute(
-            "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
-            params![serde_json::json!({"app_id":"draft-app","control_ref":reference,"action":operation}).to_string()],
-        ).unwrap();
+            let mut arguments = serde_json::json!({"app_id":"draft-app","control_ref":reference,"action":operation});
+            if operation == DesktopControlOperation::Choose {
+                arguments["option"] = serde_json::json!("Second option");
+            }
+            state
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                    params![arguments.to_string()],
+                )
+                .unwrap();
             let request = |preview_id| ResolveAgentConfirmationRequest {
                 session_id: "s1".into(),
                 message_id: "msg-1".into(),
@@ -4917,8 +7128,16 @@ mod tests {
             let preview =
                 preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
             assert_eq!(preview.operation, operation.as_str());
-            assert_eq!(preview.control_name, label);
+            assert_eq!(preview.control_name.as_deref(), Some(label));
             assert!(preview.text.is_none());
+            assert_eq!(
+                preview.option.as_deref(),
+                if operation == DesktopControlOperation::Choose {
+                    Some("Second option")
+                } else {
+                    None
+                }
+            );
             let displayed = serde_json::to_string(&preview).unwrap();
             assert!(!displayed.contains(reference));
             assert!(!displayed.contains("runtimeId"));
@@ -4969,6 +7188,8 @@ mod tests {
             "changed",
             "changed_action",
             "changed_scroll_direction",
+            "changed_check_action",
+            "changed_choice_option",
             "revoked",
             "replaced",
             "revoke_restore",
@@ -4976,10 +7197,22 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (state, mock) = setup_control_confirmation_state(dir.path());
+            if scenario == "changed_choice_option" {
+                state.db.lock().unwrap().execute(
+                    "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                    params![serde_json::json!({"app_id":"draft-app","control_ref":"mock-choice-ref","action":"choose","option":"Approved option"}).to_string()],
+                ).unwrap();
+            }
             if scenario == "changed_scroll_direction" {
                 state.db.lock().unwrap().execute(
                     "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
                     params![serde_json::json!({"app_id":"draft-app","control_ref":"mock-scroll-ref","action":"scrolldown"}).to_string()],
+                ).unwrap();
+            }
+            if scenario == "changed_check_action" {
+                state.db.lock().unwrap().execute(
+                    "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                    params![serde_json::json!({"app_id":"draft-app","control_ref":"mock-toggle-ref","action":"check"}).to_string()],
                 ).unwrap();
             }
             if matches!(
@@ -5037,6 +7270,18 @@ mod tests {
                         state.db.lock().unwrap().execute(
                             "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
                             params![serde_json::json!({"app_id":"draft-app","control_ref":"mock-scroll-ref","action":"scrollup"}).to_string()],
+                        ).unwrap();
+                    }
+                    "changed_check_action" => {
+                        state.db.lock().unwrap().execute(
+                            "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                            params![serde_json::json!({"app_id":"draft-app","control_ref":"mock-toggle-ref","action":"uncheck"}).to_string()],
+                        ).unwrap();
+                    }
+                    "changed_choice_option" => {
+                        state.db.lock().unwrap().execute(
+                            "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                            params![serde_json::json!({"app_id":"draft-app","control_ref":"mock-choice-ref","action":"choose","option":"Different option"}).to_string()],
                         ).unwrap();
                     }
                     "revoked" => {
@@ -5103,53 +7348,205 @@ mod tests {
     }
 
     #[test]
-    fn trusted_field_write_uses_observed_ref_and_backend_preview_not_model_target() {
+    fn busy_desktop_confirmation_requires_new_preview_without_settling_or_replaying() {
         let dir = tempfile::tempdir().unwrap();
         let (state, mock) = setup_field_confirmation_state(dir.path());
-        let missing = resolve_agent_confirmation_impl(
-            &state,
-            ResolveAgentConfirmationRequest {
-                session_id: "s1".into(),
-                message_id: "msg-1".into(),
-                call_id: "call-1".into(),
-                decision: "approved".into(),
-                preview_id: None,
-            },
-        );
-        assert!(missing.is_err());
-        assert!(mock.actions().is_empty());
-
         let preview =
             preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
-        assert_eq!(preview.operation, "field");
-        assert_eq!(preview.control_name, "mockField");
-        assert_eq!(preview.text.as_deref(), Some("exact field value"));
+        let request = |preview_id: String| ResolveAgentConfirmationRequest {
+            session_id: "s1".into(),
+            message_id: "msg-1".into(),
+            call_id: "call-1".into(),
+            decision: "approved".into(),
+            preview_id: Some(preview_id),
+        };
+        mock.fail_next_action_before_dispatch(crate::desktop_control::DesktopAdapterError::new(
+            "TARGET_BUSY",
+            "another operation owns the gate",
+        ));
+        let error = resolve_agent_confirmation_impl(&state, request(preview.preview_id.clone()))
+            .unwrap_err();
+        assert!(error.starts_with("TARGET_BUSY:"));
         assert!(mock.actions().is_empty());
+        assert!(
+            load_pending_confirmation(&state.db.lock().unwrap(), "s1", "msg-1", "call-1").is_ok()
+        );
+        assert!(
+            resolve_agent_confirmation_impl(&state, request(preview.preview_id)).is_err(),
+            "consumed preview cannot be replayed"
+        );
+        let fresh = preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+        assert!(
+            resolve_agent_confirmation_impl(&state, request(fresh.preview_id.clone()))
+                .unwrap()
+                .success
+        );
+        assert!(resolve_agent_confirmation_impl(&state, request(fresh.preview_id)).is_err());
+        assert_eq!(mock.actions().len(), 1);
+        for code in ["RESULT_UNKNOWN", "ADAPTER_FAILED"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, mock) = setup_field_confirmation_state(dir.path());
+            let preview =
+                preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+            mock.fail_next_action_before_dispatch(
+                crate::desktop_control::DesktopAdapterError::new(
+                    code,
+                    "not a pre-dispatch busy refusal",
+                ),
+            );
+            let receipt =
+                resolve_agent_confirmation_impl(&state, request(preview.preview_id)).unwrap();
+            assert!(!receipt.success);
+            assert!(
+                load_pending_confirmation(&state.db.lock().unwrap(), "s1", "msg-1", "call-1")
+                    .is_err(),
+                "{code} is not safe to repeat"
+            );
+        }
+    }
 
-        let result = resolve_agent_confirmation_impl(
-            &state,
-            ResolveAgentConfirmationRequest {
-                session_id: "s1".into(),
-                message_id: "msg-1".into(),
-                call_id: "call-1".into(),
-                decision: "approved".into(),
-                preview_id: Some(preview.preview_id),
-            },
-        )
-        .unwrap();
-        assert!(result.success);
-        assert!(matches!(mock.actions().as_slice(), [
+    #[test]
+    fn trusted_field_write_uses_observed_ref_and_backend_preview_not_model_target() {
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, mock) = setup_field_confirmation_state(dir.path());
+            for input in [
+                serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref"}),
+                serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref","text":null}),
+                serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref","text":false}),
+                serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref","text":"\0"}),
+                serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref","text":"x".repeat(20_001)}),
+            ] {
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                        params![input.to_string()],
+                    )
+                    .unwrap();
+                assert!(
+                    preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").is_err()
+                );
+                assert!(mock.actions().is_empty());
+            }
+            state.db.lock().unwrap().execute(
+                "UPDATE agent_steps SET tool_name = 'prepare_message_draft', tool_input = ?1 WHERE id = 'call-1'",
+                params![serde_json::json!({"app_id":"draft-app","text":""}).to_string()],
+            ).unwrap();
+            assert_eq!(
+                preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap_err(),
+                "Stored text is invalid"
+            );
+            assert!(mock.actions().is_empty());
+        }
+        for requested_text in ["exact field value", "", " \n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, mock) = setup_field_confirmation_state(dir.path());
+            state.db.lock().unwrap().execute(
+            "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+            params![serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref","text":requested_text}).to_string()],
+        ).unwrap();
+            let missing = resolve_agent_confirmation_impl(
+                &state,
+                ResolveAgentConfirmationRequest {
+                    session_id: "s1".into(),
+                    message_id: "msg-1".into(),
+                    call_id: "call-1".into(),
+                    decision: "approved".into(),
+                    preview_id: None,
+                },
+            );
+            assert!(missing.is_err());
+            assert!(mock.actions().is_empty());
+
+            let preview =
+                preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+            assert_eq!(preview.operation, "field");
+            assert_eq!(preview.control_name.as_deref(), Some("mockField"));
+            assert_eq!(preview.text.as_deref(), Some(requested_text));
+            assert!(mock.actions().is_empty());
+
+            let result = resolve_agent_confirmation_impl(
+                &state,
+                ResolveAgentConfirmationRequest {
+                    session_id: "s1".into(),
+                    message_id: "msg-1".into(),
+                    call_id: "call-1".into(),
+                    decision: "approved".into(),
+                    preview_id: Some(preview.preview_id),
+                },
+            )
+            .unwrap();
+            assert!(result.success);
+            assert!(matches!(mock.actions().as_slice(), [
             crate::desktop_control::DesktopAction::SetText {
                 app_id,
                 text,
-                expected_target: Some(_),
+                expected_target: Some(identity),
                 ..
             }
-        ] if app_id == "draft-app" && text == "exact field value"));
+        ] if app_id == "draft-app"
+            && identity.automation_id.as_deref() == Some("mock-field-ref")
+            && text == requested_text));
+        }
     }
 
     #[test]
     fn trusted_field_write_rejects_revoked_fill_or_invalid_observation_ref() {
+        for scenario in ["identity", "reference", "contentToEmpty", "emptyToContent"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, mock) = setup_field_confirmation_state(dir.path());
+            if scenario == "emptyToContent" {
+                state.db.lock().unwrap().execute(
+                    "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                    params![serde_json::json!({"app_id":"draft-app","field_ref":"mock-field-ref","text":""}).to_string()],
+                ).unwrap();
+            }
+            let preview =
+                preflight_pending_desktop_action_impl(&state, "s1", "msg-1", "call-1").unwrap();
+            assert_eq!(preview.control_name.as_deref(), Some("mockField"));
+            if scenario == "identity" {
+                let mut previews = state.desktop_action_previews.leases.lock().unwrap();
+                let DesktopActionPreviewTarget::Action(target) =
+                    &mut previews.get_mut(&preview.preview_id).unwrap().target
+                else {
+                    panic!("a field preview must bind its target");
+                };
+                target.automation_id = Some("other-field-ref".into());
+            } else {
+                let field_ref = if scenario == "reference" {
+                    "other-field-ref"
+                } else {
+                    "mock-field-ref"
+                };
+                let text = if scenario == "contentToEmpty" {
+                    ""
+                } else {
+                    "exact field value"
+                };
+                state.db.lock().unwrap().execute(
+                    "UPDATE agent_steps SET tool_input = ?1 WHERE id = 'call-1'",
+                    params![serde_json::json!({"app_id":"draft-app","field_ref":field_ref,"text":text}).to_string()],
+                ).unwrap();
+            }
+            let result = resolve_agent_confirmation_impl(
+                &state,
+                ResolveAgentConfirmationRequest {
+                    session_id: "s1".into(),
+                    message_id: "msg-1".into(),
+                    call_id: "call-1".into(),
+                    decision: "approved".into(),
+                    preview_id: Some(preview.preview_id),
+                },
+            );
+            assert!(result.is_err() || !result.unwrap().success);
+            assert!(
+                mock.actions().is_empty(),
+                "{scenario} mismatch must reject before an effect"
+            );
+        }
         let dir = tempfile::tempdir().unwrap();
         let (state, mock) = setup_field_confirmation_state(dir.path());
         {
@@ -5209,7 +7606,7 @@ mod tests {
             {
                 let mut conn = state.db.lock().unwrap();
                 let tx = conn.unchecked_transaction().unwrap();
-                arm_desktop_action_in_tx(&tx, "s1", "msg-1", "call-1", &pending).unwrap();
+                arm_confirmed_action_in_tx(&tx, "s1", "msg-1", "call-1", &pending).unwrap();
                 tx.commit().unwrap();
             }
             assert!(
@@ -5242,7 +7639,7 @@ mod tests {
             {
                 let mut conn = state.db.lock().unwrap();
                 let tx = conn.unchecked_transaction().unwrap();
-                finish_desktop_action_in_tx(
+                finish_confirmed_action_in_tx(
                     &tx,
                     "s1",
                     "msg-1",
@@ -5286,7 +7683,7 @@ mod tests {
             .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         assert!(
-            arm_desktop_action_in_tx(&tx, "s1", "msg-1", "call-1", &pending)
+            arm_confirmed_action_in_tx(&tx, "s1", "msg-1", "call-1", &pending)
                 .unwrap_err()
                 .contains("durable tool result")
         );
@@ -5296,9 +7693,24 @@ mod tests {
     }
 
     #[test]
-    fn unknown_desktop_write_blocks_continuation_after_another_approval() {
+    fn unknown_external_write_blocks_other_approvals_and_continuation() {
         let dir = tempfile::tempdir().unwrap();
-        let (state, _) = setup_field_confirmation_state(dir.path());
+        {
+            let (state, mock) = setup_field_confirmation_state(dir.path());
+            state
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE task_runs SET resumable=0 WHERE session_id='s1' AND message_id='msg-1'",
+                    [],
+                )
+                .unwrap();
+            assert!(load_pending_confirmation(&state.db.lock().unwrap(), "s1", "msg-1", "call-1").is_err(),
+                "without an unknown sibling, a non-resumable task must retain the old pending-action gate");
+            assert!(mock.actions().is_empty());
+        }
+        let (state, mock) = setup_field_confirmation_state(dir.path());
         {
             let conn = state.db.lock().unwrap();
             conn.execute_batch(
@@ -5320,28 +7732,50 @@ mod tests {
         {
             let mut conn = state.db.lock().unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            arm_desktop_action_in_tx(&tx, "s1", "msg-1", "call-1", &first).unwrap();
+            arm_confirmed_action_in_tx(&tx, "s1", "msg-1", "call-1", &first).unwrap();
             tx.commit().unwrap();
         }
-        let second =
-            load_pending_confirmation(&state.db.lock().unwrap(), "s1", "msg-1", "call-2").unwrap();
-        {
-            let mut conn = state.db.lock().unwrap();
-            let tx = conn.unchecked_transaction().unwrap();
-            settle_pending_confirmation_in_tx(
-                &tx,
-                "s1",
-                "msg-1",
-                "call-2",
-                &second,
-                true,
-                "Confirmation approved: dispatched",
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
-        let error = build_task_continuation_prompt(&state, "s1", "msg-1").unwrap_err();
+        let error = resolve_agent_confirmation_impl(
+            &state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-2".into(),
+                decision: "approved".into(),
+                preview_id: None,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("unknown result"));
+        let error = prepare_task_continuation(&state, "s1", "msg-1").unwrap_err();
+        assert!(error.contains("unknown result"));
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT resumable FROM task_runs WHERE session_id='s1' AND message_id='msg-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(mock.actions().is_empty());
+        let rejected = resolve_agent_confirmation_impl(
+            &state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-2".into(),
+                decision: "rejected".into(),
+                preview_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rejected.confirmation_status.as_deref(), Some("rejected"));
+        assert!(mock.actions().is_empty());
     }
 
     struct LiveMcpEchoServer {
@@ -5420,9 +7854,7 @@ rl.on('line', (line) => {{
         let conn = state.db.lock().unwrap();
         conn.execute_batch(
             r#"
-            ALTER TABLE sessions ADD COLUMN project_id TEXT;
-            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
-            CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+            CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, command TEXT NOT NULL DEFAULT 'node', args TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL);
             CREATE TABLE mcp_workspace_enablements (
                 workspace_id TEXT NOT NULL,
                 server_id TEXT NOT NULL,
@@ -5432,8 +7864,10 @@ rl.on('line', (line) => {{
             "#,
         )
         .unwrap();
+        conn.execute_batch(include_str!("../migrations/080_mcp_tool_catalog.sql"))
+            .unwrap();
         conn.execute(
-            "INSERT INTO projects (id, name) VALUES ('workspace-1', 'Test workspace')",
+            "INSERT INTO projects (id, name, path, kind) SELECT 'workspace-1', 'Test workspace', work_dir, 'project' FROM sessions WHERE id='s1'",
             [],
         )
         .unwrap();
@@ -5719,7 +8153,8 @@ rl.on('line', (line) => {{
         let state = setup_confirmation_state(dir.path());
         let registry =
             crate::commands::foreground_tool_surface::ForegroundToolSurface::new(&state, None)
-                .build_for_session("s1".to_string());
+                .build_for_session("s1".to_string())
+                .unwrap();
         assert!(
             registry
                 .get("materialize_delegated_change")
@@ -5765,7 +8200,8 @@ rl.on('line', (line) => {{
         let state = app_state_from_connection(conn);
         let registry =
             crate::commands::foreground_tool_surface::ForegroundToolSurface::new(&state, None)
-                .build_for_session("personal-main".to_string());
+                .build_for_session("personal-main".to_string())
+                .unwrap();
         assert!(!registry.contains("read_file"));
         assert!(!registry.contains("organize_workspace_item"));
         assert!(!registry.contains("reveal_workspace_item"));
@@ -5835,6 +8271,1089 @@ rl.on('line', (line) => {{
         assert_eq!(stored.1, "approved");
         assert_eq!(stored.2, 1);
         assert_eq!(stored.3, 1);
+        drop(conn);
+
+        let mut continuation = prepare_task_continuation(&state, "s1", "msg-1").unwrap();
+        assert_eq!(continuation.goal, "Write a file");
+        assert!(continuation.content.contains("write_file"));
+        assert!(continuation
+            .content
+            .contains("不要重复已成功或已批准的副作用"));
+        assert!(continuation
+            .content
+            .contains("\n\n原始目标：Write a file\n"));
+        assert!(!continuation.content.contains("\\n"));
+        // A new slice replaces its facts, but never turns the model-only
+        // instructions into the next durable task goal.
+        for index in 0..8 {
+            let projected = crate::commands::foreground_response_projector::project_agent_response(
+                &continuation.goal,
+                crate::agent::AgentResponse::Text("continue".into()),
+            )
+            .unwrap();
+            let facts = format!("latest confirmation {index}");
+            state.db.lock().unwrap().execute(
+                "UPDATE task_runs SET goal = ?1, continuation_context = ?2 WHERE message_id = 'msg-1'",
+                params![projected.goal, facts],
+            ).unwrap();
+            let next = prepare_task_continuation(&state, "s1", "msg-1").unwrap();
+            assert_eq!(next.goal, "Write a file");
+            assert_eq!(next.content.matches("原始目标：").count(), 1);
+            assert!(next.content.contains(&facts));
+            assert!(!next.content.contains("write_file"));
+            continuation = next;
+        }
+
+        // Stop while confirmation setup is blocked must survive preparation,
+        // not be replaced by a late mark_running immediately before execution.
+        let stopped_dir = tempfile::tempdir().unwrap();
+        let stopped_state = Arc::new(setup_confirmation_state(stopped_dir.path()));
+        let blocked_database = stopped_state.db.lock().unwrap();
+        let running_states = stopped_state.steering.control_states();
+        let resolving_state = stopped_state.clone();
+        let resolving = std::thread::spawn(move || {
+            resolve_confirmation_execution(
+                &resolving_state,
+                ResolveAgentConfirmationRequest {
+                    session_id: "s1".into(),
+                    message_id: "msg-1".into(),
+                    call_id: "call-1".into(),
+                    decision: "approved".into(),
+                    preview_id: None,
+                },
+                || {},
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Observe admission without competing for its execution slot: a probe
+        // permit could reject the resolver before it reaches the DB barrier.
+        while running_states.lock().unwrap().get("s1")
+            != Some(&crate::agent::steering::AgentControlState::Running)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        stopped_state.steering.cancellation("s1").cancel();
+        drop(blocked_database);
+        let stopped_error = resolving.join().unwrap().err().expect("must stop");
+        assert_eq!(
+            stopped_error,
+            "Confirmation stopped before executing the operation"
+        );
+        assert!(!stopped_dir.path().join("approved.txt").exists());
+        assert!(stopped_state.steering.cancellation("s1").is_cancelled());
+
+        // Ordinary confirmations must own their next slice in the backend,
+        // without a ChatArea caller or a currently selected workspace.
+        for case in [
+            "ready",
+            "cancelled",
+            "pending",
+            "unknown",
+            "stale",
+            "rejected",
+        ] {
+            let case_dir = tempfile::tempdir().unwrap();
+            let case_state = setup_confirmation_state(case_dir.path());
+            {
+                let conn = case_state.db.lock().unwrap();
+                conn.execute_batch(
+                    "ALTER TABLE sessions ADD COLUMN leaf_message_id TEXT;
+                     ALTER TABLE messages ADD COLUMN parent_id TEXT;
+                     ALTER TABLE messages ADD COLUMN is_provisional INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE messages ADD COLUMN metadata TEXT;
+                     UPDATE sessions SET leaf_message_id='msg-1' WHERE id='s1';
+                     CREATE TABLE automations (id TEXT PRIMARY KEY, executor_kind TEXT NOT NULL);
+                     CREATE TABLE automation_runs (
+                         id TEXT PRIMARY KEY, automation_id TEXT NOT NULL,
+                         supervisor_input_id TEXT, foreground_run_id TEXT,
+                         status TEXT NOT NULL, summary TEXT NOT NULL, finished_at INTEGER
+                     );
+                     INSERT INTO automations VALUES ('automation-1','agent');
+                     INSERT INTO automation_runs VALUES (
+                         'automation-run-1','automation-1','consumed-input-1','msg-1',
+                         'awaiting_confirmation','Waiting for approval',11
+                     );",
+                )
+                .unwrap();
+            }
+            let req = ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: if case == "rejected" {
+                    "rejected"
+                } else {
+                    "approved"
+                }
+                .into(),
+                preview_id: None,
+            };
+            let execution =
+                resolve_confirmation_execution(&case_state, req.clone(), || {}).unwrap();
+            match case {
+                "cancelled" => case_state.steering.cancellation("s1").cancel(),
+                "pending" | "unknown" => {
+                    let conn = case_state.db.lock().unwrap();
+                    conn.execute(
+                        "INSERT INTO agent_steps (id,session_id,tool_name,tool_output,success,seq,created_at)
+                         VALUES ('other-call','s1','write_file',?1,0,2,11)",
+                        [if case == "pending" { "Confirmation required before executing tool." } else { "RESULT_UNKNOWN" }],
+                    ).unwrap();
+                    refresh_persisted_task_run_from_steps(&conn, "s1", "msg-1", 11).unwrap();
+                }
+                "stale" => {
+                    case_state
+                        .db
+                        .lock()
+                        .unwrap()
+                        .execute_batch(
+                            "INSERT INTO messages (id,session_id,role,content,created_at,parent_id)
+                         VALUES ('newer-turn','s1','assistant','New task',12,'msg-1');
+                         UPDATE sessions SET leaf_message_id='newer-turn' WHERE id='s1';",
+                        )
+                        .unwrap();
+                }
+                "ready" | "rejected" => {}
+                _ => unreachable!(),
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let receipt = runtime
+                .block_on(complete_confirmation_execution(
+                    &case_state,
+                    None,
+                    req,
+                    execution,
+                ))
+                .unwrap();
+            assert!(
+                receipt.success == (case != "rejected"),
+                "the completed operation must not become replayable: {case}"
+            );
+            if case == "rejected" {
+                assert!(!case_dir.path().join("approved.txt").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(case_dir.path().join("approved.txt")).unwrap(),
+                    "hello"
+                );
+            }
+            let conn = case_state.db.lock().unwrap();
+            let continuations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_runs WHERE session_id='s1' AND message_id!='msg-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                continuations,
+                i64::from(case == "ready"),
+                "backend continuation: {case}"
+            );
+            if case == "ready" {
+                let next: (String, String, i32) = conn.query_row(
+                    "SELECT r.goal,m.parent_id,m.is_provisional FROM task_runs r JOIN messages m ON m.id=r.message_id WHERE r.message_id!='msg-1'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                // Missing owner/model configuration deliberately fails before
+                // any credentials/network: the failed slice must be visible.
+                assert_eq!(next, ("Write a file".into(), "msg-1".into(), 0));
+            }
+            let automation: (String, String, Option<i64>) = conn.query_row(
+                "SELECT foreground_run_id,status,finished_at FROM automation_runs WHERE id='automation-run-1'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            if case == "ready" {
+                let leaf: String = conn
+                    .query_row(
+                        "SELECT leaf_message_id FROM sessions WHERE id='s1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    automation.0, leaf,
+                    "the production reservation must move the same automation receipt"
+                );
+                assert_eq!(
+                    automation.1, "needs_attention",
+                    "the production error recovery must settle that new receipt"
+                );
+                assert!(automation.2.is_some());
+            } else {
+                assert_eq!(
+                    automation.0, "msg-1",
+                    "a blocked continuation must not move the automation receipt: {case}"
+                );
+                assert_eq!(
+                    automation.1,
+                    if case == "pending" {
+                        "awaiting_confirmation"
+                    } else {
+                        "needs_attention"
+                    }
+                );
+                assert!(automation.2.is_some());
+            }
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM automation_runs", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            drop(conn);
+            if case != "cancelled" && case != "rejected" {
+                let error = runtime
+                    .block_on(continue_agent_task_impl(
+                        &case_state,
+                        None,
+                        ContinueAgentTaskRequest {
+                            session_id: "s1".into(),
+                            message_id: "msg-1".into(),
+                        },
+                    ))
+                    .unwrap_err();
+                assert!(!error.is_empty());
+                assert_eq!(case_state.db.lock().unwrap().query_row(
+                    "SELECT COUNT(*) FROM task_runs WHERE session_id='s1' AND message_id!='msg-1'",
+                    [], |row| row.get::<_, i64>(0),
+                ).unwrap(), continuations, "a stale or blocked explicit continuation must not reserve a turn: {case}");
+            }
+            if case == "cancelled" {
+                let cancellation = ToolCancellation::new();
+                let admission = task_continuation_admission(
+                    &case_state,
+                    "s1",
+                    "msg-1",
+                    "cancelled-reply",
+                    TaskContinuationKind::Confirmed,
+                    Some(cancellation.clone()),
+                )
+                .unwrap();
+                cancellation.cancel();
+                let reserved = ForegroundRunStore::new(case_state.db.clone())
+                    .begin_with_admission(
+                        BeginForegroundTurn {
+                            session_id: "s1".into(),
+                            user_message_id: "not-a-user-turn".into(),
+                            reply_id: "cancelled-reply".into(),
+                            role: "user".into(),
+                            content: "Write a file".into(),
+                            text_attachments: Vec::new(),
+                            user_turn: ForegroundUserTurn::Preserve,
+                            now: 100,
+                        },
+                        admission,
+                    )
+                    .unwrap();
+                assert!(matches!(reserved, ForegroundRunBeginResult::Skipped));
+                assert!(case_state.steering.cancellation("s1").is_cancelled());
+                assert_eq!(
+                    case_state
+                        .db
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT COUNT(*) FROM messages WHERE id='cancelled-reply'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+            }
+            if case == "ready" {
+                let source: String = case_state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT leaf_message_id FROM sessions WHERE id='s1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let admission = task_continuation_admission(
+                    &case_state,
+                    "s1",
+                    &source,
+                    "late-reply",
+                    TaskContinuationKind::Explicit,
+                    None,
+                )
+                .unwrap();
+                case_state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "INSERT INTO messages (id,session_id,role,content,created_at)
+                     VALUES ('redirect','s1','user','Different task',100);
+                     UPDATE sessions SET leaf_message_id='redirect' WHERE id='s1';",
+                    )
+                    .unwrap();
+                let reserved = ForegroundRunStore::new(case_state.db.clone()).begin_with_admission(
+                    BeginForegroundTurn {
+                        session_id: "s1".into(),
+                        user_message_id: "not-a-user-turn".into(),
+                        reply_id: "late-reply".into(),
+                        role: "user".into(),
+                        content: "Write a file".into(),
+                        text_attachments: Vec::new(),
+                        user_turn: ForegroundUserTurn::Preserve,
+                        now: 101,
+                    },
+                    admission,
+                );
+                assert!(
+                    reserved.is_err(),
+                    "the source must be checked again inside reservation"
+                );
+                assert_eq!(
+                    case_state
+                        .db
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT COUNT(*) FROM messages WHERE id='late-reply'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+            }
+            assert!(
+                resolve_agent_confirmation_impl(
+                    &case_state,
+                    ResolveAgentConfirmationRequest {
+                        session_id: "s1".into(),
+                        message_id: "msg-1".into(),
+                        call_id: "call-1".into(),
+                        decision: "approved".into(),
+                        preview_id: None,
+                    }
+                )
+                .is_err(),
+                "a completed approval must not execute twice: {case}"
+            );
+        }
+
+        // A batch's original pending calls may outlive an image continuation.
+        // Only persisted continuation edges, not arbitrary assistant ancestry
+        // or a matching goal, authorize their next slice.
+        for (case, kind, allowed) in [
+            ("same", TaskContinuationKind::Confirmed, true),
+            ("linked", TaskContinuationKind::Confirmed, true),
+            ("linked", TaskContinuationKind::Image, true),
+            ("linked", TaskContinuationKind::Explicit, false),
+            ("unmarked", TaskContinuationKind::Confirmed, false),
+            ("unmarked", TaskContinuationKind::Image, false),
+            ("mismatch", TaskContinuationKind::Confirmed, false),
+            ("user", TaskContinuationKind::Confirmed, false),
+            ("cycle", TaskContinuationKind::Confirmed, false),
+            ("foreign", TaskContinuationKind::Confirmed, false),
+            ("broken-middle", TaskContinuationKind::Confirmed, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = setup_confirmation_state(dir.path());
+            resolve_agent_confirmation_impl(
+                &state,
+                ResolveAgentConfirmationRequest {
+                    session_id: "s1".into(),
+                    message_id: "msg-1".into(),
+                    call_id: "call-1".into(),
+                    decision: "approved".into(),
+                    preview_id: None,
+                },
+            )
+            .unwrap();
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute_batch(
+                    "ALTER TABLE sessions ADD COLUMN leaf_message_id TEXT;
+                     ALTER TABLE messages ADD COLUMN parent_id TEXT;
+                     ALTER TABLE messages ADD COLUMN is_provisional INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE messages ADD COLUMN metadata TEXT;
+                     UPDATE sessions SET leaf_message_id='msg-1' WHERE id='s1';",
+                )
+                .unwrap();
+                if case != "same" {
+                    let parent = if case == "cycle" {
+                        "child"
+                    } else if case == "broken-middle" {
+                        "middle"
+                    } else {
+                        "msg-1"
+                    };
+                    let marker = if case == "mismatch" {
+                        "other-task"
+                    } else {
+                        parent
+                    };
+                    let metadata = (case != "unmarked").then(|| {
+                        serde_json::json!({
+                            "angelbotContinuation": { "parentMessageId": marker }
+                        })
+                        .to_string()
+                    });
+                    if case == "broken-middle" {
+                        conn.execute_batch("INSERT INTO messages (id,session_id,role,content,created_at,parent_id) VALUES ('middle','s1','assistant','same goal',12,'msg-1');").unwrap();
+                    }
+                    conn.execute(
+                        "INSERT INTO messages (id,session_id,role,content,created_at,parent_id,metadata) VALUES ('child',?1,?2,'same goal',13,?3,?4)",
+                        params![if case == "foreign" { "s2" } else { "s1" }, if case == "user" { "user" } else { "assistant" }, parent, metadata],
+                    ).unwrap();
+                    conn.execute_batch(
+                        "UPDATE sessions SET leaf_message_id='child' WHERE id='s1';",
+                    )
+                    .unwrap();
+                }
+            }
+            let admission =
+                task_continuation_admission(&state, "s1", "msg-1", "next", kind, None).unwrap();
+            let result = ForegroundRunStore::new(state.db.clone()).begin_with_admission(
+                BeginForegroundTurn {
+                    session_id: "s1".into(),
+                    user_message_id: "not-a-user-turn".into(),
+                    reply_id: "next".into(),
+                    role: "user".into(),
+                    content: "Write a file".into(),
+                    text_attachments: Vec::new(),
+                    user_turn: ForegroundUserTurn::Preserve,
+                    now: 20,
+                },
+                admission,
+            );
+            assert_eq!(
+                matches!(result, Ok(ForegroundRunBeginResult::Started(_))),
+                allowed,
+                "continuation provenance: {case}"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM messages WHERE id='next'", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                i64::from(allowed)
+            );
+        }
+
+        // The same approval seam must admit argument-sensitive image reads,
+        // even though ordinary controls observation needs no confirmation.
+        let image_dir = tempfile::tempdir().unwrap();
+        let (mut image_state, _) = setup_draft_confirmation_state(image_dir.path());
+        let image_adapter =
+            Arc::new(crate::agent::handlers::desktop_handler_tests::ImageObservationAdapter::new());
+        image_state.desktop_adapter = image_adapter.clone();
+        let image_state = Arc::new(image_state);
+        {
+            let conn = image_state.db.lock().unwrap();
+            conn.execute_batch("CREATE TABLE agent_permission_grants (scope TEXT PRIMARY KEY, permission TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL);").unwrap();
+            conn.execute(
+                "UPDATE desktop_trusted_apps SET id = 'observer', capabilities = '[\"observe\",\"observeImage\"]'",
+                [],
+            ).unwrap();
+            conn.execute(
+                "UPDATE agent_steps SET tool_name = 'observe_trusted_app_window',
+                 tool_input = '{\"app_id\":\"observer\",\"mode\":\"image\"}',
+                 tool_output = 'Confirmation required before executing tool ''observe_trusted_app_window''.'
+                 WHERE id = 'call-1'",
+                [],
+            ).unwrap();
+        }
+        let release_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        image_state
+            .foreground_automation_pump
+            .defer_until_session_release("s1");
+        let occupied = image_state.steering.try_start_run("s1").unwrap();
+        let released = image_state.clone();
+        let calls = release_calls.clone();
+        let busy = resolve_confirmation_execution(
+            &image_state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: "approved".into(),
+                preview_id: None,
+            },
+            move || {
+                released
+                    .foreground_automation_pump
+                    .take_deferred_session_release("s1");
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(busy.contains("already running"));
+        assert_eq!(release_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            image_state
+                .foreground_automation_pump
+                .take_deferred_session_release("s1"),
+            "failed admission must not consume the occupied run's deferred wake"
+        );
+        drop(occupied);
+
+        image_state
+            .foreground_automation_pump
+            .defer_until_session_release("s1");
+        let released = image_state.clone();
+        let calls = release_calls.clone();
+        let missing_preview = resolve_confirmation_execution(
+            &image_state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: "approved".into(),
+                preview_id: None,
+            },
+            move || {
+                assert!(
+                    released.steering.try_start_run("s1").is_ok(),
+                    "release wake must happen after the slot is free"
+                );
+                if released
+                    .foreground_automation_pump
+                    .take_deferred_session_release("s1")
+                {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .err()
+        .expect("image approval without a trusted-app preview must be rejected before capture");
+        assert!(missing_preview.contains("Inspect"));
+        assert_eq!(release_calls.load(std::sync::atomic::Ordering::SeqCst), 1, "an acquired permit must release and wake deferred automation even when preview validation fails");
+        assert!(!image_state
+            .foreground_automation_pump
+            .take_deferred_session_release("s1"));
+        assert_eq!(
+            image_adapter
+                .capture_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let image_preview =
+            preflight_pending_desktop_action_impl(&image_state, "s1", "msg-1", "call-1").unwrap();
+        assert_eq!(image_preview.operation, "image");
+        assert_eq!(image_preview.app_display_name, "Draft App");
+        assert_eq!(image_preview.executable_name, "draft-target.exe");
+        assert!(image_preview.window_title.is_none());
+        assert!(image_preview.control_name.is_none());
+        assert!(image_preview.text.is_none());
+        let displayed = serde_json::to_value(&image_preview).unwrap();
+        assert!(displayed["windowTitle"].is_null());
+        assert!(displayed["controlName"].is_null());
+        assert!(displayed["text"].is_null());
+        for forbidden in ["executablePath", "runtimeId", "windowHandle", "iVBOR"] {
+            assert!(!displayed.to_string().contains(forbidden));
+        }
+        assert_eq!(
+            image_adapter
+                .capture_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the application scope preview must not capture pixels"
+        );
+        image_state
+            .foreground_automation_pump
+            .defer_until_session_release("s1");
+        let released = image_state.clone();
+        let calls = release_calls.clone();
+        let image_execution = resolve_confirmation_execution(
+            &image_state,
+            ResolveAgentConfirmationRequest {
+                session_id: "s1".into(),
+                message_id: "msg-1".into(),
+                call_id: "call-1".into(),
+                decision: "approved".into(),
+                preview_id: Some(image_preview.preview_id),
+            },
+            move || {
+                assert!(released.steering.try_start_run("s1").is_ok());
+                if released
+                    .foreground_automation_pump
+                    .take_deferred_session_release("s1")
+                {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .unwrap();
+        let image_result = &image_execution.receipt;
+        let captures = image_adapter
+            .capture_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            image_result.success,
+            "image approval failed (captures={captures}): {}",
+            image_result.output
+        );
+        assert_eq!(
+            image_result.confirmation_status.as_deref(),
+            Some("approved")
+        );
+        assert_eq!(captures, 1);
+        assert_eq!(
+            release_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "successful image execution must retain its release wake through delivery"
+        );
+        assert_eq!(
+            image_execution
+                .output
+                .as_ref()
+                .map(|output| output.result.images.len()),
+            Some(1),
+            "the approval must preserve its captured image for the same bounded continuation"
+        );
+        assert!(
+            image_state.steering.try_start_run("s1").is_err(),
+            "approval must retain the session slot for image delivery"
+        );
+        let mut output = image_execution.output.unwrap();
+        let history = vec![
+            LlmMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                protocol_state: None,
+                tool_calls: Some(vec![LlmToolCall {
+                    id: "call-1".into(),
+                    name: "observe_trusted_app_window".into(),
+                    arguments: serde_json::json!({"app_id":"observer","mode":"image"}),
+                }]),
+                tool_call_id: None,
+                tool_images: Vec::new(),
+            },
+            LlmMessage {
+                role: "tool".into(),
+                content: image_execution.receipt.output.clone(),
+                protocol_state: None,
+                tool_calls: None,
+                tool_call_id: Some("call-1".into()),
+                tool_images: Vec::new(),
+            },
+        ];
+        let revisions = Default::default();
+        let original_context = output.context.clone();
+        output.context = original_context.clone().with_timeout(Duration::ZERO);
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut history.clone())
+            .unwrap_err()
+            .contains("截止时间"));
+        output.context = ToolExecutionContext::new("call-1", crate::agent::ToolCancellation::new());
+        output.context.cancellation.cancel();
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut history.clone())
+            .unwrap_err()
+            .contains("取消"));
+        output.context = original_context;
+        image_state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO agent_permission_grants VALUES ('global','full_access',NULL,1)",
+                [],
+            )
+            .unwrap();
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut history.clone())
+            .unwrap_err()
+            .contains("权限已改变"));
+        image_state
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM agent_permission_grants", [])
+            .unwrap();
+        assert!(output
+            .attach_to_history(&image_state, "s1", false, &revisions, &mut history.clone())
+            .unwrap_err()
+            .contains("未接入"));
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut [])
+            .is_err());
+        let mut changed = history.clone();
+        changed[0].tool_calls.as_mut().unwrap()[0].arguments["mode"] =
+            serde_json::json!("controls");
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut changed)
+            .is_err());
+        let mut duplicate = history.clone();
+        duplicate.push(duplicate[1].clone());
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut duplicate)
+            .is_err());
+        image_state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE desktop_trusted_apps SET capabilities='[\"observe\"]'",
+                [],
+            )
+            .unwrap();
+        assert!(output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut history.clone())
+            .unwrap_err()
+            .contains("权限已改变"));
+        image_state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE desktop_trusted_apps SET capabilities='[\"observe\",\"observeImage\"]'",
+                [],
+            )
+            .unwrap();
+        let mut delivered = history.clone();
+        output
+            .attach_to_history(&image_state, "s1", true, &revisions, &mut delivered)
+            .unwrap();
+        assert_eq!(delivered[1].tool_images.len(), 1);
+        assert!(output.result.images.is_empty());
+        let wire = serde_json::to_string(&delivered).unwrap();
+        assert!(!wire.contains("tool_images") && !wire.contains("data:image/"));
+        assert!(
+            output
+                .attach_to_history(&image_state, "s1", true, &revisions, &mut history.clone())
+                .is_err(),
+            "a consumed image cannot be sent twice"
+        );
+        drop(image_execution.permit);
+        assert_eq!(release_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!image_state
+            .foreground_automation_pump
+            .take_deferred_session_release("s1"));
+        let approve = || ResolveAgentConfirmationRequest {
+            session_id: "s1".into(),
+            message_id: "msg-1".into(),
+            call_id: "call-1".into(),
+            decision: "approved".into(),
+            preview_id: None,
+        };
+        assert!(
+            resolve_confirmation_execution(&image_state, approve(), || {})
+                .err()
+                .unwrap()
+                .contains("no longer pending")
+        );
+        assert_eq!(
+            image_adapter
+                .capture_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        for (mode, decision, image_scope, change) in [
+            (None, "approved", true, "none"),
+            (Some("controls"), "approved", true, "none"),
+            (Some("image"), "rejected", true, "none"),
+            (Some("image"), "approved", false, "none"),
+            (Some("image"), "approved", true, "none"),
+            (Some("image"), "approved", true, "forged"),
+            (Some("image"), "approved", true, "expired"),
+            (Some("image"), "approved", true, "changed_args"),
+            (Some("image"), "approved", true, "renamed"),
+            (Some("image"), "approved", true, "revision"),
+            (Some("image"), "approved", true, "revoked"),
+            (Some("image"), "approved", true, "disabled"),
+            (Some("image"), "approved", true, "revoke_restore"),
+            (Some("image"), "approved", true, "delete_readd"),
+            (Some("image"), "approved", true, "unknown_argument"),
+            (Some("image"), "approved", true, "region_argument"),
+            (Some("image"), "approved", true, "unavailable"),
+            (Some("image"), "approved", true, "missing_observe"),
+        ] {
+            let case_dir = tempfile::tempdir().unwrap();
+            let (mut case_state, _) = setup_draft_confirmation_state(case_dir.path());
+            let adapter = Arc::new(
+                crate::agent::handlers::desktop_handler_tests::ImageObservationAdapter::new(),
+            );
+            case_state.desktop_adapter = adapter.clone();
+            let mut args = serde_json::json!({"app_id":"observer"});
+            if let Some(mode) = mode {
+                args["mode"] = serde_json::json!(mode);
+            }
+            if change == "unknown_argument" {
+                args["confirmed"] = serde_json::json!(true);
+            }
+            if change == "region_argument" {
+                args["region_ref"] = serde_json::json!("untrusted-region");
+            }
+            {
+                let conn = case_state.db.lock().unwrap();
+                conn.execute_batch("CREATE TABLE agent_permission_grants (scope TEXT PRIMARY KEY, permission TEXT NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL);").unwrap();
+                conn.execute(
+                    "UPDATE desktop_trusted_apps SET id='observer', capabilities=?1",
+                    [if image_scope {
+                        "[\"observe\",\"observeImage\"]"
+                    } else {
+                        "[\"observe\"]"
+                    }],
+                )
+                .unwrap();
+                conn.execute("UPDATE agent_steps SET tool_name='observe_trusted_app_window', tool_input=?1, tool_output='Confirmation required before executing tool.' WHERE id='call-1'", [args.to_string()]).unwrap();
+                if change == "unavailable" {
+                    conn.execute(
+                        "UPDATE desktop_trusted_apps SET executable_path='missing-target.exe'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                if change == "missing_observe" {
+                    conn.execute(
+                        "UPDATE desktop_trusted_apps SET capabilities='[\"observeImage\"]'",
+                        [],
+                    )
+                    .unwrap();
+                }
+            }
+            let mut req = approve();
+            req.decision = decision.into();
+            let preview =
+                preflight_pending_desktop_action_impl(&case_state, "s1", "msg-1", "call-1");
+            assert_eq!(
+                adapter
+                    .capture_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "preflight must not capture for {change}"
+            );
+            if mode != Some("image") {
+                assert!(preview.is_err());
+            } else if !image_scope
+                || matches!(
+                    change,
+                    "unknown_argument" | "region_argument" | "unavailable" | "missing_observe"
+                )
+            {
+                assert!(
+                    preview.is_err(),
+                    "invalid image scope must not issue a preview: {change}"
+                );
+                if let Ok(result) = resolve_confirmation_execution(&case_state, req, || {}) {
+                    assert!(!result.receipt.success);
+                    assert!(result.output.is_none());
+                }
+                assert_eq!(
+                    adapter
+                        .capture_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                continue;
+            } else {
+                let preview = preview.unwrap();
+                req.preview_id = Some(preview.preview_id.clone());
+                match change {
+                    "forged" => req.preview_id = Some("forged-preview".into()),
+                    "expired" => {
+                        case_state
+                            .desktop_action_previews
+                            .leases
+                            .lock()
+                            .unwrap()
+                            .get_mut(&preview.preview_id)
+                            .unwrap()
+                            .expires_at = Instant::now()
+                    }
+                    "changed_args" => {
+                        let executable = case_dir.path().join("another-target.exe");
+                        std::fs::write(&executable, b"test executable placeholder").unwrap();
+                        let executable = std::fs::canonicalize(executable).unwrap();
+                        let conn = case_state.db.lock().unwrap();
+                        conn.execute(
+                            "INSERT INTO desktop_trusted_apps
+                             SELECT 'another-app', display_name, ?1, capabilities,
+                                    draft_selector, enabled, created_at, updated_at
+                             FROM desktop_trusted_apps WHERE id='observer'",
+                            [executable.to_str().unwrap()],
+                        )
+                        .unwrap();
+                        conn.execute("UPDATE agent_steps SET tool_input='{\"app_id\":\"another-app\",\"mode\":\"image\"}' WHERE id='call-1'", []).unwrap();
+                    }
+                    "renamed" => {
+                        case_state
+                            .db
+                            .lock()
+                            .unwrap()
+                            .execute(
+                                "UPDATE desktop_trusted_apps SET display_name='Replacement'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                    "revision" => {
+                        case_state
+                            .db
+                            .lock()
+                            .unwrap()
+                            .execute(
+                                "UPDATE desktop_trusted_apps SET updated_at=updated_at+1",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                    "revoked" => {
+                        case_state
+                            .db
+                            .lock()
+                            .unwrap()
+                            .execute(
+                                "UPDATE desktop_trusted_apps SET capabilities='[\"observe\"]'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                    "disabled" => {
+                        case_state
+                            .db
+                            .lock()
+                            .unwrap()
+                            .execute("UPDATE desktop_trusted_apps SET enabled=0", [])
+                            .unwrap();
+                    }
+                    "revoke_restore" | "delete_readd" => {
+                        let original = crate::commands::desktop::get_trusted_desktop_app_from_db(
+                            &case_state.db,
+                            "observer",
+                        )
+                        .unwrap()
+                        .unwrap();
+                        if change == "revoke_restore" {
+                            let mut revoked = original.clone();
+                            revoked.enabled = false;
+                            crate::commands::desktop::save_desktop_trusted_app_impl(
+                                &case_state,
+                                revoked,
+                            )
+                            .unwrap();
+                        } else {
+                            crate::commands::desktop::delete_desktop_trusted_app_impl(
+                                &case_state,
+                                "observer",
+                            )
+                            .unwrap();
+                        }
+                        crate::commands::desktop::save_desktop_trusted_app_impl(
+                            &case_state,
+                            original,
+                        )
+                        .unwrap();
+                    }
+                    "none" => {}
+                    _ => unreachable!(),
+                }
+            }
+            let resolved = resolve_confirmation_execution(&case_state, req, || {});
+            if change != "none" {
+                if change == "disabled" {
+                    let result = resolved.unwrap();
+                    assert!(!result.receipt.success);
+                    assert!(result.receipt.output.contains("not run"));
+                    assert!(!result.receipt.output.contains("RESULT_UNKNOWN"));
+                    assert!(result.output.is_none());
+                    assert_eq!(
+                        adapter
+                            .capture_calls
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        0
+                    );
+                    continue;
+                }
+                assert!(
+                    resolved.is_err(),
+                    "changed preview must be rejected: {change}"
+                );
+                assert_eq!(
+                    adapter
+                        .capture_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                let conn = case_state.db.lock().unwrap();
+                assert!(load_pending_confirmation(&conn, "s1", "msg-1", "call-1").is_ok());
+                continue;
+            }
+            let result = resolved.unwrap();
+            if result.receipt.success {
+                result
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .context
+                    .cancellation
+                    .cancel();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let resolved = runtime
+                    .block_on(complete_confirmation_execution(
+                        &case_state,
+                        None,
+                        approve(),
+                        result,
+                    ))
+                    .unwrap();
+                assert!(!resolved.success);
+                assert!(
+                    resolved.output.contains("操作结果已记录")
+                        && resolved.output.contains("不要重复")
+                );
+                assert_eq!(
+                    adapter
+                        .capture_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                let conn = case_state.db.lock().unwrap();
+                let durable: (i32, String) = conn
+                    .query_row(
+                        "SELECT success,tool_output FROM agent_steps WHERE id='call-1'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    durable.0, 1,
+                    "cancelling image delivery must not erase the completed operation"
+                );
+                assert!(durable.1.contains("操作结果已记录"));
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM task_runs WHERE message_id='msg-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(status, "needs_attention");
+                assert!(case_state.steering.try_start_run("s1").is_ok());
+                continue;
+            }
+            assert!(!result.receipt.success, "{mode:?}/{decision}/{image_scope}");
+            assert!(result.output.is_none());
+            assert_eq!(
+                adapter
+                    .capture_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
     }
 
     #[test]
@@ -6010,6 +9529,84 @@ rl.on('line', (line) => {{
         assert_eq!(stored.2, 1);
         assert_eq!(stored.3, 1);
 
+        state.mcp_manager.stop("mcp-test").unwrap();
+    }
+
+    #[test]
+    fn mcp_confirmation_lost_receipt_cannot_replay_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = setup_confirmation_state(dir.path());
+        let server = start_live_mcp_echo_server(&state, &dir);
+        configure_test_mcp_workspace(&state, true);
+        let tool_name = crate::agent::handlers::mcp_registry_tool_name("mcp-test", "echo");
+        let revision = cached_mcp_echo_schema_version(&state);
+        configure_pending_mcp_echo_confirmation(&state, &tool_name, Some(&revision));
+        let db_path = dir.path().join("confirmation.db");
+        {
+            let mut conn = state.db.lock().unwrap();
+            conn.execute("VACUUM INTO ?1", params![db_path.to_string_lossy()])
+                .unwrap();
+            *conn = Connection::open(&db_path).unwrap();
+            // Fail only the receipt commit, after the real stdio server has
+            // recorded its effect. The pre-dispatch durable arm must survive.
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER lose_mcp_receipt BEFORE UPDATE ON agent_steps
+                 WHEN NEW.tool_output LIKE 'Confirmation approved:%'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic receipt persistence failure'); END;",
+            )
+            .unwrap();
+        }
+        let approve = || ResolveAgentConfirmationRequest {
+            session_id: "s1".into(),
+            message_id: "msg-1".into(),
+            call_id: "call-1".into(),
+            decision: "approved".into(),
+            preview_id: None,
+        };
+        let error = resolve_agent_confirmation_impl(&state, approve()).unwrap_err();
+        assert!(error.contains("synthetic receipt persistence failure"));
+        assert_eq!(
+            fs::read_to_string(&server.calls_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        {
+            let mut conn = state.db.lock().unwrap();
+            *conn = Connection::open(&db_path).unwrap();
+            assert!(
+                load_pending_confirmation(&conn, "s1", "msg-1", "call-1").is_err(),
+                "an external effect without a durable receipt must not become approvable after reopen"
+            );
+            let output: String = conn
+                .query_row(
+                    "SELECT tool_output FROM agent_steps WHERE id='call-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(output.contains("RESULT_UNKNOWN"));
+            let tool_output: String = conn
+                .query_row(
+                    "SELECT content FROM messages WHERE id='tool-msg-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tool_output, output);
+        }
+        assert!(prepare_task_continuation(&state, "s1", "msg-1")
+            .unwrap_err()
+            .contains("unknown result"));
+        assert!(resolve_agent_confirmation_impl(&state, approve()).is_err());
+        assert_eq!(
+            fs::read_to_string(&server.calls_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         state.mcp_manager.stop("mcp-test").unwrap();
     }
 

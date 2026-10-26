@@ -8,11 +8,83 @@
 use crate::vector;
 use crate::AppState;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+
+/// Preserve the two owner-selected switches when a confirmation/retry creates
+/// an internal request without frontend preferences. Never copy user facts or
+/// overwrite the other session metadata (including automatic-review cursors).
+pub(crate) fn resolve_reply_memory_controls(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    requested_memory: Option<bool>,
+    requested_learning: Option<bool>,
+) -> Result<(bool, bool), String> {
+    let stored = conn
+        .query_row(
+            "SELECT json_type(COALESCE(metadata,'{}')),
+                json_extract(metadata,'$.replyMemory.useLongTermMemory'),
+                json_extract(metadata,'$.replyMemory.evolutionEnabled')
+         FROM sessions WHERE id=?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<bool>>(1)?,
+                    row.get::<_, Option<bool>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("无法读取会话记忆设置: {e}"))?;
+    if stored.as_ref().is_some_and(|(kind, _, _)| kind != "object") {
+        return Err("会话元数据不是对象，未更改记忆设置。".into());
+    }
+    let saved_memory = stored.as_ref().and_then(|(_, memory, _)| *memory);
+    let saved_learning = stored.as_ref().and_then(|(_, _, learning)| *learning);
+    let memory = requested_memory.or(saved_memory).unwrap_or(true);
+    let learning = requested_learning.or(saved_learning).unwrap_or(true);
+    if (requested_memory.is_some() || requested_learning.is_some())
+        && (saved_memory != Some(memory) || saved_learning != Some(learning))
+    {
+        let controls = serde_json::json!({"useLongTermMemory":memory,"evolutionEnabled":learning});
+        let changed = conn.execute(
+            "UPDATE sessions SET metadata=json_set(COALESCE(metadata,'{}'),'$.replyMemory',json(?2)) WHERE id=?1",
+            params![session_id, controls.to_string()],
+        ).map_err(|e| format!("无法保存会话记忆设置: {e}"))?;
+        if changed == 0 {
+            return Err("会话不存在，无法保存记忆设置。".into());
+        }
+    }
+    Ok((memory, learning))
+}
+
+#[tauri::command]
+pub fn get_learned_preferences(
+    state: State<AppState>,
+) -> Result<Vec<crate::agent::adaptive_constraints::LearnedPreference>, String> {
+    get_learned_preferences_impl(&state)
+}
+
+pub(crate) fn get_learned_preferences_impl(
+    state: &AppState,
+) -> Result<Vec<crate::agent::adaptive_constraints::LearnedPreference>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::agent::adaptive_constraints::learned_preferences(&conn)
+}
+
+#[tauri::command]
+pub fn dismiss_learned_preference(state: State<AppState>, id: String) -> Result<(), String> {
+    dismiss_learned_preference_impl(&state, &id)
+}
+
+pub(crate) fn dismiss_learned_preference_impl(state: &AppState, id: &str) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::agent::adaptive_constraints::dismiss_learned_preference(&conn, id)
+}
 
 // ============================================
 // Memory Types
@@ -1320,7 +1392,7 @@ pub fn get_memory_stats(state: State<AppState>) -> Result<serde_json::Value, Str
 }
 
 // ============================================
-// Evolution Review Commands (Hermes KEPA pattern)
+// Background memory review and explicit evolution proposals
 // ============================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1363,7 +1435,150 @@ pub struct ReviewEvolutionProposalRequest {
     pub permanent: Option<bool>,
 }
 
-#[tauri::command]
+const AUTOMATIC_REVIEW_MIN_MESSAGES: usize = 10;
+const AUTOMATIC_REVIEW_COOLDOWN_SECONDS: i64 = 15 * 60;
+const AUTOMATIC_REVIEW_MAX_CHARS: usize = 12_000;
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct AutomaticReviewState {
+    through_created_at: i64,
+    through_message_id: Option<String>,
+    last_attempt_at: i64,
+}
+
+struct AutomaticReviewInput {
+    id: String,
+    content: String,
+    created_at: i64,
+}
+
+fn automatic_review_state(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<(serde_json::Value, AutomaticReviewState), String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let metadata: serde_json::Value = match raw {
+        Some(raw) => serde_json::from_str(&raw).map_err(|e| e.to_string())?,
+        None => serde_json::json!({}),
+    };
+    if !metadata.is_object() {
+        return Err("Invalid session metadata for automatic review".into());
+    }
+    let state = metadata
+        .get("automaticEvolution")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    Ok((metadata, state))
+}
+
+fn automatic_review_inputs(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    state: &AutomaticReviewState,
+) -> Result<Vec<AutomaticReviewInput>, String> {
+    // Follow only the active branch, never abandoned branches, tool results,
+    // assistant claims, attachments or hidden provisional replies. Bound both
+    // traversal and text before copying anything into the background request.
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE branch(id, parent_id, role, content, created_at, is_provisional, depth) AS (
+           SELECT m.id, m.parent_id, m.role, substr(m.content, 1, 1001), m.created_at, m.is_provisional, 0
+           FROM messages m JOIN sessions s ON s.leaf_message_id = m.id
+           WHERE s.id = ?1 AND m.session_id = ?1
+           UNION ALL
+           SELECT m.id, m.parent_id, m.role, substr(m.content, 1, 1001), m.created_at, m.is_provisional, b.depth + 1
+           FROM messages m JOIN branch b ON m.id = b.parent_id
+           WHERE m.session_id = ?1 AND b.depth < 500 AND b.id != COALESCE(?3, '')
+         )
+         SELECT id, content, created_at FROM branch
+         WHERE role = 'user' AND is_provisional = 0 AND created_at >= ?2 AND id != COALESCE(?3, '')
+         ORDER BY depth LIMIT 50"
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![
+                session_id,
+                state.through_created_at,
+                state.through_message_id
+            ],
+            |r| {
+                Ok(AutomaticReviewInput {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    created_at: r.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let mut remaining = AUTOMATIC_REVIEW_MAX_CHARS;
+    let mut inputs = Vec::new();
+    for row in rows {
+        let mut input = row.map_err(|e| e.to_string())?;
+        let chars = input.content.chars().count();
+        if chars == 0 {
+            continue;
+        }
+        if remaining < chars.min(1000) {
+            break;
+        }
+        remaining -= chars.min(1000);
+        if chars > 1000 {
+            input.content = input.content.chars().take(1000).collect::<String>() + "\n[消息已截断]";
+        }
+        inputs.push(input);
+    }
+    inputs.reverse();
+    Ok(inputs)
+}
+
+pub(crate) fn automatic_evolution_due(conn: &rusqlite::Connection, session_id: &str) -> bool {
+    let Ok((_, state)) = automatic_review_state(conn, session_id) else {
+        return false;
+    };
+    Utc::now().timestamp().saturating_sub(state.last_attempt_at)
+        >= AUTOMATIC_REVIEW_COOLDOWN_SECONDS
+        && automatic_review_inputs(conn, session_id, &state)
+            .is_ok_and(|inputs| inputs.len() >= AUTOMATIC_REVIEW_MIN_MESSAGES)
+}
+
+fn save_automatic_review_state(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    mut metadata: serde_json::Value,
+    state: &AutomaticReviewState,
+) -> Result<(), String> {
+    metadata["automaticEvolution"] = serde_json::to_value(state).map_err(|e| e.to_string())?;
+    let changed = conn
+        .execute(
+            "UPDATE sessions SET metadata = ?1 WHERE id = ?2",
+            params![metadata.to_string(), session_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("Session disappeared during automatic review".into());
+    }
+    Ok(())
+}
+
+fn empty_automatic_review() -> EvolutionReviewResult {
+    EvolutionReviewResult {
+        new_memories: Vec::new(),
+        preferences_json: None,
+        summary: String::new(),
+        total_stored: 0,
+        proposals_created: 0,
+    }
+}
+
 /// Internal helper: run evolution on a specific session with a given provider.
 ///
 /// This function is `async` because `provider.chat` is async and must be
@@ -1384,24 +1599,35 @@ pub async fn run_evolution_review_impl(
     db: Arc<Mutex<rusqlite::Connection>>,
     session_id: &str,
     provider: Box<dyn crate::llm::LlmProvider>,
+    thinking_settings: Option<crate::llm::ThinkingSettings>,
 ) -> Result<EvolutionReviewResult, String> {
-    let messages: Vec<(String, String)> = {
-        let conn = db.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 50",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![session_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok()).collect()
+    // Optional reviews never queue behind one another or block a foreground
+    // reply. Process exit releases the permit; the session-owned checkpoint and
+    // cooldown survive restart without introducing another job scheduler.
+    static REVIEW_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let Ok(_permit) = REVIEW_SLOT.try_acquire() else {
+        return Ok(empty_automatic_review());
     };
-    if messages.is_empty() {
-        return Err("No messages to review".to_string());
-    }
+    let inputs = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let (metadata, mut state) = automatic_review_state(&conn, session_id)?;
+        if Utc::now().timestamp().saturating_sub(state.last_attempt_at)
+            < AUTOMATIC_REVIEW_COOLDOWN_SECONDS
+        {
+            return Ok(empty_automatic_review());
+        }
+        let inputs = automatic_review_inputs(&conn, session_id, &state)?;
+        if inputs.is_empty() {
+            return Ok(empty_automatic_review());
+        }
+        state.last_attempt_at = Utc::now().timestamp();
+        save_automatic_review_state(&conn, session_id, metadata, &state)?;
+        inputs
+    };
+    let messages = inputs
+        .iter()
+        .map(|input| ("user".to_string(), input.content.clone()))
+        .collect::<Vec<_>>();
     let prompt = crate::agent::evolution::build_extraction_prompt(&messages, None);
     let llm_messages = vec![crate::llm::Message {
         tool_images: Vec::new(),
@@ -1411,22 +1637,50 @@ pub async fn run_evolution_review_impl(
         tool_calls: None,
         tool_call_id: None,
     }];
-    let response = provider
-        .chat(&llm_messages, None, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        provider.chat(&llm_messages, None, thinking_settings.as_ref()),
+    )
+    .await
+    .map_err(|_| "Automatic review timed out".to_string())?
+    .map_err(|e| e.to_string())?;
     let response_text = match response.into_parts().0 {
-        crate::llm::LlmResponse::Text { text: t, .. } => t,
+        crate::llm::LlmResponse::Text {
+            text,
+            stop_reason: crate::llm::StopReason::EndTurn,
+        } if text.chars().count() <= 16_000 => text,
+        crate::llm::LlmResponse::Text { .. } => {
+            return Err("Automatic review did not complete within its output limit".into())
+        }
         crate::llm::LlmResponse::ProtocolViolation { reason, .. } => {
             return Err(format!("Invalid tool-call protocol: {reason}"));
         }
         crate::llm::LlmResponse::ToolCalls { .. } => return Err("Unexpected tool call".to_string()),
         crate::llm::LlmResponse::WithProtocol { .. } => unreachable!("flattened protocol response"),
     };
-    let evo = crate::agent::evolution::parse_evolution_response(&response_text)?;
+    let evo = crate::agent::evolution::parse_automatic_review_response(&response_text)?;
+    if evo.new_memories.len() > 12 {
+        return Err("Automatic review produced too many memory candidates".into());
+    }
     let proposals_created = {
         let conn = db.lock().map_err(|e| e.to_string())?;
-        store_evolution_proposals(&conn, Some(session_id), &evo, "auto_evolution")?
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let (metadata, mut state) = automatic_review_state(&tx, session_id)?;
+        let current_inputs = automatic_review_inputs(&tx, session_id, &state)?;
+        if !inputs.iter().all(|input| {
+            current_inputs
+                .iter()
+                .any(|current| current.id == input.id && current.content == input.content)
+        }) {
+            return Err("Conversation changed during automatic review".into());
+        }
+        let latest = inputs.last().expect("a review always has user input");
+        state.through_created_at = latest.created_at;
+        state.through_message_id = Some(latest.id.clone());
+        let created = store_evolution_proposals(&tx, Some(session_id), &evo, "auto_evolution")?;
+        save_automatic_review_state(&tx, session_id, metadata, &state)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        created
     };
     Ok(EvolutionReviewResult {
         new_memories: evo.new_memories,
@@ -1445,7 +1699,7 @@ pub async fn run_evolution_review(
     message_count: Option<i32>,
 ) -> Result<EvolutionReviewResult, String> {
     let db = state.db.clone();
-    let limit = message_count.unwrap_or(50);
+    let limit = message_count.unwrap_or(50).clamp(1, 50);
 
     // Fetch recent messages from all sessions or a specific one. We acquire
     // the lock, copy the rows we need, and drop the guard before the await
@@ -1456,11 +1710,11 @@ pub async fn run_evolution_review(
             ref sid,
         ) = session_id
         {
-            ("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+            ("SELECT role, substr(content,1,1000) || CASE WHEN length(content)>1000 THEN char(10)||'[消息已截断]' ELSE '' END FROM messages WHERE session_id = ?1 AND role='user' AND is_provisional=0 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
              vec![Box::new(sid.clone()), Box::new(limit)])
         } else {
             (
-                "SELECT role, content FROM messages ORDER BY created_at DESC LIMIT ?1",
+                "SELECT role, substr(content,1,1000) || CASE WHEN length(content)>1000 THEN char(10)||'[消息已截断]' ELSE '' END FROM messages WHERE role='user' AND is_provisional=0 ORDER BY created_at DESC, rowid DESC LIMIT ?1",
                 vec![Box::new(limit)],
             )
         };
@@ -1596,12 +1850,14 @@ fn store_evolution_proposals(
     // queue. Only bounded preference statements are eligible, and a single
     // extraction is insufficient to affect future prompts: the same evidence
     // must recur before the reader in `message.rs` activates it.
-    crate::agent::adaptive_constraints::record_preferences(
-        conn,
-        session_id,
-        &evolution_result.new_memories,
-        source,
-    )?;
+    if source == "auto_evolution" {
+        crate::agent::adaptive_constraints::record_preferences(
+            conn,
+            session_id,
+            &evolution_result.new_memories,
+            source,
+        )?;
+    }
 
     if source != "auto_evolution" {
         if let Some(prefs_json) = &evolution_result.preferences_json {
@@ -2083,7 +2339,36 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::NamedTempFile;
 
-    struct StaticProvider;
+    enum ReviewReply {
+        Valid,
+        Unavailable,
+        Text(&'static str),
+    }
+    struct StaticProvider(Arc<Mutex<Vec<String>>>, ReviewReply);
+
+    struct PausedProvider {
+        inner: StaticProvider,
+        entered: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PausedProvider {
+        fn name(&self) -> &str {
+            "paused-test"
+        }
+
+        async fn chat(
+            &self,
+            messages: &[LlmMessage],
+            tools: Option<&[ToolSchema]>,
+            thinking: Option<&crate::llm::ThinkingSettings>,
+        ) -> Result<LlmResponse, String> {
+            self.entered.notify_one();
+            self.proceed.notified().await;
+            self.inner.chat(messages, tools, thinking).await
+        }
+    }
 
     #[async_trait]
     impl LlmProvider for StaticProvider {
@@ -2093,12 +2378,20 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: &[LlmMessage],
+            messages: &[LlmMessage],
             _tools: Option<&[ToolSchema]>,
             _thinking: Option<&crate::llm::ThinkingSettings>,
         ) -> Result<LlmResponse, String> {
+            self.0.lock().unwrap().push(messages[0].content.clone());
+            let text = match self.1 {
+                ReviewReply::Unavailable => return Err("fixture model unavailable".into()),
+                ReviewReply::Valid => {
+                    r#"{"memories":[{"content":"用户喜欢 Rust","category":"preference","importance":8}],"summary":"学到用户喜欢 Rust"}"#
+                }
+                ReviewReply::Text(text) => text,
+            };
             Ok(LlmResponse::Text {
-                text: r#"{"memories":[{"content":"用户喜欢 Rust","category":"preference","importance":8}],"summary":"学到用户喜欢 Rust"}"#.to_string(),
+                text: text.to_string(),
                 stop_reason: crate::llm::StopReason::EndTurn,
             })
         }
@@ -2125,6 +2418,78 @@ mod tests {
     }
 
     #[test]
+    fn reply_memory_controls_survive_restart_and_partial_requests_without_erasing_metadata() {
+        let (tmp, conn) = setup_db();
+        conn.execute("INSERT INTO sessions(id,title,created_at,updated_at,metadata) VALUES ('controls','test',1,1,?1)",
+            [serde_json::json!({"automaticEvolution":{"throughCreatedAt":17},"other":"keep"}).to_string()]).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,title,created_at,updated_at) VALUES ('unrelated','test',1,1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_reply_memory_controls(&conn, "controls", Some(false), Some(false)).unwrap(),
+            (false, false)
+        );
+        let metadata: String = conn
+            .query_row(
+                "SELECT metadata FROM sessions WHERE id='controls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["automaticEvolution"]["throughCreatedAt"], 17);
+        assert_eq!(metadata["other"], "keep");
+        assert_eq!(metadata["replyMemory"].as_object().unwrap().len(), 2);
+        drop(conn);
+
+        let reopened = crate::db::init(tmp.path()).unwrap();
+        assert_eq!(
+            resolve_reply_memory_controls(&reopened, "controls", None, None).unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_reply_memory_controls(&reopened, "controls", Some(true), None).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_reply_memory_controls(&reopened, "controls", None, None).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_reply_memory_controls(&reopened, "unrelated", None, None).unwrap(),
+            (true, true)
+        );
+        assert!(resolve_reply_memory_controls(&reopened, "missing", Some(false), None).is_err());
+        for damaged in [
+            "{invalid",
+            "[]",
+            r#"{"replyMemory":{"useLongTermMemory":"false"}}"#,
+        ] {
+            reopened
+                .execute(
+                    "UPDATE sessions SET metadata=?1 WHERE id='controls'",
+                    [damaged],
+                )
+                .unwrap();
+            assert!(
+                resolve_reply_memory_controls(&reopened, "controls", Some(true), Some(true))
+                    .is_err(),
+                "corrupt control state must not silently re-enable reading"
+            );
+            let unchanged: String = reopened
+                .query_row(
+                    "SELECT metadata FROM sessions WHERE id='controls'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged, damaged);
+        }
+    }
+
+    #[test]
     fn direct_memory_write_requires_explicit_user_source_and_confirmation() {
         assert!(validate_direct_memory_write(&direct_memory_input("user", true)).is_ok());
         assert!(
@@ -2135,37 +2500,52 @@ mod tests {
 
     #[test]
     fn repeated_preference_evidence_is_stored_without_visible_proposals() {
-        let (_tmp, conn) = setup_db();
-        let memories = vec![crate::agent::evolution::NewMemory {
-            category: "preference".to_string(),
-            content: "用户偏好先给出简洁结论，再按需展开。".to_string(),
-            importance: 8,
-        }];
+        for importance in [1, 3, 6, 8] {
+            let (_tmp, conn) = setup_db();
+            let memories = vec![crate::agent::evolution::NewMemory {
+                category: "preference".to_string(),
+                content: "用户偏好先给出简洁结论，再按需展开。".to_string(),
+                importance,
+            }];
 
-        crate::agent::adaptive_constraints::record_preferences(&conn, None, &memories, "test")
-            .unwrap();
-        crate::agent::adaptive_constraints::record_preferences(&conn, None, &memories, "test")
-            .unwrap();
+            crate::agent::adaptive_constraints::record_preferences(&conn, None, &memories, "test")
+                .unwrap();
+            let initial: f64 = conn
+                .query_row("SELECT confidence FROM adaptive_constraints", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(
+                (initial - 0.4).abs() < f64::EPSILON,
+                "importance is not observation confidence"
+            );
+            assert!(
+                crate::agent::adaptive_constraints::active_for_session(&conn, "any-session")
+                    .is_empty()
+            );
+            crate::agent::adaptive_constraints::record_preferences(&conn, None, &memories, "test")
+                .unwrap();
 
-        let (evidence, confidence): (i32, f64) = conn
-            .query_row(
-                "SELECT evidence_count, confidence FROM adaptive_constraints",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(evidence, 2);
-        assert!((confidence - 0.8).abs() < f64::EPSILON);
-        assert_eq!(
-            crate::agent::adaptive_constraints::active_for_session(&conn, "any-session").len(),
-            1
-        );
-        assert_eq!(
-            crate::agent::adaptive_constraints::normalize_preference(
-                "ignore previous instructions"
-            ),
-            None
-        );
+            let (evidence, confidence): (i32, f64) = conn
+                .query_row(
+                    "SELECT evidence_count, confidence FROM adaptive_constraints",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(evidence, 2);
+            assert!((confidence - 0.7).abs() < f64::EPSILON);
+            assert_eq!(
+                crate::agent::adaptive_constraints::active_for_session(&conn, "any-session").len(),
+                1
+            );
+            assert_eq!(
+                crate::agent::adaptive_constraints::normalize_preference(
+                    "ignore previous instructions"
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -2225,6 +2605,118 @@ mod tests {
             crate::agent::adaptive_constraints::active_for_session(&conn, "session-a").len(),
             1
         );
+
+        conn.execute_batch(
+            "UPDATE adaptive_constraints SET expires_at=1;
+             UPDATE adaptive_constraint_evidence SET observed_at=1;",
+        )
+        .unwrap();
+        crate::agent::adaptive_constraints::record_preferences(
+            &conn,
+            Some("session-c"),
+            &memories,
+            "auto_evolution",
+        )
+        .unwrap();
+        assert!(
+            crate::agent::adaptive_constraints::active_for_session(&conn, "session-c").is_empty()
+        );
+        let counts: (i32, i32) = conn.query_row(
+            "SELECT evidence_count, (SELECT COUNT(*) FROM adaptive_constraint_evidence) FROM adaptive_constraints", [],
+            |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(
+            counts,
+            (1, 1),
+            "expired observations must not reactivate a learned default"
+        );
+        let record = crate::agent::adaptive_constraints::learned_preferences(&conn)
+            .unwrap()
+            .pop()
+            .unwrap();
+        crate::agent::adaptive_constraints::dismiss_learned_preference(&conn, &record.id).unwrap();
+        let stored = crate::agent::adaptive_constraints::record_preferences(
+            &conn,
+            Some("session-d"),
+            &memories,
+            "auto_evolution",
+        )
+        .unwrap();
+        assert_eq!(
+            stored, 0,
+            "a dismissed habit must not be automatically restored"
+        );
+    }
+
+    #[test]
+    fn learned_habit_control_survives_restart_without_touching_user_memories() {
+        use crate::agent::adaptive_constraints::{
+            dismiss_learned_preference, learned_preferences, record_preferences,
+        };
+        let (tmp, conn) = setup_db();
+        let memories = vec![crate::agent::evolution::NewMemory {
+            category: "preference".into(),
+            content: "喜欢先说结论，再按需展开".into(),
+            importance: 8,
+        }];
+        record_preferences(&conn, Some("s1"), &memories, "auto_evolution").unwrap();
+        let pending = learned_preferences(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].ready);
+        record_preferences(&conn, Some("s2"), &memories, "auto_evolution").unwrap();
+        let records = learned_preferences(&conn).unwrap();
+        assert!(records[0].ready);
+        let id = records[0].id.clone();
+        let serialized = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 4);
+        assert!(serialized.get("updatedAt").is_some());
+        conn.execute_batch(
+            "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','owner',1,1);
+             INSERT INTO messages(id,session_id,role,content,created_at) VALUES('u','s','user','original conversation',1);
+             INSERT INTO memories(id,scope,category,content,importance,source,is_permanent,created_at,updated_at)
+             VALUES('explicit','global','preference','explicit user memory',8,'user',1,1,1);"
+        ).unwrap();
+        assert!(dismiss_learned_preference(&conn, "").is_err());
+        assert!(dismiss_learned_preference(&conn, "missing").is_err());
+        dismiss_learned_preference(&conn, &id).unwrap();
+        dismiss_learned_preference(&conn, &id).unwrap(); // Safe uncertain IPC retry.
+        assert!(learned_preferences(&conn).unwrap().is_empty());
+        assert!(crate::agent::adaptive_constraints::active_for_session(&conn, "s").is_empty());
+        let retained: (String, String, i64) = conn.query_row(
+            "SELECT status, constraint_value, (SELECT COUNT(*) FROM adaptive_constraint_evidence)
+             FROM adaptive_constraints WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        ).unwrap();
+        assert_eq!(retained, ("disabled".into(), String::new(), 0));
+        assert_eq!(
+            conn.query_row("SELECT content FROM messages WHERE id='u'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "original conversation"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT content FROM memories WHERE id='explicit'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "explicit user memory"
+        );
+        // Even an old expiry attached by a previous build must not delete the
+        // owner's suppression marker and let the automatic writer revive it.
+        conn.execute(
+            "UPDATE adaptive_constraints SET expires_at=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = crate::db::init(tmp.path()).unwrap();
+        assert_eq!(
+            record_preferences(&conn, Some("new-session"), &memories, "auto_evolution").unwrap(),
+            0
+        );
+        assert!(learned_preferences(&conn).unwrap().is_empty());
+        assert!(crate::agent::adaptive_constraints::active_for_session(&conn, "s").is_empty());
     }
 
     #[test]
@@ -2310,15 +2802,173 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE sessions SET leaf_message_id = 'm1' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
 
+        let prompts = Arc::new(Mutex::new(Vec::new()));
         let db = Arc::new(Mutex::new(conn));
-        let result = run_evolution_review_impl(db.clone(), "s1", Box::new(StaticProvider))
-            .await
-            .unwrap();
+        let result = run_evolution_review_impl(
+            db.clone(),
+            "s1",
+            Box::new(StaticProvider(prompts.clone(), ReviewReply::Valid)),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.total_stored, 0);
         assert_eq!(result.proposals_created, 0);
 
+        // A restart or a later review of the same conversation is not new
+        // preference evidence, even after the short duplicate window expires.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE adaptive_constraint_evidence SET observed_at = observed_at - 172800",
+                [],
+            )
+            .unwrap();
+        db.lock().unwrap().execute(
+            "UPDATE sessions SET metadata = json_set(metadata, '$.automaticEvolution.last_attempt_at', 0) WHERE id = 's1'",
+            [],
+        ).unwrap();
+        drop(db);
+        let conn = crate::db::init(_tmp.path()).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        run_evolution_review_impl(
+            db.clone(),
+            "s1",
+            Box::new(StaticProvider(prompts.clone(), ReviewReply::Valid)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "old messages must not be reviewed again after restart"
+        );
+
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO messages (id,session_id,role,content,parent_id,created_at)
+             VALUES ('m2','s1','user','再次说明我偏好 Rust','m1',2);
+             UPDATE sessions SET leaf_message_id='m2' WHERE id='s1';",
+            )
+            .unwrap();
+        let invalid_replies = [
+            ReviewReply::Unavailable,
+            ReviewReply::Text("not JSON"),
+            ReviewReply::Text("null"),
+            ReviewReply::Text("{}"),
+        ];
+        let failed_reviews = invalid_replies.len();
+        for reply in invalid_replies {
+            run_evolution_review_impl(
+                db.clone(),
+                "s1",
+                Box::new(StaticProvider(prompts.clone(), reply)),
+                None,
+            )
+            .await
+            .unwrap_err();
+            {
+                let conn = db.lock().unwrap();
+                let (_, review) = automatic_review_state(&conn, "s1").unwrap();
+                assert_eq!(
+                    review.through_created_at, 1,
+                    "failed review must not acknowledge the new message"
+                );
+                assert_eq!(
+                    automatic_review_inputs(&conn, "s1", &review).unwrap().len(),
+                    1
+                );
+                // Failure is cooled down rather than retried on every new turn.
+                run_cooldown_reset(&conn);
+            }
+        }
+        run_evolution_review_impl(
+            db.clone(),
+            "s1",
+            Box::new(StaticProvider(prompts.clone(), ReviewReply::Valid)),
+            None,
+        )
+        .await
+        .unwrap();
+        let captured_prompts = prompts.lock().unwrap();
+        assert_eq!(captured_prompts.len(), failed_reviews + 2);
+        assert!(captured_prompts
+            .last()
+            .unwrap()
+            .contains("再次说明我偏好 Rust"));
+        assert!(!captured_prompts.last().unwrap().contains("我喜欢 Rust"));
+        drop(captured_prompts);
+
+        // A foreground edit may withdraw the source while the background
+        // provider is in flight. Neither its evidence nor cursor may commit.
+        {
+            let conn = db.lock().unwrap();
+            run_cooldown_reset(&conn);
+            conn.execute_batch(
+                "INSERT INTO messages(id,session_id,role,content,parent_id,created_at)
+                 VALUES('m3','s1','user','a withdrawn preference','m2',3);
+                 UPDATE sessions SET leaf_message_id='m3' WHERE id='s1';",
+            )
+            .unwrap();
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let pending = tokio::spawn({
+            let db = db.clone();
+            let provider = PausedProvider {
+                inner: StaticProvider(prompts.clone(), ReviewReply::Valid),
+                entered: entered.clone(),
+                proceed: proceed.clone(),
+            };
+            async move { run_evolution_review_impl(db, "s1", Box::new(provider), None).await }
+        });
+        entered.notified().await;
+        let skipped = run_evolution_review_impl(
+            db.clone(),
+            "s1",
+            Box::new(StaticProvider(prompts.clone(), ReviewReply::Valid)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(skipped.new_memories.is_empty());
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            failed_reviews + 2,
+            "concurrent reviews do not queue extra model calls"
+        );
+        db.lock()
+            .unwrap()
+            .execute("UPDATE sessions SET leaf_message_id='m2' WHERE id='s1'", [])
+            .unwrap();
+        proceed.notify_one();
+        assert_eq!(
+            pending.await.unwrap().unwrap_err(),
+            "Conversation changed during automatic review"
+        );
+
         let conn = db.lock().unwrap();
+        let (_, review) = automatic_review_state(&conn, "s1").unwrap();
+        assert_eq!(review.through_created_at, 2);
+        let evidence_count: i64 = conn
+            .query_row(
+                "SELECT evidence_count FROM adaptive_constraints LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence_count, 2,
+            "only a genuinely new observation adds evidence"
+        );
         let proposal_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM evolution_proposals WHERE status = 'pending'",
@@ -2345,6 +2995,83 @@ mod tests {
         assert_eq!(adaptive_count, 1);
     }
 
+    fn run_cooldown_reset(conn: &Connection) {
+        conn.execute(
+            "UPDATE sessions SET metadata=json_set(metadata, '$.automaticEvolution.last_attempt_at', 0) WHERE id='s1'", []
+        ).unwrap();
+    }
+
+    #[test]
+    fn automatic_review_bounds_active_user_evidence_and_preserves_session_metadata() {
+        let (_tmp, conn) = setup_db();
+        conn.execute_batch(
+            "INSERT INTO sessions(id,title,created_at,updated_at,metadata)
+             VALUES('s1','review',1,1,'{\"modelConnectionBinding\":{\"modelRef\":\"fixture\"}}');",
+        )
+        .unwrap();
+        let mut parent: Option<String> = None;
+        for index in 0..30 {
+            let id = format!("u{index:02}");
+            conn.execute(
+                "INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES(?1,'s1','user',?2,?3,?4)",
+                params![id, format!("user-{index:02} {}", "字".repeat(1500)), parent, index + 100]
+            ).unwrap();
+            parent = Some(id);
+        }
+        conn.execute_batch(
+            "INSERT INTO messages(id,session_id,role,content,parent_id,created_at,is_provisional) VALUES
+             ('assistant','s1','assistant','assistant-only','u29',130,0),
+             ('tool','s1','tool','tool-private','assistant',131,0),
+             ('hidden','s1','user','hidden-private','tool',132,1),
+             ('abandoned','s1','user','abandoned-private',NULL,200,0);
+             UPDATE sessions SET leaf_message_id='hidden' WHERE id='s1';"
+        ).unwrap();
+        assert!(automatic_evolution_due(&conn, "s1"));
+        let (metadata, mut state) = automatic_review_state(&conn, "s1").unwrap();
+        let inputs = automatic_review_inputs(&conn, "s1", &state).unwrap();
+        assert_eq!(inputs.len(), 12);
+        assert_eq!(inputs.first().unwrap().id, "u18");
+        assert_eq!(inputs.last().unwrap().id, "u29");
+        let prompt = crate::agent::evolution::build_extraction_prompt(
+            &inputs
+                .into_iter()
+                .map(|input| ("user".into(), input.content))
+                .collect::<Vec<_>>(),
+            None,
+        );
+        assert!(prompt.chars().count() < 16_000);
+        for excluded in [
+            "assistant-only",
+            "tool-private",
+            "hidden-private",
+            "abandoned-private",
+        ] {
+            assert!(!prompt.contains(excluded));
+        }
+        state.last_attempt_at = Utc::now().timestamp();
+        save_automatic_review_state(&conn, "s1", metadata, &state).unwrap();
+        assert!(!automatic_evolution_due(&conn, "s1"));
+        let (metadata, _) = automatic_review_state(&conn, "s1").unwrap();
+        assert_eq!(metadata["modelConnectionBinding"]["modelRef"], "fixture");
+        state.through_created_at = 129;
+        state.through_message_id = Some("u29".into());
+        assert!(automatic_review_inputs(&conn, "s1", &state)
+            .unwrap()
+            .is_empty());
+        conn.execute_batch(
+            "INSERT INTO messages(id,session_id,role,content,parent_id,created_at)
+             VALUES('same-clock','s1','user','new at same clock','hidden',129);
+             UPDATE sessions SET leaf_message_id='same-clock' WHERE id='s1';",
+        )
+        .unwrap();
+        let inputs = automatic_review_inputs(&conn, "s1", &state).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].id, "same-clock");
+        conn.execute("UPDATE sessions SET metadata='broken' WHERE id='s1'", [])
+            .unwrap();
+        assert!(!automatic_evolution_due(&conn, "s1"));
+    }
+
     #[test]
     fn accepting_evolution_proposal_writes_memory_and_audit_history() {
         let (_tmp, conn) = setup_db();
@@ -2359,6 +3086,15 @@ mod tests {
         };
         let created = store_evolution_proposals(&conn, None, &evo, "test").unwrap();
         assert_eq!(created, 1);
+        let learned: i32 = conn
+            .query_row("SELECT COUNT(*) FROM adaptive_constraints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            learned, 0,
+            "unaccepted manual proposals cannot feed automatic adaptation"
+        );
 
         let proposal_id: String = conn
             .query_row("SELECT id FROM evolution_proposals LIMIT 1", [], |r| {

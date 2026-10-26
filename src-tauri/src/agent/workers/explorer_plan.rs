@@ -170,6 +170,7 @@ impl ExplorerPlanDocument {
         digest: &str,
     ) -> Result<ExplorerWorkPlan, ExplorerPlanError> {
         let delivery = DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: format!("explorer-delivery-{}", identity.attempt_id),
             delivery_revision: 1,
@@ -1272,6 +1273,7 @@ mod tests {
                 evidence_refs: vec!["evidence://test".into()],
             };
             let delivery = DelegationDelivery {
+                file_read_evidence: vec![],
                 schema_version: 1,
                 delivery_id: "delivery-a".into(),
                 delivery_revision: 1,

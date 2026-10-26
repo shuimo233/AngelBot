@@ -969,11 +969,23 @@
   to { transform: rotate(360deg); }
 }
 
-/* Avatar Section */
-.avatar-section {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+/* Personality basics and progressive disclosure */
+.personality-basic-fields {
+  display: grid;
+  gap: 16px;
+}
+
+.personality-note {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: var(--settings-font-caption);
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+.personality-settings .direction-match-card {
+  flex-wrap: wrap;
+  border-radius: var(--radius-control, 6px);
 }
 
 /* Direction Matching */
@@ -996,20 +1008,6 @@
   display: flex;
   align-items: center;
   gap: 14px;
-}
-
-.direction-match-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex: 1;
-  min-width: 0;
-}
-
-.direction-avatar {
-  font-size: 28px;
-  line-height: 1;
-  flex-shrink: 0;
 }
 
 .direction-match-info {
@@ -1719,6 +1717,12 @@
 }
 
 .settings-save-hint.is-error { color: var(--color-danger, #b42318); }
+.settings-leave-prompt { flex-shrink: 0; padding: 12px 20px; border-bottom: 1px solid var(--color-border-muted); background: var(--color-surface); font-size: var(--settings-font-body); }
+.settings-leave-prompt p { margin: 0 0 8px; }
+.settings-leave-prompt > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.settings-leave-prompt button { padding: 6px 10px; border: 1px solid var(--color-border-muted); border-radius: var(--radius-control); background: transparent; color: var(--color-text); cursor: pointer; }
+.settings-leave-prompt button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.settings-leave-prompt button:disabled { opacity: .5; cursor: wait; }
 .settings-save-btn:disabled { cursor: wait; opacity: .65; }
 
 /* Env Banner */
@@ -3041,6 +3045,12 @@
 }
 
 .project-network-approval-revoke:disabled { cursor: not-allowed; opacity: .55; }
+
+.restored-directory-list { margin: 12px 0; padding: 12px; border: 1px solid var(--color-border); min-width: 0; }
+.restored-directory-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr) auto; gap: 12px; align-items: center; padding: 10px 0; }
+.restored-directory-row + .restored-directory-row { border-top: 1px solid var(--color-border); }
+.restored-directory-row code { overflow-wrap: anywhere; font-size: var(--settings-font-caption); }
+@media (max-width: 620px) { .restored-directory-row { grid-template-columns: 1fr; gap: 8px; } .restored-directory-row button { justify-self: start; } }
 
 .project-network-approvals-error {
   margin: 0;

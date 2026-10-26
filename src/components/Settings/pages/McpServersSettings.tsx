@@ -4,9 +4,12 @@ import { TextField } from '../components/TextField';
 import { ToggleField } from '../components/ToggleField';
 import {
   clearMcpEnv,
+  clearBrowserTempFiles,
   deleteMcpServer,
   getMcpServerStatus,
   getMcpServers,
+  prepareBrowserMcp,
+  previewBrowserCleanup,
   removeMcpEnvVar,
   refreshMcpTools,
   saveMcpServer,
@@ -15,6 +18,7 @@ import {
   stopMcpServer,
   type McpServerStatus,
   type McpTool,
+  type BrowserCleanupPreview,
 } from '$lib/commands/mcp';
 import { getWorkspaces, type Workspace } from '$lib/commands/workspace';
 import type { McpServer } from '$types';
@@ -26,7 +30,7 @@ type McpRuntimeState = {
 };
 
 type RuntimeAction = { serverId: string; kind: 'check' | 'stop' };
-type ServerDraft = Pick<McpServer, 'name' | 'command' | 'args'>;
+type ServerDraft = Pick<McpServer, 'name' | 'command' | 'args'> & { id?: string };
 const validEnvKey = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const stoppedStatus = (serverId: string): McpServerStatus => ({
@@ -85,7 +89,8 @@ function runtimeLabel(server: McpServer, runtime: McpRuntimeState | undefined, a
     return runtime.tools === null ? '运行中 · 待检查' : `运行中 · ${runtime.tools.length} 个工具`;
   }
   if (runtime?.status.status === 'error') return '连接失败';
-  return '未连接';
+  if (server.catalogError) return '目录需重新检查';
+  return server.catalogReady ? '按需连接 · 目录已准备' : '未连接';
 }
 
 function runtimeTone(server: McpServer, runtime: McpRuntimeState | undefined, action: RuntimeAction['kind'] | null): string {
@@ -106,6 +111,34 @@ export function McpServersSettings() {
   const [error, setError] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [preparingBrowser, setPreparingBrowser] = useState(false);
+  const [cleanup, setCleanup] = useState<{ busy: boolean; preview: BrowserCleanupPreview | null; message: string | null; error: string | null }>({ busy: false, preview: null, message: null, error: null });
+
+  const inspectCleanup = async () => {
+    if (cleanup.busy) return;
+    setCleanup({ busy: true, preview: null, message: null, error: null });
+    try {
+      const preview = await previewBrowserCleanup();
+      setCleanup({ busy: false, preview, message: preview.fileCount ? null : '没有可清理的 7 天前临时文件，只读文件会保留。', error: null });
+    } catch (reason) {
+      setCleanup({ busy: false, preview: null, message: null, error: typeof reason === 'string' ? reason : '无法检查临时文件，请检查占用和数据目录后重新查看。' });
+    }
+  };
+
+  const confirmCleanup = async () => {
+    if (cleanup.busy || !cleanup.preview) return;
+    const preview = cleanup.preview;
+    // Consume the preview before dispatch. A failure never offers replay of an
+    // old destructive request; another explicit inspection is required.
+    setCleanup({ busy: true, preview: null, message: null, error: null });
+    try {
+      const result = await clearBrowserTempFiles(preview);
+      const message = `已清理 ${result.deletedFiles} 个旧临时文件。${result.partial ? '部分文件未能确认清理，不会自动重试。' : ''}${result.remainingFiles ? `仍有约 ${result.remainingFiles} 个旧文件，可重新查看下一批。` : '正式成果与近期文件未改动。'}`;
+      setCleanup({ busy: false, preview: null, error: result.partial ? message : null, message: result.partial ? null : message });
+    } catch (reason) {
+      setCleanup({ busy: false, preview: null, message: null, error: typeof reason === 'string' ? reason : '清理未能完成；请重新查看，不要重复旧请求。' });
+    }
+  };
   const [runtimeAction, setRuntimeAction] = useState<RuntimeAction | null>(null);
   const actionGeneration = useRef<Record<string, number>>({});
   const [newServer, setNewServer] = useState<ServerDraft>({ name: '', command: '', args: '' });
@@ -115,6 +148,18 @@ export function McpServersSettings() {
   const [envValueDraft, setEnvValueDraft] = useState('');
   const [confirmRemoveEnvKey, setConfirmRemoveEnvKey] = useState<string | null>(null);
   const [confirmClearEnvServerId, setConfirmClearEnvServerId] = useState<string | null>(null);
+
+  const prepareBrowser = async () => {
+    const personal = workspaces.find((workspace) => workspace.kind === 'personal');
+    if (!personal?.activeSessionId || preparingBrowser) return;
+    setPreparingBrowser(true);
+    setError(null);
+    try {
+      setNewServer(await prepareBrowserMcp(personal.activeSessionId));
+    } catch {
+      setError('无法准备日常结果区，未更改浏览器配置。请重新打开设置后再试。');
+    } finally { setPreparingBrowser(false); }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -183,7 +228,7 @@ export function McpServersSettings() {
 
   const handleAdd = async () => {
     if (!newServer.name.trim() || !newServer.command.trim()) return;
-    const server: McpServer = { id: crypto.randomUUID(), ...newServer, env: '', envKeys: [], envUnavailable: false, enabled: true, enabledWorkspaceIds: [] };
+    const server: McpServer = { ...newServer, id: newServer.id ?? crypto.randomUUID(), env: '', envKeys: [], envUnavailable: false, enabled: true, enabledWorkspaceIds: [] };
     if (await persist(server)) {
       setNewServer({ name: '', command: '', args: '' });
       setShowAddForm(false);
@@ -224,7 +269,7 @@ export function McpServersSettings() {
   const markEnvironmentChanged = (serverId: string, envKeys: string[]) => {
     actionGeneration.current[serverId] = (actionGeneration.current[serverId] ?? 0) + 1;
     setServers((items) => items.map((item) => item.id === serverId
-      ? { ...item, envKeys, envUnavailable: false, enabledWorkspaceIds: [] }
+      ? { ...item, envKeys, envUnavailable: false, enabledWorkspaceIds: [], catalogReady: false, catalogError: null }
       : item));
     setRuntime(serverId, { status: stoppedStatus(serverId), tools: [] });
   };
@@ -299,6 +344,7 @@ export function McpServersSettings() {
       if (actionGeneration.current[server.id] !== generation) return;
       const tools = await refreshMcpTools(server.id);
       if (actionGeneration.current[server.id] !== generation) return;
+      setServers((current) => current.map((item) => item.id === server.id ? { ...item, catalogReady: true, catalogError: null } : item));
       setRuntime(server.id, { status: { ...status, tools_count: tools.length }, tools });
     } catch (reason) {
       if (actionGeneration.current[server.id] !== generation) return;
@@ -353,6 +399,7 @@ export function McpServersSettings() {
       <SettingsSection title="MCP 服务" description="服务只有在明确启用到工作区，并由你连接检查后，才会出现在对应主对话的工具面。检查只读取工具清单，不会调用任何工具。" defaultOpen>
         <p className="settings-muted">MCP 服务不会自动继承 AngelBot 的模型密钥等环境变量。添加服务后，可为该服务单独配置环境变量；请勿将密钥写入命令或参数。</p>
         <p className="settings-muted">使用 npx 的首次连接可能下载并运行第三方包，请先确认来源；连接过程中可随时取消。</p>
+        <p className="settings-muted">新服务请先连接一次以准备工具目录。之后仅在任务实际调用时启动，不随应用启动；停止连接会结束进程但保留目录，停用服务才会禁止后续调用。修改命令、参数或凭据后需重新连接。</p>
         <p className="settings-muted">把服务启用到工作区会让该工作区的 AngelBot 使用它的工具；在“工作区自动”或“完全访问”执行权限下，普通工具可能直接运行。只启用你信任的服务，敏感操作是否专项询问仍以现有保护规则为准。</p>
         {error && <p className="settings-error" role="alert">{error}</p>}
         {loading ? <p className="settings-muted">正在读取配置…</p> : (
@@ -377,6 +424,7 @@ export function McpServersSettings() {
                       <span className="status-text">{runtimeLabel(server, runtime, action)}</span>
                     </span>
                   </div>
+                  {server.catalogError && <p className="settings-error">{server.catalogError}</p>}
                   {editDraft ? (
                     <div className="add-server-form">
                       <TextField label="名称" value={editDraft.name} onChange={(name) => setEditingServer({ ...editDraft, name })} />
@@ -509,6 +557,14 @@ export function McpServersSettings() {
 
         {showAddForm ? (
           <div className="add-server-form">
+            <SettingsSection title="网页操作（Playwright）" description="可选：使用 Microsoft 官方 MCP 服务，复用现有模型和执行权限。">
+              <p className="settings-muted">需要已安装 Node.js 20 或更新版本及 Microsoft Edge。首次连接会下载并运行固定版本的第三方服务。</p>
+              <p className="settings-muted">使用独立、可见的临时浏览器会话，不接管你已有的标签页或登录账号；停止浏览器会话后不保留登录和页面存储，重开时需重新核对任务结果。</p>
+              <p className="settings-muted">临时会话不是系统、文件或网络安全沙箱。该服务包含脚本、上传和文件相关工具；只启用你完全信任的服务。网页内容可能发给当前模型，省略图像响应不等于禁止截图落盘。</p>
+              <p className="settings-muted">这里只填入配置，不会启动或授权。添加后仍需选择允许的工作区，再连接检查；不自动接入网页自行注册的工具。</p>
+              <p className="settings-muted">新配置将快照、日志及下载放入独立的浏览器临时区，不随备份。需要保留的下载由 AngelBot 复制到正式结果区后交付；也可在文件工作台查看并另存。停止服务不会自动删除文件，已有服务配置保持不变。</p>
+              <button className="btn btn-secondary" type="button" disabled={saving || preparingBrowser || !workspaces.some((workspace) => workspace.kind === 'personal' && workspace.activeSessionId)} onClick={() => void prepareBrowser()}>{preparingBrowser ? '正在准备…' : '填入浏览器配置'}</button>
+            </SettingsSection>
             <TextField label="名称" value={newServer.name} placeholder="服务名称" onChange={(name) => setNewServer({ ...newServer, name })} />
             <TextField label="命令" value={newServer.command} placeholder="npx.cmd" onChange={(command) => setNewServer({ ...newServer, command })} />
             <TextField label="参数" value={newServer.args} placeholder="-y @modelcontextprotocol/server-..." onChange={(args) => setNewServer({ ...newServer, args })} />
@@ -524,6 +580,18 @@ export function McpServersSettings() {
           <button className="add-server-btn" type="button" disabled={loading || saving || editingServer !== null || editingEnvServerId !== null} onClick={() => setShowAddForm(true)}><PlusIcon />添加服务</button>
         )}
       </SettingsSection>
+        <SettingsSection title="浏览器临时文件管理" description="仅处理已登记临时区，不按扩展名扫描普通成果或旧配置目录。">
+          <p className="settings-muted">先停止使用临时区的浏览器服务，处理当前或待确认的任务。这里只清理创建和修改均已超过 7 天的文件，每批最多 1024 个；只读文件、近期文件、目录和正式成果保留。</p>
+          <button className="btn btn-secondary" type="button" disabled={cleanup.busy || loading || saving} onClick={() => void inspectCleanup()}>{cleanup.busy ? '处理中…' : '查看 7 天前文件'}</button>
+          {cleanup.preview && cleanup.preview.fileCount > 0 && <div>
+            <p>本批 {cleanup.preview.fileCount} 个文件，共 {(cleanup.preview.bytes / 1024 / 1024).toFixed(2)} MiB；共有 {cleanup.preview.eligibleFiles} 个符合条件的旧文件。</p>
+            <p className="settings-muted">可能含尚未交付的下载，请先另存需要的文件。删除不可撤销；文件清单变化或预览超过 5 分钟需重新确认，不会自动重试。</p>
+            <details><summary>查看本批完整清单</summary><ul style={{ maxHeight: 200, overflow: 'auto' }}>{cleanup.preview.files.map((file) => <li key={file}>{file}</li>)}</ul></details>
+            <button className="btn btn-secondary" type="button" disabled={cleanup.busy} onClick={() => void confirmCleanup()}>删除本批旧临时文件</button>
+          </div>}
+          {cleanup.error && <p role="alert">{cleanup.error}</p>}
+          {cleanup.message && <p role="status">{cleanup.message}</p>}
+        </SettingsSection>
     </div>
   );
 }

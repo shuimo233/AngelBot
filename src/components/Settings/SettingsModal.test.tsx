@@ -13,7 +13,10 @@ const settingsState = vi.hoisted(() => ({
 }));
 
 vi.mock('$stores/settings', () => ({
-  useSettingsStore: (selector: (state: typeof settingsState) => unknown) => selector(settingsState),
+  hasUnsavedApiConfig: () => false,
+  useSettingsStore: Object.assign((selector: (state: typeof settingsState) => unknown) => selector(settingsState), {
+    getState: () => settingsState,
+  }),
 }));
 
 vi.mock('./SettingsRouter', () => ({
@@ -37,7 +40,7 @@ describe('SettingsModal', () => {
         </>
       );
     };
-    render(<Harness />);
+    const { rerender } = render(<Harness />);
 
     const trigger = screen.getByRole('button', { name: '打开设置' });
     await user.click(trigger);
@@ -45,6 +48,8 @@ describe('SettingsModal', () => {
     await waitFor(() => expect(closeButton).toHaveFocus());
 
     await user.tab({ shift: true });
+    expect(screen.getByRole('button', { name: '第二项' })).toHaveFocus();
+    rerender(<Harness />);
     expect(screen.getByRole('button', { name: '第二项' })).toHaveFocus();
     await user.tab();
     expect(closeButton).toHaveFocus();

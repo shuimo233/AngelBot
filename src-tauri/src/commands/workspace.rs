@@ -7,11 +7,30 @@
 use crate::{commands::session::Session, AppState};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
 pub const PERSONAL_WORKSPACE_ID: &str = "personal";
+
+/// Empty or legacy restores must still leave the single Daily entry usable.
+pub(crate) fn ensure_personal_workspace(conn: &Connection) -> Result<(), String> {
+    let now = Utc::now().timestamp();
+    conn.execute("INSERT OR IGNORE INTO projects(id,name,path,created_at,kind,updated_at) VALUES('personal','AngelBot 日常','',?1,'personal',?1)",[now]).map_err(|e|e.to_string())?;
+    conn.execute("INSERT OR IGNORE INTO sessions(id,title,created_at,updated_at,project_id) SELECT 'personal-main','',?1,?1,'personal' WHERE EXISTS(SELECT 1 FROM projects WHERE id='personal' AND active_session_id IS NULL)",[now]).map_err(|e|e.to_string())?;
+    conn.execute("UPDATE projects SET active_session_id='personal-main' WHERE id='personal' AND active_session_id IS NULL AND EXISTS(SELECT 1 FROM sessions WHERE id='personal-main' AND project_id='personal')",[]).map_err(|e|e.to_string())?;
+    if conn
+        .query_row(
+            "SELECT active_session_id IS NULL FROM projects WHERE id='personal'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| e.to_string())?
+    {
+        return Err("日常主会话标识与现有项目冲突，未提交恢复。".to_owned());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Workspace {
@@ -26,6 +45,8 @@ pub struct Workspace {
     pub updated_at: i64,
     #[serde(rename = "activeSessionId")]
     pub active_session_id: String,
+    #[serde(rename = "directoryConfirmed")]
+    pub directory_confirmed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +57,10 @@ pub struct OpenWorkspace {
 
 #[tauri::command]
 pub fn get_workspaces(state: State<AppState>) -> Result<Vec<Workspace>, String> {
+    get_workspaces_impl(&state)
+}
+
+pub fn get_workspaces_impl(state: &AppState) -> Result<Vec<Workspace>, String> {
     let conn = state.db.lock().map_err(|error| error.to_string())?;
     list_workspaces(&conn)
 }
@@ -43,6 +68,16 @@ pub fn get_workspaces(state: State<AppState>) -> Result<Vec<Workspace>, String> 
 #[tauri::command]
 pub fn create_project_workspace(
     state: State<AppState>,
+    path: String,
+    name: Option<String>,
+    agent_provider: Option<String>,
+    agent_model: Option<String>,
+) -> Result<OpenWorkspace, String> {
+    create_project_workspace_impl(&state, path, name, agent_provider, agent_model)
+}
+
+pub fn create_project_workspace_impl(
+    state: &AppState,
     path: String,
     name: Option<String>,
     agent_provider: Option<String>,
@@ -166,8 +201,66 @@ fn seed_desktop_e2e_network_approval(
 
 #[tauri::command]
 pub fn open_workspace(state: State<AppState>, id: String) -> Result<OpenWorkspace, String> {
+    open_workspace_impl(&state, &id)
+}
+
+pub fn open_workspace_impl(state: &AppState, id: &str) -> Result<OpenWorkspace, String> {
     let conn = state.db.lock().map_err(|error| error.to_string())?;
-    open_workspace_by_id(&conn, &id)
+    open_workspace_by_id(&conn, id)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectoryConfirmation {
+    pub id: String,
+    pub expected_path: String,
+    pub path: String,
+}
+
+/// One user-selected batch; no Agent tool or automatic restore may call this.
+#[tauri::command]
+pub fn confirm_restored_project_directories(
+    state: State<AppState>,
+    directories: Vec<DirectoryConfirmation>,
+) -> Result<(), String> {
+    confirm_restored_project_directories_impl(&state, directories)
+}
+
+pub fn confirm_restored_project_directories_impl(
+    state: &AppState,
+    directories: Vec<DirectoryConfirmation>,
+) -> Result<(), String> {
+    if directories.is_empty() || directories.len() > 1000 {
+        return Err("请选择需要确认的项目目录（最多 1000 个）。".to_owned());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    for directory in directories {
+        if !seen.insert(directory.id.clone()) {
+            return Err("同一个项目不能重复确认。".to_owned());
+        }
+        let expected: Option<String> = tx.query_row(
+            "SELECT path FROM projects WHERE id=?1 AND kind='project' AND directory_confirmed=0",
+            [&directory.id], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        if expected.as_deref() != Some(directory.expected_path.as_str()) {
+            return Err("待确认的项目已改变，请刷新后重试。".to_owned());
+        }
+        let root = canonical_project_root(&directory.path)?;
+        let path = crate::commands::file::display_work_dir(&root);
+        tx.execute(
+            "UPDATE projects SET path=?1,directory_confirmed=1,updated_at=?2 WHERE id=?3",
+            params![path, Utc::now().timestamp(), directory.id],
+        )
+        .map_err(|_| "该目录已属于另一个项目，未确认本批目录。".to_owned())?;
+        tx.execute(
+            "UPDATE sessions SET work_dir=?1,additional_read_dirs='[]' WHERE project_id=?2",
+            params![path, directory.id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 fn canonical_project_root(path: &str) -> Result<std::path::PathBuf, String> {
@@ -182,7 +275,7 @@ fn list_workspaces(conn: &Connection) -> Result<Vec<Workspace>, String> {
     let mut statement = conn
         .prepare(
             "SELECT p.id, p.name, p.kind, p.path, p.created_at,
-                    COALESCE(s.updated_at, p.updated_at), p.active_session_id
+                    COALESCE(s.updated_at, p.updated_at), p.active_session_id, p.directory_confirmed
              FROM projects p
              LEFT JOIN sessions s ON s.id = p.active_session_id
              ORDER BY CASE p.kind WHEN 'personal' THEN 0 ELSE 1 END,
@@ -201,7 +294,7 @@ fn open_workspace_by_id(conn: &Connection, id: &str) -> Result<OpenWorkspace, St
     let workspace = conn
         .query_row(
             "SELECT p.id, p.name, p.kind, p.path, p.created_at,
-                    COALESCE(s.updated_at, p.updated_at), p.active_session_id
+                    COALESCE(s.updated_at, p.updated_at), p.active_session_id, p.directory_confirmed
              FROM projects p LEFT JOIN sessions s ON s.id = p.active_session_id
              WHERE p.id = ?1",
             params![id],
@@ -230,6 +323,7 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
         active_session_id: row.get(6)?,
+        directory_confirmed: row.get(7)?,
     })
 }
 

@@ -32,6 +32,7 @@ export function Sidebar({ onToggleTheme, dark, onOpenSettings, onOpenQuickSwitch
     if (creating) return;
     setCreating(true);
     setProjectError('');
+    const navigation = useNavigationStore.getState();
     try {
       const selected = await openDialog({
         directory: true,
@@ -39,7 +40,8 @@ export function Sidebar({ onToggleTheme, dark, onOpenSettings, onOpenQuickSwitch
         title: '选择项目文件夹',
       });
       if (typeof selected !== 'string') return;
-      await createProject(selected);
+      const accepted = await createProject(selected);
+      if (!accepted || navigation !== useNavigationStore.getState()) return;
       setPage('chat');
       onClose?.();
     } catch (reason) {
@@ -61,8 +63,10 @@ export function Sidebar({ onToggleTheme, dark, onOpenSettings, onOpenQuickSwitch
     if (openingWorkspaceId) return;
     setOpeningWorkspaceId(id);
     setProjectError('');
+    const navigation = useNavigationStore.getState();
     try {
-      await openWorkspace(id);
+      const accepted = await openWorkspace(id);
+      if (!accepted || navigation !== useNavigationStore.getState()) return;
       setPage('chat');
       onClose?.();
     } catch (reason) {
@@ -78,12 +82,13 @@ export function Sidebar({ onToggleTheme, dark, onOpenSettings, onOpenQuickSwitch
       <button type="button" className="icon-btn" title={dark ? '浅色模式' : '深色模式'} aria-label={dark ? '浅色模式' : '深色模式'} onClick={onToggleTheme}>{dark ? <SunIcon /> : <MoonIcon />}</button>
       <button type="button" className="icon-btn" title="设置" aria-label="设置" onClick={onOpenSettings}><SettingsIcon /></button>
     </div>
-    <nav className="sidebar-primary-nav" aria-label="主导航">{NAVIGATION.map((item) => <button key={item.id} type="button" className={`sidebar-primary-nav-item ${currentPage === item.id ? 'active' : ''}`} onClick={() => setPage(item.id)}>{item.label}</button>)}</nav>
+    <nav className="sidebar-primary-nav" aria-label="主导航">{NAVIGATION.map((item) => <button key={item.id} type="button" className={`sidebar-primary-nav-item ${currentPage === item.id ? 'active' : ''}`} onClick={() => { setPage(item.id); onClose?.(); }}>{item.label}</button>)}</nav>
     <div className="sidebar-session-bar"><span className="sidebar-section-heading">工作区</span><div className="sidebar-spacer" />{onOpenQuickSwitch && <button type="button" className="sidebar-quick-switch" title="快速切换 (Ctrl+K)" aria-label="快速切换" onClick={onOpenQuickSwitch}><SearchIcon /></button>}<button type="button" className="sidebar-add-project" title={creating ? '正在创建项目' : '新建项目'} aria-label={creating ? '正在创建项目' : '新建项目'} disabled={creating} onClick={() => void createFromDirectory()}><span aria-hidden="true">+</span></button></div>
     <div className="sidebar-section">
       {projectError && <p className="sidebar-project-error" role="alert">{projectError}</p>}
       {personal && <button type="button" className={`session-item-select ${activeWorkspaceId === personal.id ? 'active' : ''}`} onClick={() => void choose(personal.id)} disabled={Boolean(openingWorkspaceId)} aria-busy={openingWorkspaceId === personal.id || undefined}><span className="session-item-title">AngelBot 日常</span><span className="session-item-time">陪伴与日常事务</span></button>}
       <div className="sidebar-section-label">项目</div>
+      {projects.some((workspace) => workspace.directoryConfirmed === false) && <button type="button" className="sidebar-restore-directories" onClick={() => window.dispatchEvent(new CustomEvent('open-settings', { detail: 'data' }))}>确认恢复目录（{projects.filter((workspace) => workspace.directoryConfirmed === false).length}）</button>}
       {projects.map((workspace) => <button key={workspace.id} type="button" className={`session-item-select ${activeWorkspaceId === workspace.id ? 'active' : ''}`} onClick={() => void choose(workspace.id)} title={workspace.rootPath} disabled={Boolean(openingWorkspaceId)} aria-busy={openingWorkspaceId === workspace.id || undefined}><FolderIcon /><span className="session-item-title">{workspace.name}</span></button>)}
       {projects.length === 0 && <div className="session-empty"><div className="session-empty-hint">创建项目后，AngelBot 会为它保留唯一的主对话。</div></div>}
     </div>

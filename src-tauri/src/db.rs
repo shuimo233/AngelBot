@@ -219,6 +219,19 @@ const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("migrations/077_delegated_delivery_follow_ups.sql"),
     ),
     (78, include_str!("migrations/078_mcp_credential_refs.sql")),
+    (
+        79,
+        include_str!("migrations/079_maa_automation_options.sql"),
+    ),
+    (80, include_str!("migrations/080_mcp_tool_catalog.sql")),
+    (
+        81,
+        include_str!("migrations/081_restored_project_directories.sql"),
+    ),
+    (
+        82,
+        include_str!("migrations/082_automation_result_notifications.sql"),
+    ),
 ];
 
 /// Short human-readable description for each migration version, used in
@@ -303,6 +316,10 @@ const MIGRATION_DESCRIPTIONS: &[&str] = &[
     "agent automation foreground dispatch linkage",
     "reviewed Explorer delivery foreground follow-ups",
     "MCP environment credential references",
+    "authorized on-demand MAA automation options",
+    "credential-free MCP discovery catalog",
+    "restored project directories require local confirmation",
+    "owned automation result notification receipts",
 ];
 
 /// Read an integer setting, returning `default` if the key is missing or unparseable.
@@ -778,6 +795,15 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
                     .map_err(|error| format!("Migration v{} schema failed: {error}", *version))?;
             }
             MIGRATION_078_INDEX_AND_GC.to_owned()
+        } else if *version == 81 && projects_has_column(conn, "directory_confirmed") {
+            // A surviving schema is not an instruction to re-grant imported
+            // paths. Journal repair must preserve pending zero values too.
+            String::new()
+        } else if *version == 82 && automation_runs_has_column(conn, "notification_status") {
+            // A recovered database may retain the column but lose the journal.
+            // Preserve every notification claim, especially unconfirmed: adding
+            // the column again or clearing claims must not trigger a resend.
+            String::new()
         } else {
             (*sql).to_owned()
         };
@@ -1450,7 +1476,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(applied, 1);
-        assert_eq!(get_setting_int(&conn, "schema_version", 0), 78);
+        assert_eq!(
+            get_setting_int(&conn, "schema_version", 0),
+            MIGRATIONS.last().unwrap().0
+        );
     }
 
     #[test]
@@ -1487,6 +1516,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(queue_exists, 1);
+    }
+
+    #[test]
+    fn restored_directory_migration_handles_surviving_and_missing_schema_without_regranting() {
+        for survived in [true, false] {
+            let (_tmp, conn) = setup_test_db();
+            migrate(&conn).unwrap();
+            conn.execute("INSERT INTO projects(id,name,path,created_at,kind,updated_at,directory_confirmed) VALUES('restore-probe','Preserved','D:/owned/probe',1,'project',1,0)",[]).unwrap();
+            if !survived {
+                conn.execute_batch("ALTER TABLE projects DROP COLUMN directory_confirmed;")
+                    .unwrap();
+            }
+            conn.execute_batch("DELETE FROM migration_log WHERE version=81; UPDATE settings SET value='80' WHERE key='schema_version';").unwrap();
+            migrate(&conn).unwrap();
+            assert_eq!(conn.query_row("SELECT directory_confirmed FROM projects WHERE id='restore-probe'",[],|r|r.get::<_,i64>(0)).unwrap(),if survived {0}else{1},"journal replay cannot grant a pending path; a genuinely old schema preserves its existing local grant");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT path FROM projects WHERE id='restore-probe'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "D:/owned/probe"
+            );
+            assert!(conn
+                .execute(
+                    "UPDATE projects SET directory_confirmed=2 WHERE id='restore-probe'",
+                    []
+                )
+                .is_err());
+            migrate(&conn).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM migration_log WHERE version=81 AND status='applied'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub(crate) struct ProcessTree {
 }
 
 impl ProcessTree {
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub(crate) fn spawn(command: &mut Command) -> Result<Self, String> {
         #[cfg(windows)]
         {

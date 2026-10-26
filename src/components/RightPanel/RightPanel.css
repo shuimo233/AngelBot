@@ -501,24 +501,17 @@
 .file-preview-header .file-reference-btn { padding: 3px 6px; border: 1px solid var(--color-border); border-radius: var(--radius-control); color: var(--color-text); background: var(--color-surface); font-size: 11px; }
 .file-preview-header .file-save-btn { padding: 3px 7px; border: 1px solid var(--color-accent-fill); border-radius: 5px; color: var(--color-accent-contrast); background: var(--color-accent); font-size: 11px; cursor: pointer; }.file-preview-header .file-save-btn:disabled { opacity: .45; cursor: default; }.file-editor { box-sizing: border-box; display: block; width: 100%; min-height: 320px; resize: vertical; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-bg); color: var(--color-text); padding: 10px; font: 12px/1.55 var(--font-mono, monospace); tab-size: 2; }
 .right-panel-content--files { display: flex; overflow: hidden; }.workbench-files--workspace { display: flex; flex: 1; min-height: 0; flex-direction: column; }.workbench-files--workspace > .file-tree { min-height: 0; max-height: 42%; overflow: auto; padding-right: 3px; }.workbench-files--workspace .file-preview { display: flex; flex: 1; min-height: 220px; flex-direction: column; }.workbench-files--workspace .file-editor { min-height: 0; flex: 1; border: 0; border-radius: 0; }.file-type-icon { display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-right: 4px; color: var(--color-muted); font: 700 9px/1 var(--font-mono, monospace); }.file-type-icon.folder { color: #d49a2a; font-size: 14px; }.file-type-icon.ext-py { color: #367bb7; }.file-type-icon.ext-js,.file-type-icon.ext-ts,.file-type-icon.ext-tsx { color: #c79a00; }.file-type-icon.ext-html { color: #d65a39; }.file-type-icon.ext-css { color: #6b63c7; }.file-type-icon.ext-md { color: #3c8b75; }.file-type-icon.ext-json,.file-type-icon.ext-yml,.file-type-icon.ext-yaml { color: #8b6c44; }.file-type-icon.ext-bat,.file-type-icon.ext-ps1,.file-type-icon.ext-vbs { color: #7a66a5; }
-.workbench-files--workspace { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); gap: 8px; overflow: hidden; }.workbench-files--workspace > .workbench-section-title,.workbench-files--workspace > .workbench-hint,.workbench-files--workspace > .workbench-error,.workbench-files--workspace > .context-loading { grid-column: 1 / -1; }.workbench-files--workspace > .file-tree { max-height: none; overflow: auto; padding: 2px 0; }.workbench-files--workspace .file-preview { min-height: 0; margin: 0; overflow: hidden; }.workbench-files--workspace .file-item { justify-content: flex-start; min-width: 0; text-align: left; }.workbench-files--workspace .file-name { min-width: 0; max-width: 100%; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }.workbench-files--has-preview { grid-template-columns: minmax(0, 1fr) minmax(190px, 36%); }.workbench-files--has-preview > .file-preview { grid-column: 1; grid-row: 3; }.workbench-files--has-preview > .file-tree { grid-column: 2; grid-row: 3; border-left: 1px solid var(--color-border); padding-left: 8px; }.workbench-files--has-preview .file-editor { min-height: 0; flex: 1; }.file-preview-header span { min-width: 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
-
-/* The workbench is intentionally narrow: keep the tree and preview vertically useful. */
-.workbench-files--has-preview {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(72px, max-content) minmax(0, 1fr);
-}
-
-.workbench-files--has-preview > .file-tree {
-  grid-column: 1;
-  grid-row: 3;
-  padding: 0 0 8px;
-  max-height: 30vh;
-  border-left: 0;
-  border-bottom: 1px solid var(--color-border-muted);
-}
-
-.workbench-files--has-preview > .file-preview {
-  grid-column: 1;
-  grid-row: 4;
-}
+/* One vertical flow also reserves space for loading, errors and save receipts. */
+.workbench-files--workspace { gap: 8px; }
+.workbench-files--workspace > .file-tree { flex: 1; min-height: 0; max-height: none; overflow: auto; padding: 2px 0; }
+.workbench-files--has-preview > .file-tree { flex: 0 1 30vh; padding-bottom: 8px; border-bottom: 1px solid var(--color-border-muted); }
+.workbench-files--workspace > .file-preview { flex: 1; min-height: 0; margin: 0; }
+.workbench-files--workspace .file-item { justify-content: flex-start; min-width: 0; text-align: left; }
+.workbench-files--workspace .file-name { min-width: 0; max-width: 100%; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.file-preview-header span { min-width: 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-node { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.file-tree-children { grid-column: 1 / -1; }
+.file-save-as { border: 0; background: transparent; color: var(--color-muted); padding: 6px; font: inherit; cursor: pointer; }
+.file-save-as:hover { color: var(--color-accent); }
+.workbench-files > .workbench-section-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.workbench-section-title > button { border: 0; background: transparent; color: var(--color-muted); font: inherit; cursor: pointer; }

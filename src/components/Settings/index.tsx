@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { SettingsRouter } from './SettingsRouter';
 import type { SettingsPage } from './types';
-import { useSettingsStore } from '$stores/settings';
+import { hasUnsavedApiConfig, useSettingsStore } from '$stores/settings';
 import { useDialogFocus } from '$lib/useDialogFocus';
 
 interface SettingsModalProps {
@@ -13,33 +13,57 @@ interface SettingsModalProps {
 export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: SettingsModalProps) {
   const [activePage, setActivePage] = useState<SettingsPage>('personality');
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [closeRequested, setCloseRequested] = useState(false);
   const loadProfile = useSettingsStore((s) => s.loadProfile);
   const loadApiConfig = useSettingsStore((s) => s.loadApiConfig);
   const persistProfile = useSettingsStore((s) => s.persistProfile);
   const persistApiConfig = useSettingsStore((s) => s.persistApiConfig);
   const apiConfig = useSettingsStore((s) => s.apiConfig);
+  const activeApiConfig = useSettingsStore((s) => s.activeApiConfig);
+  const discardApiConfigDraft = useSettingsStore((s) => s.discardApiConfigDraft);
   const profile = useSettingsStore((s) => s.profile);
   const apiConfigLoadError = useSettingsStore((s) => s.apiConfigLoadError);
   const savedApiConfig = useRef(apiConfig);
   const savedProfile = useRef(profile);
+  const activePageRef = useRef(activePage);
+  activePageRef.current = activePage;
+  const openGeneration = useRef(0);
+  const unsaved = hasUnsavedApiConfig(apiConfig, activeApiConfig)
+    || JSON.stringify(profile) !== JSON.stringify(savedProfile.current);
   const requiresExplicitSave = activePage === 'personality' || activePage === 'api';
+  const requestClose = useCallback(() => {
+    if (saveState === 'saving' || saveState === 'error' || unsaved) setCloseRequested(true);
+    else onClose();
+  }, [saveState, unsaved, onClose]);
   const dialogRef = useDialogFocus<HTMLDivElement>({
     isOpen,
-    onClose,
+    onClose: requestClose,
     initialFocusSelector: '.settings-close-btn',
   });
 
   useEffect(() => {
     if (isOpen) {
-      setActivePage(initialPage);
+      ++openGeneration.current;
+      setCloseRequested(false);
       setSaveState('idle');
       loadProfile();
+      savedProfile.current = useSettingsStore.getState().profile;
       loadApiConfig();
     }
-  }, [initialPage, isOpen, loadProfile, loadApiConfig]);
+    return () => { ++openGeneration.current; };
+  }, [isOpen, loadProfile, loadApiConfig]);
+
+  useEffect(() => { if (isOpen) setActivePage(initialPage); }, [initialPage, isOpen]);
 
   useEffect(() => {
-    setSaveState('idle');
+    if (isOpen && closeRequested && !unsaved && saveState !== 'saving' && saveState !== 'error') {
+      setCloseRequested(false);
+      onClose();
+    }
+  }, [isOpen, closeRequested, unsaved, saveState, onClose]);
+
+  useEffect(() => {
+    setSaveState((state) => state === 'saving' ? state : 'idle');
   }, [activePage]);
 
   useEffect(() => {
@@ -55,23 +79,25 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
   }, [saveState]);
 
   const handleSave = async () => {
+    const generation = openGeneration.current;
     setSaveState('saving');
     try {
       if (activePage === 'personality') persistProfile();
       if (activePage === 'api') await persistApiConfig();
+      if (openGeneration.current !== generation) return;
       const state = useSettingsStore.getState();
-      savedApiConfig.current = state.apiConfig;
-      savedProfile.current = state.profile;
-      setSaveState(activePage === 'api' && state.apiConfig !== state.activeApiConfig ? 'idle' : 'saved');
+      if (activePage === 'api') savedApiConfig.current = state.apiConfig;
+      if (activePage === 'personality') savedProfile.current = state.profile;
+      setSaveState(activePageRef.current !== activePage || (activePage === 'api' && state.apiConfig !== state.activeApiConfig) ? 'idle' : 'saved');
     } catch {
-      setSaveState('error');
+      if (openGeneration.current === generation) setSaveState('error');
     }
   };
 
   if (!isOpen) return null;
 
   return (
-    <div className="settings-overlay" onClick={onClose}>
+    <div className="settings-overlay" onClick={requestClose}>
       <div
         ref={dialogRef}
         className="settings-modal"
@@ -83,7 +109,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
         onClick={(e) => e.stopPropagation()}
       >
         <div className="settings-header">
-          <button className="settings-close-btn" onClick={onClose} aria-label="关闭">
+          <button className="settings-close-btn" onClick={requestClose} aria-label="关闭">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="18" y1="6" x2="6" y2="18" />
               <line x1="6" y1="6" x2="18" y2="18" />
@@ -114,6 +140,22 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
             </button>
           )}
         </div>
+        {closeRequested && <div className="settings-leave-prompt" role="alert">
+          <p>{saveState === 'saving'
+            ? '正在保存，完成后将核对是否可以关闭。关闭设置不会取消已提交的保存。'
+            : saveState === 'error'
+              ? '本次保存未能确认成功。请先核对配置；关闭不会自动重试保存。'
+              : '还有未保存的模型或性格修改，离开前请保存，或明确放弃修改。'}</p>
+          <div>
+            <button type="button" onClick={() => setCloseRequested(false)}>继续编辑</button>
+            <button type="button" disabled={saveState === 'saving'} onClick={() => {
+              setCloseRequested(false);
+              loadProfile();
+              discardApiConfigDraft();
+              onClose();
+            }}>放弃未保存修改并关闭</button>
+          </div>
+        </div>}
         <SettingsRouter activePage={activePage} onNavigate={setActivePage} />
       </div>
     </div>

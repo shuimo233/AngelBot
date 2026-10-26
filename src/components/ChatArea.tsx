@@ -1,4 +1,4 @@
-import { Component, Fragment, useEffect, useRef, useState, useCallback, type ErrorInfo, type ReactNode } from 'react';
+import { Component, Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, type ErrorInfo, type ReactNode } from 'react';
 import { useMessagesStore, type LiveBlock } from '$stores/messages';
 import { useSessionsStore } from '$stores/sessions';
 import { projectWorkspaceForMessage, useWorkspacesStore } from '$stores/workspaces';
@@ -6,11 +6,12 @@ import { usePreferencesStore } from '$stores/preferences';
 import { useSettingsStore } from '$stores/settings';
 import { ComposerInput, type ComposerInputHandle } from './Composer/ComposerInput';
 import { ChatEmptyState } from './ChatEmptyState';
-import { WorkspaceReminders, AUTOMATIONS_UPDATED_EVENT } from './WorkspaceReminders';
+import { WorkspaceReminders } from './WorkspaceReminders';
+import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { ChatHeader } from './ChatHeader';
 import { useThinkingEffortStore } from '$stores/thinkingEffort';
 import { sendMessage, getMessages, resolveAgentConfirmation, interruptAgent, pauseAgent, resumeAgent, submitInProgressCommand } from '$lib/commands';
-import { continueAgentTask, deleteMessage, editAndResendMessage } from '$lib/commands/message';
+import { deleteMessage, editAndResendMessage } from '$lib/commands/message';
 import { getWorkspaceTaskUnderstanding, type TaskDecisionProjection } from '$lib/commands/task-understanding';
 import { MessageActions } from './MessageActions';
 import { ContentBlockRenderer } from './ContentBlockRenderer';
@@ -24,7 +25,7 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { Message, ToolCall, ToolResult, PersonalityTemplate, TextAttachment } from '$types';
-import { textAttachmentBytes } from '$lib/text-attachments';
+import { TextAttachmentDetails } from './TextAttachmentDetails';
 import { cardDescription } from '$lib/tavern-card';
 import { extractSecureWebSearchSetup } from '$lib/web-search-setup';
 import { WorkspaceActivityCapsule } from './WorkspaceActivityCapsule';
@@ -35,9 +36,10 @@ import { UpdateNotice } from './UpdateNotice';
 import { ModelConfigurationNotice } from './ModelConfigurationNotice';
 import { formatModelSendError } from '$lib/model-config';
 import { getToolDisplayName, parseMcpToolIdentity } from '$lib/tool-display';
-import { desktopActionOperation, getToolConfirmationSummary, requiresDesktopActionPreview } from '$lib/tool-confirmation';
-import { desktopActionReceipt, isResultUnknown } from '$lib/desktop-action-result';
-import { DesktopActionApproval } from './DesktopActionApproval';
+import { desktopActionOperation, desktopConfirmationOperation, getToolConfirmationSummary, requiresDesktopActionPreview, requiresDesktopConfirmationPreview } from '$lib/tool-confirmation';
+import { toolActionReceipt } from '$lib/tool-action-result';
+import { DesktopActionApproval, type DesktopApprovalRecheck, type DesktopApprovalResolution } from './DesktopActionApproval';
+import { ToolActionApproval } from './ToolActionApproval';
 
 // ─── Tool Display Helpers ──────────────────────────────────────────────────────
 
@@ -77,35 +79,29 @@ export function restoreRetryableLiveConfirmation(
   ));
 }
 
-const UNKNOWN_DESKTOP_ACTION_CONFIRMATION = `Error: ${JSON.stringify({
+const UNKNOWN_ACTION_CONFIRMATION = `Error: ${JSON.stringify({
   code: 'RESULT_UNKNOWN',
   message: '确认请求状态未知；目标应用可能已改变。请先在应用中核对，勿直接重试。',
 })}`;
 
-function canAutoContinueConfirmedTurn(messages: Message[], messageId: string): boolean {
-  const turn = messages.find((message) => message.id === messageId);
-  return turn?.taskRun?.status === 'continue_suggested'
-    && !(turn.toolResults ?? []).some(isResultUnknown);
-}
-
-function markUnknownLiveDesktopConfirmation(blocks: LiveBlock[], callId: string): LiveBlock[] {
+function markUnknownLiveConfirmation(blocks: LiveBlock[], callId: string): LiveBlock[] {
   return blocks.map((block) => block.kind === 'tool_call' && block.callId === callId
-    ? { ...block, status: 'failed', error: UNKNOWN_DESKTOP_ACTION_CONFIRMATION }
+    ? { ...block, status: 'failed', error: UNKNOWN_ACTION_CONFIRMATION }
     : block);
 }
 
-function markUnknownPersistedDesktopConfirmation(messageId: string, callId: string): void {
+function markUnknownPersistedConfirmation(messageId: string, callId: string): void {
   useMessagesStore.setState((state) => ({
     messages: state.messages.map((message) => {
       if (message.id !== messageId) return message;
       const toolName = message.toolCalls?.find((tool) => tool.id === callId)?.name;
-      if (!toolName || !requiresDesktopActionPreview(toolName)) return message;
+      if (!toolName || (!requiresDesktopActionPreview(toolName) && !toolName.startsWith('mcp_'))) return message;
       const result: ToolResult = {
         callId,
         toolName,
         success: false,
-        output: UNKNOWN_DESKTOP_ACTION_CONFIRMATION,
-        error: UNKNOWN_DESKTOP_ACTION_CONFIRMATION,
+        output: UNKNOWN_ACTION_CONFIRMATION,
+        error: UNKNOWN_ACTION_CONFIRMATION,
         confirmationRequired: false,
         confirmationStatus: 'unknown',
       };
@@ -207,6 +203,14 @@ function truncateTechnicalOutput(output: unknown, limit = 4_000): string {
   return text.length > limit ? `${text.slice(0, limit)}\n… 输出已截断` : text;
 }
 
+function isFailedToolResult(toolName: string, result?: ToolResult): boolean {
+  return result?.success === false
+    && result.confirmationStatus !== 'pending'
+    && result.confirmationStatus !== 'cancelled'
+    && result.confirmationStatus !== 'rejected'
+    && toolActionReceipt(toolName, result)?.status !== 'result_unknown';
+}
+
 const AgentStepTechnicalDetails = ({
   tool,
   result,
@@ -218,12 +222,13 @@ const AgentStepTechnicalDetails = ({
 }) => {
   const [argumentsOpen, setArgumentsOpen] = useState(false);
   const [outputOpen, setOutputOpen] = useState(false);
-  const pendingDesktopOperation = desktopActionOperation(tool.name, tool.arguments);
-  const redactPendingDesktopAction = requiresDesktopActionPreview(tool.name)
+  const pendingDesktopOperation = desktopConfirmationOperation(tool.name, tool.arguments);
+  const redactPendingDesktopAction = requiresDesktopConfirmationPreview(tool.name, tool.arguments)
     && result?.confirmationRequired && result.confirmationStatus === 'pending';
   const redactNetworkScope = isRestrictedNetworkExploration(tool.name) || redactPendingDesktopAction;
   const args = redactNetworkScope ? {} : parseToolArguments(tool);
   const output = result?.success ? result.output : result?.error ?? result?.output;
+  const failed = result?.success === false && result.confirmationStatus !== 'rejected';
 
   return (
     <div className="agent-step-technical-details">
@@ -232,7 +237,9 @@ const AgentStepTechnicalDetails = ({
           <code>{tool.name}</code>
           <div className="agent-step-args">
             <span>{redactPendingDesktopAction
-              ? pendingDesktopOperation !== 'draft' && pendingDesktopOperation !== 'field'
+              ? pendingDesktopOperation === 'image'
+                ? '授权应用以实时预检卡片为准；本次核对不读取或截取窗口。'
+              : pendingDesktopOperation !== 'draft' && pendingDesktopOperation !== 'field'
                 ? '目标窗口和待操作控件以实时预检卡片为准。'
                 : '目标窗口和待填写内容以实时预检卡片为准。'
               : getToolConfirmationSummary(tool.name, tool.arguments)}</span>
@@ -277,8 +284,8 @@ const AgentStepTechnicalDetails = ({
       )}
 
       {!redactNetworkScope && result && recalled.length === 0 && output != null && (
-        <div className={`agent-step-output ${result.success ? '' : 'error'}`}>
-          {!result.success && result.error && (
+        <div className={`agent-step-output ${failed ? 'error' : ''}`}>
+          {failed && result.error && (
             <div className="agent-step-output-summary">{truncateTechnicalOutput(result.error, 600)}</div>
           )}
           {/* Issue #102: post-call verifier mismatch — render a red note
@@ -309,7 +316,7 @@ function getStepVerb(toolName: string) {
   return getToolDisplayName(toolName);
 }
 
-function DesktopActionReceipts({
+function ToolActionReceipts({
   toolCalls = [],
   toolResults = [],
 }: {
@@ -318,13 +325,13 @@ function DesktopActionReceipts({
 }) {
   const results = authoritativeToolResultsByCallId(toolResults);
   const receipts = toolCalls.flatMap((tool) => {
-    const receipt = desktopActionReceipt(tool.name, results.get(tool.id));
+    const receipt = toolActionReceipt(tool.name, results.get(tool.id));
     return receipt ? [{ tool, receipt }] : [];
   });
   if (receipts.length === 0) return null;
 
   return (
-    <div className="desktop-action-receipts" role="list" aria-label="桌面操作结果">
+    <div className="desktop-action-receipts" role="list" aria-label="操作结果">
       {receipts.map(({ tool, receipt }) => (
         <div className={`desktop-action-receipt desktop-action-receipt--${receipt.status}`} role="listitem" key={tool.id}>
           <div className="desktop-action-receipt-heading">
@@ -341,18 +348,20 @@ function DesktopActionReceipts({
 /** A user-visible explanation of an audited action, never hidden chain-of-thought. */
 function getStepContext(tool: ToolCall, result?: ToolResult) {
   if (result?.confirmationRequired && result.confirmationStatus === 'pending') {
+    if (desktopConfirmationOperation(tool.name, tool.arguments) === 'image') return '等待核对授权应用与窗口图像观察范围。';
     const desktopOperation = desktopActionOperation(tool.name, tool.arguments);
     if (requiresDesktopActionPreview(tool.name)) return desktopOperation !== 'draft' && desktopOperation !== 'field'
       ? '等待核对目标窗口和待操作控件。'
       : '等待核对目标窗口和待填写内容。';
     return getToolConfirmationSummary(tool.name, tool.arguments);
   }
+  if (result?.confirmationStatus === 'rejected') return '你已拒绝这项操作；未执行该请求，不会自动重试。';
   if (isRestrictedNetworkExploration(tool.name)) {
     if (result?.success === false) return '受限联网探索委派未能建立。';
     if (result?.success) return '已创建受限联网探索委派。';
     return '正在准备受限联网探索委派。';
   }
-  const desktopReceipt = desktopActionReceipt(tool.name, result);
+  const desktopReceipt = toolActionReceipt(tool.name, result);
   if (desktopReceipt) return desktopReceipt.explanation;
   if (result?.success === false) return result.error ?? result.output ?? '该操作未能完成。';
   try {
@@ -410,18 +419,20 @@ const AgentRunSteps = ({
   toolResults = [],
   sessionId,
   messageId,
+  desktopRecheck,
   onResolveConfirmation,
 }: {
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
   sessionId?: string;
   messageId: string;
+  desktopRecheck?: DesktopApprovalRecheck;
   onResolveConfirmation: (
     messageId: string,
     callId: string,
     decision: 'approved' | 'rejected',
     previewId?: string,
-  ) => void;
+  ) => DesktopApprovalResolution | Promise<DesktopApprovalResolution>;
 }) => {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const safeToolCalls = Array.isArray(toolCalls)
@@ -448,34 +459,31 @@ const AgentRunSteps = ({
     const result = resultMap.get(tool.id);
     return result?.confirmationRequired && result.confirmationStatus === 'pending';
   });
-  const hasUnknownDesktopResult = safeToolCalls.some((tool) =>
-    desktopActionReceipt(tool.name, resultMap.get(tool.id))?.status === 'result_unknown'
+  const hasUnknownActionResult = safeToolCalls.some((tool) =>
+    toolActionReceipt(tool.name, resultMap.get(tool.id))?.status === 'result_unknown'
   );
-  const hasFailure = safeToolCalls.some((tool) => {
-    const result = resultMap.get(tool.id);
-    return result?.success === false
-      && result.confirmationStatus !== 'pending'
-      && result.confirmationStatus !== 'cancelled'
-      && desktopActionReceipt(tool.name, result)?.status !== 'result_unknown';
-  });
+  const hasFailure = safeToolCalls.some((tool) => isFailedToolResult(tool.name, resultMap.get(tool.id)));
+  const hasRejection = effectiveToolResults.some((result) => result.confirmationStatus === 'rejected');
   const completedCount = effectiveToolResults.filter((r) => r.success).length;
   const terminalCount = completedCount
     + effectiveToolResults.filter((result) => result.confirmationStatus === 'cancelled').length;
-  const isPassive = !hasPendingConfirmation && !hasFailure && terminalCount === safeToolCalls.length;
+  const isPassive = !hasPendingConfirmation && !hasFailure && !hasRejection && terminalCount === safeToolCalls.length;
 
   // Successful implementation details are not part of the user's main
   // conversation. The final assistant response and project worktree carry the
-  // result; only confirmations, failures, or genuinely incomplete work need
+  // result; only confirmations, rejections, failures, or genuinely incomplete work need
   // to interrupt the reading flow.
   if (isPassive) return null;
 
   // Compact summary shown as small inline text
-  const summaryText = hasPendingConfirmation
+  const summaryText = hasUnknownActionResult
+    ? '有操作结果待核对'
+    : hasPendingConfirmation
     ? '等待确认'
     : hasFailure
       ? '有步骤失败'
-      : hasUnknownDesktopResult
-        ? '有操作结果待核对'
+      : hasRejection
+        ? '已按你的决定取消操作'
       : completedCount === safeToolCalls.length
         ? `${completedCount} 个动作已完成`
         : `${completedCount}/${safeToolCalls.length} 已完成`;
@@ -499,8 +507,8 @@ const AgentRunSteps = ({
                 : result?.success === true
                   ? 'completed'
                   : 'running';
-          const desktopOperation = desktopActionOperation(tool.name, tool.arguments);
-          const needsDesktopPreview = requiresDesktopActionPreview(tool.name);
+          const desktopOperation = desktopConfirmationOperation(tool.name, tool.arguments);
+          const needsDesktopPreview = requiresDesktopConfirmationPreview(tool.name, tool.arguments);
 
           return (
             <div key={tool.id} className={`agent-run-badge-row agent-run-badge-row--${status}`}>
@@ -515,31 +523,19 @@ const AgentRunSteps = ({
                   callId={tool.id}
                   operation={desktopOperation}
                   layout="compact"
+                  recheck={desktopRecheck}
+                  approvalBlocked={hasUnknownActionResult}
                   onResolve={(decision, previewId) => onResolveConfirmation(messageId, tool.id, decision, previewId)}
                 />
               )}
               {needsApproval && !needsDesktopPreview && (
-                <>
-                  <span className="agent-run-confirmation-summary">
-                    {getToolConfirmationSummary(tool.name, tool.arguments)}
-                  </span>
-                  <span className="agent-run-badge-actions">
-                    <button
-                      type="button"
-                      className="agent-inline-btn agent-inline-btn--approve"
-                      onClick={() => onResolveConfirmation(messageId, tool.id, 'approved')}
-                    >
-                      允许一次
-                    </button>
-                    <button
-                      type="button"
-                      className="agent-inline-btn agent-inline-btn--reject"
-                      onClick={() => onResolveConfirmation(messageId, tool.id, 'rejected')}
-                    >
-                      拒绝
-                    </button>
-                  </span>
-                </>
+                <ToolActionApproval
+                  toolName={tool.name}
+                  arguments={tool.arguments}
+                  layout="compact"
+                  approvalBlocked={hasUnknownActionResult}
+                  onResolve={(decision) => onResolveConfirmation(messageId, tool.id, decision)}
+                />
               )}
             </div>
           );
@@ -552,7 +548,7 @@ const AgentRunSteps = ({
         <button
           type="button"
           className={`agent-run-disclosure agent-run-disclosure--${
-            hasPendingConfirmation ? 'needs_approval' : hasFailure ? 'failed' : hasUnknownDesktopResult ? 'unknown' : isPassive ? 'completed' : 'running'
+            hasUnknownActionResult ? 'unknown' : hasPendingConfirmation ? 'needs_approval' : hasFailure ? 'failed' : hasRejection ? 'cancelled' : isPassive ? 'completed' : 'running'
           }`}
           aria-expanded={detailsOpen}
           onClick={() => setDetailsOpen((v) => !v)}
@@ -572,6 +568,7 @@ const AgentRunSteps = ({
             const result = resultMap.get(tool.id);
             const success = result?.success;
             const needsApproval = result?.confirmationRequired && result.confirmationStatus === 'pending';
+            const rejected = result?.confirmationStatus === 'rejected';
             const recalled = tool.name === 'recall_memories' && result?.success
               ? parseRecalledMemories(result.output)
               : [];
@@ -579,14 +576,14 @@ const AgentRunSteps = ({
             return (
               <li
                 key={tool.id}
-                className={`agent-step ${needsApproval ? 'approval' : success === false ? 'error' : success === true ? 'success' : 'pending'}`}
+                className={`agent-step ${needsApproval ? 'approval' : rejected ? 'cancelled' : success === false ? 'error' : success === true ? 'success' : 'pending'}`}
               >
                 <div className="agent-step-index">{safeToolCalls.indexOf(tool) + 1}</div>
                 <div className="agent-step-body">
                   <div className="agent-step-topline">
                     <span className="agent-step-title">{getStepVerb(tool.name)}</span>
                     <span className="agent-step-status">
-                      {getStepStatusLabel(Boolean(needsApproval), success, desktopActionReceipt(tool.name, result)?.label)}
+                      {rejected ? '已拒绝' : getStepStatusLabel(Boolean(needsApproval), success, toolActionReceipt(tool.name, result)?.label)}
                     </span>
                   </div>
                   <p className="agent-step-context">{getStepContext(tool, result)}</p>
@@ -595,7 +592,7 @@ const AgentRunSteps = ({
                     <AgentStepTechnicalDetails tool={tool} result={result} recalled={recalled} />
                   </AgentRunDetailsBoundary>
 
-                  {result?.success === false && !needsApproval && !desktopActionReceipt(tool.name, result) && (
+                  {result?.success === false && !needsApproval && !rejected && !toolActionReceipt(tool.name, result) && (
                     <div className="agent-step-recovery">
                       <span>此操作未完成：{getRecoveryHint(tool.name, result)}</span>
                     </div>
@@ -632,7 +629,7 @@ export function workspaceFilePathFromHref(href?: string): string | null {
       || parsed.pathname.startsWith('/')
     ) return null;
     const path = decodeURIComponent(parsed.pathname);
-    if (!path || path.includes('\\') || path.includes('\0')) return null;
+    if (!path || /[\\:\x00-\x1f\x7f]/.test(path)) return null;
     const segments = path.split('/');
     if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
     return path;
@@ -698,6 +695,20 @@ function completedTimelineText(blocks: LiveBlock[]): string {
     .join('\n\n');
 }
 
+/** Hide only the empty shell of tool details that are already intentionally hidden. */
+function isEmptySuccessfulToolTurn(message: Message): boolean {
+  if (message.role !== 'assistant' || message.content.trim()
+    || completedTimelineText(message.timelineBlocks ?? [])
+    || message.metadata?.isToolExecuting || !message.toolCalls?.length) return false;
+  const results = authoritativeToolResultsByCallId(message.toolResults ?? []);
+  return message.toolCalls.every((tool) => {
+    const result = results.get(tool.id);
+    return result?.success
+      && (!result.confirmationStatus || result.confirmationStatus === 'approved')
+      && !toolActionReceipt(tool.name, result);
+  });
+}
+
 // ─── Personality Mapping ──────────────────────────────────────────────────────
 
 function mapPersonalityTraits(tone: string, personality: string) {
@@ -747,8 +758,20 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
     state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId)?.kind ?? null
   ));
   const messages = useMessagesStore((state) => state.messages);
+  const checkedModelFailure = useRef<string | null>(null);
+  useEffect(() => {
+    const latestReply = messages.filter((message) => message.role === 'assistant').at(-1);
+    if (latestReply?.taskRun?.status !== 'provider_unavailable'
+      || checkedModelFailure.current === latestReply.id) return;
+    checkedModelFailure.current = latestReply.id;
+    // A revoked/expired plan may have been invalidated during this turn.
+    // Recheck local metadata once; never sign in or retry the failed task.
+    void useSettingsStore.getState().refreshApiConfigReadiness();
+  }, [messages]);
   const input = useMessagesStore((state) => state.input);
   const setInput = useMessagesStore((state) => state.setInput);
+  const activateInput = useMessagesStore((state) => state.activateInput);
+  const clearSubmittedInput = useMessagesStore((state) => state.clearSubmittedInput);
   const loadMessages = useMessagesStore((state) => state.loadMessages);
   const appendMessage = useMessagesStore((state) => state.appendMessage);
   const addToolResult = useMessagesStore((state) => state.addToolResult);
@@ -770,25 +793,37 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   ));
   const containerRef = useRef<HTMLDivElement>(null);
   const pendingProjectMessageRef = useRef<{
-    text: string; files: TextAttachment[]; workspaceId: string; sessionId: string | null;
+    text: string; files: TextAttachment[]; workspaceId: string; sessionId: string | null; sourceSessionId?: string; sourceInputToken: object;
     resolve: (accepted: boolean) => void;
   } | null>(null);
   const [routeVersion, setRouteVersion] = useState(0);
+  useEffect(() => () => {
+    const pending = pendingProjectMessageRef.current;
+    pendingProjectMessageRef.current = null;
+    pending?.resolve(false);
+  }, []);
   // Keep following only while the reader is already at the newest content.
   // Streaming updates otherwise must not pull them away from older messages.
   const shouldFollowLatestRef = useRef(true);
   const composerInputRef = useRef<ComposerInputHandle>(null);
   const [resolvingCallId, setResolvingCallId] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [historyAction, setHistoryAction] = useState<{
+    sessionId: string; generation: number; pending: boolean; error?: boolean;
+    kind?: 'load';
+    notice?: string;
+    edit?: { messageId: string; sourceContent: string; content: string };
+  } | null>(null);
+  const historyAttempt = useRef<symbol | null>(null);
   const [isPaused, setIsPaused] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [toolPreset, setToolPreset] = useState<'none' | 'default' | 'full'>('default');
   const [taskDecision, setTaskDecision] = useState<TaskDecisionProjection | null>(null);
   const isStreamingRef = useRef(false);
-  // Message loads and model calls can complete after the user has switched
-  // sessions. A monotonically increasing generation prevents those stale
-  // completions from overwriting the visible conversation.
+  // Session changes and new foreground chains take ownership of Main's UI;
+  // older refreshes/finally blocks cannot overwrite that newer owner.
   const sessionGenerationRef = useRef(0);
+  const stopEpochRef = useRef(0);
   isStreamingRef.current = isStreaming;
   const thinkingEffort = useThinkingEffortStore((s) => s.effort);
 
@@ -827,19 +862,28 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   const isCurrentSessionGeneration = (sessionId: string, generation: number) =>
     sessionGenerationRef.current === generation
     && useSessionsStore.getState().activeSessionId === sessionId;
+  const currentHistoryAction = historyAction?.sessionId === session?.id
+    && historyAction?.generation === sessionGenerationRef.current ? historyAction : null;
+  const historyBlocked = Boolean(currentHistoryAction?.pending || currentHistoryAction?.error);
 
   const hydrateTimelineBlocks = useCallback(async (sessionId: string, source: Message[]) => {
     const hydrated = await Promise.all(source.map(async (message, index) => {
+      if (message.role !== 'assistant') return message;
       // The persisted message list can normalize tool results into separate
       // `tool` rows, so an assistant run is not guaranteed to retain a
       // `toolCalls` array after completion. In that shape, tool results occur
       // as subsequent `tool` rows. Avoid replay queries for ordinary assistant
       // messages, which also keeps normal conversation loading lightweight.
-      const hasFollowingToolRow = source.slice(index + 1).some((following) => {
-        if (following.role === 'user' || following.role === 'assistant') return false;
-        return following.role === 'tool';
-      });
-      if (message.role !== 'assistant' || (!(message.toolCalls?.length) && !hasFollowingToolRow)) return message;
+      let hasFollowingToolRow = false;
+      for (let next = index + 1; next < source.length; next += 1) {
+        const role = source[next].role;
+        if (role === 'user' || role === 'assistant') break;
+        if (role === 'tool') {
+          hasFollowingToolRow = true;
+          break;
+        }
+      }
+      if (!(message.toolCalls?.length) && !hasFollowingToolRow) return message;
       try {
         const events = await getDurableAgentRunEvents(sessionId, message.id);
         const timelineBlocks = contentBlocksFromDurableEvents(events, message.toolResults);
@@ -881,23 +925,32 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
     });
   }, []);
 
-  // Load messages when session changes
-  useEffect(() => {
+  // Restore only this session's text before painting; attachments keep their
+  // existing scope-bound lifecycle and no draft is written to browser storage.
+  useLayoutEffect(() => { activateInput(session?.id ?? null); }, [session?.id, activateInput]);
+
+  // Load messages when session changes. Failure is not an empty conversation.
+  useLayoutEffect(() => {
     const sessionId = session?.id;
     const generation = ++sessionGenerationRef.current;
     clearMessages();
-    // The composer is currently an in-memory, per-visible-session draft. A
-    // workbench file reference must never be carried into another session.
-    setInput('');
     setIsStreaming(false);
     setIsPaused(false);
     setResolvingCallId(null);
+    historyAttempt.current = null;
+    setHistoryAction(null);
 
     if (sessionId) {
+      const attempt = Symbol();
+      historyAttempt.current = attempt;
+      const current = () => historyAttempt.current === attempt && isCurrentSessionGeneration(sessionId, generation);
+      setHistoryAction({ sessionId, generation, kind: 'load', pending: true, notice: '正在读取对话记录…' });
       getMessages(sessionId).then(async (msgs) => {
         const hydratedMessages = await hydrateTimelineBlocks(sessionId, msgs);
-        if (isCurrentSessionGeneration(sessionId, generation)) {
+        if (current()) {
           loadMessages(hydratedMessages);
+          historyAttempt.current = null;
+          setHistoryAction(null);
           const active = useSessionsStore.getState().activeSession;
           const firstUserMessage = msgs.find((message) => message.role === 'user');
           if (active && !active.title.trim() && firstUserMessage) {
@@ -905,9 +958,15 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
             if (nextTitle) useSessionsStore.getState().updateSessionTitle(sessionId, nextTitle);
           }
         }
-      }).catch(() => {});
+      }).catch(() => {
+        if (current()) setHistoryAction({ sessionId, generation, kind: 'load', pending: false, error: true,
+          notice: '暂时无法读取对话记录。输入草稿已保留，请重新载入后继续。' });
+      }).finally(() => {
+        if (historyAttempt.current === attempt) historyAttempt.current = null;
+      });
     }
-  }, [session?.id, clearMessages, loadMessages, hydrateTimelineBlocks, setInput]);
+    return () => { historyAttempt.current = null; };
+  }, [session?.id, clearMessages, loadMessages, hydrateTimelineBlocks]);
 
   useEffect(() => () => unsubscribeFromAgentEvents(), [session?.id, unsubscribeFromAgentEvents]);
 
@@ -927,9 +986,15 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   }, [messages, streamingText, liveStatus, liveToolSteps]);
 
   const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
+  const confirmationPlaceholderRef = useRef<{ id: string; generation: number } | null>(null);
+  const [failedDesktopPreview, setFailedDesktopPreview] = useState<Omit<DesktopApprovalRecheck, 'onRecheck'> | null>(null);
+  const desktopRecheck = failedDesktopPreview ? {
+    ...failedDesktopPreview,
+    onRecheck: () => setFailedDesktopPreview((current) => current === failedDesktopPreview ? null : current),
+  } : undefined;
 
   const onSend = async (text: string, files: TextAttachment[] = [], clearSubmittedDraft = true): Promise<boolean> => {
-    if ((!text.trim() && !files.length) || isStreamingRef.current) return false;
+    if ((!text.trim() && !files.length) || isStreamingRef.current || historyAttempt.current || historyBlocked) return false;
     const workspaceState = useWorkspacesStore.getState();
     const route = projectWorkspaceForMessage(
       text,
@@ -943,11 +1008,17 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
       const sourceSessionId = session?.id;
       const sourceGeneration = sessionGenerationRef.current;
       return new Promise<boolean>((resolve) => {
-        const pending = { text, files, workspaceId: route.id, sessionId: null as string | null, resolve };
+        const pending = { text, files, workspaceId: route.id, sessionId: null as string | null, sourceSessionId,
+          sourceInputToken: useMessagesStore.getState().inputToken, resolve };
         pendingProjectMessageRef.current = pending;
-        setInput('');
-        void workspaceState.openWorkspace(route.id).then(() => {
+        // Keep the source draft until the routed turn is actually accepted.
+        void workspaceState.openWorkspace(route.id).then((accepted) => {
           if (pendingProjectMessageRef.current !== pending) return;
+          if (!accepted) {
+            pendingProjectMessageRef.current = null;
+            resolve(false);
+            return;
+          }
           const currentWorkspace = useWorkspacesStore.getState();
           const currentSession = useSessionsStore.getState();
           const targetSessionId = currentWorkspace.workspaces.find((item) => item.id === route.id)?.activeSessionId;
@@ -973,10 +1044,10 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
     const secureWebSearch = extractSecureWebSearchSetup(text);
     const messageContent = secureWebSearch.displayContent;
     const sessionId = session.id;
-    const generation = sessionGenerationRef.current;
+    const generation = ++sessionGenerationRef.current;
     // Clear only the draft submitted by this caller, synchronously before
     // subscription can yield. Routed turns do not own the destination draft.
-    if (clearSubmittedDraft && useMessagesStore.getState().input.trim() === text.trim()) setInput('');
+    if (clearSubmittedDraft) clearSubmittedInput(sessionId, text);
     clearLiveActivity();
     useMessagesStore.getState().setLiveStatus('正在理解你的请求');
     try { await subscribeToAgentEvents(sessionId); }
@@ -1052,6 +1123,7 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
     } catch (err) {
       console.error('[ChatArea] sendMessage error:', err);
       let accepted = false;
+      let durableFailureVisible = false;
       if (isCurrentSessionGeneration(sessionId, generation)) {
         useMessagesStore.getState().removeMessage(placeholderId);
         // A model/transport failure can occur after the user turn was saved.
@@ -1060,15 +1132,25 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
         try {
           const durableMessages = await getMessages(sessionId);
           if (!isCurrentSessionGeneration(sessionId, generation)) return false;
-          accepted = durableMessages.some((message) => message.id === userMessage.id);
+          accepted = durableMessages.some((message) => message.id === userMessage.id
+            && message.sessionId === sessionId && message.role === 'user');
           if (accepted) {
             const refreshedMessages = await hydrateTimelineBlocks(sessionId, durableMessages);
-            if (isCurrentSessionGeneration(sessionId, generation)) loadMessages(refreshedMessages);
+            if (isCurrentSessionGeneration(sessionId, generation)) {
+              loadMessages(refreshedMessages);
+              // Only this accepted user's durable failed reply can replace the
+              // transport error, after its visible transcript has loaded.
+              durableFailureVisible = refreshedMessages.some((message) =>
+                message.sessionId === sessionId && message.role === 'assistant'
+                && message.parentId === userMessage.id && Boolean(message.content.trim())
+                && message.taskRun?.id === message.id
+                && ['needs_attention', 'provider_unavailable', 'failed'].includes(message.taskRun.status));
+            }
           } else useMessagesStore.getState().removeMessage(userMessage.id);
         } catch { /* Unknown persistence: retain attachments for user inspection. */ }
         if (!isCurrentSessionGeneration(sessionId, generation)) return false;
         if (!accepted && !useMessagesStore.getState().input.trim()) setInput(messageContent);
-        appendMessage({
+        if (!durableFailureVisible) appendMessage({
           id: crypto.randomUUID(),
           sessionId,
           role: 'assistant',
@@ -1078,6 +1160,9 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
       }
       return accepted;
     } finally {
+      // A live confirmation may take over this anchor before send returns.
+      // Other stale requests still clean only their own optimistic message.
+      if (confirmationPlaceholderRef.current?.id !== placeholderId) useMessagesStore.getState().removeMessage(placeholderId);
       if (isCurrentSessionGeneration(sessionId, generation)) {
         setIsStreaming(false);
         isStreamingRef.current = false;
@@ -1088,10 +1173,24 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   };
 
   const onAbort = async () => {
-    if (session?.id) await interruptAgent(session.id).catch(() => {});
+    const sessionId = session?.id;
+    const generation = sessionGenerationRef.current;
+    // Fence continuation immediately; interrupt IPC may be slow or lost.
+    stopEpochRef.current += 1;
     unsubscribeFromAgentEvents();
     setIsStreaming(false);
     setIsPaused(false);
+    setResolvingCallId(null);
+    if (sessionId) {
+      try {
+        await interruptAgent(sessionId);
+      } catch {
+        if (isCurrentSessionGeneration(sessionId, generation)) appendMessage({
+          id: crypto.randomUUID(), sessionId, role: 'assistant', createdAt: Date.now(),
+          content: '未能确认停止请求，Agent 可能仍在执行。请先核对运行状态与操作结果，不要重复提交原任务。',
+        });
+      }
+    }
   };
 
   const togglePause = async () => {
@@ -1112,92 +1211,31 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
    * call through the existing pipeline and waits for the backend result before
    * refreshing the inline state.
    */
-  const onBlockResolveConfirmation = async (
+  const onBlockResolveConfirmation = (
     callId: string,
     decision: 'approved' | 'rejected',
     previewId?: string,
-  ) => {
-    if (!session?.id || resolvingCallId) return;
-    const messageId = liveMessageId;
-    if (!messageId) return;
-    const sessionId = session.id;
-    const generation = sessionGenerationRef.current;
-    setResolvingCallId(callId);
-    // Keep the confirmation pending until the backend returns its outcome.
-    // Approval alone does not prove that the desktop action succeeded.
-    let resolved = false;
-    try {
-      const result = await resolveAgentConfirmation({
-        sessionId,
-        messageId,
-        callId,
-        decision,
-        previewId,
-      });
-      resolved = true;
-      if (isCurrentSessionGeneration(sessionId, generation)) {
-        addToolResult(messageId, result);
-      }
-
-      if (isCurrentSessionGeneration(sessionId, generation)) {
-        clearLiveActivity();
-        const refreshedMessages = await getMessages(sessionId);
-        if (!isCurrentSessionGeneration(sessionId, generation)) return;
-        loadMessages(refreshedMessages);
-        if (decision === 'approved' && result.success
-          && canAutoContinueConfirmedTurn(refreshedMessages, messageId)) {
-          await subscribeToAgentEvents(sessionId);
-          setIsStreaming(true);
-          await continueAgentTask({ sessionId, messageId });
-          if (isCurrentSessionGeneration(sessionId, generation)) {
-            loadMessages(await getMessages(sessionId));
-          }
-        }
-      }
-    } catch (err) {
-      console.error('[ChatArea] block resolve confirmation error:', err);
-      if (isCurrentSessionGeneration(sessionId, generation)) {
-        // A lost IPC response may hide a dispatched action. First ask the
-        // backend; never turn an uncertain desktop action into a retry button.
-        try {
-          const refreshedMessages = await getMessages(sessionId);
-          if (isCurrentSessionGeneration(sessionId, generation)) {
-            loadMessages(refreshedMessages);
-            unsubscribeFromAgentEvents();
-            setIsStreaming(false);
-            setStreamingMsgId(null);
-          }
-        } catch {
-          if (!isCurrentSessionGeneration(sessionId, generation)) return;
-          if (!resolved && decision === 'approved' && previewId) {
-            useMessagesStore.setState((state) => ({
-              liveBlocks: markUnknownLiveDesktopConfirmation(state.liveBlocks, callId),
-            }));
-          } else if (!resolved) {
-            useMessagesStore.setState((state) => ({
-              liveBlocks: restoreRetryableLiveConfirmation(state.liveBlocks, callId),
-            }));
-          }
-        }
-      }
-    } finally {
-      if (isCurrentSessionGeneration(sessionId, generation)) {
-        setResolvingCallId(null);
-        window.dispatchEvent(new Event(AUTOMATIONS_UPDATED_EVENT));
-      }
-    }
+  ): DesktopApprovalResolution | Promise<DesktopApprovalResolution> => {
+    const messageId = useMessagesStore.getState().liveMessageId;
+    if (messageId) return onResolveConfirmation(messageId, callId, decision, previewId);
   };
 
   useEffect(() => {
     const routedMessage = pendingProjectMessageRef.current;
     if (!routedMessage?.sessionId) return;
+    if (currentHistoryAction?.kind === 'load' && currentHistoryAction.pending) return;
     pendingProjectMessageRef.current = null;
     if (activeWorkspaceId !== routedMessage.workspaceId || session?.id !== routedMessage.sessionId) {
       routedMessage.resolve(false);
       return;
     }
+    const sending = onSend(routedMessage.text, routedMessage.files, false);
     const routedGeneration = sessionGenerationRef.current;
-    void onSend(routedMessage.text, routedMessage.files, false).then((accepted) => {
+    void sending.then((accepted) => {
+      if (accepted) {
+        const sourceSessionId = routedMessage.sourceSessionId;
+        if (sourceSessionId) clearSubmittedInput(sourceSessionId, routedMessage.text, routedMessage.sourceInputToken);
+      }
       if (!accepted && isCurrentSessionGeneration(routedMessage.sessionId!, routedGeneration)
         && useWorkspacesStore.getState().activeWorkspaceId === routedMessage.workspaceId
         && useSessionsStore.getState().activeSessionId === routedMessage.sessionId) {
@@ -1205,20 +1243,56 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
       }
       routedMessage.resolve(accepted);
     });
-  }, [session?.id, activeWorkspaceId, routeVersion]);
+  }, [session?.id, activeWorkspaceId, routeVersion, currentHistoryAction?.kind, currentHistoryAction?.pending, clearSubmittedInput]);
 
   const onResolveConfirmation = async (
     messageId: string,
     callId: string,
     decision: 'approved' | 'rejected',
     previewId?: string,
-  ) => {
+  ): Promise<DesktopApprovalResolution> => {
     if (!session?.id || resolvingCallId) return;
     const sessionId = session.id;
-    const generation = sessionGenerationRef.current;
+    const generation = ++sessionGenerationRef.current;
+    const stopEpoch = stopEpochRef.current;
+    const liveTool = useMessagesStore.getState().liveBlocks.find((block): block is Extract<LiveBlock, { kind: 'tool_call' }> =>
+      block.kind === 'tool_call' && block.callId === callId);
+    const toolName = useMessagesStore.getState().messages.find((message) => message.id === messageId)
+      ?.toolCalls?.find((call) => call.id === callId)?.name
+      ?? liveTool?.toolName;
     setResolvingCallId(callId);
     let resolved = false;
+    let placeholderId: string | null = null;
     try {
+      if (decision === 'approved') {
+        // Resolution owns both the approved action and any backend continuation.
+        // Keep the streaming anchor if its original send returns while
+        // subscribing. That send must no longer clean up the shared anchor.
+        const existingPlaceholder = useMessagesStore.getState().messages.find((message) =>
+          message.id === streamingMsgId && message.sessionId === sessionId
+          && message.role === 'assistant' && !message.content);
+        if (existingPlaceholder) {
+          placeholderId = existingPlaceholder.id;
+          confirmationPlaceholderRef.current = { id: placeholderId, generation };
+        }
+        // The retained live trace can reappear inside the new placeholder.
+        // This call is now resolving, not asking for approval again: otherwise
+        // its remounted card starts a target read that competes with execution.
+        useMessagesStore.setState((state) => ({
+          liveBlocks: state.liveBlocks.map((block) => block.kind === 'tool_call'
+            && block.callId === callId && block.status === 'needs_approval'
+            ? { ...block, status: 'running' } : block),
+        }));
+        await subscribeToAgentEvents(sessionId);
+        if (!isCurrentSessionGeneration(sessionId, generation) || stopEpoch !== stopEpochRef.current) return;
+        if (!placeholderId) {
+          placeholderId = crypto.randomUUID();
+          appendMessage({ id: placeholderId, sessionId, role: 'assistant', content: '', createdAt: Date.now() });
+          confirmationPlaceholderRef.current = { id: placeholderId, generation };
+        }
+        setStreamingMsgId(placeholderId);
+        setIsStreaming(true);
+      }
       const result = await resolveAgentConfirmation({
         sessionId,
         messageId,
@@ -1236,17 +1310,6 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
         const refreshedMessages = await getMessages(sessionId);
         if (!isCurrentSessionGeneration(sessionId, generation)) return;
         loadMessages(refreshedMessages);
-        if (decision === 'approved' && result.success
-          && canAutoContinueConfirmedTurn(refreshedMessages, messageId)) {
-          // A successful step alone is not enough: another pending or unknown
-          // step in this turn must keep the Main Agent paused.
-          await subscribeToAgentEvents(sessionId);
-          setIsStreaming(true);
-          await continueAgentTask({ sessionId, messageId });
-          if (isCurrentSessionGeneration(sessionId, generation)) {
-            loadMessages(await getMessages(sessionId));
-          }
-        }
       }
     } catch (err) {
       console.error('[ChatArea] resolve confirmation error:', err);
@@ -1254,13 +1317,27 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
         try {
           const refreshedMessages = await getMessages(sessionId);
           if (isCurrentSessionGeneration(sessionId, generation)) {
+            const durableTurn = refreshedMessages.find((message) => message.id === messageId && message.sessionId === sessionId);
+            const durableResult = authoritativeToolResultsByCallId(durableTurn?.toolResults ?? []).get(callId);
+            const stillPending = durableResult?.confirmationRequired && durableResult.confirmationStatus === 'pending';
+            const recheckRequired = !resolved && decision === 'approved' && previewId && stillPending;
+            // Record before replacing the live renderer with its durable card.
+            // This is UI-only evidence, not a retryable/unknown tool result.
+            if (recheckRequired) setFailedDesktopPreview({ sessionId, messageId, callId, previewId });
+            clearLiveActivity();
             loadMessages(refreshedMessages);
+            if (recheckRequired) return 'recheck_required';
           }
         } catch {
           if (!isCurrentSessionGeneration(sessionId, generation)) return;
-          if (!resolved && decision === 'approved' && previewId) {
-            markUnknownPersistedDesktopConfirmation(messageId, callId);
+          if (!resolved && decision === 'approved' && (previewId || toolName?.startsWith('mcp_'))) {
+            if (toolName && (requiresDesktopActionPreview(toolName) || toolName.startsWith('mcp_'))) {
+              markUnknownPersistedConfirmation(messageId, callId);
+              useMessagesStore.setState((state) => ({ liveBlocks: markUnknownLiveConfirmation(state.liveBlocks, callId) }));
+            }
+            if (previewId) throw err;
           } else if (!resolved) {
+            useMessagesStore.setState((state) => ({ liveBlocks: restoreRetryableLiveConfirmation(state.liveBlocks, callId) }));
             addToolResult(messageId, {
               callId,
               toolName: 'confirmation',
@@ -1274,9 +1351,15 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
         }
       }
     } finally {
+      if (placeholderId) {
+        const owner = confirmationPlaceholderRef.current;
+        if (owner?.id !== placeholderId || owner.generation === generation) useMessagesStore.getState().removeMessage(placeholderId);
+        if (owner?.id === placeholderId && owner.generation === generation) confirmationPlaceholderRef.current = null;
+      }
       if (isCurrentSessionGeneration(sessionId, generation)) {
         setResolvingCallId(null);
         setIsStreaming(false);
+        setStreamingMsgId(null);
         window.dispatchEvent(new Event(AUTOMATIONS_UPDATED_EVENT));
       }
     }
@@ -1288,32 +1371,36 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   messagesRef.current = messages;
 
   const handleEditMessage = useCallback(async (messageId: string, newContent: string) => {
-    if (!session?.id) return;
+    if (!session?.id || isStreamingRef.current || historyAttempt.current || historyBlocked) return;
     const sessionId = session.id;
-    const generation = sessionGenerationRef.current;
+    const generation = ++sessionGenerationRef.current;
+    const attempt = Symbol();
+    historyAttempt.current = attempt;
+    const current = () => historyAttempt.current === attempt && isCurrentSessionGeneration(sessionId, generation);
+    const edit = { messageId, sourceContent: messagesRef.current.find((message) => message.id === messageId)?.content ?? '', content: newContent };
     const placeholderId = crypto.randomUUID();
-    let messagesBeforeEdit: Message[] | null = null;
+    setHistoryAction({ sessionId, generation, pending: true, edit });
     try {
+      setIsStreaming(true);
+      setStreamingMsgId(placeholderId);
       clearLiveActivity();
       useMessagesStore.getState().setLiveStatus('正在基于编辑后的消息重新生成');
       await subscribeToAgentEvents(sessionId);
-      setIsStreaming(true);
-      setStreamingMsgId(placeholderId);
-      const current = messagesRef.current;
-      messagesBeforeEdit = current;
-      const editedIndex = current.findIndex((message) => message.id === messageId);
+      if (!current()) return;
+      const transcript = messagesRef.current;
+      const editedIndex = transcript.findIndex((message) => message.id === messageId);
       if (editedIndex >= 0) {
-        // Backend hard-deletes the edited message and everything after it.
+        // Backend atomically replaces the edited turn and its later branch.
         // Keep the replacement user turn visible while its new assistant
         // response streams. This avoids a blank gap between pressing resend
         // and receiving the durable transcript back from the backend.
         const editedMessage = {
-          ...current[editedIndex],
+          ...transcript[editedIndex],
           content: newContent,
         };
         useMessagesStore.setState({
           messages: [
-            ...current.slice(0, editedIndex),
+            ...transcript.slice(0, editedIndex),
             editedMessage,
             {
               id: placeholderId,
@@ -1342,53 +1429,95 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
         preferences: mapPreferences(preferences),
         thinkingEffort,
       });
-      if (isCurrentSessionGeneration(sessionId, generation)) {
+      if (current()) {
         useMessagesStore.getState().removeMessage(placeholderId);
         try {
           const durableMessages = await getMessages(sessionId);
-          if (!isCurrentSessionGeneration(sessionId, generation)) return;
+          if (!current()) return;
 
           // Never let a transient or inconsistent reload erase the local
           // replacement turn. The backend preserves `messageId` on a resend;
           // its absence is therefore a recoverable refresh failure, not an
           // empty conversation.
-          if (!durableMessages.some((message) => message.id === messageId)) {
-            appendMessage(reply);
-            return;
+          if (!durableMessages.some((message) => message.id === messageId && message.role === 'user' && message.content === newContent)) {
+            throw new Error('Edited turn not confirmed');
           }
 
-          loadMessages(await hydrateTimelineBlocks(sessionId, durableMessages));
+          const hydrated = await hydrateTimelineBlocks(sessionId, durableMessages);
+          if (!current()) return;
+          loadMessages(hydrated);
+          setHistoryAction(null);
         } catch {
+          if (!current()) return;
           appendMessage(reply);
+          setHistoryAction({ sessionId, generation, pending: false, error: true, edit });
         }
       }
-    } catch (err) {
-      console.error('[ChatArea] edit and resend error:', err);
-      if (isCurrentSessionGeneration(sessionId, generation)) {
-        if (messagesBeforeEdit) {
-          loadMessages(messagesBeforeEdit);
-        } else {
-          useMessagesStore.getState().removeMessage(placeholderId);
+    } catch {
+      if (current()) {
+        // A failed transport/model request may already have replaced history.
+        // Read the durable branch, never restore the pre-send snapshot as fact
+        // and never retry the edit automatically.
+        try {
+          const hydrated = await hydrateTimelineBlocks(sessionId, await getMessages(sessionId));
+          if (!current()) return;
+          clearLiveActivity();
+          loadMessages(hydrated);
+          setHistoryAction({ sessionId, generation, pending: false,
+            notice: '未能确认重新生成结果；已载入保存记录，请先核对任务状态。',
+            edit: hydrated.some((message) => message.id === messageId && message.role === 'user'
+              && message.content === edit.sourceContent && message.content !== newContent) ? edit : undefined });
+        } catch {
+          if (current()) setHistoryAction({ sessionId, generation, pending: false, error: true, edit });
         }
       }
     } finally {
+      if (confirmationPlaceholderRef.current?.id !== placeholderId) useMessagesStore.getState().removeMessage(placeholderId);
       if (isCurrentSessionGeneration(sessionId, generation)) {
         setIsStreaming(false);
         setStreamingMsgId(null);
         window.dispatchEvent(new Event(AUTOMATIONS_UPDATED_EVENT));
       }
+      if (historyAttempt.current === attempt) historyAttempt.current = null;
     }
-  }, [session?.id, thinkingEffort, clearLiveActivity, subscribeToAgentEvents, appendMessage, hydrateTimelineBlocks]);
+  }, [session?.id, historyBlocked, thinkingEffort, clearLiveActivity, subscribeToAgentEvents, appendMessage, hydrateTimelineBlocks, loadMessages]);
 
-  const handleDeleteMessage = useCallback(async (messageId: string) => {
-    if (!confirm('Delete this message?')) return;
+  // Omitting messageId only reloads history; it never retries an edit or delete
+  // whose outcome is unknown. Both paths preserve the same generation owner.
+  const handleHistoryAction = useCallback(async (messageId?: string) => {
+    if (!session?.id || isStreaming || historyAttempt.current) return;
+    if (messageId && currentHistoryAction?.error) return;
+    if (messageId && !confirm('删除这条消息及其后续分支？已执行的操作不会撤销，删除记录无法恢复。')) return;
+    const sessionId = session.id;
+    const generation = sessionGenerationRef.current;
+    const edit = messageId ? undefined : currentHistoryAction?.edit;
+    const loadingHistory = currentHistoryAction?.kind === 'load';
+    const attempt = Symbol();
+    historyAttempt.current = attempt;
+    const current = () => historyAttempt.current === attempt && isCurrentSessionGeneration(sessionId, generation);
+    setHistoryAction({ sessionId, generation, pending: true, edit,
+      ...(loadingHistory ? { kind: 'load', notice: '正在重新读取对话记录…' } : {}) });
     try {
-      await deleteMessage(messageId);
-      useMessagesStore.getState().removeMessage(messageId);
-    } catch (err) {
-      console.error('[ChatArea] delete message error:', err);
+      if (messageId) await deleteMessage(messageId);
+      if (!current()) return;
+      const hydrated = await hydrateTimelineBlocks(sessionId, await getMessages(sessionId));
+      if (current()) {
+        if (!isStreamingRef.current) {
+          clearLiveActivity();
+          loadMessages(hydrated);
+        }
+        setHistoryAction(edit && hydrated.some((message) => message.id === edit.messageId && message.role === 'user'
+          && message.content === edit.sourceContent && message.content !== edit.content)
+          ? { sessionId, generation, pending: false, edit, notice: '已载入保存记录；未采用的修改保留在编辑框中，发送前请先核对任务结果。' }
+          : null);
+      }
+    } catch {
+      if (current()) setHistoryAction({ sessionId, generation, pending: false, error: true, edit,
+        ...(loadingHistory ? { kind: 'load', notice: '暂时无法读取对话记录。输入草稿已保留，请重新载入后继续。' } : {}) });
+    } finally {
+      if (historyAttempt.current === attempt) historyAttempt.current = null;
     }
-  }, []);
+  }, [session?.id, isStreaming, currentHistoryAction?.error, currentHistoryAction?.edit, currentHistoryAction?.kind, clearLiveActivity, hydrateTimelineBlocks, loadMessages]);
 
   const handleCopyMessage = useCallback((_messageId: string) => {
     // Clipboard write is handled inside MessageActions; this is just a callback hook
@@ -1407,13 +1536,14 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
           <WorkspaceReminders workspaceId={activeWorkspaceKind ? activeWorkspaceId : null} />
         )}
       <div className="messages" ref={containerRef} onScroll={updateFollowLatest}>
-        {messages.length === 0 && (
+        {messages.length === 0 && !historyBlocked && (
           <ChatEmptyState
             onDraftSelect={(prompt) => composerInputRef.current?.insertIfEmpty(prompt)}
             showStarters={!input.trim()}
           />
         )}
-        {messages.map((message) => (
+        {messages.filter((message) => (isStreaming && message.id === streamingMsgId)
+          || !isEmptySuccessfulToolTurn(message)).map((message) => (
           <Fragment key={message.id}>
           <div className={`message-row ${message.role}`}>
             {message.role === 'user' && (
@@ -1432,7 +1562,8 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
               {message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0 && (
                 !message.timelineBlocks?.length
                 || message.toolResults?.some((result) =>
-                  result.confirmationStatus === 'pending' || result.confirmationStatus === 'rejected')
+                  result.confirmationStatus === 'pending' || result.confirmationStatus === 'rejected'
+                  || isFailedToolResult(result.toolName, result))
               ) && (
                 <AgentRunSteps
                   toolCalls={isStreaming && liveMessageId
@@ -1442,6 +1573,7 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
                   toolResults={message.toolResults}
                   sessionId={session?.id}
                   messageId={message.id}
+                  desktopRecheck={desktopRecheck}
                   onResolveConfirmation={onResolveConfirmation}
                 />
               )}
@@ -1449,16 +1581,13 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
               {message.role === 'user' && Boolean(message.textAttachments?.length) && (
                 <div className="message-text-attachments" aria-label="已发送文本附件">
                   {message.textAttachments?.map((file, index) => (
-                    <details key={index}>
-                      <summary>{file.name}<small>{textAttachmentBytes(file.text)} B · 文本快照</small></summary>
-                      <pre>{file.text}</pre>
-                    </details>
+                    <TextAttachmentDetails key={index} file={file} />
                   ))}
                 </div>
               )}
 
               {message.role === 'assistant' && !(isStreaming && message.id === streamingMsgId) && (
-                <DesktopActionReceipts toolCalls={message.toolCalls} toolResults={message.toolResults} />
+                <ToolActionReceipts toolCalls={message.toolCalls} toolResults={message.toolResults} />
               )}
 
               {/* Live streaming is rendered through ContentBlockRenderer below; no separate timeline needed. */}
@@ -1472,6 +1601,7 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
                     blocks={liveBlocks}
                     sessionId={session?.id}
                     messageId={liveMessageId ?? undefined}
+                    desktopRecheck={desktopRecheck}
                     onResolveConfirmation={onBlockResolveConfirmation}
                   />
                 </div>
@@ -1503,8 +1633,12 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
 
               <MessageActions
                 message={message}
+                disabled={(isStreaming || historyBlocked) && message.role === 'user'}
+                recoveredEditContent={!historyBlocked && currentHistoryAction?.edit?.messageId === message.id
+                  && currentHistoryAction.edit.sourceContent === message.content ? currentHistoryAction.edit.content : undefined}
+                isStreaming={isStreaming && message.id === streamingMsgId}
                 onEdit={handleEditMessage}
-                onDelete={handleDeleteMessage}
+                onDelete={handleHistoryAction}
                 onCopy={handleCopyMessage}
               />
             </div>
@@ -1514,6 +1648,11 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
       </div>
       <WorkspaceActivityCapsule />
       <div className="composer">
+        {currentHistoryAction && <div className="chat-history-feedback" role={currentHistoryAction.pending ? 'status' : 'alert'}>
+          <span>{currentHistoryAction.pending ? currentHistoryAction.notice ?? '正在更新对话记录…' : currentHistoryAction.notice
+            ?? '未能确认删除或更新对话，请重新载入后核对结果，勿直接重复删除或发送。'}</span>
+          {currentHistoryAction.error && <button type="button" onClick={() => { void handleHistoryAction(); }}>重新载入对话</button>}
+        </div>}
         {isStreaming && <div className="agent-run-controls" aria-label="运行控制">
           <div className="agent-run-status">
             <span className={`agent-run-status-dot${isPaused ? ' paused' : ''}`} aria-hidden="true" />
@@ -1539,7 +1678,8 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
           onToolPresetChange={setToolPreset}
           soundEnabled={soundEnabled}
           onSoundToggle={() => setSoundEnabled((v) => !v)}
-          disabled={!session}
+          disabled={!session || (historyBlocked && currentHistoryAction?.kind !== 'load')}
+          sendDisabled={historyBlocked}
         />
       </div>
       </div>

@@ -112,6 +112,10 @@ impl WorkerHostBinding {
 /// resolving them to a sandbox path or a network client is a host concern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerHostOperation {
+    /// Read-only, non-recursive discovery within the same granted read roots.
+    List {
+        reference: String,
+    },
     Read {
         reference: String,
     },
@@ -193,6 +197,11 @@ pub enum WorkerHostResult {
     Acknowledged,
     Text(String),
     Evidence(Vec<String>),
+    Directory {
+        /// Worktree-relative references; directory references end with `/`.
+        entries: Vec<String>,
+        truncated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,9 +391,16 @@ impl FakeWorkerHost {
             &self.binding.task_shape,
             operation,
         ) {
-            (WorkerProfile::Explorer, _, WorkerHostOperation::Read { .. })
-            | (WorkerProfile::Implementer, TaskShape::Change, WorkerHostOperation::Read { .. })
-            | (WorkerProfile::Verifier, _, WorkerHostOperation::Read { .. }) => Ok(()),
+            (
+                WorkerProfile::Explorer | WorkerProfile::Verifier,
+                _,
+                WorkerHostOperation::Read { .. } | WorkerHostOperation::List { .. },
+            )
+            | (
+                WorkerProfile::Implementer,
+                TaskShape::Change,
+                WorkerHostOperation::Read { .. } | WorkerHostOperation::List { .. },
+            ) => Ok(()),
             (
                 WorkerProfile::Explorer,
                 TaskShape::Explore,
@@ -498,6 +514,16 @@ fn validate_operation_shape(operation: &WorkerHostOperation) -> Result<(), Worke
     const MAX_METHOD_CHARS: usize = 16;
     let non_empty = |value: &str| !value.trim().is_empty() && value != "." && value != "..";
     match operation {
+        WorkerHostOperation::List { reference } => {
+            if reference.trim().is_empty()
+                || reference.len() > 512
+                || reference.starts_with(['/', '\\'])
+                || reference.contains(['\0', '\r', '\n', ':'])
+                || reference.split(['/', '\\']).any(|part| part == "..")
+            {
+                return Err(WorkerHostError::InvalidOperation);
+            }
+        }
         WorkerHostOperation::Read { reference }
         | WorkerHostOperation::WriteCandidate { reference, .. } => {
             if !non_empty(reference) {
@@ -562,6 +588,7 @@ mod tests {
 
     fn delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery-1".into(),
             delivery_revision: 1,
@@ -612,6 +639,14 @@ mod tests {
         let factory = FakeWorkerHostFactory;
         let b = binding(WorkerProfile::Explorer, TaskShape::Explore);
         let mut task = factory.start(b.clone()).unwrap();
+        task.dispatch(request(
+            &b,
+            WorkerHostOperation::List {
+                reference: ".".into(),
+            },
+        ))
+        .await
+        .unwrap();
         task.dispatch(request(
             &b,
             WorkerHostOperation::Read {

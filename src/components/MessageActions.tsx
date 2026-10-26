@@ -4,8 +4,9 @@
  */
 "use client";
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import type { Message } from '$types';
+import { saveMessageReply } from '$lib/commands/message';
 
 export interface MessageActionsProps {
   message: Message;
@@ -13,6 +14,8 @@ export interface MessageActionsProps {
   onDelete?: (messageId: string) => void;
   onCopy?: (messageId: string) => void;
   disabled?: boolean;
+  isStreaming?: boolean;
+  recoveredEditContent?: string;
 }
 
 // ── Icons ───────────────────────────────────────────────────────────────────────
@@ -43,6 +46,13 @@ const CopyIcon = () => (
 const CheckIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
     <polyline points="20 6 9 17 4 12"/>
+  </svg>
+);
+
+const SaveIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <path d="m7 10 5 5 5-5M12 15V3" />
   </svg>
 );
 
@@ -119,8 +129,7 @@ function ActionButton({ onClick, disabled, title, children, variant = 'default',
         flexShrink: 0,
       }}
     >
-      {activeLabel && isActive ? <CheckIcon /> : children}
-      {activeLabel && isActive && <span>{activeLabel}</span>}
+      {activeLabel && active ? <><CheckIcon /><span>{activeLabel}</span></> : children}
     </button>
   );
 }
@@ -131,15 +140,16 @@ interface InlineEditProps {
   initialContent: string;
   onConfirm: (newContent: string) => void;
   onCancel: () => void;
+  disabled?: boolean;
 }
 
-function InlineEdit({ initialContent, onConfirm, onCancel }: InlineEditProps) {
+function InlineEdit({ initialContent, onConfirm, onCancel, disabled }: InlineEditProps) {
   const [value, setValue] = useState(initialContent);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const handleConfirm = () => {
     const trimmed = value.trim();
-    if (!trimmed) return;
+    if (disabled || !trimmed) return;
     onConfirm(trimmed);
   };
 
@@ -149,6 +159,7 @@ function InlineEdit({ initialContent, onConfirm, onCancel }: InlineEditProps) {
         ref={textareaRef}
         className="message-inline-editor-input"
         value={value}
+        disabled={disabled}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleConfirm(); }
@@ -159,7 +170,7 @@ function InlineEdit({ initialContent, onConfirm, onCancel }: InlineEditProps) {
         aria-label="编辑后的消息内容"
       />
       <div className="message-inline-editor-footer">
-        <span className="message-inline-editor-hint">Ctrl / ⌘ + Enter 重新发送</span>
+        <span className="message-inline-editor-hint">{disabled ? '当前操作处理中，暂不能重新发送' : 'Ctrl / ⌘ + Enter 重新发送'}</span>
         <div className="message-inline-editor-actions">
           <button type="button" className="message-inline-editor-cancel" onClick={onCancel}>
             取消
@@ -168,7 +179,7 @@ function InlineEdit({ initialContent, onConfirm, onCancel }: InlineEditProps) {
             type="button"
             className="message-inline-editor-submit"
             onClick={handleConfirm}
-            disabled={!value.trim()}
+            disabled={disabled || !value.trim()}
           >
             重新发送
           </button>
@@ -180,31 +191,87 @@ function InlineEdit({ initialContent, onConfirm, onCancel }: InlineEditProps) {
 
 // ── Main Component ─────────────────────────────────────────────────────────────
 
-export function MessageActions({ message, onEdit, onDelete, onCopy, disabled }: MessageActionsProps) {
-  const [editing, setEditing] = useState(false);
-  const [copied, setCopied] = useState(false);
+export function MessageActions({ message, onEdit, onDelete, onCopy, disabled, isStreaming, recoveredEditContent }: MessageActionsProps) {
+  const [editing, setEditing] = useState<{ source: Message; content: string } | null>(null);
+  const [copyState, setCopyState] = useState<{
+    source: Message; status: 'pending' | 'copied' | 'error';
+  } | null>(null);
+  const copyAttempt = useRef<symbol | null>(null);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>();
+  const [exportState, setExportState] = useState<{
+    source: Message; pending: boolean; notice?: string; error?: string;
+  } | null>(null);
+  const exportAttempt = useRef<symbol | null>(null);
+  useEffect(() => {
+    setEditing(recoveredEditContent !== undefined && message.role === 'user'
+      ? { source: message, content: recoveredEditContent } : null);
+    setCopyState(null);
+    setExportState(null);
+    return () => {
+      exportAttempt.current = null;
+      copyAttempt.current = null;
+      clearTimeout(copyTimer.current);
+    };
+  }, [message.id, message.sessionId, message.content, recoveredEditContent]);
+  const isCurrent = (source?: Message | null) => source?.id === message.id
+    && source.sessionId === message.sessionId && source.content === message.content;
+  const activeExport = isCurrent(exportState?.source) ? exportState : null;
+  const activeCopy = isCurrent(copyState?.source) ? copyState : null;
+  const copied = activeCopy?.status === 'copied';
 
-  const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(message.content).then(() => {
-      setCopied(true);
-      onCopy?.(message.id);
-      setTimeout(() => setCopied(false), 1800);
-    }).catch(() => {
-      // clipboard not available
-    });
-  }, [message.content, message.id, onCopy]);
-
-  const handleEditConfirm = (newContent: string) => {
-    onEdit?.(message.id, newContent);
-    setEditing(false);
+  const handleSave = async () => {
+    if (disabled || isStreaming || exportAttempt.current || message.role !== 'assistant' || !message.content.trim()) return;
+    const attempt = Symbol();
+    exportAttempt.current = attempt;
+    setExportState({ source: message, pending: true });
+    try {
+      const result = await saveMessageReply(message.sessionId, message.id);
+      if (exportAttempt.current !== attempt) return;
+      setExportState({ source: message, pending: false,
+        notice: result.status === 'saved' ? `已保存回复快照：${result.name}` : undefined });
+    } catch (error) {
+      if (exportAttempt.current === attempt) setExportState({ source: message, pending: false,
+        error: error instanceof Error ? error.message : '未能确认保存结果，请先检查所选位置；原回复未改变。' });
+    } finally {
+      if (exportAttempt.current === attempt) exportAttempt.current = null;
+    }
   };
 
-  if (editing) {
+  const handleCopy = async () => {
+    if (disabled || copyAttempt.current || !message.content.trim()) return;
+    const attempt = Symbol();
+    copyAttempt.current = attempt;
+    clearTimeout(copyTimer.current);
+    setCopyState({ source: message, status: 'pending' });
+    try {
+      await navigator.clipboard.writeText(message.content);
+    } catch {
+      if (copyAttempt.current === attempt) {
+        copyAttempt.current = null;
+        setCopyState({ source: message, status: 'error' });
+      }
+      return;
+    }
+    if (copyAttempt.current !== attempt) return;
+    copyAttempt.current = null;
+    setCopyState({ source: message, status: 'copied' });
+    copyTimer.current = setTimeout(() => setCopyState(null), 1800);
+    onCopy?.(message.id);
+  };
+
+  const handleEditConfirm = (newContent: string) => {
+    if (disabled || !isCurrent(editing?.source)) return;
+    onEdit?.(message.id, newContent);
+    setEditing(null);
+  };
+
+  if (editing && isCurrent(editing.source)) {
     return (
       <InlineEdit
-        initialContent={message.content}
+        initialContent={editing.content}
         onConfirm={handleEditConfirm}
-        onCancel={() => setEditing(false)}
+        onCancel={() => setEditing(null)}
+        disabled={disabled}
       />
     );
   }
@@ -216,11 +283,11 @@ export function MessageActions({ message, onEdit, onDelete, onCopy, disabled }: 
     <div className="message-actions" style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 6, flexWrap: 'wrap' }}>
       {isUser && (
         <>
-          <ActionButton onClick={() => setEditing(true)} disabled={disabled} title="编辑消息">
+          <ActionButton onClick={() => setEditing({ source: message, content: message.content })} disabled={disabled} title={disabled ? '请先等待当前操作结束后编辑消息' : '编辑消息'}>
             <EditIcon />
             <span>编辑</span>
           </ActionButton>
-          <ActionButton onClick={() => onDelete?.(message.id)} disabled={disabled} title="删除消息" variant="danger">
+          <ActionButton onClick={() => onDelete?.(message.id)} disabled={disabled} title={disabled ? '请先等待当前操作结束后删除消息' : '删除消息'} variant="danger">
             <TrashIcon />
             <span>删除</span>
           </ActionButton>
@@ -228,10 +295,22 @@ export function MessageActions({ message, onEdit, onDelete, onCopy, disabled }: 
       )}
       {isAssistant && (
         <>
-          <ActionButton onClick={handleCopy} disabled={disabled} title="复制回复" active={copied} activeLabel="已复制">
+          <ActionButton onClick={() => { void handleCopy(); }} disabled={disabled || activeCopy?.status === 'pending' || !message.content.trim()} title="复制回复" active={copied} activeLabel="已复制">
             {copied ? <CheckIcon /> : <CopyIcon />}
-            <span>{copied ? '已复制' : '复制'}</span>
+            <span>{activeCopy?.status === 'pending' ? '正在复制…' : '复制'}</span>
           </ActionButton>
+          {activeCopy?.status === 'error' && <span role="alert"
+            style={{ fontSize: 12, overflowWrap: 'anywhere', color: 'var(--color-danger)' }}>
+            无法复制到剪贴板，请手动选择正文复制；原回复未改变。
+          </span>}
+          {!isStreaming && message.content.trim() && <ActionButton onClick={() => { void handleSave(); }}
+            disabled={disabled || activeExport?.pending} title="保存为 Markdown 或文本新文件，不覆盖已有文件">
+            <SaveIcon /><span>{activeExport?.pending ? '正在保存…' : '保存回复…'}</span>
+          </ActionButton>}
+          {(activeExport?.notice || activeExport?.error) && <span role={activeExport.error ? 'alert' : 'status'}
+            style={{ fontSize: 12, overflowWrap: 'anywhere', color: activeExport.error ? 'var(--color-danger)' : 'var(--color-muted)' }}>
+            {activeExport.error ?? activeExport.notice}
+          </span>}
         </>
       )}
     </div>

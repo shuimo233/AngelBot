@@ -8,7 +8,7 @@ use super::{
     ThinkingSettings, ToolCall, ToolSchema,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn openai_compatible_request_headers(
@@ -341,13 +341,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
             return Err(format!("[{}] API error {}: {}", self.label, status, text));
         }
 
-        let mut buffer = String::new();
+        // Decode complete SSE lines, not individual HTTP chunks: a chunk may
+        // end in the middle of a UTF-8 character.
+        let mut buffer = Vec::new();
         let mut raw_content = String::new();
         let mut sent_visible = String::new();
         let mut tool_calls: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
-        // Issue #078: track the last SSE delta's `finish_reason` so we can
-        // tag the response at the end. Some providers emit it on every
-        // delta; others emit it once at the tail.
+        // Output arriving after a finish reason must receive its own terminal
+        // choice; an earlier marker cannot authorize a later partial call.
         let mut last_finish_reason: Option<String> = None;
 
         while let Some(chunk) = response
@@ -355,9 +356,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .await
             .map_err(|e| format!("[{}] SSE read failed: {}", self.label, e))?
         {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(newline) = buffer.find('\n') {
-                let line = buffer[..newline].trim_end_matches('\r').trim().to_string();
+            buffer.extend_from_slice(&chunk);
+            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = std::str::from_utf8(&buffer[..newline])
+                    .map_err(|_| format!("[{}] SSE 编码无效；未提交工具调用。", self.label))?
+                    .trim_end_matches('\r')
+                    .trim()
+                    .to_string();
                 buffer.drain(..=newline);
                 let Some(payload) = line.strip_prefix("data:") else {
                     continue;
@@ -366,14 +371,41 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 if payload == "[DONE]" {
                     continue;
                 }
-                let Ok(event) = serde_json::from_str::<Value>(payload) else {
+                if payload.is_empty() {
                     continue;
-                };
-                let Some(delta) = event["choices"]
+                }
+                let event: Value = serde_json::from_str(payload)
+                    .map_err(|_| format!("[{}] SSE 事件无效；未提交工具调用。", self.label))?;
+                if event.get("error").is_some_and(|error| !error.is_null()) {
+                    return Err(format!(
+                        "[{}] SSE 返回模型错误；未提交工具调用。",
+                        self.label
+                    ));
+                }
+                let Some(choice) = event["choices"]
                     .as_array()
                     .and_then(|choices| choices.first())
-                    .and_then(|choice| choice.get("delta"))
                 else {
+                    continue;
+                };
+                if choice.get("delta").is_some_and(|delta| {
+                    delta
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                        || delta
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|calls| !calls.is_empty())
+                }) {
+                    last_finish_reason = None;
+                }
+                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                    if !reason.is_empty() {
+                        last_finish_reason = Some(reason.to_string());
+                    }
+                }
+                let Some(delta) = choice.get("delta") else {
                     continue;
                 };
 
@@ -388,18 +420,6 @@ impl LlmProvider for OpenAiCompatibleProvider {
                                 let _ = sender.send(suffix.to_string());
                             }
                             sent_visible.push_str(suffix);
-                        }
-                    }
-                }
-
-                // Issue #078: capture the last non-null finish_reason.
-                if let Some(choice) = event["choices"]
-                    .as_array()
-                    .and_then(|choices| choices.first())
-                {
-                    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                        if !reason.is_empty() {
-                            last_finish_reason = Some(reason.to_string());
                         }
                     }
                 }
@@ -434,12 +454,21 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
         }
 
+        // A clean HTTP EOF or [DONE] alone does not prove the selected choice
+        // finished. Preserve legacy non-stream compatibility in parse_response,
+        // but never promote a partial stream to an executable response.
+        if last_finish_reason.is_none() || buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            return Err(format!(
+                "[{}] SSE 响应不完整或缺少 finish_reason；未提交工具调用。",
+                self.label
+            ));
+        }
+
         let calls: Vec<Value> = tool_calls
             .into_values()
-            .filter(|(_, name, _)| !name.is_empty())
             .map(|(id, name, arguments)| {
                 serde_json::json!({
-                    "id": if id.is_empty() { uuid::Uuid::new_v4().to_string() } else { id },
+                    "id": id,
                     "type": "function",
                     "function": { "name": name, "arguments": arguments },
                 })
@@ -467,29 +496,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
 /// Normalize tool arguments so handlers always receive a serde_json::Value::Object.
 /// Some providers (e.g. DeepSeek) send `arguments` as a JSON string, others as an object.
-/// This function parses strings and validates the result, returning an empty object on failure.
-fn normalize_tool_args(raw: &Value) -> Value {
-    match raw {
-        // Already an object — use as-is
-        Value::Object(_) => raw.clone(),
-        // String — attempt to parse; on failure return empty object so the handler
-        // can produce a structured error rather than panicking
-        Value::String(s) => {
-            match serde_json::from_str::<Value>(s) {
-                Ok(Value::Object(_)) => {
-                    serde_json::from_str(s).unwrap_or(Value::Object(Default::default()))
-                }
-                Ok(v) => v, // parsed but not an object — let handler deal with it
-                Err(e) => {
-                    eprintln!(
-                        "[{}] Failed to parse tool arguments JSON string: {} — raw: {}",
-                        "openai_compat", e, s
-                    );
-                    Value::Object(Default::default())
-                }
-            }
-        }
-        _ => raw.clone(),
+/// Invalid input is not an empty argument list and must never reach a handler.
+fn normalize_tool_args(raw: &Value) -> Result<Value, String> {
+    let parsed = match raw {
+        Value::String(value) => serde_json::from_str(value).ok(),
+        value => Some(value.clone()),
+    };
+    match parsed {
+        Some(value @ Value::Object(_)) => Ok(value),
+        _ => Err("工具调用参数不是完整 JSON 对象；未提交工具调用。".into()),
     }
 }
 
@@ -1256,22 +1271,38 @@ impl OpenAiCompatibleProvider {
         let content = strip_hidden_thinking(&raw_content);
 
         // Check for tool calls
-        if let Some(tool_calls) = message["tool_calls"].as_array() {
+        if let Some(tool_calls) = message.get("tool_calls").filter(|value| !value.is_null()) {
+            let tool_calls = tool_calls
+                .as_array()
+                .ok_or_else(|| "工具调用列表格式无效；未提交工具调用。".to_string())?;
             if !tool_calls.is_empty() {
                 let calls: Vec<ToolCall> = tool_calls
                     .iter()
-                    .filter_map(|tc| {
+                    .map(|tc| {
                         let raw_args = &tc["function"]["arguments"];
                         // DeepSeek sometimes sends arguments as a JSON string instead of an object.
                         // Normalize to a serde_json::Value::Object so handlers can deserialize it.
-                        let arguments = normalize_tool_args(raw_args);
-                        Some(ToolCall {
-                            id: tc["id"].as_str()?.to_string(),
-                            name: tc["function"]["name"].as_str()?.to_string(),
+                        let arguments = normalize_tool_args(raw_args)?;
+                        let identifier = |value: &Value| {
+                            value
+                                .as_str()
+                                .filter(|value| !value.trim().is_empty())
+                                .map(str::to_string)
+                                .ok_or_else(|| {
+                                    "工具调用缺少标识或名称；未提交工具调用。".to_string()
+                                })
+                        };
+                        Ok(ToolCall {
+                            id: identifier(&tc["id"])?,
+                            name: identifier(&tc["function"]["name"])?,
                             arguments,
                         })
                     })
-                    .collect();
+                    .collect::<Result<_, String>>()?;
+                let mut identities = BTreeSet::new();
+                if calls.iter().any(|call| !identities.insert(&call.id)) {
+                    return Err("工具调用标识重复；未提交工具调用。".into());
+                }
 
                 if !calls.is_empty() {
                     let text = if content.is_empty() {
@@ -1370,6 +1401,7 @@ impl OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::OpenAiCompatibleProvider;
+    use crate::llm::LlmProvider;
     use serde_json::json;
 
     fn provider() -> OpenAiCompatibleProvider {
@@ -1381,6 +1413,152 @@ mod tests {
             0.0,
             "test".to_string(),
         )
+    }
+
+    async fn stream_fixture(body: String) -> Result<crate::llm::LlmResponse, String> {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+                .expect("stream fixture received no request");
+            assert_eq!(request.url(), "/chat/completions");
+            let value: serde_json::Value = serde_json::from_reader(request.as_reader()).unwrap();
+            assert_eq!(value["stream"], true);
+            request
+                .respond(tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap(),
+                ))
+                .unwrap();
+        });
+        let mut model = provider();
+        model.base_url = format!("http://{address}");
+        let result = model.chat_stream(&[], None, None, None).await;
+        handle.join().unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn streaming_requires_terminal_choice_and_complete_tool_arguments() {
+        let text = json!({"choices":[{"delta":{"content":"partial-private-marker"},"finish_reason":null}]});
+        let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call1","function":{"name":"list_automations","arguments":"{}"}}]},"finish_reason":null}]});
+        let terminal = json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]});
+        let event = |value: &serde_json::Value| format!("data: {value}\n\n");
+        let mut malformed = call.clone();
+        malformed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] =
+            json!("{\"private-marker\":");
+        for (name, body) in [
+            ("text EOF", event(&text)),
+            ("tool EOF", event(&call)),
+            ("DONE without finish", format!("{}data: [DONE]\n\n", event(&call))),
+            ("late output after finish", format!("{}{}data: [DONE]\n\n", event(&terminal), event(&call))),
+            ("malformed arguments", format!("{}{}data: [DONE]\n\n", event(&malformed), event(&terminal))),
+            ("stream error", format!("{}data: {{\"error\":{{\"message\":\"private-marker\"}}}}\n\n{}data: [DONE]\n\n", event(&call), event(&terminal))),
+            ("malformed event", format!("{}data: {{broken-private-marker\n\n{}", event(&call), event(&terminal))),
+        ] {
+            let result = stream_fixture(body).await;
+            assert!(result.is_err(), "{name}: incomplete stream must not authorize text or tool output; got {result:?}");
+            let error = result.unwrap_err();
+            assert!(!error.contains("private-marker"), "{name}: private payload reached error text");
+        }
+        let result = stream_fixture(format!(
+            "{}{}data: [DONE]\n\n",
+            event(&call),
+            event(&terminal)
+        ))
+        .await
+        .unwrap();
+        match result {
+            crate::llm::LlmResponse::ToolCalls {
+                calls, stop_reason, ..
+            } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call1");
+                assert_eq!(calls[0].arguments, json!({}));
+                assert_eq!(stop_reason, crate::llm::StopReason::ToolUse);
+            }
+            _ => panic!("complete stream did not retain its tool call"),
+        }
+        // Compatible gateways may omit [DONE] or delta in the terminal choice;
+        // the explicit choice finish reason is authoritative, not EOF itself.
+        let response = stream_fixture(format!(
+            "{}data: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\r\n\r\n",
+            event(&json!({"choices":[{"delta":{"content":"你好"}}]}))
+        ))
+        .await
+        .unwrap();
+        match response {
+            crate::llm::LlmResponse::Text { text, stop_reason } => {
+                assert_eq!(text, "你好");
+                assert_eq!(stop_reason, crate::llm::StopReason::EndTurn);
+            }
+            _ => panic!("explicit terminal text was not retained"),
+        }
+    }
+
+    #[test]
+    fn native_tool_batches_reject_corrupt_arguments_or_identity_without_partial_success() {
+        let valid = json!({"id":"call1","type":"function",
+            "function":{"name":"list_automations","arguments":"{}"}});
+        for raw in [
+            json!("{\"private-marker\":"),
+            json!("[]"),
+            json!("null"),
+            json!(null),
+            json!(["private-marker"]),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["id"] = json!("call2");
+            invalid["function"]["arguments"] = raw;
+            let error = provider()
+                .parse_response(json!({"choices":[{"message":{
+                "tool_calls":[valid.clone(),invalid]}}]}))
+                .unwrap_err();
+            assert!(!error.contains("private-marker"));
+        }
+        for (field, value) in [("id", json!(null)), ("id", json!(" ")), ("name", json!(""))] {
+            let mut invalid = valid.clone();
+            if field == "id" {
+                invalid["id"] = value;
+            } else {
+                invalid["function"]["name"] = value;
+            }
+            assert!(provider()
+                .parse_response(json!({"choices":[{"message":{
+                "tool_calls":[valid.clone(),invalid]}}]}))
+                .is_err());
+        }
+        assert!(provider()
+            .parse_response(json!({"choices":[{"message":{
+            "tool_calls":[valid.clone(),valid.clone()]}}]}))
+            .is_err());
+        for invalid in [
+            json!("private-marker"),
+            json!({"function":"private-marker"}),
+        ] {
+            assert!(provider()
+                .parse_response(json!({"choices":[{"message":{
+                    "content":"not a completed tool task", "tool_calls":invalid}}]}))
+                .is_err());
+        }
+        for raw in [
+            json!({"query":"保持原参数"}),
+            json!("{\"query\":\"保持原参数\"}"),
+        ] {
+            let mut call = valid.clone();
+            call["function"]["arguments"] = raw;
+            match provider()
+                .parse_response(json!({"choices":[{"message":{
+                "tool_calls":[call]}}]}))
+                .unwrap()
+            {
+                crate::llm::LlmResponse::ToolCalls { calls, .. } => {
+                    assert_eq!(calls[0].arguments, json!({"query":"保持原参数"}));
+                }
+                _ => panic!("valid native object/string arguments were rejected"),
+            }
+        }
     }
 
     fn headers_for(label: &str, api_key: &str) -> Vec<(&'static str, String)> {

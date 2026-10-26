@@ -1,5 +1,6 @@
 use crate::{
     agent::supervision::{SupervisorInputKind, WorkspaceSupervisor},
+    child_process_tree::ProcessTree,
     AppState,
 };
 use chrono::{TimeZone, Utc};
@@ -10,11 +11,11 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
@@ -23,14 +24,96 @@ const MAX_TIMEOUT_SECONDS: u64 = 3600;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
 const AUTOMATION_CLAIM_TTL_SECONDS: i64 = MAX_TIMEOUT_SECONDS as i64 + 60;
 
+// Read surfaces share one effective receipt priority. History is chronological
+// after this bounded selection; old terminal failures do not remain on top.
+const RECEIPT_PRIORITY_SQL: &str =
+    "CASE WHEN run.id=owner.schedule_claim_token AND run.status='attention_required' THEN 0
+          WHEN run.status='running' THEN 1
+          WHEN run.status IN ('queued','awaiting_confirmation') THEN 2 ELSE 3 END";
+const EFFECTIVE_RECEIPT_SQL: &str = "(run.status!='skipped' OR owner.executor_kind='notification')";
+const AUTOMATION_COLUMNS_SQL: &str = "a.id,a.title,a.prompt,a.trigger_kind,a.trigger_value,a.enabled,a.permission_summary,a.executor_kind,a.script_path,a.script_args,a.working_dir,a.timeout_seconds,a.next_run_at,a.last_run_at,a.workspace_id";
+
+#[path = "automation_maa.rs"]
+mod maa;
+#[path = "automation_overview.rs"]
+mod overview;
+pub(crate) use overview::{maa_config_for_automation, workspace_automation_overview};
+pub use overview::{
+    AutomationDashboard, WorkspaceAutomationOverview, WorkspaceAutomationRunStatus,
+    WorkspaceAutomationStatus, WorkspaceMaaAutomationConfig,
+};
+#[path = "automation_script_admission.rs"]
+mod script_admission;
+pub(crate) use maa::create_maa_automation_definition;
+pub use maa::create_maa_automation_impl;
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn create_maa_automation(
+    state: State<AppState>,
+    title: String,
+    trigger_value: String,
+    workspace_id: String,
+    app_id: String,
+    launch_emulator: bool,
+    timeout_seconds: Option<u64>,
+) -> Result<Automation, String> {
+    create_maa_automation_impl(
+        &state,
+        title,
+        trigger_value,
+        workspace_id,
+        app_id,
+        launch_emulator,
+        timeout_seconds,
+    )
+}
+
+fn is_owned_executor(kind: &str) -> bool {
+    matches!(kind, "script" | "maa")
+}
+
+#[tauri::command]
+pub fn get_workspace_automation_overview(
+    state: State<AppState>,
+    workspace_id: String,
+) -> Result<WorkspaceAutomationOverview, String> {
+    get_workspace_automation_overview_impl(&state, &workspace_id)
+}
+
+pub fn get_workspace_automation_overview_impl(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<WorkspaceAutomationOverview, String> {
+    workspace_automation_overview(state.db.clone(), workspace_id, None)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScheduledAutomationClaim {
     id: String,
     token: String,
+    skipped: bool,
 }
 
 struct ScheduledAutomationExecution {
     notification: Option<ReminderNotification>,
+}
+
+#[derive(Default)]
+struct AutomationBatch {
+    count: usize,
+    notifications: Vec<ReminderNotification>,
+    failed: bool,
+}
+
+impl AutomationBatch {
+    fn result(&self) -> Result<usize, String> {
+        if self.failed {
+            Err("部分自动化需要处理，请查看运行记录".into())
+        } else {
+            Ok(self.count)
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +146,13 @@ pub struct Automation {
     pub last_run_at: Option<i64>,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationStopControl {
+    Available,
+    Requested,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AutomationRun {
     pub id: String,
@@ -73,6 +163,10 @@ pub struct AutomationRun {
     pub output: String,
     #[serde(rename = "startedAt")]
     pub started_at: i64,
+    #[serde(rename = "notificationStatus", skip_serializing_if = "Option::is_none")]
+    pub notification_status: Option<String>,
+    #[serde(rename = "stopControl", skip_serializing_if = "Option::is_none")]
+    pub stop_control: Option<AutomationStopControl>,
 }
 
 #[derive(Debug)]
@@ -118,6 +212,8 @@ pub(crate) enum AgentAutomationDispatchAdmission {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReminderNotification {
+    automation_id: String,
+    run_id: String,
     title: String,
     body: String,
 }
@@ -244,6 +340,9 @@ fn validate_script_path(
 }
 
 fn script_command(script: &Path, args: &[String], working_dir: &Path) -> Result<Command, String> {
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err("脚本参数不能包含空字符".to_string());
+    }
     let extension = script
         .extension()
         .and_then(OsStr::to_str)
@@ -258,15 +357,61 @@ fn script_command(script: &Path, args: &[String], working_dir: &Path) -> Result<
             command
         }
         "cmd" | "bat" => {
+            // cmd.exe reparses argv as shell text. Command::args alone cannot
+            // protect batch arguments from operators, expansion, or quoting.
+            // Keep batch support for literal arguments and reject ambiguous
+            // inputs explicitly rather than silently changing their meaning.
+            let is_shell_text = |value: &str| {
+                value.chars().any(|character| {
+                    character.is_control()
+                        || matches!(
+                            character,
+                            '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!' | '"'
+                        )
+                })
+            };
+            if is_shell_text(&script.to_string_lossy()) || args.iter().any(|arg| is_shell_text(arg))
+            {
+                return Err(
+                    "批处理脚本路径和参数不能包含 shell 元字符、引号或控制字符；请使用 Python、Node.js 或 PowerShell 包装脚本"
+                        .to_string(),
+                );
+            }
             let mut command = Command::new("cmd");
-            command.args(["/d", "/c"]);
+            command.args(["/d", "/s", "/v:off", "/c"]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+
+                // cmd /s removes the outer pair of quotes. Its inner quoting
+                // rules differ from Win32 argv quoting: do not let Command::arg
+                // insert backslash escapes around the quoted batch path.
+                let mut shell_text =
+                    format!("\"\"{}\"", crate::commands::file::display_work_dir(script));
+                for arg in args {
+                    shell_text.push_str(" \"");
+                    shell_text.push_str(arg);
+                    shell_text.push('"');
+                }
+                shell_text.push('"');
+                command.raw_arg(shell_text);
+            }
+            #[cfg(not(windows))]
+            command.arg(script).args(args);
             command
         }
         _ => return Err("仅支持 .py、.js、.mjs、.cjs、.ps1、.cmd 或 .bat 脚本".to_string()),
     };
+    if !matches!(extension.as_str(), "cmd" | "bat") {
+        // Keep canonical paths for scope checks, but Windows interpreters do
+        // not consistently accept the extended-length form as a script argv.
+        #[cfg(windows)]
+        command.arg(crate::commands::file::display_work_dir(script));
+        #[cfg(not(windows))]
+        command.arg(script);
+        command.args(args);
+    }
     command
-        .arg(script)
-        .args(args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -274,33 +419,174 @@ fn script_command(script: &Path, args: &[String], working_dir: &Path) -> Result<
     Ok(command)
 }
 
-fn capture_stream<R: Read + Send + 'static>(mut stream: R, sender: mpsc::Sender<Vec<u8>>) {
+#[derive(Default)]
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn capture_stream<R: Read + Send + 'static>(
+    mut stream: R,
+) -> thread::JoinHandle<Result<CapturedStream, String>> {
     thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stream.read_to_end(&mut buffer);
-        let _ = sender.send(buffer);
-    });
-}
-
-fn truncate_output(stdout: Vec<u8>, stderr: Vec<u8>) -> String {
-    let mut combined = stdout;
-    if !stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.extend_from_slice(b"\n");
+        let mut captured = CapturedStream::default();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = match stream.read(&mut chunk) {
+                Ok(0) => return Ok(captured),
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("无法读取脚本输出：{error}")),
+            };
+            let retained = count.min(MAX_CAPTURED_OUTPUT_BYTES - captured.bytes.len());
+            captured.bytes.extend_from_slice(&chunk[..retained]);
+            captured.truncated |= retained < count;
+            // Always drain the pipe, including after the capture limit. A noisy
+            // child must not block on a full pipe or consume unbounded memory.
         }
-        combined.extend_from_slice(b"[stderr]\n");
-        combined.extend_from_slice(&stderr);
-    }
-    let truncated = combined.len() > MAX_CAPTURED_OUTPUT_BYTES;
-    combined.truncate(MAX_CAPTURED_OUTPUT_BYTES);
-    let mut text = String::from_utf8_lossy(&combined).trim().to_string();
-    if truncated {
-        text.push_str("\n[输出已截断]");
-    }
-    text
+    })
 }
 
-fn execute_script(state: &AppState, automation: &Automation) -> ScriptRunResult {
+fn join_capture(
+    reader: Option<thread::JoinHandle<Result<CapturedStream, String>>>,
+) -> Result<CapturedStream, String> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "脚本输出读取线程异常退出".to_string())?,
+        None => Ok(CapturedStream::default()),
+    }
+}
+
+fn truncate_output(stdout: CapturedStream, stderr: CapturedStream) -> String {
+    let mut text = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    if stdout.truncated {
+        text.push_str("\n[stdout 输出已截断]");
+    }
+    if !stderr.bytes.is_empty() || stderr.truncated {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[stderr]\n");
+        text.push_str(&String::from_utf8_lossy(&stderr.bytes));
+        if stderr.truncated {
+            text.push_str("\n[stderr 输出已截断]");
+        }
+    }
+    text.trim().to_string()
+}
+
+/// Execute a script task, not a detached launcher. The script must wait for its
+/// own subprocess work: its exit ends the owned process tree, but does not prove
+/// that any GUI application or game's daily tasks have completed.
+fn execute_script_command(
+    mut command: Command,
+    timeout_seconds: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ScriptRunResult, String> {
+    if cancelled() {
+        return Ok(ScriptRunResult {
+            status: "cancelled",
+            summary: "本次脚本已停止，未启动进程".into(),
+            exit_code: None,
+            output: String::new(),
+            supervisor_input_id: None,
+        });
+    }
+    crate::child_process_env::apply_minimal_child_environment(&mut command);
+    let mut child =
+        ProcessTree::spawn(&mut command).map_err(|error| format!("无法启动脚本：{error}"))?;
+    // Dedicated handles retain stream identity even if stderr reaches EOF first.
+    let stdout_reader = child.take_stdout().map(capture_stream);
+    let stderr_reader = child.take_stderr().map(capture_stream);
+    let started = Instant::now();
+    let timeout = Duration::from_secs(timeout_seconds);
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok((Some(status), false, false)),
+            Ok(None) => {}
+            Err(error) => break Err(format!("无法检查脚本状态：{error}")),
+        }
+        if cancelled() {
+            break Ok((None, false, true));
+        }
+        if started.elapsed() >= timeout {
+            break Ok((None, true, false));
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    // Even a successful launcher may leave descendants holding the output pipes.
+    // Scripts own their process tree: stop it on exit, timeout, or wait failure
+    // before joining readers. Drop also closes the Windows kill-on-close job if
+    // explicit termination fails, so no owned descendants keep readers alive.
+    let cleanup = child
+        .terminate_and_wait()
+        .map_err(|error| format!("无法停止脚本进程树：{error}"));
+    let stopped_status = child.try_wait().ok().flatten();
+    drop(child);
+    let stdout = join_capture(stdout_reader);
+    let stderr = join_capture(stderr_reader);
+    let (status, timed_out, was_cancelled) = outcome?;
+    if was_cancelled && (cleanup.is_err() || stdout.is_err() || stderr.is_err()) {
+        return Ok(ScriptRunResult {
+            status: "attention_required",
+            summary: "已请求停止，但未能确认脚本进程与输出清理完成；请检查后再重试".into(),
+            exit_code: None,
+            output: String::new(),
+            supervisor_input_id: None,
+        });
+    }
+    cleanup?;
+    let output = truncate_output(stdout?, stderr?);
+    if was_cancelled {
+        return Ok(ScriptRunResult {
+            status: "cancelled",
+            summary: "本次脚本已停止；已产生的操作不会回滚".into(),
+            exit_code: stopped_status.and_then(|status| status.code()),
+            output,
+            supervisor_input_id: None,
+        });
+    }
+    if timed_out {
+        return Ok(ScriptRunResult {
+            status: "timed_out",
+            summary: format!("脚本超过 {timeout_seconds} 秒，已停止"),
+            exit_code: stopped_status.and_then(|status| status.code()),
+            output,
+            supervisor_input_id: None,
+        });
+    }
+    let status = status.ok_or_else(|| "脚本缺少退出状态".to_string())?;
+    let exit_code = status.code();
+    Ok(if status.success() {
+        ScriptRunResult {
+            status: "completed",
+            // This records script exit, not completion of a game's daily tasks.
+            summary: "脚本执行完成".to_string(),
+            exit_code,
+            output,
+            supervisor_input_id: None,
+        }
+    } else {
+        ScriptRunResult {
+            status: "failed",
+            summary: format!(
+                "脚本执行失败（退出码 {}）",
+                exit_code.map_or("未知".to_string(), |value| value.to_string())
+            ),
+            exit_code,
+            output,
+            supervisor_input_id: None,
+        }
+    })
+}
+
+fn execute_script(
+    state: &AppState,
+    automation: &Automation,
+    cancelled: &dyn Fn() -> bool,
+) -> ScriptRunResult {
     let run = || -> Result<ScriptRunResult, String> {
         let script_path = automation
             .script_path
@@ -308,75 +594,8 @@ fn execute_script(state: &AppState, automation: &Automation) -> ScriptRunResult 
             .ok_or_else(|| "未配置脚本路径".to_string())?;
         let (script, work_dir) =
             validate_script_path(state, script_path, automation.working_dir.as_deref())?;
-        let mut command = script_command(&script, &automation.script_args, &work_dir)?;
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("无法启动脚本：{}", e))?;
-        let (sender, receiver) = mpsc::channel();
-        if let Some(stdout) = child.stdout.take() {
-            capture_stream(stdout, sender.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            capture_stream(stderr, sender);
-        }
-
-        let started = Instant::now();
-        let timeout = Duration::from_secs(automation.timeout_seconds);
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| format!("无法检查脚本状态：{}", e))?
-            {
-                break (status, false);
-            }
-            if started.elapsed() >= timeout {
-                child
-                    .kill()
-                    .map_err(|e| format!("无法停止超时脚本：{}", e))?;
-                let status = child
-                    .wait()
-                    .map_err(|e| format!("无法等待脚本停止：{}", e))?;
-                break (status, true);
-            }
-            thread::sleep(Duration::from_millis(100));
-        };
-        let stdout = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap_or_default();
-        let stderr = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap_or_default();
-        let output = truncate_output(stdout, stderr);
-        if status.1 {
-            return Ok(ScriptRunResult {
-                status: "timed_out",
-                summary: format!("脚本超过 {} 秒，已停止", automation.timeout_seconds),
-                exit_code: status.0.code(),
-                output,
-                supervisor_input_id: None,
-            });
-        }
-        let exit_code = status.0.code();
-        Ok(if status.0.success() {
-            ScriptRunResult {
-                status: "completed",
-                summary: "脚本执行完成".to_string(),
-                exit_code,
-                output,
-                supervisor_input_id: None,
-            }
-        } else {
-            ScriptRunResult {
-                status: "failed",
-                summary: format!(
-                    "脚本执行失败（退出码 {}）",
-                    exit_code.map_or("未知".to_string(), |value| value.to_string())
-                ),
-                exit_code,
-                output,
-                supervisor_input_id: None,
-            }
-        })
+        let command = script_command(&script, &automation.script_args, &work_dir)?;
+        execute_script_command(command, automation.timeout_seconds, cancelled)
     };
     run().unwrap_or_else(|error| ScriptRunResult {
         status: "failed",
@@ -387,6 +606,10 @@ fn execute_script(state: &AppState, automation: &Automation) -> ScriptRunResult 
     })
 }
 
+#[cfg(test)]
+#[path = "automation_script_tests.rs"]
+mod script_tests;
+
 #[tauri::command]
 pub fn get_automations(state: State<AppState>) -> Result<Vec<Automation>, String> {
     get_automations_impl(&state)
@@ -394,12 +617,24 @@ pub fn get_automations(state: State<AppState>) -> Result<Vec<Automation>, String
 
 pub fn get_automations_impl(state: &AppState) -> Result<Vec<Automation>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn.prepare("SELECT id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,script_path,script_args,working_dir,timeout_seconds,next_run_at,last_run_at,workspace_id FROM automations ORDER BY updated_at DESC").map_err(|e| e.to_string())?;
+    let sql =
+        format!("SELECT {AUTOMATION_COLUMNS_SQL} FROM automations a ORDER BY a.updated_at DESC");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], automation_from_row)
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+/// Global settings UI projection; Main tools retain their workspace-scoped API.
+#[tauri::command]
+pub fn get_automation_dashboard(state: State<AppState>) -> Result<AutomationDashboard, String> {
+    get_automation_dashboard_impl(&state)
+}
+
+pub fn get_automation_dashboard_impl(state: &AppState) -> Result<AutomationDashboard, String> {
+    overview::automation_dashboard(state)
 }
 
 fn automation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
@@ -502,7 +737,10 @@ pub fn create_automation_impl(
         let path = script_path
             .as_deref()
             .ok_or_else(|| "脚本任务需要脚本路径".to_string())?;
-        validate_script_path(state, path, working_dir.as_deref())?;
+        let (script, work_dir) = validate_script_path(state, path, working_dir.as_deref())?;
+        // Validate the same executable/argv contract before saving an enabled
+        // definition. Constructing Command has no process-launch side effects.
+        script_command(&script, &script_args, &work_dir)?;
     }
     let now = Utc::now().timestamp();
     let next_run_at = Some(validated_next_run_at(&trigger_kind, &trigger_value, now)?);
@@ -634,7 +872,16 @@ fn persist_automation(
     item: &Automation,
     now: i64,
 ) -> Result<(), String> {
-    db.lock().map_err(|e| e.to_string())?.execute(
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    persist_automation_in_conn(&conn, item, now)
+}
+
+fn persist_automation_in_conn(
+    conn: &Connection,
+    item: &Automation,
+    now: i64,
+) -> Result<(), String> {
+    conn.execute(
         "INSERT INTO automations (id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,workspace_id,script_path,script_args,working_dir,timeout_seconds,next_run_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,1,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
         params![item.id, item.title, item.prompt, item.trigger_kind, item.trigger_value, item.permission_summary, item.executor_kind, item.workspace_id, item.script_path, serde_json::to_string(&item.script_args).map_err(|e| e.to_string())?, item.working_dir, item.timeout_seconds as i64, item.next_run_at, now],
     ).map_err(|e| e.to_string())?;
@@ -666,6 +913,19 @@ pub fn delete_automation(state: State<AppState>, id: String) -> Result<(), Strin
 pub fn delete_automation_impl(state: &AppState, id: &str) -> Result<(), String> {
     let now = Utc::now().timestamp();
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let maa_path: Option<String> = conn
+        .query_row(
+            "SELECT app.executable_path FROM maa_automation_options opts
+         JOIN desktop_trusted_apps app ON app.id=opts.trusted_app_id
+         WHERE opts.automation_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(path) = maa_path {
+        crate::maa_routine::cleanup_install(&path)?;
+    }
     delete_automation_in_conn(&mut conn, id, now)
 }
 
@@ -679,19 +939,68 @@ fn set_automation_enabled_in_conn(
     enabled: bool,
     now: i64,
 ) -> Result<(), String> {
+    set_automation_enabled_scoped_in_conn(conn, id, enabled, now, None)
+}
+
+/// Model tools may only pause an automation owned by their durable workspace.
+/// Scope validation and lifecycle mutation share the existing transaction.
+pub(crate) fn pause_workspace_automation(
+    db: Arc<Mutex<Connection>>,
+    workspace_id: &str,
+    id: &str,
+) -> Result<(), String> {
+    if workspace_id.trim().is_empty() || id.trim().is_empty() {
+        return Err("暂停自动化必须确定当前工作区和准确任务 ID".into());
+    }
+    let mut conn = db.lock().map_err(|error| error.to_string())?;
+    set_automation_enabled_scoped_in_conn(
+        &mut conn,
+        id,
+        false,
+        Utc::now().timestamp(),
+        Some(workspace_id),
+    )
+}
+
+fn set_automation_enabled_scoped_in_conn(
+    conn: &mut Connection,
+    id: &str,
+    enabled: bool,
+    now: i64,
+    workspace_id: Option<&str>,
+) -> Result<(), String> {
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    let (kind, value): (String, String) = transaction
+    if let Some(workspace) = workspace_id {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+                [workspace],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !exists {
+            return Err("归属工作区不存在".into());
+        }
+    }
+    let schedule: Option<(String, String)> = transaction
         .query_row(
-            "SELECT trigger_kind,trigger_value FROM automations WHERE id=?1",
-            params![id],
+            "SELECT trigger_kind,trigger_value FROM automations WHERE id=?1 AND (?2 IS NULL OR workspace_id=?2)",
+            params![id, workspace_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
+        .optional()
         .map_err(|error| error.to_string())?;
+    let (kind, value) = schedule.ok_or_else(|| "当前工作区中未找到该自动化".to_string())?;
     let next_run_at = enabled
         .then(|| validated_next_run_at(&kind, &value, now))
         .transpose()?;
+    if enabled && script_admission::requires_attention(&transaction, id)? {
+        return Err(
+            "上次受控执行结果无法确认；请检查后明确点击立即运行重试，再启用定时".to_string(),
+        );
+    }
     if !enabled {
         cancel_unstarted_agent_automation_dispatches_in_tx(
             &transaction,
@@ -703,7 +1012,10 @@ fn set_automation_enabled_in_conn(
     transaction
         .execute(
             "UPDATE automations
-             SET enabled=?2,next_run_at=?3,schedule_claim_token=NULL,schedule_claimed_at=NULL,updated_at=?4
+             SET enabled=?2,next_run_at=?3,
+                 schedule_claim_token=CASE WHEN executor_kind IN ('script','maa') THEN schedule_claim_token ELSE NULL END,
+                 schedule_claimed_at=CASE WHEN executor_kind IN ('script','maa') THEN schedule_claimed_at ELSE NULL END,
+                 updated_at=?4
              WHERE id=?1",
             params![id, enabled, next_run_at, now],
         )
@@ -716,6 +1028,17 @@ fn delete_automation_in_conn(conn: &mut Connection, id: &str, now: i64) -> Resul
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
+    let running_owned_process: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM automation_runs run JOIN automations a ON a.id=run.automation_id
+             WHERE a.id=?1 AND a.executor_kind IN ('script','maa') AND run.status='running')",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if running_owned_process {
+        return Err("受控进程仍在执行，不能删除其定义和运行记录；暂停只影响后续定时".to_string());
+    }
     // Deletion cascades automation_runs but not supervisor inputs.  Settle every
     // linked delivery first, including a task that already started: that task is
     // independent Main-Agent work now, while its old delivery lease must not be
@@ -789,37 +1112,133 @@ fn cancel_all_agent_automation_inputs_in_tx(
 }
 
 #[tauri::command]
-pub fn run_automation_now(
+pub async fn run_automation_now(app_handle: AppHandle, id: String) -> Result<(), String> {
+    let blocking_app = app_handle.clone();
+    let notification = tauri::async_runtime::spawn_blocking(move || {
+        let state = blocking_app.state::<AppState>();
+        run_automation_now_with_events_impl(
+            &state,
+            &id,
+            &|| {
+                let _ = blocking_app.emit("angelbot:automations-updated", ());
+            },
+            &|outcome| {
+                publish_owned_run_outcome(&state, &blocking_app, outcome);
+            },
+        )
+    })
+    .await
+    .map_err(|error| format!("自动化执行线程异常：{error}"))??;
+    let _ = app_handle.emit("angelbot:automations-updated", ());
+    let state = app_handle.state::<AppState>();
+    finish_automation_batch(
+        &state,
+        AutomationBatch {
+            count: 1,
+            notifications: notification.into_iter().collect(),
+            failed: false,
+        },
+        &|notification| {
+            crate::commands::settings::send_notification_channel_impl(
+                &state,
+                &app_handle,
+                "reminder".to_string(),
+                notification.title.clone(),
+                notification.body.clone(),
+            )
+        },
+        &|| {
+            let _ = app_handle.emit("angelbot:automations-updated", ());
+        },
+        &|| state.foreground_automation_pump.wake(app_handle.clone()),
+    )
+    .map(|_| ())
+}
+#[cfg(test)]
+pub fn run_automation_now_impl(state: &AppState, id: &str) -> Result<(), String> {
+    run_automation_now_with_notification_impl(state, id).map(|_| ())
+}
+
+#[tauri::command]
+pub fn stop_automation_run(
     state: State<AppState>,
     app_handle: AppHandle,
     id: String,
+    run_id: String,
 ) -> Result<(), String> {
-    let notification = run_automation_now_with_notification_impl(&state, &id)?;
-    if let Some(notification) = notification {
-        crate::commands::settings::emit_notification_channel_impl(
-            &state,
-            &app_handle,
-            "reminder".to_string(),
-            notification.title,
-            notification.body,
-        )?;
-    }
-    state.foreground_automation_pump.wake(app_handle.clone());
+    stop_automation_run_impl(&state, &id, &run_id)?;
+    let _ = app_handle.emit("angelbot:automations-updated", ());
     Ok(())
 }
-pub fn run_automation_now_impl(state: &AppState, id: &str) -> Result<(), String> {
-    run_automation_now_with_notification_impl(state, id).map(|_| ())
+
+pub fn stop_automation_run_impl(state: &AppState, id: &str, run_id: &str) -> Result<(), String> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| "无法核验本次执行归属".to_string())?;
+    script_admission::request_stop(&conn, id, run_id)
+}
+
+pub(crate) fn stop_workspace_automation_run(
+    db: Arc<Mutex<Connection>>,
+    workspace_id: &str,
+    id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    if workspace_id.trim().is_empty() || id.trim().is_empty() || run_id.trim().is_empty() {
+        return Err("停止必须确定当前工作区及准确的自动化和运行 ID".into());
+    }
+    let conn = db.lock().map_err(|_| "无法核验本次执行归属".to_string())?;
+    let in_scope: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM automations a JOIN projects p ON p.id=a.workspace_id
+         WHERE a.id=?1 AND a.workspace_id=?2)",
+            params![id, workspace_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "无法核验本次执行归属".to_string())?;
+    if !in_scope {
+        return Err("当前工作区中未找到该自动化".into());
+    }
+    // Scope and live ownership are checked under the same connection lock.
+    script_admission::request_stop(&conn, id, run_id)
 }
 
 fn run_automation_now_with_notification_impl(
     state: &AppState,
     id: &str,
 ) -> Result<Option<ReminderNotification>, String> {
+    // Development/test-only execution has no native notification handle.
+    run_automation_now_with_events_impl(state, id, &|| {}, &|_| {})
+}
+
+fn run_automation_now_with_events_impl(
+    state: &AppState,
+    id: &str,
+    on_update: &dyn Fn(),
+    on_complete: &dyn Fn(script_admission::OwnedRunOutcome),
+) -> Result<Option<ReminderNotification>, String> {
     let automation = get_automations_impl(state)?
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| "未找到自动化任务".to_string())?;
     let now = Utc::now().timestamp();
+    if is_owned_executor(&automation.executor_kind) {
+        match script_admission::admit(state, id, script_admission::Origin::Manual, now, on_update)?
+        {
+            script_admission::Admission::Started(ticket) => {
+                let outcome = script_admission::execute_ticket(
+                    state,
+                    ticket,
+                    on_update,
+                    &execute_owned_automation,
+                )?;
+                on_complete(outcome);
+            }
+            script_admission::Admission::Consumed | script_admission::Admission::NotDue => {}
+        }
+        return Ok(None);
+    }
     {
         let mut conn = state.db.lock().map_err(|error| error.to_string())?;
         let transaction = conn
@@ -837,24 +1256,31 @@ fn run_automation_now_with_notification_impl(
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
-        transaction.commit().map_err(|error| error.to_string())?;
+        if automation.executor_kind == "notification" {
+            let run_id = persist_automation_run_in_conn(
+                &transaction,
+                &automation,
+                notification_run_result(),
+                now,
+                None,
+            )?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(notification_for_automation(&automation, run_id));
+        }
+        Err("该执行方式必须通过受控的自动化派发路径运行".to_string())
     }
-    let result = run_automation_executor(state, &automation)?;
-    let notification = notification_for_automation(&automation);
-    persist_automation_run(state, &automation, result, now, None)?;
-    Ok(notification)
 }
 
-fn run_automation_executor(
+fn execute_owned_automation(
     state: &AppState,
     automation: &Automation,
-) -> Result<ScriptRunResult, String> {
-    if automation.executor_kind == "script" {
-        Ok(execute_script(state, automation))
-    } else if automation.executor_kind == "notification" {
-        Ok(notification_run_result())
+    run_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> ScriptRunResult {
+    if automation.executor_kind == "maa" {
+        maa::execute(state, automation, run_id, cancelled)
     } else {
-        Err("该执行方式必须通过受控的自动化派发路径运行".to_string())
+        execute_script(state, automation, cancelled)
     }
 }
 
@@ -878,6 +1304,7 @@ fn persist_agent_automation_run_in_tx(
         now,
         claim_token,
     )
+    .map(|_| ())
 }
 
 fn pause_unsupported_schedule_in_tx(
@@ -929,26 +1356,16 @@ fn notification_run_result() -> ScriptRunResult {
     }
 }
 
-fn notification_for_automation(automation: &Automation) -> Option<ReminderNotification> {
+fn notification_for_automation(
+    automation: &Automation,
+    run_id: String,
+) -> Option<ReminderNotification> {
     (automation.executor_kind == "notification").then(|| ReminderNotification {
+        automation_id: automation.id.clone(),
+        run_id,
         title: automation.title.clone(),
         body: automation.prompt.clone(),
     })
-}
-
-fn persist_automation_run(
-    state: &AppState,
-    automation: &Automation,
-    result: ScriptRunResult,
-    now: i64,
-    claim_token: Option<&str>,
-) -> Result<(), String> {
-    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-    let transaction = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    persist_automation_run_in_conn(&transaction, automation, result, now, claim_token)?;
-    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn persist_automation_run_in_conn(
@@ -957,14 +1374,15 @@ fn persist_automation_run_in_conn(
     result: ScriptRunResult,
     now: i64,
     claim_token: Option<&str>,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    let run_id = Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO automation_runs (
             id, automation_id, status, summary, exit_code, output, started_at,
             finished_at, supervisor_input_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
         params![
-            Uuid::new_v4().to_string(),
+            run_id,
             automation.id,
             result.status,
             result.summary,
@@ -994,43 +1412,297 @@ fn persist_automation_run_in_conn(
         )
         .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(run_id)
 }
 
 /// Run all enabled schedule definitions which are due while the desktop app is
 /// alive. A durable claim prevents overlapping heartbeats from launching the
 /// same due task twice; no database lock is retained during execution.
+#[cfg(test)]
 pub fn run_due_automations_impl(state: &AppState, now: i64) -> Result<usize, String> {
-    run_due_automations_with_notifications_impl(state, now).map(|outcome| outcome.0)
+    run_due_automations_with_notifications_impl(state, now)?.result()
 }
 
 fn run_due_automations_with_notifications_impl(
     state: &AppState,
     now: i64,
-) -> Result<(usize, Vec<ReminderNotification>), String> {
+) -> Result<AutomationBatch, String> {
+    run_due_automations_with_events_impl(state, now, &|| {})
+}
+
+fn run_due_automations_with_events_impl(
+    state: &AppState,
+    now: i64,
+    on_update: &dyn Fn(),
+) -> Result<AutomationBatch, String> {
+    dispatch_due_automations(state, now, on_update, &|ticket| {
+        script_admission::execute_ticket(state, ticket, on_update, &execute_owned_automation)
+            .map(|_| ())
+    })
+}
+
+fn dispatch_due_automations(
+    state: &AppState,
+    now: i64,
+    on_update: &dyn Fn(),
+    dispatch: &dyn Fn(script_admission::Ticket) -> Result<(), String>,
+) -> Result<AutomationBatch, String> {
     let claims = {
         let mut conn = state.db.lock().map_err(|error| error.to_string())?;
         claim_due_automations(&mut conn, now)?
     };
-    run_claimed_automations(state, &claims, now)
+    on_update();
+    dispatch_claimed_automations(state, &claims, now, on_update, dispatch)
 }
 
 fn run_claimed_automations(
     state: &AppState,
     claims: &[ScheduledAutomationClaim],
     now: i64,
-) -> Result<(usize, Vec<ReminderNotification>), String> {
-    let mut notifications = Vec::new();
-    let mut executed = 0;
+) -> Result<AutomationBatch, String> {
+    run_claimed_automations_with_events(state, claims, now, &|| {})
+}
+
+fn run_claimed_automations_with_events(
+    state: &AppState,
+    claims: &[ScheduledAutomationClaim],
+    now: i64,
+    on_update: &dyn Fn(),
+) -> Result<AutomationBatch, String> {
+    dispatch_claimed_automations(state, claims, now, on_update, &|ticket| {
+        script_admission::execute_ticket(state, ticket, on_update, &execute_owned_automation)
+            .map(|_| ())
+    })
+}
+
+fn dispatch_claimed_automations(
+    state: &AppState,
+    claims: &[ScheduledAutomationClaim],
+    now: i64,
+    on_update: &dyn Fn(),
+    dispatch: &dyn Fn(script_admission::Ticket) -> Result<(), String>,
+) -> Result<AutomationBatch, String> {
+    let mut batch = AutomationBatch::default();
+    let started = Instant::now();
     for claim in claims {
-        if let Some(execution) = run_claimed_automation_impl(state, claim, now)? {
-            executed += 1;
-            if let Some(notification) = execution.notification {
-                notifications.push(notification);
+        let dispatch_now = now.saturating_add(started.elapsed().as_secs() as i64);
+        match dispatch_claimed_automation(state, claim, dispatch_now, on_update, dispatch) {
+            Ok(Some(execution)) => {
+                batch.count += 1;
+                if let Some(notification) = execution.notification {
+                    batch.notifications.push(notification);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                batch.failed = true;
+                // The exact claim owns only an unstarted non-process dispatch.
+                // Owned processes seal their exact running receipt below.
+                let _ = record_failed_claim(state, claim, dispatch_now);
+                on_update();
             }
         }
     }
-    Ok((executed, notifications))
+    Ok(batch)
+}
+
+fn record_failed_claim(
+    state: &AppState,
+    claim: &ScheduledAutomationClaim,
+    now: i64,
+) -> Result<(), String> {
+    let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO automation_runs(id,automation_id,status,summary,output,started_at,finished_at)
+         SELECT ?3,id,'needs_attention','自动化派发失败，已暂停；请检查后手动重试','',?4,?4
+         FROM automations WHERE id=?1 AND schedule_claim_token=?2
+           AND executor_kind NOT IN ('script','maa')",
+        params![claim.id, claim.token, Uuid::new_v4().to_string(), now],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE automations SET enabled=0,next_run_at=NULL,schedule_claim_token=NULL,
+           schedule_claimed_at=NULL,updated_at=?3
+         WHERE id=?1 AND schedule_claim_token=?2 AND executor_kind NOT IN ('script','maa')",
+        params![claim.id, claim.token, now],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn record_uncertain_owned_dispatch(
+    state: &AppState,
+    id: &str,
+    run_id: &str,
+    now: i64,
+) -> Result<(), String> {
+    let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let changed = tx
+        .execute(
+            "UPDATE automation_runs SET status='attention_required',
+           summary='本次受控执行结果无法确认，定时已暂停；请检查后明确重试',finished_at=?3
+         WHERE id=?2 AND automation_id=?1 AND status='running'
+           AND EXISTS(SELECT 1 FROM automations WHERE id=?1
+             AND executor_kind IN ('script','maa') AND schedule_claim_token=?2)",
+            params![id, run_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 1 {
+        tx.execute(
+            "UPDATE automations SET enabled=0,next_run_at=NULL,updated_at=?3
+             WHERE id=?1 AND schedule_claim_token=?2",
+            params![id, run_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn notify_owned_run_outcome(
+    state: &AppState,
+    outcome: script_admission::OwnedRunOutcome,
+    emit: &dyn Fn(&str, &str) -> Result<bool, String>,
+) -> Result<(), String> {
+    let (automation_id, run_id) = outcome.into_ids();
+    let (kind, status, title): (String, String, String) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT a.executor_kind,run.status,a.title FROM automation_runs run
+             JOIN automations a ON a.id=run.automation_id
+             WHERE run.id=?1 AND a.id=?2 AND run.finished_at IS NOT NULL",
+            params![run_id, automation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| "无法核对自动化的结束回执".to_string())?
+    };
+    if !is_owned_executor(&kind) {
+        return Err("不是本次受控运行的结果通知".into());
+    }
+    let label = match status.as_str() {
+        "completed" => {
+            if kind == "maa" {
+                "MAA 队列已结束，不代表游戏目标全部完成"
+            } else {
+                "脚本已退出，不代表外部业务目标完成"
+            }
+        }
+        "cancelled" => "本次执行已停止，已发生的操作不会撤回",
+        "failed" => "本次执行有失败，请核对实际结果",
+        "timed_out" => "本次执行已超时，请核对实际状态",
+        "attention_required" | "needs_attention" => "本次执行需要检查，不会自动重放未知结果",
+        _ => return Err("自动化尚无可通知的结束结果".into()),
+    };
+    let title: String = title.chars().filter(|c| !c.is_control()).take(48).collect();
+    let body = format!("{title}：{label}。请在 AngelBot 原工作区查看结果。");
+    let claimed = state
+        .db
+        .lock()
+        .map_err(|e| e.to_string())?
+        .execute(
+            "UPDATE automation_runs SET notification_status='unconfirmed'
+         WHERE id=?1 AND automation_id=?2 AND status=?3 AND finished_at IS NOT NULL
+           AND notification_status IS NULL",
+            params![run_id, automation_id, status],
+        )
+        .map_err(|e| e.to_string())?;
+    if claimed == 0 {
+        // Already consumed, including after a crash: never resend.
+        return Ok(());
+    }
+    let notification_status = match emit("AngelBot 自动化结果", &body) {
+        Ok(true) => "requested", // OS accepted the request, not display/read proof.
+        Ok(false) => "muted",
+        Err(_) => "unavailable",
+    };
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let changed = conn
+        .execute(
+            "UPDATE automation_runs SET notification_status=?4
+         WHERE id=?1 AND automation_id=?2 AND status=?3 AND finished_at IS NOT NULL
+           AND notification_status='unconfirmed'",
+            params![run_id, automation_id, status, notification_status],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("通知状态未能附加到原运行回执".into());
+    }
+    Ok(())
+}
+
+fn publish_owned_run_outcome(
+    state: &AppState,
+    app: &AppHandle,
+    outcome: script_admission::OwnedRunOutcome,
+) {
+    if notify_owned_run_outcome(state, outcome, &|title, body| {
+        crate::commands::settings::send_notification_channel_impl(
+            state,
+            app,
+            "task_complete".into(),
+            title.into(),
+            body.into(),
+        )
+    })
+    .is_err()
+    {
+        eprintln!("[Automation] Result notification could not be recorded; inspect the saved run. No task or notification is replayed.");
+    }
+    let _ = app.emit("angelbot:automations-updated", ());
+}
+
+fn finish_automation_batch(
+    state: &AppState,
+    mut batch: AutomationBatch,
+    emit: &dyn Fn(&ReminderNotification) -> Result<bool, String>,
+    on_update: &dyn Fn(),
+    wake: &dyn Fn(),
+) -> Result<usize, String> {
+    for notification in &batch.notifications {
+        let (status, summary) = match emit(notification) {
+            Ok(true) => continue, // OS request accepted, not proof of display/read.
+            Ok(false) => ("skipped", "通知已关闭，本次提醒未发送；不会自动补发"),
+            Err(_) => {
+                batch.failed = true;
+                (
+                    "needs_attention",
+                    "本地提醒已触发，但无法请求系统通知；请检查通知设置",
+                )
+            }
+        };
+        // Keep the consumed occurrence, including when deliberately muted.
+        // A receipt write failure must not make this batch look successful.
+        let recorded = state
+            .db
+            .lock()
+            .map_err(|error| error.to_string())
+            .and_then(|conn| {
+                conn.execute(
+                    "UPDATE automation_runs SET status=?3,summary=?4
+                 WHERE id=?1 AND automation_id=?2 AND status='completed'
+                   AND EXISTS(SELECT 1 FROM automations
+                     WHERE id=?2 AND executor_kind='notification')",
+                    params![
+                        notification.run_id,
+                        notification.automation_id,
+                        status,
+                        summary
+                    ],
+                )
+                .map_err(|error| error.to_string())
+            });
+        if recorded.is_err() {
+            batch.failed = true;
+        }
+    }
+    on_update();
+    wake();
+    batch.result()
 }
 
 fn claim_due_automations(
@@ -1038,28 +1710,43 @@ fn claim_due_automations(
     now: i64,
 ) -> Result<Vec<ScheduledAutomationClaim>, String> {
     let stale_before = now - AUTOMATION_CLAIM_TTL_SECONDS;
+    let database = script_admission::database_identity(conn);
     let transaction = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
+    // Recovery happens on an explicit heartbeat, never whenever a database
+    // connection opens. Expired side effects are uncertain, not replayable.
+    script_admission::recover_expired(&transaction, now, None, &database)?;
     let due_ids = {
         let mut statement = transaction
             .prepare(
-                "SELECT id FROM automations
+                "SELECT id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,
+                 executor_kind,script_path,script_args,working_dir,timeout_seconds,next_run_at,last_run_at,workspace_id
+                 FROM automations
              WHERE enabled = 1 AND trigger_kind IN ('schedule', 'once')
                AND next_run_at IS NOT NULL AND next_run_at <= ?1
-               AND (schedule_claim_token IS NULL OR schedule_claimed_at <= ?2)
+                AND (executor_kind IN ('script','maa') OR schedule_claim_token IS NULL OR schedule_claimed_at <= ?2)
              ORDER BY next_run_at ASC, id ASC",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(params![now, stale_before], |row| row.get::<_, String>(0))
+            .query_map(params![now, stale_before], automation_from_row)
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
     let mut claims = Vec::with_capacity(due_ids.len());
-    for id in due_ids {
+    for automation in due_ids {
+        let id = automation.id.clone();
         let token = format!("automation_{}", Uuid::new_v4().simple());
+        if is_owned_executor(&automation.executor_kind) {
+            let skipped = script_admission::skip_busy_due_in_tx(&transaction, &automation, now)?;
+            // A script batch candidate is not an execution lease. Its receipt
+            // is reserved immediately before execution, not behind earlier
+            // slow items. Already-running overlap is consumed during this scan.
+            claims.push(ScheduledAutomationClaim { id, token, skipped });
+            continue;
+        }
         let changed = transaction
             .execute(
                 "UPDATE automations
@@ -1071,7 +1758,11 @@ fn claim_due_automations(
             )
             .map_err(|error| error.to_string())?;
         if changed == 1 {
-            claims.push(ScheduledAutomationClaim { id, token });
+            claims.push(ScheduledAutomationClaim {
+                id,
+                token,
+                skipped: false,
+            });
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
@@ -1083,10 +1774,72 @@ fn run_claimed_automation_impl(
     claim: &ScheduledAutomationClaim,
     now: i64,
 ) -> Result<Option<ScheduledAutomationExecution>, String> {
+    run_claimed_automation_with_events_impl(state, claim, now, &|| {})
+}
+
+fn run_claimed_automation_with_events_impl(
+    state: &AppState,
+    claim: &ScheduledAutomationClaim,
+    now: i64,
+    on_update: &dyn Fn(),
+) -> Result<Option<ScheduledAutomationExecution>, String> {
+    dispatch_claimed_automation(state, claim, now, on_update, &|ticket| {
+        script_admission::execute_ticket(state, ticket, on_update, &execute_owned_automation)
+            .map(|_| ())
+    })
+}
+
+fn dispatch_claimed_automation(
+    state: &AppState,
+    claim: &ScheduledAutomationClaim,
+    now: i64,
+    on_update: &dyn Fn(),
+    dispatch: &dyn Fn(script_admission::Ticket) -> Result<(), String>,
+) -> Result<Option<ScheduledAutomationExecution>, String> {
+    if claim.skipped {
+        // This occurrence was consumed atomically by the scan. Its former
+        // manual owner may now be finished; never reinterpret it as runnable.
+        return Ok(Some(ScheduledAutomationExecution { notification: None }));
+    }
+    let owned_process = {
+        let conn = state.db.lock().map_err(|error| error.to_string())?;
+        conn.query_row(
+            "SELECT executor_kind IN ('script','maa') FROM automations WHERE id=?1",
+            [&claim.id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(false)
+    };
+    if owned_process {
+        return match script_admission::admit(
+            state,
+            &claim.id,
+            script_admission::Origin::Scheduled,
+            now,
+            on_update,
+        )? {
+            script_admission::Admission::Started(ticket) => {
+                let id = ticket.automation.id.clone();
+                let run_id = ticket.run_id.clone();
+                if let Err(error) = dispatch(ticket) {
+                    let _ = record_uncertain_owned_dispatch(state, &id, &run_id, now);
+                    on_update();
+                    return Err(error);
+                }
+                Ok(Some(ScheduledAutomationExecution { notification: None }))
+            }
+            script_admission::Admission::Consumed => {
+                Ok(Some(ScheduledAutomationExecution { notification: None }))
+            }
+            script_admission::Admission::NotDue => Ok(None),
+        };
+    }
     // A batch claim is not permission to run forever. Earlier items may take
     // time while the user cancels/deletes this definition or a newer heartbeat
     // recovers its claim. Revalidate immediately before crossing execution.
-    let automation = {
+    {
         let mut conn = state.db.lock().map_err(|error| error.to_string())?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1120,7 +1873,7 @@ fn run_claimed_automation_impl(
             // Preparing this local notification has no external side effects.
             // Admission and completion share one lock/transaction: cancellation
             // either wins first, or sees that this reminder has already fired.
-            persist_automation_run_in_conn(
+            let run_id = persist_automation_run_in_conn(
                 &transaction,
                 &automation,
                 notification_run_result(),
@@ -1129,38 +1882,83 @@ fn run_claimed_automation_impl(
             )?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(Some(ScheduledAutomationExecution {
-                notification: notification_for_automation(&automation),
+                notification: notification_for_automation(&automation, run_id),
             }));
         }
-        // Scripts can take time. Never retain a database lock
-        // while executing; cancellation after this admission point cannot undo
-        // an external action which has already started.
-        transaction.commit().map_err(|error| error.to_string())?;
-        automation
-    };
-    let result = run_automation_executor(state, &automation)?;
-    let notification = notification_for_automation(&automation);
-    persist_automation_run(state, &automation, result, now, Some(&claim.token))?;
-    Ok(Some(ScheduledAutomationExecution { notification }))
+        Err("该执行方式必须通过受控的自动化派发路径运行".to_string())
+    }
 }
 
 #[tauri::command]
-pub fn run_due_automations(state: State<AppState>, app_handle: AppHandle) -> Result<usize, String> {
-    let (count, notifications) =
-        run_due_automations_with_notifications_impl(&state, Utc::now().timestamp())?;
-    for notification in notifications {
-        crate::commands::settings::emit_notification_channel_impl(
+pub async fn run_due_automations(app_handle: AppHandle) -> Result<usize, String> {
+    let blocking_app = app_handle.clone();
+    let batch = tauri::async_runtime::spawn_blocking(move || {
+        let state = blocking_app.state::<AppState>();
+        dispatch_due_automations(
             &state,
-            &app_handle,
-            "reminder".to_string(),
-            notification.title,
-            notification.body,
-        )?;
-    }
-    // Also wakes previously queued work when this heartbeat finds no new due
-    // definitions (for example, a foreground turn was busy on the prior tick).
-    state.foreground_automation_pump.wake(app_handle.clone());
-    Ok(count)
+            Utc::now().timestamp(),
+            &|| {
+                let _ = blocking_app.emit("angelbot:automations-updated", ());
+            },
+            &|ticket| {
+                let worker_app = blocking_app.clone();
+                // The already-durable ticket owns the receipt and live guard.
+                // This worker retrieves managed state; AppState is never cloned.
+                tauri::async_runtime::spawn_blocking(move || {
+                    let state = worker_app.state::<AppState>();
+                    let id = ticket.automation.id.clone();
+                    let run_id = ticket.run_id.clone();
+                    match script_admission::execute_ticket(
+                        &state,
+                        ticket,
+                        &|| {
+                            let _ = worker_app.emit("angelbot:automations-updated", ());
+                        },
+                        &execute_owned_automation,
+                    ) {
+                        Ok(outcome) => publish_owned_run_outcome(&state, &worker_app, outcome),
+                        Err(_) => {
+                            let _ = record_uncertain_owned_dispatch(
+                                &state,
+                                &id,
+                                &run_id,
+                                Utc::now().timestamp(),
+                            );
+                            let _ = worker_app.emit("angelbot:automations-updated", ());
+                        }
+                    }
+                });
+                Ok(())
+            },
+        )
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_else(|| AutomationBatch {
+        failed: true,
+        ..AutomationBatch::default()
+    });
+    let _ = app_handle.emit("angelbot:automations-updated", ());
+    let state = app_handle.state::<AppState>();
+    finish_automation_batch(
+        &state,
+        batch,
+        &|notification| {
+            crate::commands::settings::send_notification_channel_impl(
+                &state,
+                &app_handle,
+                "reminder".to_string(),
+                notification.title.clone(),
+                notification.body.clone(),
+            )
+        },
+        &|| {
+            let _ = app_handle.emit("angelbot:automations-updated", ());
+        },
+        // Wake queued Main-Agent work even after a local notification error.
+        &|| state.foreground_automation_pump.wake(app_handle.clone()),
+    )
 }
 
 fn enqueue_agent_automation_in_tx(
@@ -1411,6 +2209,37 @@ pub(crate) fn foreground_task_status(
     .map_err(|error| error.to_string())
 }
 
+/// Move only an existing Agent-automation receipt to its explicitly continued
+/// foreground slice. The caller owns the foreground reservation transaction.
+pub(crate) fn handoff_agent_automation_dispatch_in_tx(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    source_message_id: &str,
+    new_reply_id: &str,
+) -> Result<(), String> {
+    if !super::foreground_history::table_exists(transaction, "automation_runs")? {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "UPDATE automation_runs
+             SET foreground_run_id = ?1, status = 'running',
+                 summary = '主 Agent 正在处理此自动化任务', finished_at = NULL
+             WHERE foreground_run_id = ?2
+               AND status IN ('running', 'awaiting_confirmation', 'needs_attention')
+               AND EXISTS (
+                 SELECT 1 FROM automations automation
+                 JOIN task_runs task ON task.id = automation_runs.foreground_run_id
+                 WHERE automation.id = automation_runs.automation_id
+                   AND automation.executor_kind = 'agent'
+                   AND task.session_id = ?3 AND task.message_id = ?2
+               )",
+            params![new_reply_id, source_message_id, session_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Reflect a persisted foreground outcome in the automation list. Queue
 /// settlement is separate: this function never replays or mutates the
 /// Main-Agent turn itself.
@@ -1419,29 +2248,183 @@ pub(crate) fn sync_agent_automation_dispatch(
     dispatch: &AgentAutomationDispatch,
     now: i64,
 ) -> Result<Option<String>, String> {
-    let Some(task_status) = foreground_task_status(state, &dispatch.foreground_run_id)? else {
+    let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let status = sync_agent_automation_dispatch_in_tx(&transaction, dispatch, now)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(status)
+}
+
+fn sync_agent_automation_dispatch_in_tx(
+    transaction: &Transaction<'_>,
+    dispatch: &AgentAutomationDispatch,
+    now: i64,
+) -> Result<Option<String>, String> {
+    let task: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT session_id,status FROM task_runs WHERE id=?1",
+            [&dispatch.foreground_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((session_id, task_status)) = task else {
         return Ok(None);
     };
-    let Some((status, summary, terminal)) = agent_automation_outcome(&task_status) else {
+    let receipt: Option<(String, Option<i64>)> = transaction
+        .query_row(
+            "SELECT status,finished_at FROM automation_runs WHERE id=?1 AND foreground_run_id=?2",
+            params![dispatch.automation_run_id, dispatch.foreground_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((run_status, finished_at)) = receipt else {
         return Ok(Some(task_status));
     };
-    let conn = state.db.lock().map_err(|error| error.to_string())?;
-    conn.execute(
-        "UPDATE automation_runs
+    let Some((status, summary, terminal)) = effective_agent_automation_outcome_in_tx(
+        transaction,
+        &session_id,
+        &dispatch.foreground_run_id,
+        &task_status,
+        &run_status,
+    )?
+    else {
+        return Ok(Some(task_status));
+    };
+    if run_status != status || (terminal && finished_at.is_none()) {
+        transaction
+            .execute(
+                "UPDATE automation_runs
          SET status = ?1, summary = ?2,
              finished_at = CASE WHEN ?3 THEN ?4 ELSE finished_at END
          WHERE id = ?5 AND foreground_run_id = ?6",
-        params![
-            status,
-            summary,
-            terminal,
-            now,
-            dispatch.automation_run_id,
-            dispatch.foreground_run_id,
-        ],
-    )
-    .map_err(|error| error.to_string())?;
+                params![
+                    status,
+                    summary,
+                    terminal,
+                    now,
+                    dispatch.automation_run_id,
+                    dispatch.foreground_run_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(Some(status.to_string()))
+}
+
+/// A continuation has a new reply id, but keeps the original automation
+/// receipt and already-consumed queue input. Resolve only that exact binding.
+pub(crate) fn sync_agent_automation_continuation(
+    state: &AppState,
+    session_id: &str,
+    reply_id: &str,
+    now: i64,
+) -> Result<(), String> {
+    let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+    if !super::foreground_history::table_exists(&conn, "automation_runs")? {
+        return Ok(());
+    }
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let exact = agent_automation_dispatches_in_tx(&transaction, session_id, Some(reply_id))?;
+    let exact_match = !exact.is_empty();
+    let dispatches = if exact_match {
+        exact
+    } else {
+        agent_automation_dispatches_in_tx(&transaction, session_id, None)?
+    };
+    for dispatch in dispatches {
+        // A late approval/Stop on an ancestor can update its own continued
+        // receipt, but never a newer background Start or an unrelated task.
+        if exact_match
+            || super::foreground_run_store::is_continuation_chain_in_tx(
+                &transaction,
+                session_id,
+                &dispatch.foreground_run_id,
+                reply_id,
+            )?
+        {
+            sync_agent_automation_dispatch_in_tx(&transaction, &dispatch, now)?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn agent_automation_dispatches_in_tx(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    reply_id: Option<&str>,
+) -> Result<Vec<AgentAutomationDispatch>, String> {
+    let mut statement = transaction.prepare(
+        "SELECT run.id, run.foreground_run_id, run.supervisor_input_id FROM automation_runs run
+                 JOIN automations automation ON automation.id = run.automation_id
+                 JOIN task_runs task ON task.id = run.foreground_run_id
+                 WHERE task.session_id = ?1 AND task.message_id = run.foreground_run_id
+                   AND automation.executor_kind = 'agent'
+                   AND run.supervisor_input_id IS NOT NULL
+                   AND ((?2 IS NOT NULL AND run.foreground_run_id = ?2)
+                     OR (?2 IS NULL AND run.status IN ('running','awaiting_confirmation','needs_attention')))",
+    ).map_err(|error| error.to_string())?;
+    let dispatches = statement
+        .query_map(params![session_id, reply_id], |row| {
+            Ok(AgentAutomationDispatch {
+                automation_run_id: row.get(0)?,
+                foreground_run_id: row.get(1)?,
+                supervisor_input_id: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(dispatches)
+}
+
+fn effective_agent_automation_outcome_in_tx(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    reply_id: &str,
+    task_status: &str,
+    run_status: &str,
+) -> Result<Option<(&'static str, &'static str, bool)>, String> {
+    if task_status != "completed" {
+        return Ok(agent_automation_outcome(task_status));
+    }
+    let preserve_attention = matches!(run_status, "awaiting_confirmation" | "needs_attention");
+    let mut statement = transaction
+        .prepare(
+            "SELECT message_id,status FROM task_runs
+         WHERE session_id=?1 AND message_id<>?2
+           AND (status='awaiting_confirmation' OR (?3 AND status IN
+             ('continue_suggested','needs_attention','provider_unavailable','stopped')))",
+        )
+        .map_err(|error| error.to_string())?;
+    let candidates = statement
+        .query_map(params![session_id, reply_id, preserve_attention], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut attention = false;
+    for (source_id, source_status) in candidates {
+        if super::foreground_run_store::is_continuation_chain_in_tx(
+            transaction,
+            session_id,
+            reply_id,
+            &source_id,
+        )? {
+            if source_status == "awaiting_confirmation" {
+                return Ok(agent_automation_outcome("awaiting_confirmation"));
+            }
+            attention = true;
+        }
+    }
+    Ok(agent_automation_outcome(if attention {
+        "needs_attention"
+    } else {
+        task_status
+    }))
 }
 
 /// Restore an automation record to a safe queued state when admission failed
@@ -1488,8 +2471,9 @@ pub(crate) fn mark_agent_automation_dispatch_needs_attention(
 
 /// Reconcile dispatch records after foreground-run startup recovery. A linked
 /// task row means the prompt crossed the non-replay boundary and the queue can
-/// be settled. A reserved id without a task row never reached that boundary,
-/// so it is safely made eligible again.
+/// be settled. A continued receipt may lag its task after its input was already
+/// consumed; reconcile that binding without replaying the input. A reserved id
+/// without a task row never reached that boundary, so it is safely eligible again.
 pub(crate) fn recover_interrupted_agent_automation_dispatches_in_conn(
     conn: &mut Connection,
     now: i64,
@@ -1500,11 +2484,15 @@ pub(crate) fn recover_interrupted_agent_automation_dispatches_in_conn(
     let linked = {
         let mut statement = transaction
             .prepare(
-                "SELECT input.id, run.id, run.foreground_run_id, task.status
+                "SELECT input.id, run.id, run.foreground_run_id, task.status,
+                        run.status, run.finished_at, task.session_id
                  FROM workspace_supervisor_inputs input
                  JOIN automation_runs run ON run.supervisor_input_id = input.id
                  JOIN task_runs task ON task.id = run.foreground_run_id
-                 WHERE input.kind = 'follow_up' AND input.status = 'claimed'",
+                 WHERE input.kind = 'follow_up'
+                   AND (input.status = 'claimed'
+                     OR (input.status = 'completed'
+                       AND run.status IN ('running', 'awaiting_confirmation', 'needs_attention')))",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -1514,6 +2502,9 @@ pub(crate) fn recover_interrupted_agent_automation_dispatches_in_conn(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -1522,37 +2513,57 @@ pub(crate) fn recover_interrupted_agent_automation_dispatches_in_conn(
         rows
     };
     let mut reconciled = 0;
-    for (input_id, automation_run_id, foreground_run_id, task_status) in linked {
-        let Some((status, summary, terminal)) = agent_automation_outcome(&task_status) else {
+    for (
+        input_id,
+        automation_run_id,
+        foreground_run_id,
+        task_status,
+        run_status,
+        finished_at,
+        session_id,
+    ) in linked
+    {
+        let Some((status, summary, terminal)) = effective_agent_automation_outcome_in_tx(
+            &transaction,
+            &session_id,
+            &foreground_run_id,
+            &task_status,
+            &run_status,
+        )?
+        else {
             continue;
         };
-        transaction
-            .execute(
-                "UPDATE automation_runs
+        let mut changed = run_status != status || (terminal && finished_at.is_none());
+        if changed {
+            transaction
+                .execute(
+                    "UPDATE automation_runs
                  SET status = ?1, summary = ?2,
                      finished_at = CASE WHEN ?3 THEN ?4 ELSE finished_at END
                  WHERE id = ?5 AND foreground_run_id = ?6",
-                params![
-                    status,
-                    summary,
-                    terminal,
-                    now,
-                    automation_run_id,
-                    foreground_run_id,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+                    params![
+                        status,
+                        summary,
+                        terminal,
+                        now,
+                        automation_run_id,
+                        foreground_run_id,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         if terminal {
-            transaction
+            changed |= transaction
                 .execute(
                     "UPDATE workspace_supervisor_inputs
                      SET status = 'completed', updated_at = ?1
                      WHERE id = ?2 AND status = 'claimed'",
                     params![now, input_id],
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+                > 0;
         }
-        reconciled += 1;
+        reconciled += usize::from(changed);
     }
     let requeued = transaction
         .execute(
@@ -1617,21 +2628,53 @@ pub fn get_automation_runs_impl(
     automation_id: &str,
 ) -> Result<Vec<AutomationRun>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn.prepare("SELECT id,status,summary,exit_code,output,started_at FROM automation_runs WHERE automation_id=?1 ORDER BY started_at DESC LIMIT 20").map_err(|e| e.to_string())?;
+    // Keep important receipts even if more than 20 later outcomes exist, but
+    // preserve the chronological history contract for the selected rows.
+    let sql = format!(
+        "SELECT id,status,summary,exit_code,output,started_at,notification_status FROM (
+             SELECT run.id,run.status,run.summary,run.exit_code,run.output,run.started_at,run.notification_status,
+                    run.rowid AS insertion_order
+             FROM automation_runs run JOIN automations owner ON owner.id=run.automation_id
+             WHERE run.automation_id=?1
+             ORDER BY {},run.started_at DESC,run.rowid DESC LIMIT 20
+         ) ORDER BY started_at DESC,insertion_order DESC",
+        RECEIPT_PRIORITY_SQL
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![automation_id], |r| {
+            let notification_status: Option<String> = r.get(6)?;
+            let summary: String = r.get(2)?;
             Ok(AutomationRun {
                 id: r.get(0)?,
                 status: r.get(1)?,
-                summary: r.get(2)?,
+                summary: format!(
+                    "{}{}",
+                    summary,
+                    overview::notification_receipt_summary(notification_status.as_deref())
+                ),
                 exit_code: r.get(3)?,
                 output: r.get(4)?,
                 started_at: r.get(5)?,
+                notification_status,
+                stop_control: None,
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+    let mut runs = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for run in &mut runs {
+        if run.status == "running" {
+            let (owned, requested) = script_admission::stop_state(&conn, automation_id, &run.id)?;
+            run.stop_control = owned.then_some(if requested {
+                AutomationStopControl::Requested
+            } else {
+                AutomationStopControl::Available
+            });
+        }
+    }
+    Ok(runs)
 }
 
 #[cfg(test)]
@@ -1693,11 +2736,11 @@ mod tests {
     #[test]
     fn automation_contract_regression_agent_receipt_failure_leaves_no_orphan_input() {
         for scheduled in [false, true] {
-            for failure in [
-                "CREATE TRIGGER reject_receipt BEFORE INSERT ON automation_runs
-                 BEGIN SELECT RAISE(ABORT,'test receipt failure'); END;",
-                "CREATE TRIGGER reject_schedule_advance BEFORE UPDATE OF last_run_at ON automations
-                 BEGIN SELECT RAISE(ABORT,'test schedule advance failure'); END;",
+            for (failure, can_record_failure) in [
+                ("CREATE TRIGGER reject_receipt BEFORE INSERT ON automation_runs
+                 BEGIN SELECT RAISE(ABORT,'test receipt failure'); END;", false),
+                ("CREATE TRIGGER reject_schedule_advance BEFORE UPDATE OF last_run_at ON automations
+                 BEGIN SELECT RAISE(ABORT,'test schedule advance failure'); END;", true),
             ] {
                 let state = crate::tests::test_app_state();
                 {
@@ -1738,16 +2781,33 @@ mod tests {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(runs, 0);
-                let (next_run, last_run): (i64, Option<i64>) = connection
+                let failure_recorded = scheduled && can_record_failure;
+                assert_eq!(runs, i64::from(failure_recorded));
+                let admitted: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM automation_runs WHERE automation_id='agent-due'
+                       AND (status<>'needs_attention' OR supervisor_input_id IS NOT NULL
+                         OR foreground_run_id IS NOT NULL)",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(admitted, 0, "failed Supervisor transactions cannot leave queued, running or completed work");
+                let (enabled, next_run, last_run, token): (bool, Option<i64>, Option<i64>, Option<String>) = connection
                     .query_row(
-                        "SELECT next_run_at,last_run_at FROM automations WHERE id='agent-due'",
+                        "SELECT enabled,next_run_at,last_run_at,schedule_claim_token FROM automations WHERE id='agent-due'",
                         [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .unwrap();
-                assert_eq!(next_run, 10);
+                assert_eq!(enabled, !failure_recorded);
+                assert_eq!(next_run, if failure_recorded { None } else { Some(10) });
                 assert_eq!(last_run, None);
+                if failure_recorded {
+                    assert_eq!(token, None, "the exact failed claim must be cleared after pausing");
+                    let receipt: (String, String, String) = connection.query_row(
+                        "SELECT status,summary,output FROM automation_runs WHERE automation_id='agent-due'",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ).unwrap();
+                    assert_eq!(receipt, ("needs_attention".into(), "自动化派发失败，已暂停；请检查后手动重试".into(), String::new()));
+                }
                 connection
                     .execute_batch(
                         "DROP TRIGGER IF EXISTS reject_receipt;
@@ -1755,7 +2815,15 @@ mod tests {
                     )
                     .unwrap();
                 drop(connection);
-                if scheduled {
+                if failure_recorded {
+                    assert_eq!(
+                        run_due_automations_impl(&state, 15 + AUTOMATION_CLAIM_TTL_SECONDS + 1).unwrap(),
+                        0,
+                        "a persisted failed dispatch requires an explicit retry, not TTL replay"
+                    );
+                    set_automation_enabled_in_conn(&mut state.db.lock().unwrap(), "agent-due", true, 19).unwrap();
+                    run_automation_now_impl(&state, "agent-due").unwrap();
+                } else if scheduled {
                     assert_eq!(
                         run_due_automations_impl(&state, 15 + AUTOMATION_CLAIM_TTL_SECONDS + 1)
                             .unwrap(),
@@ -1778,6 +2846,12 @@ mod tests {
                     owned_inputs, 1,
                     "a successful retry exposes the queue input and owner together"
                 );
+                let totals: (i64, i64) = connection.query_row(
+                    "SELECT (SELECT COUNT(*) FROM workspace_supervisor_inputs WHERE workspace_id='project-a'),
+                       (SELECT COUNT(*) FROM automation_runs WHERE automation_id='agent-due')",
+                    [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert_eq!(totals, (1, 1 + i64::from(failure_recorded)), "retry must preserve only the exact failure receipt and one owned input");
                 let (enabled, next_run): (bool, Option<i64>) = connection
                     .query_row(
                         "SELECT enabled,next_run_at FROM automations WHERE id='agent-due'",
@@ -2162,6 +3236,25 @@ mod tests {
                 ("input-unstarted".into(), "queued".into(), "queued".into()),
             ]
         );
+        connection.execute_batch(
+            "UPDATE workspace_supervisor_inputs SET status='claimed' WHERE id='input-completed';
+             UPDATE automation_runs SET summary='retained receipt' WHERE id='run-completed';",
+        ).unwrap();
+        assert_eq!(
+            recover_interrupted_agent_automation_dispatches_in_conn(&mut connection, 20,).unwrap(),
+            1,
+            "an unchanged terminal receipt must still settle its claimed input"
+        );
+        let settled: (String, String, Option<i64>) = connection.query_row(
+            "SELECT input.status,run.summary,run.finished_at
+             FROM automation_runs run JOIN workspace_supervisor_inputs input ON input.id=run.supervisor_input_id
+             WHERE run.id='run-completed'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            settled,
+            ("completed".into(), "retained receipt".into(), Some(10))
+        );
     }
 
     #[test]
@@ -2191,7 +3284,7 @@ mod tests {
     }
 
     #[test]
-    fn due_scan_claims_only_enabled_scheduled_automations_once() {
+    fn due_scan_claims_only_enabled_scheduled_non_script_automations_once() {
         let mut connection = Connection::open_in_memory().unwrap();
         migrate(&connection).unwrap();
         for (id, enabled, trigger_kind, next_run_at) in [
@@ -2203,7 +3296,7 @@ mod tests {
             ("unscheduled", 1, "schedule", None),
         ] {
             connection.execute(
-                "INSERT INTO automations (id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,script_args,timeout_seconds,next_run_at,created_at,updated_at) VALUES (?1,?1,'',?2,'',?3,'','script','[]',300,?4,1,1)",
+                "INSERT INTO automations (id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,script_args,timeout_seconds,next_run_at,created_at,updated_at) VALUES (?1,?1,'',?2,'',?3,'','notification','[]',300,?4,1,1)",
                 params![id, trigger_kind, enabled, next_run_at],
             ).unwrap();
         }
@@ -2351,10 +3444,11 @@ mod tests {
 
             let mut state = crate::tests::test_app_state();
             state.db = Arc::new(Mutex::new(Connection::open(database.path()).unwrap()));
-            let (executed, notifications) = run_claimed_automations(&state, &claims, 17).unwrap();
-            assert_eq!(executed, 1, "{invalidation}");
-            assert_eq!(notifications.len(), 1, "{invalidation}");
-            assert_eq!(notifications[0].title, "valid");
+            let batch = run_claimed_automations(&state, &claims, 17).unwrap();
+            assert_eq!(batch.count, 1, "{invalidation}");
+            assert!(!batch.failed);
+            assert_eq!(batch.notifications.len(), 1, "{invalidation}");
+            assert_eq!(batch.notifications[0].title, "valid");
             let connection = state.db.lock().unwrap();
             let (count, id): (i64, String) = connection
                 .query_row(
@@ -2401,6 +3495,106 @@ mod tests {
             .unwrap();
         assert!(enabled);
         assert_eq!(token, claim.token);
+
+        drop(connection);
+        let state = crate::tests::test_app_state();
+        let claims = {
+            let mut connection = state.db.lock().unwrap();
+            migrate(&connection).unwrap();
+            connection.execute_batch(
+                "INSERT INTO automations (id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,script_args,timeout_seconds,next_run_at,created_at,updated_at) VALUES
+                 ('first','First','','once','1970-01-01T00:00:10Z',1,'','notification','[]',300,10,1,1),
+                 ('broken','Broken','','once','1970-01-01T00:00:11Z',1,'','notification','[]',300,11,1,1),
+                 ('last','Last','','once','1970-01-01T00:00:12Z',1,'','notification','[]',300,12,1,1),
+                 ('muted','Muted','','once','1970-01-01T00:00:12Z',1,'','notification','[]',300,12,1,1);
+                 INSERT INTO projects(id,name,path,created_at,kind,updated_at)
+                 VALUES('batch-project','Batch project','C:/batch-fixture',1,'project',1);
+                 INSERT INTO automations(id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,
+                   executor_kind,workspace_id,script_args,timeout_seconds,next_run_at,created_at,updated_at)
+                 VALUES('agent','Agent','Fixture task','once','1970-01-01T00:00:13Z',1,'',
+                   'agent','batch-project','[]',300,13,1,1);
+                 CREATE TRIGGER reject_one_completion BEFORE UPDATE OF last_run_at ON automations
+                 WHEN NEW.id='broken'
+                 BEGIN SELECT RAISE(ABORT,'fixture private failure must not enter receipts'); END;",
+            ).unwrap();
+            claim_due_automations(&mut connection, 15).unwrap()
+        };
+        assert_eq!(claims.len(), 5);
+        let batch = run_claimed_automations(&state, &claims, 17);
+        assert!(
+            batch.is_ok(),
+            "one failed dispatch must not discard a prepared reminder or block later claims"
+        );
+        let batch = batch.unwrap();
+        assert_eq!(batch.count, 4);
+        assert!(batch.failed);
+        assert_eq!(
+            batch
+                .notifications
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "Last", "Muted"]
+        );
+        let failed = get_automation_runs_impl(&state, "broken").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, "needs_attention");
+        assert!(!failed[0].summary.contains("fixture private"));
+        assert!(failed[0].output.is_empty());
+        let agent = get_automation_runs_impl(&state, "agent").unwrap();
+        assert_eq!(agent.len(), 1);
+        assert_eq!(
+            agent[0].status, "queued",
+            "a later Main-Agent input must not wait for the failed claim's TTL"
+        );
+        let connection = state.db.lock().unwrap();
+        let schedule: (bool, Option<i64>, Option<String>) = connection.query_row(
+            "SELECT enabled,next_run_at,schedule_claim_token FROM automations WHERE id='broken'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(schedule, (false, None, None));
+        drop(connection);
+        assert_eq!(
+            run_due_automations_impl(&state, 18).unwrap(),
+            0,
+            "failed occurrences are not automatically replayed"
+        );
+
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let woke = std::cell::Cell::new(0);
+        assert!(finish_automation_batch(
+            &state,
+            batch,
+            &|notification| {
+                attempted.borrow_mut().push(notification.title.clone());
+                if notification.title == "First" {
+                    Err("fixture private emitter failure".into())
+                } else {
+                    Ok(notification.title != "Muted")
+                }
+            },
+            &|| {},
+            &|| woke.set(woke.get() + 1),
+        )
+        .is_err());
+        assert_eq!(*attempted.borrow(), ["First", "Last", "Muted"]);
+        assert_eq!(
+            woke.get(),
+            1,
+            "local notification errors must not suppress Main-Agent work"
+        );
+        let first = get_automation_runs_impl(&state, "first").unwrap();
+        let last = get_automation_runs_impl(&state, "last").unwrap();
+        assert_eq!(first.len(), 1, "do not add a second delivery ledger");
+        assert_eq!(first[0].status, "needs_attention");
+        assert!(!first[0].summary.contains("fixture private"));
+        assert_eq!(last[0].status, "completed");
+        let muted = get_automation_runs_impl(&state, "muted").unwrap();
+        assert_eq!(muted.len(), 1);
+        assert_eq!(muted[0].status, "skipped");
+        assert_eq!(muted[0].summary, "通知已关闭，本次提醒未发送；不会自动补发");
+        assert_eq!(run_due_automations_impl(&state, 19).unwrap(), 0);
     }
 
     fn insert_claimed_agent_dispatch(connection: &Connection) {
@@ -2598,6 +3792,407 @@ mod tests {
         assert_eq!(
             task_count, 1,
             "recovery must not replay an already-started turn"
+        );
+
+        for (status, executor, session_id, source, expected_handoff) in [
+            ("running", "agent", "session-a", "turn-a", true),
+            (
+                "awaiting_confirmation",
+                "agent",
+                "session-a",
+                "turn-a",
+                true,
+            ),
+            ("needs_attention", "agent", "session-a", "turn-a", true),
+            ("completed", "agent", "session-a", "turn-a", false),
+            ("cancelled", "agent", "session-a", "turn-a", false),
+            ("queued", "agent", "session-a", "turn-a", false),
+            (
+                "needs_attention",
+                "notification",
+                "session-a",
+                "turn-a",
+                false,
+            ),
+            ("needs_attention", "agent", "other-session", "turn-a", false),
+            ("needs_attention", "agent", "session-a", "other-turn", false),
+        ] {
+            connection
+                .execute(
+                    "UPDATE automations SET executor_kind=?1 WHERE id='automation-a'",
+                    [executor],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE automation_runs SET status=?1,summary='before',finished_at=99
+                 WHERE id='run-a'",
+                    [status],
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            handoff_agent_automation_dispatch_in_tx(&transaction, session_id, source, "turn-b")
+                .unwrap();
+            let receipt: (String, String, String, Option<i64>, i64, String) = transaction
+                .query_row(
+                    "SELECT foreground_run_id,status,summary,finished_at,started_at,supervisor_input_id
+                     FROM automation_runs WHERE id='run-a'",
+                    [],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+                ).unwrap();
+            let expected = if expected_handoff {
+                ("turn-b", "running", "主 Agent 正在处理此自动化任务", None)
+            } else {
+                ("turn-a", status, "before", Some(99))
+            };
+            assert_eq!(
+                (&*receipt.0, &*receipt.1, &*receipt.2, receipt.3),
+                expected,
+                "status={status},executor={executor},session={session_id},source={source}",
+            );
+            assert_eq!((receipt.4, &*receipt.5), (1, "input-a"));
+            // A later foreground reservation failure must roll the binding
+            // and its reopened receipt back together, without another input.
+            transaction.rollback().unwrap();
+            let restored: (String, String, Option<i64>) = connection.query_row(
+                "SELECT foreground_run_id,status,finished_at FROM automation_runs WHERE id='run-a'",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap();
+            assert_eq!(restored, ("turn-a".into(), status.into(), Some(99)));
+        }
+
+        connection.execute_batch(
+            "UPDATE task_runs SET status='awaiting_confirmation' WHERE id='turn-a';
+             UPDATE automation_runs SET status='awaiting_confirmation',finished_at=10 WHERE id='run-a';
+             UPDATE workspace_supervisor_inputs SET status='completed' WHERE id='input-a';",
+        ).unwrap();
+        drop(connection);
+        for (index, (source, reply, task_status, interrupted, expected_status)) in [
+            (
+                "turn-a",
+                "turn-b",
+                "awaiting_confirmation",
+                false,
+                "awaiting_confirmation",
+            ),
+            ("turn-b", "turn-c", "running", true, "needs_attention"),
+            ("turn-c", "turn-d", "completed", false, "completed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = 20 + index as i64 * 10;
+            {
+                let mut connection = state.db.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                handoff_agent_automation_dispatch_in_tx(&transaction, "session-a", source, reply)
+                    .unwrap();
+                transaction.execute(
+                    "INSERT INTO messages (id,session_id,role,content,created_at,parent_id,is_provisional)
+                     VALUES (?1,'session-a','assistant','',?2,?3,?4)",
+                    params![reply, now, source, interrupted],
+                ).unwrap();
+                transaction.execute(
+                    "INSERT INTO task_runs (id,session_id,message_id,goal,status,plan,created_at,updated_at)
+                     VALUES (?1,'session-a',?1,'Summarize notes',?2,'[]',?3,?3)",
+                    params![reply, task_status, now],
+                ).unwrap();
+                transaction.commit().unwrap();
+            }
+            // The original pump and unrelated continuations cannot finalize
+            // a receipt after its explicit source binding has moved.
+            sync_agent_automation_dispatch(&state, &dispatch, now).unwrap();
+            sync_agent_automation_continuation(&state, "other-session", reply, now).unwrap();
+            sync_agent_automation_continuation(&state, "session-a", "other-turn", now).unwrap();
+            {
+                let connection = state.db.lock().unwrap();
+                let receipt: (String, Option<i64>) = connection
+                    .query_row(
+                        "SELECT status,finished_at FROM automation_runs WHERE id='run-a'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(receipt, ("running".into(), None));
+            }
+            if interrupted {
+                let mut connection = state.db.lock().unwrap();
+                assert_eq!(
+                    super::super::foreground_run_store::recover_interrupted_runs_in_conn(
+                        &mut connection,
+                        now,
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    recover_interrupted_agent_automation_dispatches_in_conn(&mut connection, now,)
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    recover_interrupted_agent_automation_dispatches_in_conn(
+                        &mut connection,
+                        now + 1,
+                    )
+                    .unwrap(),
+                    0
+                );
+            } else {
+                sync_agent_automation_continuation(&state, "session-a", reply, now).unwrap();
+            }
+            let mut connection = state.db.lock().unwrap();
+            let receipt: (String, String, Option<i64>, i64, String) = connection.query_row(
+                "SELECT run.foreground_run_id,run.status,run.finished_at,run.started_at,input.status
+                 FROM automation_runs run JOIN workspace_supervisor_inputs input ON input.id=run.supervisor_input_id
+                 WHERE run.id='run-a'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).unwrap();
+            assert_eq!(
+                receipt,
+                (
+                    reply.into(),
+                    expected_status.into(),
+                    Some(now),
+                    1,
+                    "completed".into()
+                )
+            );
+            let counts: (i64, i64) = connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM automation_runs),
+                        (SELECT COUNT(*) FROM workspace_supervisor_inputs)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                (1, 1),
+                "continuation must not enqueue another automation"
+            );
+            if expected_status == "awaiting_confirmation" {
+                // Native execution persisted its new task state, but the
+                // process exited before the continuation callback synced it.
+                connection
+                    .execute(
+                        "UPDATE task_runs SET status='continue_suggested' WHERE id=?1",
+                        [reply],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    recover_interrupted_agent_automation_dispatches_in_conn(
+                        &mut connection,
+                        now + 1,
+                    )
+                    .unwrap(),
+                    1
+                );
+                let read_receipt = |connection: &Connection| {
+                    connection.query_row(
+                        "SELECT run.status,run.finished_at,run.summary,input.status
+                         FROM automation_runs run JOIN workspace_supervisor_inputs input ON input.id=run.supervisor_input_id
+                         WHERE run.id='run-a'",
+                        [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,row.get::<_, String>(3)?)),
+                    ).unwrap()
+                };
+                let recovered = read_receipt(&connection);
+                assert_eq!(
+                    (&*recovered.0, recovered.1, &*recovered.3),
+                    ("needs_attention", Some(now + 1), "completed")
+                );
+                assert_eq!(
+                    recover_interrupted_agent_automation_dispatches_in_conn(
+                        &mut connection,
+                        now + 2,
+                    )
+                    .unwrap(),
+                    0
+                );
+                assert_eq!(read_receipt(&connection), recovered);
+            }
+        }
+
+        {
+            let mut connection = state.db.lock().unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE task_runs SET status='awaiting_confirmation' WHERE id='turn-d';
+                 UPDATE automation_runs SET status='awaiting_confirmation' WHERE id='run-a';
+                 UPDATE sessions SET leaf_message_id='turn-d' WHERE id='session-a';",
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            handoff_agent_automation_dispatch_in_tx(&transaction, "session-a", "turn-d", "turn-e")
+                .unwrap();
+            transaction.execute_batch(
+                "INSERT INTO messages (id,session_id,role,content,created_at,parent_id,metadata)
+                 VALUES ('turn-e','session-a','assistant','text result',50,'turn-d',
+                   '{\"angelbotContinuation\":{\"parentMessageId\":\"turn-d\"}}');
+                 INSERT INTO task_runs (id,session_id,message_id,goal,status,plan,created_at,updated_at)
+                 VALUES ('turn-e','session-a','turn-e','Summarize notes','completed','[]',50,50);
+                 UPDATE sessions SET leaf_message_id='turn-e' WHERE id='session-a';",
+            ).unwrap();
+            transaction.commit().unwrap();
+        }
+        sync_agent_automation_continuation(&state, "session-a", "turn-e", 50).unwrap();
+        let read_receipt = || {
+            state.db.lock().unwrap().query_row(
+                "SELECT foreground_run_id,status,summary,finished_at FROM automation_runs WHERE id='run-a'",
+                [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,row.get::<_, Option<i64>>(3)?)),
+            ).unwrap()
+        };
+        assert_eq!(
+            read_receipt().1,
+            "awaiting_confirmation",
+            "a text-only continuation must not hide its verified ancestor's pending approval"
+        );
+        {
+            let connection = state.db.lock().unwrap();
+            connection.execute_batch(
+                "INSERT INTO messages (id,session_id,role,content,created_at,parent_id)
+                 VALUES ('background','session-a','assistant','new work',51,'turn-e');
+                 INSERT INTO task_runs (id,session_id,message_id,goal,status,plan,created_at,updated_at)
+                 VALUES ('background','session-a','background','Summarize notes','completed','[]',51,51);
+                 UPDATE sessions SET leaf_message_id='background' WHERE id='session-a';
+                 UPDATE automation_runs SET status='running',finished_at=NULL WHERE id='run-a';",
+            ).unwrap();
+        }
+        assert_eq!(
+            recover_interrupted_agent_automation_dispatches_in_conn(
+                &mut state.db.lock().unwrap(),
+                51,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(read_receipt().1, "awaiting_confirmation");
+        for (index, source_status) in [
+            "needs_attention",
+            "continue_suggested",
+            "provider_unavailable",
+            "stopped",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for startup in [false, true] {
+                let now = 60 + index as i64 * 10 + i64::from(startup) * 3;
+                {
+                    let connection = state.db.lock().unwrap();
+                    connection
+                        .execute(
+                            "UPDATE task_runs SET status=?1 WHERE id='turn-d'",
+                            [source_status],
+                        )
+                        .unwrap();
+                    connection.execute(
+                        "UPDATE automation_runs SET status=?1,finished_at=NULL WHERE id='run-a'",
+                        [if source_status == "provider_unavailable" { "needs_attention" } else { "awaiting_confirmation" }],
+                    ).unwrap();
+                }
+                if startup {
+                    assert_eq!(
+                        recover_interrupted_agent_automation_dispatches_in_conn(
+                            &mut state.db.lock().unwrap(),
+                            now,
+                        )
+                        .unwrap(),
+                        1
+                    );
+                } else {
+                    // Even after a background Start advanced the active leaf,
+                    // late Stop/rejection syncs only the proven old binding.
+                    sync_agent_automation_continuation(&state, "session-a", "turn-d", now).unwrap();
+                }
+                let recovered = read_receipt();
+                assert_eq!(
+                    (&*recovered.0, &*recovered.1, recovered.3),
+                    ("turn-e", "needs_attention", Some(now))
+                );
+                sync_agent_automation_continuation(&state, "session-a", "turn-d", now + 1).unwrap();
+                assert_eq!(
+                    recover_interrupted_agent_automation_dispatches_in_conn(
+                        &mut state.db.lock().unwrap(),
+                        now + 2,
+                    )
+                    .unwrap(),
+                    0
+                );
+                assert_eq!(read_receipt(), recovered);
+            }
+        }
+        {
+            let connection = state.db.lock().unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE task_runs SET status='awaiting_confirmation' WHERE id='turn-d';
+                 UPDATE messages SET metadata=NULL WHERE id='turn-e';
+                 UPDATE automation_runs SET status='running',finished_at=NULL WHERE id='run-a';",
+                )
+                .unwrap();
+        }
+        sync_agent_automation_continuation(&state, "session-a", "turn-e", 100).unwrap();
+        assert_eq!(
+            read_receipt().1,
+            "completed",
+            "an ordinary parent and equal goal are not task-continuity evidence"
+        );
+        {
+            let connection = state.db.lock().unwrap();
+            connection.execute_batch(
+                "UPDATE task_runs SET status='completed' WHERE id='turn-d';
+                 UPDATE messages SET metadata='{\"angelbotContinuation\":{\"parentMessageId\":\"turn-d\"}}' WHERE id='turn-e';
+                 INSERT INTO sessions (id,title,created_at,updated_at) VALUES ('other-session','Other',1,1);
+                 INSERT INTO messages (id,session_id,role,content,created_at)
+                 VALUES ('other-pending','other-session','assistant','',1);
+                 INSERT INTO task_runs (id,session_id,message_id,goal,status,plan,created_at,updated_at)
+                 VALUES ('other-pending','other-session','other-pending','Summarize notes','awaiting_confirmation','[]',1,1);
+                 UPDATE automation_runs SET status='running',finished_at=NULL WHERE id='run-a';",
+            ).unwrap();
+        }
+        sync_agent_automation_continuation(&state, "session-a", "turn-e", 101).unwrap();
+        assert_eq!(
+            read_receipt().1,
+            "completed",
+            "another session's pending task must not affect the receipt"
+        );
+        {
+            let mut connection = state.db.lock().unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE task_runs SET status='needs_attention' WHERE id='turn-d';
+                 UPDATE automation_runs SET status='needs_attention' WHERE id='run-a';
+                 UPDATE sessions SET leaf_message_id='turn-e' WHERE id='session-a';",
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            handoff_agent_automation_dispatch_in_tx(&transaction, "session-a", "turn-e", "turn-f")
+                .unwrap();
+            transaction.execute_batch(
+                "INSERT INTO messages (id,session_id,role,content,created_at,parent_id,metadata)
+                 VALUES ('turn-f','session-a','assistant','done',110,'turn-e',
+                   '{\"angelbotContinuation\":{\"parentMessageId\":\"turn-e\"}}');
+                 INSERT INTO task_runs (id,session_id,message_id,goal,status,plan,created_at,updated_at)
+                 VALUES ('turn-f','session-a','turn-f','Summarize notes','completed','[]',110,110);
+                 UPDATE sessions SET leaf_message_id='turn-f' WHERE id='session-a';",
+            ).unwrap();
+            transaction.commit().unwrap();
+        }
+        sync_agent_automation_continuation(&state, "session-a", "turn-f", 110).unwrap();
+        let completed = read_receipt();
+        assert_eq!(
+            (&*completed.0, &*completed.1, completed.3),
+            ("turn-f", "completed", Some(110)),
+            "new handoff must not be blocked by an old failed ancestor"
+        );
+        sync_agent_automation_dispatch(&state, &dispatch, 111).unwrap();
+        assert_eq!(
+            read_receipt(),
+            completed,
+            "the original dispatch cannot overwrite a newer binding"
         );
     }
 

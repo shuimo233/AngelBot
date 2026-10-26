@@ -16,7 +16,7 @@ describe('ApiSettings', () => {
     vi.clearAllMocks();
     localStorage.clear();
     vi.mocked(chatgptPlanChangeAccount).mockReset();
-    vi.mocked(testModelConnection).mockResolvedValue(true);
+    vi.mocked(testModelConnection).mockResolvedValue({ toolRoundTrip: 'verified' });
     vi.mocked(chatgptPlanStatus).mockResolvedValue({ connected: false, planEnabled: false, needsSignIn: true, credentialRef: null, accountLabel: null });
     vi.mocked(chatgptPlanModels).mockResolvedValue([{ id: 'account-model', name: 'Account model' }]);
     useSettingsStore.setState({
@@ -96,6 +96,23 @@ describe('ApiSettings', () => {
       base_url: 'https://api.anthropic.com', api_key: '', provider: 'anthropic', model: 'claude-sonnet-4-20250514',
     })));
     expect(within(screen.getByRole('region', { name: '连接测试' })).getByText('连接测试通过')).toBeInTheDocument();
+    expect(screen.getByText('对话和工具往返均通过验证。实际操作仍需授权，不代表复杂任务已经完成。')).toBeInTheDocument();
+
+    for (const [status, detail] of [
+      ['notObserved', '模型未返回原生工具调用；这不等于模型不支持工具。可以继续对话，请核对协议或模型后重试。'],
+      ['invalidCall', '工具调用格式或参数未通过校验。可以继续对话，请核对协议或换用支持工具调用的模型。'],
+      ['invalidResult', '模型未正确接收工具结果并完成回答。可以继续对话，操作任务的可靠性尚未验证。'],
+      ['requestFailed', '工具验证请求失败；对话连接已通过。请检查服务状态或协议后重试，未操作文件或应用。'],
+      ['timedOut', '工具验证在总计 60 秒内未完成；对话连接已通过。请稍后重试，未操作文件或应用。'],
+    ] as const) {
+      vi.mocked(testModelConnection).mockResolvedValue({ toolRoundTrip: status });
+      await user.click(screen.getByRole('button', { name: '测试连接' }));
+      await waitFor(() => expect(screen.getByText(detail)).toBeInTheDocument());
+      expect(within(screen.getByRole('region', { name: '连接测试' })).getByText('对话连接正常，工具往返未验证')).toBeInTheDocument();
+      expect(screen.getAllByText('对话连接正常，工具往返未验证').find((element) => element.tagName === 'DD')).toHaveAttribute('data-state', 'partial');
+      expect(screen.queryByText('连接测试通过')).not.toBeInTheDocument();
+      expect(saveApiConfig).not.toHaveBeenCalled();
+    }
   });
 
   it('allows custom protocols and explicit no-auth without an API key', async () => {
@@ -181,14 +198,14 @@ describe('ApiSettings', () => {
 
   it('does not mark an edited model as tested when an old test finishes late', async () => {
     const user = userEvent.setup();
-    let resolve: ((success: boolean) => void) | undefined;
+    let resolve: ((report: Awaited<ReturnType<typeof testModelConnection>>) => void) | undefined;
     vi.mocked(testModelConnection).mockImplementation(() => new Promise((done) => { resolve = done; }));
     useSettingsStore.setState((state) => ({ apiConfig: { ...state.apiConfig, hasApiKey: true } }));
     render(<ApiSettings />);
     await user.click(screen.getByRole('button', { name: '测试连接' }));
     await user.clear(screen.getByLabelText('模型标识'));
     await user.type(screen.getByLabelText('模型标识'), 'edited-model');
-    await act(async () => { resolve?.(true); });
+    await act(async () => { resolve?.({ toolRoundTrip: 'verified' }); });
     expect(within(screen.getByRole('region', { name: '连接测试' })).getByText('尚未测试')).toBeInTheDocument();
     expect(screen.queryByText('连接测试通过')).not.toBeInTheDocument();
   });

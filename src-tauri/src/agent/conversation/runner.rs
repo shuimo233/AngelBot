@@ -29,7 +29,9 @@ use crate::agent::lifecycle::{
     DefaultToolLifecycleHook, DynamicApiKeyProvider, LifecycleContext, LoopDecision, ResponseKind,
     TerminalBranchKind, ToolCallContext, ToolLifecycleHook, TransformResult, TurnContext,
 };
-use crate::agent::registry::{requires_immediate_confirmation, ToolRegistry};
+use crate::agent::registry::{
+    requires_argument_confirmation, requires_immediate_confirmation, ToolRegistry,
+};
 use crate::agent::steering::AgentControlState;
 use crate::agent::task_facts::{derive_task_phase, DerivedTaskPhase};
 use crate::agent::tool::{
@@ -53,9 +55,9 @@ use uuid::Uuid;
 /// `NetProgressGuard` (default 5 consecutive non-progress iterations).
 /// Both are soft terminators that return a structured `LoopDecision`
 /// instead of silently dropping the turn. The side-effect guard
-/// (`SideEffectAutoPauseGuard`, default 8 side-effects) keeps the run
-/// honest about irreversible actions before the wall-clock backstop
-/// fires.
+/// (`SideEffectAutoPauseGuard`, default 8 side-effects) asks for continuation
+/// outside full access. Full access retains the other controls rather than
+/// asking the user to renew the same task authorization by call count.
 const ITERATION_TIMEOUT_SECS: u64 = 45;
 const MAX_LLM_ATTEMPTS_PER_ITERATION: usize = 2;
 const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 6_000;
@@ -338,7 +340,8 @@ mod uncertain_outcome_tests {
         let mut runner = AgentRunner::new(
             Box::new(WouldRepeatProvider(Arc::clone(&calls))),
             AgentConfig::default(),
-        );
+        )
+        .with_execution_permission("full_access".into());
         runner.tool_registry_mut().register(
             Tool::new(
                 "uncertain_side_effect",
@@ -1073,13 +1076,11 @@ pub struct AgentStep {
     pub verification: Option<crate::agent::verifier::VerificationEvidence>,
 }
 
-fn task_requires_project_verification(user_message: &str) -> bool {
+fn task_requires_project_verification(user_message: &str, modified_files: &[String]) -> bool {
     let goal = user_message.to_ascii_lowercase();
-    [
+    if ![
         "code",
         "代码",
-        "项目",
-        "project",
         "package.json",
         "测试",
         "test",
@@ -1088,14 +1089,102 @@ fn task_requires_project_verification(user_message: &str) -> bool {
     ]
     .iter()
     .any(|marker| goal.contains(marker))
+    {
+        return false;
+    }
+    // A ban on execution is not a request for a coding build. Exempt only
+    // ordinary data deliveries; build configuration and unknown artifacts
+    // retain the existing conservative gate. This never changes permissions.
+    let extension = |path: &str| path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if modified_files.iter().any(|path| {
+        let path = path.replace('\\', "/").to_ascii_lowercase();
+        let name = path.rsplit('/').next().unwrap_or("");
+        matches!(
+            name,
+            "package.json" | "package-lock.json" | "requirements.txt" | "cmakelists.txt"
+        ) || ((name.starts_with("tsconfig") || name.starts_with("jsconfig"))
+            && name.ends_with(".json"))
+            || path.starts_with(".github/workflows/")
+            || path.contains("/.github/workflows/")
+    }) {
+        return true;
+    }
+    // A prohibition may govern a list rather than an adjacent action. Remove
+    // only bare execution items in that list; positive/compound code requests
+    // stay visible to the conservative gate below.
+    let mut request = goal
+        .split(['。', '；', ';', '，', ',', '\n', '！', '!', '？', '?'])
+        .map(|clause| {
+            if !["禁止", "不要", "无需", "不能", "不允许"]
+                .iter()
+                .any(|prefix| clause.trim_start().starts_with(prefix))
+            {
+                return clause.to_owned();
+            }
+            clause
+                .split('、')
+                .filter(|item| {
+                    !matches!(
+                        item.trim(),
+                        "运行代码"
+                            | "执行代码"
+                            | "运行任何代码"
+                            | "执行任何代码"
+                            | "运行测试"
+                            | "执行测试"
+                            | "运行任何测试"
+                            | "执行任何测试"
+                            | "编译"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("、")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    for negative in ["禁止", "不要", "无需", "不能", "不允许", "不"] {
+        for verb in ["运行", "执行"] {
+            for any in ["", "任何"] {
+                for target in ["代码", "测试"] {
+                    request = request.replace(&format!("{negative}{verb}{any}{target}"), "");
+                }
+            }
+        }
+        request = request.replace(&format!("{negative}编译"), "");
+    }
+    for negative in ["do not", "don't", "never"] {
+        for action in ["run code", "execute code", "run tests", "run test", "build"] {
+            request = request.replace(&format!("{negative} {action}"), "");
+        }
+    }
+    for prohibition in ["no code execution", "no tests", "no build"] {
+        request = request.replace(prohibition, "");
+    }
+    if ["代码", "测试", "编译"]
+        .iter()
+        .any(|marker| request.contains(marker))
+        || request
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| matches!(word, "code" | "test" | "tests" | "build"))
+    {
+        return true;
+    }
+    modified_files.iter().any(|path| {
+        !matches!(
+            extension(path).as_str(),
+            "json" | "txt" | "md" | "csv" | "tsv" | "yaml" | "yml" | "xml" | "log"
+        )
+    })
 }
 
-/// A project mutation invalidates earlier verification evidence. A final text
-/// response is therefore acceptable only after the facts show fresh evidence.
-fn coding_task_has_unverified_changes(user_message: &str, steps: &[AgentStep]) -> bool {
+/// Completion can require attention for unresolved operations or for project
+/// changes without fresh verification. Keep the feedback appropriate to each.
+fn task_needs_completion_attention(user_message: &str, steps: &[AgentStep]) -> bool {
     let facts = task_facts_from_steps(user_message, steps);
-    derive_task_phase(&facts, task_requires_project_verification(user_message))
-        == crate::agent::task_facts::DerivedTaskPhase::NeedsAttention
+    derive_task_phase(
+        &facts,
+        task_requires_project_verification(user_message, &facts.modified_files),
+    ) == crate::agent::task_facts::DerivedTaskPhase::NeedsAttention
 }
 
 /// Issue #102: scan the trace for post-call verifier evidence that did not
@@ -1147,6 +1236,9 @@ pub enum AgentResponse {
     Error(String),
 }
 
+pub(crate) const STOPPED_RUN_NOTICE: &str =
+    "本次运行已停止。已完成的操作记录已保留；结果未确认的操作请先核对，不会自动重试。";
+
 /// The terminal state of one bounded AgentRunner execution slice.
 ///
 /// This is intentionally not a workflow engine: callers may persist the
@@ -1157,6 +1249,7 @@ pub enum AgentSliceOutcome {
     Completed(AgentResponse),
     AwaitingConfirmation(AgentResponse),
     NeedsAttention(AgentResponse),
+    Stopped(AgentResponse),
 }
 
 /// Backend-only result. Never serialize this transcript into UI responses or
@@ -1164,6 +1257,9 @@ pub enum AgentSliceOutcome {
 pub struct NativeAgentSliceResult {
     pub outcome: AgentSliceOutcome,
     pub protocol_transcript: Vec<LlmMessage>,
+    /// Untrusted provider text, for protected diagnostic storage only.
+    /// Never put it in the transcript, tool output, UI events or debug output.
+    pub private_diagnostic: Option<String>,
 }
 
 fn record_private_message(
@@ -1456,7 +1552,7 @@ mod private_protocol_tests {
             ));
     }
     #[tokio::test]
-    async fn incomplete_private_tool_batch_never_executes_or_enters_replay_ledger() {
+    async fn incomplete_model_output_never_completes_or_replays_effects() {
         let (runner, requests, executions) = runner(true, 0);
         let result = runner
             .run_slice_with_private_transcript("inspect", &[], None)
@@ -1464,6 +1560,215 @@ mod private_protocol_tests {
         assert_eq!(executions.load(Ordering::SeqCst), 0);
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(result.protocol_transcript.is_empty());
+
+        struct TextStopProvider {
+            inner: NativeProvider,
+            reason: StopReason,
+            tool_reason: Option<StopReason>,
+            native: bool,
+            empty: bool,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for TextStopProvider {
+            fn name(&self) -> &str {
+                "text-stop-fixture"
+            }
+            async fn chat(
+                &self,
+                messages: &[LlmMessage],
+                tools: Option<&[ToolSchema]>,
+                thinking: Option<&ThinkingSettings>,
+            ) -> Result<LlmResponse, String> {
+                let (mut response, mut state) = self
+                    .inner
+                    .chat(messages, tools, thinking)
+                    .await?
+                    .into_parts();
+                if let LlmResponse::Text { text, stop_reason } = &mut response {
+                    *stop_reason = self.reason;
+                    if self.empty {
+                        *text = " \n\t".into();
+                        state.as_mut().unwrap().output_items[0]["content"][0]["text"] =
+                            serde_json::json!(text);
+                    }
+                }
+                if let LlmResponse::ToolCalls { stop_reason, .. } = &mut response {
+                    if let Some(reason) = self.tool_reason {
+                        *stop_reason = reason;
+                    }
+                }
+                Ok(if self.native {
+                    LlmResponse::WithProtocol {
+                        response: Box::new(response),
+                        protocol: state.unwrap(),
+                    }
+                } else {
+                    response
+                })
+            }
+        }
+        for (reason, empty, warning) in [
+            (StopReason::MaxTokens, false, "输出长度限制"),
+            (StopReason::ContentFilter, false, "内容限制"),
+            (StopReason::Unknown, false, "停止状态"),
+            (StopReason::ToolUse, false, "未提供原生工具调用"),
+            (StopReason::EndTurn, true, "没有返回可用回复"),
+            (StopReason::EndTurn, false, ""),
+        ] {
+            for native in [false, true] {
+                for with_tool in [false, true] {
+                    let requests = Arc::new(Mutex::new(Vec::new()));
+                    let executions = Arc::new(AtomicUsize::new(0));
+                    let events = Arc::new(Mutex::new(Vec::new()));
+                    let mut agent = AgentRunner::new(
+                        Box::new(TextStopProvider {
+                            inner: NativeProvider {
+                                calls: AtomicUsize::new(usize::from(!with_tool)),
+                                requests: requests.clone(),
+                                incomplete: false,
+                            },
+                            reason,
+                            tool_reason: None,
+                            native,
+                            empty,
+                        }),
+                        AgentConfig::default(),
+                    )
+                    .with_emitter(Arc::new(Events(events.clone())));
+                    agent.tool_registry_mut().register(
+                        Tool::new("read_file", "Read", serde_json::json!({"type":"object"})),
+                        Arc::new(Read(executions.clone())),
+                    );
+                    let result = agent
+                        .run_slice_with_private_transcript("inspect", &[], None)
+                        .await;
+                    assert_eq!(executions.load(Ordering::SeqCst), usize::from(with_tool));
+                    assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(with_tool));
+                    if warning.is_empty() {
+                        assert!(matches!(result.outcome, AgentSliceOutcome::Completed(_)));
+                        continue;
+                    }
+                    let AgentSliceOutcome::NeedsAttention(AgentResponse::TextWithToolCalls {
+                        text,
+                        steps,
+                    }) = result.outcome
+                    else {
+                        panic!("{reason:?}, native={native}, with_tool={with_tool}: incomplete reply must not complete");
+                    };
+                    assert!(text.contains(warning), "{text}");
+                    assert!(text.contains("不会自动重复"));
+                    if !empty {
+                        assert!(text.starts_with("done\n\n"), "preserve partial model reply");
+                    }
+                    assert_eq!(steps.len(), 1 + usize::from(with_tool));
+                    assert_eq!(steps.last().unwrap().tool_name, "agent_loop");
+                    assert!(!steps.last().unwrap().success);
+                    assert_eq!(
+                        result.protocol_transcript.len(),
+                        1 + 2 * usize::from(with_tool)
+                    );
+                    assert_eq!(
+                        result.protocol_transcript.last().unwrap().content,
+                        if empty { " \n\t" } else { "done" },
+                        "private continuation retains model content, not host warning"
+                    );
+                    let events = events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|event| serde_json::from_str::<AgentEvent>(event).unwrap())
+                        .collect::<Vec<_>>();
+                    let ends = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            AgentEvent::TurnEnd { success, .. } => Some(*success),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(ends, [false]);
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                            .count(),
+                        1
+                    );
+                    assert!(events.iter().any(|event| matches!(
+                        event, AgentEvent::MessageEnd { full_text, .. } if full_text == &text
+                    )));
+                }
+            }
+        }
+        for reason in [
+            StopReason::MaxTokens,
+            StopReason::ContentFilter,
+            StopReason::Unknown,
+            StopReason::EndTurn,
+        ] {
+            for native in [false, true] {
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let executions = Arc::new(AtomicUsize::new(0));
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let mut agent = AgentRunner::new(
+                    Box::new(TextStopProvider {
+                        inner: NativeProvider {
+                            calls: AtomicUsize::new(0),
+                            requests: requests.clone(),
+                            incomplete: false,
+                        },
+                        reason: StopReason::EndTurn,
+                        tool_reason: Some(reason),
+                        native,
+                        empty: false,
+                    }),
+                    AgentConfig::default(),
+                )
+                .with_emitter(Arc::new(Events(events.clone())));
+                agent.tool_registry_mut().register(
+                    Tool::new("read_file", "Read", serde_json::json!({"type":"object"})),
+                    Arc::new(Read(executions.clone())),
+                );
+                let result = agent
+                    .run_slice_with_private_transcript("inspect", &[], None)
+                    .await;
+                // Legacy compatible endpoints may omit finish_reason and
+                // normalize a complete tool call to EndTurn. Preserve that
+                // existing compatibility, but never allow explicit failure.
+                let legacy_complete = reason == StopReason::EndTurn && !native;
+                assert_eq!(
+                    executions.load(Ordering::SeqCst),
+                    usize::from(legacy_complete),
+                    "{reason:?}, native={native}: abnormal tool batch must not execute"
+                );
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    1 + usize::from(legacy_complete)
+                );
+                if legacy_complete {
+                    assert!(matches!(result.outcome, AgentSliceOutcome::Completed(_)));
+                } else {
+                    let AgentSliceOutcome::NeedsAttention(AgentResponse::TextWithToolCalls {
+                        text,
+                        ..
+                    }) = &result.outcome
+                    else {
+                        panic!("abnormal tool batch must remain visible and resumable");
+                    };
+                    assert!(result.protocol_transcript.is_empty());
+                    let events = events.lock().unwrap();
+                    let events = events
+                        .iter()
+                        .map(|event| serde_json::from_str::<AgentEvent>(event).unwrap())
+                        .collect::<Vec<_>>();
+                    assert!(events.iter().any(|event| matches!(
+                        event, AgentEvent::MessageEnd { full_text, .. } if full_text == text
+                    )));
+                    assert!(!events
+                        .iter()
+                        .any(|event| matches!(event, AgentEvent::TurnEnd { success: true, .. })));
+                }
+            }
+        }
     }
     #[tokio::test]
     async fn private_followup_keeps_history_and_defers_protocol_aware_compaction() {
@@ -1657,7 +1962,8 @@ mod tool_image_runtime_tests {
         let response = match &result.outcome {
             AgentSliceOutcome::Completed(response)
             | AgentSliceOutcome::AwaitingConfirmation(response)
-            | AgentSliceOutcome::NeedsAttention(response) => response,
+            | AgentSliceOutcome::NeedsAttention(response)
+            | AgentSliceOutcome::Stopped(response) => response,
         };
         if let AgentResponse::TextWithToolCalls { steps, .. } = response {
             let steps_json = serde_json::to_string(steps).unwrap();
@@ -1767,6 +2073,21 @@ mod tool_image_runtime_tests {
                 assert_eq!(text, "inspection complete");
                 assert_eq!(steps.len(), 2);
                 assert!(steps.iter().all(|step| step.success));
+                if !supports_images {
+                    assert!(
+                        steps[0].output.contains("未发送图像"),
+                        "the visible/durable step must disclose unsupported image input"
+                    );
+                    assert!(
+                        events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|event| event.contains("ToolExecutionEnd")
+                                && event.contains("未发送图像")),
+                        "the UI receipt must match the durable unsupported-image notice"
+                    );
+                }
                 // Even serializing a live model request must not leak its transient payload.
                 assert!(!serde_json::to_string(&*requests)
                     .unwrap()
@@ -1821,11 +2142,18 @@ mod tool_image_runtime_tests {
                 .unwrap();
             assert!(receipt.content.contains("运行已取消；未将图像交给模型"));
             assert!(receipt.tool_images.is_empty());
-            let AgentSliceOutcome::Completed(AgentResponse::Error(message)) = &result.outcome
+            let AgentSliceOutcome::Stopped(AgentResponse::TextWithToolCalls { text, steps }) =
+                &result.outcome
             else {
                 panic!("runner must report cancellation: {:?}", result.outcome);
             };
-            assert!(message.contains("取消"));
+            assert_eq!(text, STOPPED_RUN_NOTICE);
+            assert_eq!(
+                steps.len(),
+                1,
+                "retain the actual completed observation only"
+            );
+            assert!(steps[0].success);
             assert_no_payload(&result, &events.lock().unwrap(), &encoded);
         }
     }
@@ -1973,20 +2301,29 @@ impl AgentRunner {
         mut steps: Vec<AgentStep>,
         summary: String,
     ) -> AgentResponse {
-        const DIAGNOSTIC: &str =
-            "代码修改后尚无成功的验证证据；已停止自动收尾。请继续任务以选择验证命令、处理失败，或明确跳过验证。";
+        let (diagnostic, status) = if task_facts_from_steps("", &steps).has_unhandled_failures() {
+            (
+                "仍有操作未完成；已停止自动收尾。请先核对未完成事项与已发生的结果，再决定如何继续。",
+                "执行状态：仍有操作未完成，需要核对后继续；已完成的操作不会自动撤回。",
+            )
+        } else {
+            (
+                "代码修改后尚无成功的验证证据；已停止自动收尾。请继续任务以选择验证命令、处理失败，或明确跳过验证。",
+                "验证状态：尚无成功验证证据。可继续任务选择验证命令、处理失败，或明确跳过验证。",
+            )
+        };
         steps.push(AgentStep {
             call_id: format!("agent-loop-{}", Uuid::new_v4()),
             tool_name: "agent_loop".to_string(),
             arguments: serde_json::Value::Null,
             success: false,
-            output: DIAGNOSTIC.to_string(),
+            output: diagnostic.to_string(),
             confirmation_required: false,
             confirmation_status: None,
             verification: None,
         });
         AgentResponse::TextWithToolCalls {
-            text: format!("{summary}\n\n验证状态：尚无成功验证证据。可继续任务选择验证命令、处理失败，或明确跳过验证。"),
+            text: format!("{summary}\n\n{status}"),
             steps,
         }
     }
@@ -2100,7 +2437,6 @@ impl AgentRunner {
         Self::protocol_violation_slice_response(steps, format!("工具协议违规: {reason}"))
     }
 
-    /// Emit turn end event
     /// Build the lifecycle context for a terminal-branch hook and call the hook.
     /// Centralised because every terminal branch needed the exact same five
     /// arguments and forgetting any one of them silently produced a hook
@@ -2263,6 +2599,20 @@ impl AgentRunner {
         exec_result: &crate::agent::registry::ToolExecResult,
         include_hint: bool,
     ) -> LlmMessage {
+        // Model capability is part of the visible receipt, not only a hidden
+        // prompt suffix. Never persist or emit a misleading image-read success.
+        let mut safe_result = exec_result.clone();
+        if !safe_result.result.images.is_empty()
+            && (self.cancellation.is_cancelled() || !self.provider.supports_tool_images())
+        {
+            safe_result.result.images.clear();
+            safe_result.result.content.push_str(if self.cancellation.is_cancelled() {
+                "\n[操作结果已记录；运行已取消；未将图像交给模型。请勿重复已完成的操作。]"
+            } else {
+                "\n[操作结果已记录；当前模型接口未接入工具图像输入，未发送图像，请勿声称已经查看或重复已完成的操作。]"
+            });
+        }
+        let exec_result = &safe_result;
         // Issue #102: run the tool's post-call verifier (if any) so the
         // step carries disk-truth evidence to the audit log and the
         // completion gate. Verifier is read-only — it never alters the
@@ -2270,7 +2620,7 @@ impl AgentRunner {
         let evidence = self.tool_registry.get(tool_name).and_then(|tool| {
             tool.post_call_verifier
                 .as_ref()
-                .map(|v| v.verify(&arguments, &exec_result.result))
+                .map(|v| v.verify(&arguments, &exec_result.result, &self.work_dir))
         });
 
         steps.push(AgentStep {
@@ -2319,10 +2669,12 @@ impl AgentRunner {
         message
     }
 
+    /// Close an interrupted, paused or failed turn. Successful completion emits
+    /// its own success event in the final-answer branch.
     fn emit_turn_end(&self, turn_id: &str, total_tool_calls: usize) {
         self.emit(AgentEvent::TurnEnd {
             turn_id: turn_id.to_string(),
-            success: true,
+            success: false,
             tool_calls_count: total_tool_calls,
         });
     }
@@ -2398,8 +2750,21 @@ impl AgentRunner {
         history: &[LlmMessage],
         attention_context: Option<&str>,
     ) -> NativeAgentSliceResult {
+        self.run_slice_with_owned_history(user_message, history.to_vec(), attention_context)
+            .await
+    }
+
+    /// Own the initial history so transient observations have no retained
+    /// caller-side copy after the runner builds its active transcript.
+    pub(crate) async fn run_slice_with_owned_history(
+        &self,
+        user_message: &str,
+        history: Vec<LlmMessage>,
+        attention_context: Option<&str>,
+    ) -> NativeAgentSliceResult {
         let mut initial_messages =
-            self.build_initial_messages_with_native_history(user_message, history);
+            self.build_initial_messages_with_native_history(user_message, &history);
+        drop(history);
         if let Some(context) = attention_context {
             initial_messages.insert(
                 1,
@@ -2407,35 +2772,44 @@ impl AgentRunner {
             );
         }
         let mut protocol_transcript = Vec::new();
+        let mut private_diagnostic = None;
         let response = self
             .run_with_initial_messages_collect(
                 user_message,
                 initial_messages,
                 &mut protocol_transcript,
+                &mut private_diagnostic,
             )
             .await;
         NativeAgentSliceResult {
             outcome: self.slice_outcome(user_message, response),
             protocol_transcript,
+            private_diagnostic,
         }
     }
 
     fn slice_outcome(&self, user_message: &str, response: AgentResponse) -> AgentSliceOutcome {
+        if self.cancellation.is_cancelled() {
+            return AgentSliceOutcome::Stopped(response);
+        }
         match &response {
-            AgentResponse::TextWithToolCalls { steps, .. } => match derive_task_phase(
-                &task_facts_from_steps(user_message, steps),
-                task_requires_project_verification(user_message),
-            ) {
-                DerivedTaskPhase::AwaitingConfirmation => {
-                    AgentSliceOutcome::AwaitingConfirmation(response)
+            AgentResponse::TextWithToolCalls { steps, .. } => {
+                let facts = task_facts_from_steps(user_message, steps);
+                match derive_task_phase(
+                    &facts,
+                    task_requires_project_verification(user_message, &facts.modified_files),
+                ) {
+                    DerivedTaskPhase::AwaitingConfirmation => {
+                        AgentSliceOutcome::AwaitingConfirmation(response)
+                    }
+                    DerivedTaskPhase::NeedsAttention | DerivedTaskPhase::Stopped => {
+                        AgentSliceOutcome::NeedsAttention(response)
+                    }
+                    DerivedTaskPhase::Running | DerivedTaskPhase::Completed => {
+                        AgentSliceOutcome::Completed(response)
+                    }
                 }
-                DerivedTaskPhase::NeedsAttention | DerivedTaskPhase::Stopped => {
-                    AgentSliceOutcome::NeedsAttention(response)
-                }
-                DerivedTaskPhase::Running | DerivedTaskPhase::Completed => {
-                    AgentSliceOutcome::Completed(response)
-                }
-            },
+            }
             _ => AgentSliceOutcome::Completed(response),
         }
     }
@@ -2660,6 +3034,9 @@ impl AgentRunner {
 
     async fn wait_for_control(&self, session_id: &str) -> Result<(), String> {
         loop {
+            if self.cancellation.is_cancelled() {
+                return Err("运行已停止".into());
+            }
             let state = self
                 .control_states
                 .as_ref()
@@ -2772,9 +3149,7 @@ impl AgentRunner {
         if tool_name == "write_file" {
             return true;
         }
-        if tool_name == "observe_trusted_app_window"
-            && arguments.get("mode").and_then(serde_json::Value::as_str) == Some("image")
-        {
+        if requires_argument_confirmation(tool_name, arguments) {
             // Scope admission does not replace permission to disclose window
             // pixels to the current model. Controls remain read-only metadata;
             // image mode uses the existing normal operation approval flow.
@@ -2799,8 +3174,13 @@ impl AgentRunner {
         user_message: &str,
         initial_messages: Vec<LlmMessage>,
     ) -> AgentResponse {
-        self.run_with_initial_messages_collect(user_message, initial_messages, &mut Vec::new())
-            .await
+        self.run_with_initial_messages_collect(
+            user_message,
+            initial_messages,
+            &mut Vec::new(),
+            &mut None,
+        )
+        .await
     }
 
     async fn run_with_initial_messages_collect(
@@ -2808,6 +3188,7 @@ impl AgentRunner {
         user_message: &str,
         initial_messages: Vec<LlmMessage>,
         transcript: &mut Vec<LlmMessage>,
+        private_diagnostic: &mut Option<String>,
     ) -> AgentResponse {
         let session_id = self
             .session_id
@@ -2878,6 +3259,7 @@ impl AgentRunner {
                 iteration,
                 turn_wall_clock_elapsed: turn_wall_clock_start.elapsed(),
                 side_effect_count,
+                full_access: self.execution_permission == "full_access",
                 no_progress_streak,
                 last_response_was_progress,
             };
@@ -2910,38 +3292,15 @@ impl AgentRunner {
                     }
                 }
             }
-            if let Err(msg) = self.wait_for_control(&session_id).await {
-                self.notify_terminal_branch(
-                    TerminalBranchKind::LlmRepeatedlyFailed,
-                    iteration,
-                    &messages,
-                    &steps,
-                    total_tool_calls,
-                );
-                self.emit_turn_end(&turn_id, total_tool_calls);
-                self.emit_agent_end(&session_id, iteration, total_tool_calls, Some(msg.clone()));
-                return AgentResponse::Error(msg);
-            }
-
             // Pre-flight cancellation. The control plane may have cancelled
             // the run between iterations; honour that before any LLM tokens.
-            if self.cancellation.is_cancelled() {
-                let reason = "运行在 LLM 调用前已被取消。".to_string();
-                self.notify_terminal_branch(
-                    TerminalBranchKind::LlmRepeatedlyFailed,
-                    iteration,
-                    &messages,
-                    &steps,
-                    total_tool_calls,
-                );
-                self.emit_turn_end(&turn_id, total_tool_calls);
-                self.emit_agent_end(
-                    &session_id,
-                    iteration,
-                    total_tool_calls,
-                    Some(reason.clone()),
-                );
-                return AgentResponse::Error(reason);
+            if self.wait_for_control(&session_id).await.is_err() || self.cancellation.is_cancelled()
+            {
+                self.close_turn_and_end(&turn_id, &session_id, total_tool_calls, iteration, None);
+                return AgentResponse::TextWithToolCalls {
+                    text: STOPPED_RUN_NOTICE.into(),
+                    steps,
+                };
             }
 
             // Drain mid-turn user messages. Sits after the cancellation
@@ -3119,7 +3478,7 @@ impl AgentRunner {
                 Duration::from_secs(ITERATION_TIMEOUT_SECS),
                 MAX_LLM_ATTEMPTS_PER_ITERATION,
             );
-            let chat_result = match execution_kernel
+            let kernel_result = execution_kernel
                 .run_model_turn(
                     self.provider.as_ref(),
                     &messages,
@@ -3127,9 +3486,31 @@ impl AgentRunner {
                     self.thinking_settings.as_ref(),
                     Some(delta_sender.clone()),
                 )
-                .await
-            {
+                .await;
+            // Cancellation drops the request too. Drain already-produced
+            // deltas before any terminal event, not after the turn ended.
+            drop(delta_sender);
+            let _ = delta_task.await;
+            let kernel_result = if self.cancellation.is_cancelled() {
+                Err(KernelModelTurnError::Cancelled)
+            } else {
+                kernel_result
+            };
+            let chat_result = match kernel_result {
                 Ok(response) => Ok(response),
+                Err(KernelModelTurnError::Cancelled) => {
+                    self.close_turn_and_end(
+                        &turn_id,
+                        &session_id,
+                        total_tool_calls,
+                        iteration,
+                        None,
+                    );
+                    return AgentResponse::TextWithToolCalls {
+                        text: STOPPED_RUN_NOTICE.into(),
+                        steps,
+                    };
+                }
                 Err(KernelModelTurnError::Provider(error)) => Err(error),
                 Err(KernelModelTurnError::TimedOut { attempts, timeout }) => {
                     self.notify_terminal_branch(
@@ -3170,13 +3551,6 @@ impl AgentRunner {
                     );
                 }
             };
-            // The provider has returned, so no more deltas can be produced.
-            // Close and drain the receiver before emitting ToolCallStart. This
-            // preserves the model's visible "text → tool" chronology even
-            // when the receiver was briefly scheduled behind the main loop.
-            drop(delta_sender);
-            let _ = delta_task.await;
-
             match chat_result {
                 Ok(response) => {
                     // A successful model round consumes its transient observations.
@@ -3217,10 +3591,7 @@ impl AgentRunner {
                         );
                     }
                     match response {
-                        LlmResponse::Text {
-                            text,
-                            stop_reason: _,
-                        } => {
+                        LlmResponse::Text { text, stop_reason } => {
                             record_private_message(
                                 &mut messages,
                                 transcript,
@@ -3233,6 +3604,63 @@ impl AgentRunner {
                                     protocol_state,
                                 },
                             );
+                            // A partial reply is useful evidence, not a completed
+                            // task. Stop before protocol/completion repair so no
+                            // model request or external effect is replayed implicitly.
+                            let incomplete = match stop_reason {
+                                crate::llm::StopReason::MaxTokens => Some(
+                                    "回复达到模型输出长度限制，尚未完整生成。可缩小请求范围，或调整模型的输出上限后继续。",
+                                ),
+                                crate::llm::StopReason::ContentFilter => Some(
+                                    "模型服务因内容限制中止了回复。请查看已有说明并调整请求；AngelBot 不会自动重试。",
+                                ),
+                                crate::llm::StopReason::Unknown => Some(
+                                    "模型返回了无法确认完成的停止状态。请检查模型与接口设置后再决定是否继续。",
+                                ),
+                                crate::llm::StopReason::ToolUse => Some(
+                                    "模型表示需要调用工具，但未提供原生工具调用。请检查模型与接口设置后再决定是否继续。",
+                                ),
+                                crate::llm::StopReason::EndTurn if text.trim().is_empty() => Some(
+                                    "模型没有返回可用回复。请检查模型服务或缩小请求范围后再决定是否继续。",
+                                ),
+                                crate::llm::StopReason::EndTurn => None,
+                            };
+                            if let Some(notice) = incomplete {
+                                let diagnostic = format!(
+                                    "回复状态：{notice} 任务尚未确认完成；已发生的操作不会自动撤回，也不会自动重复。继续前请核对已有结果。"
+                                );
+                                let visible_text = if text.trim().is_empty() {
+                                    diagnostic.clone()
+                                } else {
+                                    format!("{text}\n\n{diagnostic}")
+                                };
+                                self.notify_terminal_branch(
+                                    TerminalBranchKind::CompletionBlocked,
+                                    iteration,
+                                    &messages,
+                                    &steps,
+                                    total_tool_calls,
+                                );
+                                self.emit(AgentEvent::MessageEnd {
+                                    turn_id: turn_id.clone(),
+                                    message_id: message_id.clone(),
+                                    full_text: visible_text.clone(),
+                                });
+                                self.close_turn_and_end(
+                                    &turn_id,
+                                    &session_id,
+                                    total_tool_calls,
+                                    iteration + 1,
+                                    Some(diagnostic.clone()),
+                                );
+                                let mut response =
+                                    Self::auditable_terminal_slice_response(steps, diagnostic);
+                                if let AgentResponse::TextWithToolCalls { text, .. } = &mut response
+                                {
+                                    *text = visible_text;
+                                }
+                                return response;
+                            }
                             if self.tools_enabled
                                 && malformed_protocol_repairs == 0
                                 && is_malformed_tool_protocol_response(&text)
@@ -3249,7 +3677,7 @@ impl AgentRunner {
                                 continue;
                             }
                             if self.tools_enabled
-                                && coding_task_has_unverified_changes(user_message, &steps)
+                                && task_needs_completion_attention(user_message, &steps)
                             {
                                 if completion_repairs == 0 {
                                     completion_repairs += 1;
@@ -3259,7 +3687,14 @@ impl AgentRunner {
                                     // is advisory — the completion gate
                                     // remains a soft repair, not a hard
                                     // block, in line with §1 user-sovereignty.
-                                    let unverified = collect_unverified_artifacts(&steps);
+                                    let has_failed_operations =
+                                        task_facts_from_steps(user_message, &steps)
+                                            .has_unhandled_failures();
+                                    let unverified = if has_failed_operations {
+                                        Vec::new()
+                                    } else {
+                                        collect_unverified_artifacts(&steps)
+                                    };
                                     let verification_hint = if unverified.is_empty() {
                                         String::new()
                                     } else {
@@ -3271,40 +3706,48 @@ impl AgentRunner {
                                             unverified.join("\n- ")
                                         )
                                     };
-                                    record_private_message(&mut messages, transcript, LlmMessage {
-                                        role: "user".to_string(),
-                                        content: format!(
-                                            "System completion gate: this coding task changed project files but has no successful verification command after the latest change. Do not summarize yet. Run the smallest appropriate project verification command. If it fails, make at most one targeted repair and verify again; otherwise explain the concrete blocker.{verification_hint}"
-                                        ),
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                        tool_images: Vec::new(),
-                                        protocol_state: None,
-                                    });
+                                    let feedback = if has_failed_operations {
+                                        "System completion gate: this task still has unresolved tool failures. Do not claim full success. Explain the remaining failed operations and distinguish partial results from task completion. Do not repeat external actions or run unrelated project verification commands.".to_string()
+                                    } else {
+                                        format!("System completion gate: this coding task changed project files but has no successful verification command after the latest change. Do not summarize yet. Run the smallest appropriate project verification command. If it fails, make at most one targeted repair and verify again; otherwise explain the concrete blocker.{verification_hint}")
+                                    };
+                                    record_private_message(
+                                        &mut messages,
+                                        transcript,
+                                        LlmMessage {
+                                            role: "user".to_string(),
+                                            content: feedback,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                            tool_images: Vec::new(),
+                                            protocol_state: None,
+                                        },
+                                    );
                                     continue;
                                 }
                                 self.notify_terminal_branch(
-                                    TerminalBranchKind::CodingCompletionBlocked,
+                                    TerminalBranchKind::CompletionBlocked,
                                     iteration,
                                     &messages,
                                     &steps,
                                     total_tool_calls,
                                 );
+                                let response = Self::completion_gate_handoff_response(steps, text);
+                                let (visible_text, diagnostic) = match &response {
+                                    AgentResponse::TextWithToolCalls { text, steps } => {
+                                        (text.clone(), steps.last().map(|step| step.output.clone()))
+                                    }
+                                    _ => unreachable!(
+                                        "completion-gate handoff always has auditable steps"
+                                    ),
+                                };
                                 self.close_turn_and_end(
                                     &turn_id,
                                     &session_id,
                                     total_tool_calls,
                                     iteration,
-                                    Some("代码修改后尚无成功的验证证据".to_string()),
+                                    diagnostic,
                                 );
-                                let response = Self::completion_gate_handoff_response(steps, text);
-                                let visible_text = match &response {
-                                    AgentResponse::TextWithToolCalls { text, .. }
-                                    | AgentResponse::Text(text) => text.clone(),
-                                    AgentResponse::Error(_) => unreachable!(
-                                        "completion-gate handoff always has auditable steps"
-                                    ),
-                                };
                                 // Emit the same persisted handoff text that we return, so a
                                 // streaming view cannot briefly show a different terminal reply.
                                 self.emit(AgentEvent::MessageEnd {
@@ -3352,37 +3795,63 @@ impl AgentRunner {
                             text,
                             stop_reason,
                         } => {
-                            // When the provider reports `MaxTokens`, the
-                            // tool-call arguments may be incomplete.
-                            // Executing them would produce corrupted
-                            // side effects that cannot be audited.
-                            if stop_reason == crate::llm::StopReason::MaxTokens
-                                || (protocol_state.is_some()
-                                    && stop_reason != crate::llm::StopReason::ToolUse)
+                            // Explicitly interrupted/unknown output is never
+                            // authority to execute a tool, even when its JSON
+                            // happens to parse. Legacy endpoints may normalize
+                            // missing finish_reason to EndTurn; private replay
+                            // requires the explicit ToolUse contract.
+                            if matches!(
+                                stop_reason,
+                                crate::llm::StopReason::MaxTokens
+                                    | crate::llm::StopReason::ContentFilter
+                                    | crate::llm::StopReason::Unknown
+                            ) || (protocol_state.is_some()
+                                && stop_reason != crate::llm::StopReason::ToolUse)
                             {
+                                let reason = match stop_reason {
+                                    crate::llm::StopReason::MaxTokens => {
+                                        "工具调用前的模型输出已被 token 限制截断，可能不完整。"
+                                    }
+                                    crate::llm::StopReason::ContentFilter => {
+                                        "模型服务因内容限制中止了工具调用。"
+                                    }
+                                    _ => "工具调用的停止状态异常，无法确认调用完整。",
+                                };
+                                let notice = format!(
+                                    "{reason} 未执行本批次工具调用；此前已发生的操作不会自动撤回或重复。请核对已有结果及模型配置后再决定是否继续。"
+                                );
                                 for tc in &tool_calls {
                                     steps.push(AgentStep {
                                         call_id: tc.id.clone(),
                                         tool_name: tc.name.clone(),
                                         arguments: tc.arguments.clone(),
                                         success: false,
-                                        output: "模型输出被 token 限制截断；未执行该工具调用。请减少上下文后重试。".to_string(),
+                                        output: notice.clone(),
                                         confirmation_required: false,
                                         confirmation_status: None,
                                         verification: None,
                                     });
                                 }
-                                self.emit_turn_end(&turn_id, total_tool_calls);
-                                self.emit_agent_end(
-                                    &session_id,
-                                    iteration + 1,
+                                self.notify_terminal_branch(
+                                    TerminalBranchKind::CompletionBlocked,
+                                    iteration,
+                                    &messages,
+                                    &steps,
                                     total_tool_calls,
-                                    Some("工具调用前的模型输出已被 token 限制截断。".to_string()),
                                 );
-                                return Self::terminal_slice_response(
-                                    steps,
-                                    "工具调用前的模型输出已被 token 限制截断。未执行任何可能不完整的工具调用。请减少上下文长度后重试，或将任务拆分为多个独立步骤。".to_string(),
+                                self.emit(AgentEvent::MessageEnd {
+                                    turn_id: turn_id.clone(),
+                                    message_id: message_id.clone(),
+                                    full_text: notice.clone(),
+                                });
+                                self.close_turn_and_end(
+                                    &turn_id,
+                                    &session_id,
+                                    total_tool_calls,
+                                    iteration + 1,
+                                    Some(notice.clone()),
                                 );
+                                return Self::auditable_terminal_slice_response(steps, notice);
                             }
                             // Repeating the same batch without consuming any new evidence is
                             // a common provider failure mode. Never execute duplicate effects,
@@ -3514,9 +3983,12 @@ impl AgentRunner {
                                 if let Err(validation_error) =
                                     self.tool_registry.validate_arguments(&tool_name, &args)
                                 {
-                                    let output = format!(
-                                        "Tool call for '{}' was not executed: {}. Provide every required argument and retry the tool call.",
-                                        tool_name, validation_error
+                                    let output = crate::agent::registry::argument_rejection_output(
+                                        &self.tool_registry,
+                                        &call_id,
+                                        &tool_name,
+                                        &args,
+                                        &validation_error,
                                     );
                                     self.emit_tool_start(
                                         &mut turn_state,
@@ -3637,9 +4109,9 @@ impl AgentRunner {
                                     tool_calls_count: total_tool_calls,
                                 });
                                 return AgentResponse::TextWithToolCalls {
-                                    text: text.unwrap_or_else(|| {
-                                        "该操作需要你的确认后才能继续。".to_string()
-                                    }),
+                                    // Pending state is projected by the confirmation card.
+                                    // Do not persist temporary host status as assistant prose.
+                                    text: text.unwrap_or_default(),
                                     steps,
                                 };
                             }
@@ -3887,10 +4359,13 @@ impl AgentRunner {
                                     record_private_message(&mut messages, transcript, tool_msg);
                                     total_tool_calls += 1;
                                     // Count successful side-effect calls for SideEffectAutoPauseGuard.
-                                    // The registry's predicate is the single source of truth
-                                    // so the guard cannot drift from the confirmation list.
+                                    // Explicit MCP read-only hints affect only this budget;
+                                    // confirmation and recovery remain independently gated.
                                     if exec_result.result.success
-                                        && crate::agent::guards::is_side_effect(&tool_name)
+                                        && crate::agent::guards::is_side_effect(
+                                            &self.tool_registry,
+                                            &tool_name,
+                                        )
                                     {
                                         side_effect_count += 1;
                                     }
@@ -4077,7 +4552,10 @@ impl AgentRunner {
                                 total_tool_calls += 1;
                                 // Count successful side-effect calls.
                                 if exec_result.result.success
-                                    && crate::agent::guards::is_side_effect(&tool_name)
+                                    && crate::agent::guards::is_side_effect(
+                                        &self.tool_registry,
+                                        &tool_name,
+                                    )
                                 {
                                     side_effect_count += 1;
                                 }
@@ -4188,7 +4666,7 @@ impl AgentRunner {
                             if requires_user_review {
                                 self.emit_turn_end(&turn_id, total_tool_calls);
                                 return AgentResponse::TextWithToolCalls {
-                                    text: "操作结果尚未确认，目标内容可能已经改变。请先检查实际状态，再决定是否重试。".to_string(),
+                                    text: "操作结果尚未确认，目标内容可能已经改变。请先检查实际状态；你可以让我只读核对，确认前不会自动重试。".to_string(),
                                     steps,
                                 };
                             }
@@ -4269,9 +4747,7 @@ impl AgentRunner {
                                     tool_calls_count: total_tool_calls,
                                 });
                                 return AgentResponse::TextWithToolCalls {
-                                    text: text.unwrap_or_else(|| {
-                                        "该操作需要你的确认后才能继续。".to_string()
-                                    }),
+                                    text: text.unwrap_or_default(),
                                     steps,
                                 };
                             }
@@ -4282,6 +4758,15 @@ impl AgentRunner {
                     }
                 }
                 Err(e) => {
+                    // Provider errors are untrusted diagnostics: they can carry
+                    // request URLs, credentials or private response bodies.
+                    // Transport events and persisted tool summaries are visible
+                    // to the user and future model turns, not a diagnostic sink.
+                    *private_diagnostic = Some(e.diagnostic.clone());
+                    let notice = e
+                        .kind
+                        .visible_notice()
+                        .unwrap_or("模型请求未完成。请检查模型连接，恢复后发送新消息继续。");
                     self.notify_terminal_branch(
                         TerminalBranchKind::LlmRepeatedlyFailed,
                         iteration,
@@ -4290,8 +4775,15 @@ impl AgentRunner {
                         total_tool_calls,
                     );
                     self.emit(AgentEvent::Error {
-                        code: crate::agent::event::ErrorCode::LlmError,
-                        message: e.clone(),
+                        code: match e.kind {
+                            crate::llm::LlmFailureKind::QuotaExceeded => {
+                                crate::agent::event::ErrorCode::LlmQuotaExceeded
+                            }
+                            crate::llm::LlmFailureKind::Unclassified => {
+                                crate::agent::event::ErrorCode::LlmError
+                            }
+                        },
+                        message: notice.to_string(),
                         recoverable: true,
                         turn_id: Some(turn_id.clone()),
                     });
@@ -4300,14 +4792,16 @@ impl AgentRunner {
                         &session_id,
                         total_tool_calls,
                         iteration,
-                        Some(format!("模型请求未完成：{}", e)),
+                        Some(notice.to_string()),
                     );
+                    if steps.is_empty() {
+                        // The coordinator stores raw diagnostics in the existing
+                        // protected attention evidence, never the visible reply.
+                        return AgentResponse::Error(e.diagnostic);
+                    }
                     return Self::terminal_slice_response(
                         steps,
-                        format!(
-                            "模型请求未完成：{}。此前已完成的工具结果已保留；请继续任务以从已知事实恢复。",
-                            e
-                        ),
+                        format!("{notice} 此前已完成的操作结果已保留，不会自动重做。"),
                     );
                 }
             }
@@ -4370,6 +4864,27 @@ impl AgentRunner {
                 }
             })
             .collect()
+    }
+
+    /// Explicit test-only protocol diagnosis. Rebuild current host instructions
+    /// without adding another user turn; return even requested tool calls to
+    /// the caller. Never enter the agent loop or execute a tool.
+    #[cfg(test)]
+    pub(crate) async fn probe_recorded_inference(
+        &self,
+        history: &[LlmMessage],
+    ) -> Result<LlmResponse, crate::llm::LlmFailure> {
+        let mut messages = self.build_initial_messages_with_native_history("", history);
+        messages.pop(); // Remove the builder's empty new-user placeholder.
+        let schemas = self.get_tool_schemas();
+        self.provider
+            .chat_stream_classified(
+                &messages,
+                Some(&schemas),
+                self.thinking_settings.as_ref(),
+                None,
+            )
+            .await
     }
 
     /// Execute a tool by name, within the current work directory sandbox
@@ -4569,6 +5084,7 @@ mod tests {
             let runner = AgentRunner::new(
                 Box::new(MutationThenUnverifiedSummaries {
                     calls: Arc::new(AtomicUsize::new(0)),
+                    write_succeeds: true,
                 }),
                 AgentConfig::default(),
             )
@@ -4603,6 +5119,144 @@ mod tests {
 
     struct MutationThenUnverifiedSummaries {
         calls: Arc<AtomicUsize>,
+        write_succeeds: bool,
+    }
+
+    struct NullThenValidObservation {
+        calls: AtomicUsize,
+        corrected_target: &'static str,
+        changed_filter: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NullThenValidObservation {
+        fn name(&self) -> &str {
+            "null-then-valid-observation"
+        }
+        async fn chat(
+            &self,
+            _messages: &[LlmMessage],
+            _tools: Option<&[ToolSchema]>,
+            _thinking: Option<&ThinkingSettings>,
+        ) -> Result<LlmResponse, String> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if index < 2 {
+                Ok(LlmResponse::ToolCalls {
+                    calls: vec![LlmToolCall {
+                        id: format!("observe-{index}"),
+                        name: "snapshot".into(),
+                        arguments: serde_json::json!({"target": if index == 0 { "a" } else { self.corrected_target }, "depth": if index == 0 { serde_json::Value::Null } else { serde_json::json!(10) }, "filter": if index > 0 && self.changed_filter { serde_json::json!("different") } else { serde_json::Value::Null }}),
+                    }],
+                    text: None,
+                    stop_reason: crate::llm::StopReason::ToolUse,
+                })
+            } else {
+                Ok(LlmResponse::Text {
+                    text: "已核对实际状态。".into(),
+                    stop_reason: crate::llm::StopReason::EndTurn,
+                })
+            }
+        }
+    }
+
+    struct CountedObservation(Arc<AtomicUsize>);
+    impl crate::agent::ToolHandler for CountedObservation {
+        fn name(&self) -> &str {
+            "snapshot"
+        }
+        fn execute(
+            &self,
+            _arguments: &serde_json::Value,
+            _work_dir: &std::path::Path,
+        ) -> crate::agent::ToolResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            crate::agent::ToolResult::success("snapshot", "fresh target state")
+        }
+    }
+
+    #[tokio::test]
+    async fn corrected_null_arguments_do_not_block_completion_or_hide_other_targets() {
+        let mut rejected_receipt = None;
+        for (target, changed_filter, expected_complete) in
+            [("a", false, true), ("b", false, false), ("a", true, false)]
+        {
+            let executed = Arc::new(AtomicUsize::new(0));
+            let root = tempfile::tempdir().unwrap();
+            let mut registry = ToolRegistry::empty();
+            registry.register(crate::agent::Tool::new("snapshot", "Observe the selected target", serde_json::json!({"type":"object","properties":{"target":{"type":"string"},"depth":{"type":"number"},"filter":{"type":["string","null"]}},"required":["target"],"additionalProperties":false})), Arc::new(CountedObservation(executed.clone())));
+            let runner = AgentRunner::with_registry(
+                Box::new(NullThenValidObservation {
+                    calls: AtomicUsize::new(0),
+                    corrected_target: target,
+                    changed_filter,
+                }),
+                AgentConfig {
+                    work_dir: Some(root.path().to_path_buf()),
+                    ..Default::default()
+                },
+                registry,
+            );
+            let response = runner.run("核对目标 a 的实际状态", &[]).await;
+            assert_eq!(
+                executed.load(Ordering::SeqCst),
+                1,
+                "invalid arguments must never be dispatched"
+            );
+            if let AgentResponse::TextWithToolCalls { text, steps } = &response {
+                assert!(!steps[0].success);
+                assert!(steps[1].success);
+                assert_eq!(
+                    !task_facts_from_steps("", steps).has_unhandled_failures(),
+                    expected_complete
+                );
+                if expected_complete {
+                    assert_eq!(text, "已核对实际状态。");
+                    rejected_receipt = Some(steps[0].output.clone());
+                }
+            } else {
+                panic!("expected tool receipts: {response:?}");
+            }
+            assert_eq!(
+                matches!(
+                    runner.slice_outcome("核对目标 a 的实际状态", response),
+                    AgentSliceOutcome::Completed(_)
+                ),
+                expected_complete
+            );
+        }
+        let original = serde_json::json!({"target":"a","depth":null,"filter":null});
+        let corrected = serde_json::json!({"target":"a","depth":10,"filter":null});
+        let rejection = rejected_receipt.expect("real pre-dispatch rejection receipt");
+        for (call_id, output, args) in [
+            ("other", rejection.clone(), corrected.clone()),
+            (
+                "observe-0",
+                crate::agent::ToolResult::error("snapshot", &rejection).content,
+                corrected.clone(),
+            ),
+            (
+                "observe-0",
+                "Error: {\"code\":\"RESULT_UNKNOWN\"}".into(),
+                corrected.clone(),
+            ),
+            (
+                "observe-0",
+                rejection.clone(),
+                serde_json::json!({"target":"a","depth":10,"new_target":"b"}),
+            ),
+        ] {
+            assert!(!crate::agent::registry::repairs_argument_rejection(
+                call_id, "snapshot", &original, &output, &args
+            ));
+        }
+        assert!(!crate::agent::registry::operation_repair_matches(
+            "snapshot",
+            "unknown",
+            &corrected,
+            "Error: {\"code\":\"RESULT_UNKNOWN\"}",
+            "snapshot",
+            &corrected,
+        ));
     }
 
     #[async_trait::async_trait]
@@ -4613,7 +5267,7 @@ mod tests {
 
         async fn chat(
             &self,
-            _messages: &[LlmMessage],
+            messages: &[LlmMessage],
             _tools: Option<&[ToolSchema]>,
             _thinking: Option<&ThinkingSettings>,
         ) -> Result<LlmResponse, String> {
@@ -4631,55 +5285,182 @@ mod tests {
                     text: "第一次收尾".to_string(),
                     stop_reason: crate::llm::StopReason::EndTurn,
                 }),
-                _ => Ok(LlmResponse::Text {
-                    text: "已完成修改；验证仍待后续执行。".to_string(),
-                    stop_reason: crate::llm::StopReason::EndTurn,
-                }),
+                _ => {
+                    if !self.write_succeeds {
+                        let hint = messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.content.starts_with("System completion gate:"))
+                            .expect("bounded completion feedback");
+                        assert!(!hint
+                            .content
+                            .contains("this coding task changed project files"));
+                        assert!(!hint
+                            .content
+                            .contains("Run the smallest appropriate project verification command"));
+                    }
+                    Ok(LlmResponse::Text {
+                        text: if self.write_succeeds {
+                            "已完成修改；验证仍待后续执行。"
+                        } else {
+                            "清单未能保存；请核对目标目录权限。"
+                        }
+                        .to_string(),
+                        stop_reason: crate::llm::StopReason::EndTurn,
+                    })
+                }
             }
         }
     }
 
-    struct SuccessfulWriteHandler;
+    struct WriteOutcomeHandler(bool);
 
-    impl crate::agent::ToolHandler for SuccessfulWriteHandler {
+    struct CompletionEvents(crate::agent::event::EventChannel);
+
+    impl crate::agent::event::AgentEventEmitter for CompletionEvents {
+        fn emit(&self, _: &str, event: AgentEvent) {
+            self.0.emit(event);
+        }
+    }
+
+    impl crate::agent::ToolHandler for WriteOutcomeHandler {
         fn name(&self) -> &str {
             "write_file"
         }
 
         fn execute(&self, _: &serde_json::Value, _: &std::path::Path) -> crate::agent::ToolResult {
-            crate::agent::ToolResult::success("write_file", "written")
+            if self.0 {
+                crate::agent::ToolResult::success("write_file", "written")
+            } else {
+                crate::agent::ToolResult::error("write_file", "Target is not writable")
+            }
         }
     }
 
     #[tokio::test]
     async fn completion_gate_preserves_the_model_summary_when_verification_is_still_needed() {
-        let mut runner = AgentRunner::new(
-            Box::new(MutationThenUnverifiedSummaries {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            AgentConfig::default(),
-        )
-        .with_execution_permission("full_access".to_string());
-        runner.tool_registry_mut().register(
-            crate::agent::Tool::new(
-                "write_file",
-                "Write a file",
-                serde_json::json!({"type":"object"}),
+        for (write_succeeds, goal, ordinary_file_task) in [
+            (true, "修改这个项目，然后运行测试", false),
+            (false, "保存我的购物清单", false),
+            (
+                true,
+                "读取当前项目的 expenses.csv，汇总到 summary.txt 并回读核对",
+                true,
             ),
-            Arc::new(SuccessfulWriteHandler),
-        );
+            (
+                true,
+                "Summarize the project expenses into summary.txt and read it back",
+                true,
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let events = Arc::new(CompletionEvents(crate::agent::event::EventChannel::new()));
+            let mut runner = AgentRunner::new(
+                Box::new(MutationThenUnverifiedSummaries {
+                    calls: calls.clone(),
+                    write_succeeds,
+                }),
+                AgentConfig::default(),
+            )
+            .with_execution_permission("full_access".to_string())
+            .with_session_id("completion-test".to_string())
+            .with_emitter(events.clone());
+            runner.tool_registry_mut().register(
+                crate::agent::Tool::new(
+                    "write_file",
+                    "Write a file",
+                    serde_json::json!({"type":"object"}),
+                ),
+                Arc::new(WriteOutcomeHandler(write_succeeds)),
+            );
 
-        let response = runner.run("修改这个项目，然后运行测试", &[]).await;
+            let response = runner.run(goal, &[]).await;
 
-        match response {
-            AgentResponse::TextWithToolCalls { text, steps } => {
-                assert!(text.starts_with("已完成修改；验证仍待后续执行。"));
-                assert!(text.contains("验证状态：尚无成功验证证据"));
-                assert!(steps.iter().any(|step| {
-                    step.tool_name == "agent_loop" && step.output.contains("尚无成功的验证证据")
-                }));
+            if ordinary_file_task {
+                let AgentResponse::TextWithToolCalls { text, steps } = response else {
+                    panic!("ordinary file task must retain its tool result");
+                };
+                assert_eq!(
+                    text, "第一次收尾",
+                    "must not inject a coding-verification correction"
+                );
+                assert_eq!(steps.len(), 1);
+                assert_eq!(steps[0].tool_name, "write_file");
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert!(events
+                    .0
+                    .get_events()
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::TurnEnd { success: true, .. })));
+                continue;
             }
-            other => panic!("expected resumable response, got {other:?}"),
+
+            match &response {
+                AgentResponse::TextWithToolCalls { text, steps } => {
+                    if write_succeeds {
+                        assert!(text.starts_with("已完成修改；验证仍待后续执行。"));
+                        assert!(text.contains("验证状态：尚无成功验证证据"));
+                        assert!(steps.iter().any(|step| {
+                            step.tool_name == "agent_loop"
+                                && step.output.contains("尚无成功的验证证据")
+                        }));
+                    } else {
+                        assert!(text.starts_with("清单未能保存；请核对目标目录权限。"));
+                        assert!(text.contains("仍有操作未完成"));
+                        for forbidden in ["代码修改", "验证命令", "成功验证证据"] {
+                            assert!(!text.contains(forbidden));
+                            assert!(steps.iter().all(|step| !step.output.contains(forbidden)));
+                        }
+                    }
+                    assert_eq!(
+                        steps
+                            .iter()
+                            .filter(|step| step.tool_name == "write_file")
+                            .count(),
+                        1
+                    );
+                }
+                other => panic!("expected resumable response, got {other:?}"),
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                3,
+                "only one completion correction"
+            );
+            let emitted = events.0.get_events();
+            assert!(emitted
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnd { success: false, .. })));
+            assert!(!emitted
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnd { success: true, .. })));
+            let summary = emitted
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    AgentEvent::AgentEnd { summary, .. } => summary.as_deref(),
+                    _ => None,
+                })
+                .expect("completion attention summary");
+            if !write_succeeds {
+                assert!(summary.contains("仍有操作未完成"));
+                assert!(!summary.contains("代码修改"));
+            }
+            let final_text = emitted
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    AgentEvent::MessageEnd { full_text, .. } => Some(full_text.as_str()),
+                    _ => None,
+                })
+                .expect("final visible text");
+            if let AgentResponse::TextWithToolCalls { text, .. } = &response {
+                assert_eq!(final_text, text);
+            }
+            assert!(matches!(
+                runner.slice_outcome(goal, response),
+                AgentSliceOutcome::NeedsAttention(_)
+            ));
         }
     }
 
@@ -4774,18 +5555,85 @@ mod tests {
             verification: None,
         };
 
-        assert!(coding_task_has_unverified_changes(
+        assert!(task_needs_completion_attention(
             "修改这个项目并运行测试",
             &[write.clone()]
         ));
-        assert!(!coding_task_has_unverified_changes(
+        assert!(!task_needs_completion_attention(
             "修改这个项目并运行测试",
             &[write.clone(), verify]
         ));
-        assert!(!coding_task_has_unverified_changes(
+        assert!(!task_needs_completion_attention(
             "写一条普通笔记",
-            &[write]
+            &[write.clone()]
         ));
+        let report_write = AgentStep {
+            arguments: serde_json::json!({"path":"receipt.json","content":"{\"draft_id\":1}"}),
+            ..write
+        };
+        let readback = AgentStep {
+            call_id: "read-1".into(),
+            tool_name: "read_file".into(),
+            arguments: serde_json::json!({"path":"receipt.json"}),
+            ..report_write.clone()
+        };
+        assert!(
+            !task_needs_completion_attention(
+                "保存 receipt.json，读回确认；禁止运行代码、脚本、终端。",
+                &[report_write.clone(), readback]
+            ),
+            "ordinary data delivery must not require a coding build"
+        );
+        for goal in [
+            "保存 receipt.json，读回确认。",
+            "在当前项目保存 receipt.json，读取并核对数据。",
+            "保存 receipt.json，禁止运行任何代码；不要编译。",
+            "Save receipt.json; do not run code, scripts or terminals.",
+            "Save the latest postal codes in receipt.json; no code execution.",
+            "读取 package.json，将版本信息保存到 receipt.json。",
+            "保存 receipt.json；不要重做旧任务、下载、运行代码、命令或自动化。",
+            "保存 receipt.json；禁止下载、编译、运行任何代码。",
+        ] {
+            assert!(
+                !task_needs_completion_attention(goal, &[report_write.clone()]),
+                "{goal}"
+            );
+        }
+        assert!(task_needs_completion_attention(
+            "修改代码，但不要运行测试",
+            &[report_write.clone()]
+        ));
+        for goal in [
+            "不要下载、运行代码，但请修改代码并运行测试。",
+            "禁止下载、编译；不过请更新测试数据并运行测试。",
+        ] {
+            assert!(
+                task_needs_completion_attention(goal, &[report_write.clone()]),
+                "{goal}"
+            );
+        }
+        for path in [
+            "src/main.rs",
+            "src/app.ts",
+            "scripts/job.py",
+            "package.json",
+            "tsconfig.json",
+            "Cargo.toml",
+            ".github/workflows/check.yml",
+            "unknown.custom",
+        ] {
+            let code_write = AgentStep {
+                arguments: serde_json::json!({"path":path}),
+                ..report_write.clone()
+            };
+            assert!(
+                task_needs_completion_attention(
+                    "请修改文件，不运行代码、测试或编译。",
+                    &[code_write]
+                ),
+                "execution bans must not waive verification for {path}"
+            );
+        }
     }
 
     #[test]

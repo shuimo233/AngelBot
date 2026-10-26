@@ -255,11 +255,11 @@ where
             {
                 return self.unknown(&receipt, &request, "cherry_pick_abort_unknown");
             }
-            return self.refuse(&request, "cherry_pick_conflict");
+            return self.record_refusal(&receipt, &request, "cherry_pick_conflict");
         }
 
-        let applied_head = self.git_output(&canonical, vec!["rev-parse".into(), "HEAD".into()])?;
-        let Some(applied_head) = text_line(&applied_head) else {
+        let applied_head = self.git_output(&canonical, vec!["rev-parse".into(), "HEAD".into()]);
+        let Some(applied_head) = applied_head.ok().and_then(|output| text_line(&output)) else {
             return self.unknown(&receipt, &request, "post_apply_head_unavailable");
         };
         // `cherry-pick` deliberately creates a new commit, so its SHA must
@@ -410,6 +410,15 @@ where
                 .as_deref()
                 .ok_or(MaterializationError::ArtifactNotReady)?,
         )?;
+        self.record_refusal(&receipt, request, reason)
+    }
+
+    fn record_refusal(
+        &self,
+        receipt: &MaterializationReceipt,
+        request: &MaterializeRequest,
+        reason: &str,
+    ) -> Result<MaterializationReceipt, MaterializationError> {
         let _ = self.update_receipt(
             &receipt.id,
             MaterializationStatus::Refused,
@@ -431,6 +440,7 @@ where
         Err(match reason {
             "canonical_workspace_dirty" => MaterializationError::WorkspaceDirty,
             "base_commit_drift" => MaterializationError::WorkspaceDrift,
+            "cherry_pick_conflict" => MaterializationError::GitFailed,
             _ => MaterializationError::BindingInvalid,
         })
     }

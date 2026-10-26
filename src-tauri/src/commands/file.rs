@@ -1,11 +1,12 @@
 //! File service commands with sandboxing.
 //!
-//! Work directory resolution order:
-//!   1. Session-level work_dir (from sessions.work_dir column)
-//!   2. Global setting (settings.work_directory)
-//!   3. Fallback to user's Documents folder
+//! Workspace sessions use only their project root or host-owned Daily results.
+//! Legacy sessions retain their work_dir, global setting and Documents fallback.
+//! Missing or unknown workspace sessions fail closed instead of inheriting it.
 
+use crate::document_text::{DocumentFormat, MAX_DOCUMENT_BYTES};
 use rusqlite::OptionalExtension;
+use std::io::Read;
 use std::path::Path;
 use tauri::command;
 
@@ -16,6 +17,8 @@ pub struct WorkDirEntry {
     pub name: String,
     pub is_directory: bool,
     pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporary: Option<bool>,
 }
 
 /// File-system scope associated with a session. Supplemental directories are
@@ -226,6 +229,8 @@ pub enum FileReadError {
     MissingWorkDir,
     #[error("path escapes the work directory")]
     EscapesWorkDir,
+    #[error("unsupported Windows file name or alternate data stream")]
+    InvalidPath,
     #[error("read failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -236,8 +241,51 @@ pub fn resolve_and_validate(
     target: &Path,
     require_exists: bool,
 ) -> Result<std::path::PathBuf, FileReadError> {
-    // Ensure work_dir exists and get its canonical form
-    std::fs::create_dir_all(work_dir).map_err(FileReadError::Io)?;
+    resolve_with_root_policy(work_dir, target, require_exists, true)
+}
+
+/// Read-only observations must not bootstrap or resurrect a removed root.
+pub(crate) fn resolve_in_existing_root(
+    work_dir: &Path,
+    target: &Path,
+    require_exists: bool,
+) -> Result<std::path::PathBuf, FileReadError> {
+    resolve_with_root_policy(work_dir, target, require_exists, false)
+}
+
+fn resolve_with_root_policy(
+    work_dir: &Path,
+    target: &Path,
+    require_exists: bool,
+    ensure_root: bool,
+) -> Result<std::path::PathBuf, FileReadError> {
+    for component in target.components() {
+        if let std::path::Component::Normal(name) = component {
+            let name = name.to_string_lossy();
+            let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+            if name
+                .chars()
+                .any(|c| c.is_control() || ":<>\"|?*".contains(c))
+                || name.ends_with([' ', '.'])
+                || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                || ["COM", "LPT"].iter().any(|prefix| {
+                    stem.strip_prefix(prefix).is_some_and(|n| {
+                        matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                    })
+                })
+            {
+                return Err(FileReadError::InvalidPath);
+            }
+        }
+        #[cfg(windows)]
+        if matches!(component, std::path::Component::Prefix(prefix) if matches!(prefix.kind(), std::path::Prefix::DeviceNS(_)))
+        {
+            return Err(FileReadError::InvalidPath);
+        }
+    }
+    if ensure_root {
+        std::fs::create_dir_all(work_dir).map_err(FileReadError::Io)?;
+    }
     let work_canonical = std::fs::canonicalize(work_dir).map_err(FileReadError::Io)?;
 
     // Build the target path
@@ -265,7 +313,14 @@ pub fn resolve_and_validate(
         return Ok(target_canonical);
     }
 
-    if joined.try_exists().map_err(FileReadError::Io)? {
+    // An existing entry may be a dangling link. Never treat it as a fresh
+    // writable path merely because following it reports NotFound.
+    let entry_exists = match std::fs::symlink_metadata(&joined) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(FileReadError::Io(error)),
+    };
+    if entry_exists {
         let target_canonical = std::fs::canonicalize(&joined).map_err(FileReadError::Io)?;
         if !target_canonical.starts_with(&work_canonical) {
             return Err(FileReadError::EscapesWorkDir);
@@ -294,15 +349,15 @@ pub fn resolve_and_validate(
 
 /// Resolve the effective work directory.
 /// Workspace-owned sessions resolve only their workspace root. Legacy sessions
-/// retain the old fallback while data is being migrated; the Personal workspace
-/// has no filesystem capability at all.
+/// retain the old fallback while data is being migrated. Personal result files
+/// are not a project root and never grant delegated workers project authority.
 pub(crate) fn resolve_delegation_workspace_root(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> Result<Option<std::path::PathBuf>, String> {
     let workspace: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT p.kind, p.path, s.work_dir FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
+            "SELECT p.kind, CASE WHEN p.directory_confirmed=1 THEN p.path END, s.work_dir FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
             rusqlite::params![session_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -312,9 +367,9 @@ pub(crate) fn resolve_delegation_workspace_root(
     match workspace {
         Some((Some(kind), _, _)) if kind == "personal" => Ok(None),
         Some((Some(kind), root, _)) if kind == "project" => {
-            let root = root
-                .filter(|path| !path.is_empty())
-                .ok_or_else(|| "项目工作区缺少根目录。".to_owned())?;
+            let root = root.filter(|path| !path.is_empty()).ok_or_else(|| {
+                "项目目录尚未确认，请在设置的数据备份页批量确认恢复目录。".to_owned()
+            })?;
             let root = std::path::PathBuf::from(root);
             root.exists()
                 .then_some(Some(root))
@@ -340,26 +395,63 @@ pub fn resolve_work_dir(
     session_id: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    resolve_work_dir_from_connection(&conn, session_id)
+}
 
+/// The database location, not model input or a configurable work_dir, owns this
+/// durable directory. In-memory tests must supply a real temporary database to
+/// exercise files; never fall back to a user's application data in tests.
+pub(crate) fn personal_files_root(
+    conn: &rusqlite::Connection,
+) -> Result<std::path::PathBuf, String> {
+    let database = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "日常结果区需要持久化数据库。".to_owned())?;
+    let parent = std::fs::canonicalize(
+        Path::new(database)
+            .parent()
+            .ok_or_else(|| "日常结果区位置不可用。".to_owned())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let root = parent.join("results");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let canonical = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
+    if canonical != root {
+        return Err("日常结果区不能重定向到其它目录。".to_owned());
+    }
+    Ok(canonical)
+}
+
+fn resolve_work_dir_from_connection(
+    conn: &rusqlite::Connection,
+    session_id: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
     // 1. Workspace-owned sessions have a non-negotiable filesystem boundary.
     if let Some(sid) = session_id {
         let workspace: Option<(Option<String>, Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT p.kind, p.path, s.work_dir FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
+                "SELECT p.kind, CASE WHEN p.directory_confirmed=1 THEN p.path END, s.work_dir FROM sessions s LEFT JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
                 rusqlite::params![sid],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .ok();
+            .optional().map_err(|error| error.to_string())?;
+
+        if workspace.is_none() {
+            return Err("会话不存在，无法建立文件范围。".to_owned());
+        }
 
         if let Some((Some(kind), root, _)) = workspace.as_ref() {
             if kind == "personal" {
-                return Err("AngelBot 日常工作区不具有项目文件访问权限。".to_owned());
+                return personal_files_root(conn);
             }
             if kind == "project" {
                 let root = root
                     .as_ref()
                     .filter(|path| !path.is_empty())
-                    .ok_or_else(|| "项目工作区缺少根目录。".to_owned())?;
+                    .ok_or_else(|| {
+                        "项目目录尚未确认，请在设置的数据备份页批量确认恢复目录。".to_owned()
+                    })?;
                 let root = std::path::PathBuf::from(root);
                 return root
                     .exists()
@@ -416,15 +508,55 @@ pub fn resolve_work_dir(
 ///
 /// Absolute paths are accepted only when they resolve inside the workspace.
 /// This keeps direct UI, dev HTTP, and Main-Agent reads on the same canonical
-/// traversal and symlink-safe boundary.
+/// traversal and symlink-safe boundary. Office files return an explicitly
+/// labelled bounded text snapshot, never the binary package or rendered view.
 pub fn read_file_core(work_dir: &Path, path: &str) -> Result<String, String> {
+    read_file_snapshot_core(work_dir, path).map(|snapshot| snapshot.content)
+}
+
+/// Agent-facing provenance from the same authorized read as the text. The
+/// document itself may contain historical paths; they are not this binding.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileTextSnapshot {
+    resolved_path: String,
+    content: String,
+}
+
+pub(crate) fn read_file_snapshot_core(
+    work_dir: &Path,
+    path: &str,
+) -> Result<FileTextSnapshot, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("read_file path cannot be empty".to_string());
     }
     let resolved = resolve_and_validate(work_dir, Path::new(trimmed), true)
         .map_err(|error| error.to_string())?;
-    std::fs::read_to_string(resolved).map_err(|error| error.to_string())
+    let content = if let Some(format) = DocumentFormat::from_path(Path::new(trimmed))
+        .or_else(|| DocumentFormat::from_path(&resolved))
+    {
+        let mut bytes = Vec::new();
+        std::fs::File::open(&resolved)
+            .map_err(|error| error.to_string())?
+            .take((MAX_DOCUMENT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        format.extract(&bytes)?
+    } else {
+        std::fs::read_to_string(&resolved).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                "该文件不是 UTF-8 文本，暂不支持文字预览。原文件保留，可另存后用对应应用打开。"
+                    .to_owned()
+            } else {
+                error.to_string()
+            }
+        })?
+    };
+    Ok(FileTextSnapshot {
+        resolved_path: display_work_dir(&resolved),
+        content,
+    })
 }
 
 /// Lists one directory within the session work directory. Entries are relative
@@ -453,6 +585,7 @@ pub fn list_work_dir_core(work_dir: &Path, path: &str) -> Result<Vec<WorkDirEntr
                 name: entry.file_name().to_string_lossy().into_owned(),
                 is_directory: metadata.is_dir(),
                 size: (!metadata.is_dir()).then_some(metadata.len()),
+                temporary: None,
             })
         })
         .collect::<Vec<_>>();
@@ -500,6 +633,11 @@ pub fn write_file_core(work_dir: &Path, path: &str, content: &str) -> Result<(),
     }
     let resolved =
         resolve_and_validate(work_dir, Path::new(trimmed), false).map_err(|e| e.to_string())?;
+    if DocumentFormat::from_path(Path::new(trimmed)).is_some()
+        || DocumentFormat::from_path(&resolved).is_some()
+    {
+        return Err("DOCX/XLSX 只能读取文字快照，不能用文本写入覆盖 Office 文件；请将结果保存为 Markdown、TXT 或 CSV。".into());
+    }
     std::fs::write(&resolved, content).map_err(|e| e.to_string())
 }
 
@@ -573,7 +711,19 @@ pub fn organize_workspace_item_core(
             )
         }
         "copy" => {
-            std::fs::copy(&source_path, &destination_path).map_err(|e| e.to_string())?;
+            let parent = destination_path.parent().ok_or("复制目标位置无效")?;
+            let mut temporary =
+                tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+            let mut source =
+                std::fs::File::open(&source_path).map_err(|error| error.to_string())?;
+            std::io::copy(&mut source, &mut temporary).map_err(|error| error.to_string())?;
+            temporary
+                .as_file()
+                .sync_all()
+                .map_err(|error| error.to_string())?;
+            temporary
+                .persist_noclobber(&destination_path)
+                .map_err(|error| error.to_string())?;
             if !source_path.is_file() || !destination_path.is_file() {
                 return Err("post-call verification failed after copying the file".to_string());
             }
@@ -629,8 +779,26 @@ pub fn list_work_dir(
     session_id: String,
     path: String,
 ) -> Result<Vec<WorkDirEntry>, String> {
-    let work_dir = resolve_work_dir(&state, Some(&session_id))?;
-    list_work_dir_core(&work_dir, &path)
+    list_work_dir_impl(&state, &session_id, &path)
+}
+
+pub(crate) fn list_work_dir_impl(
+    state: &crate::AppState,
+    session_id: &str,
+    path: &str,
+) -> Result<Vec<WorkDirEntry>, String> {
+    let work_dir = resolve_work_dir(state, Some(session_id))?;
+    let mut entries = list_work_dir_core(&work_dir, path)?;
+    let conn = state.db.lock().map_err(|error| error.to_string())?;
+    let personal: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.id=?1 AND p.kind='personal')", [session_id], |row| row.get(0)).map_err(|error| error.to_string())?;
+    if personal {
+        if let Some(owned) = crate::browser_storage::owned_namespace(&conn)? {
+            for entry in &mut entries {
+                entry.temporary = Some(work_dir.join(&entry.path).starts_with(&owned));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -639,15 +807,45 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn personal_workspace_has_no_delegation_root() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+    fn personal_files_are_durable_without_granting_project_or_delegation_scope() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("data.db");
+        let conn = rusqlite::Connection::open(&database).unwrap();
         crate::db::migrate(&conn).unwrap();
-
-        let root = resolve_delegation_workspace_root(&conn, "personal-main").unwrap();
-
-        assert!(
-            root.is_none(),
-            "personal chat must remain available without granting project file access"
+        let root = resolve_work_dir_from_connection(&conn, Some("personal-main")).unwrap();
+        assert_eq!(
+            root,
+            directory.path().canonicalize().unwrap().join("results")
+        );
+        write_file_core(&root, "清单.csv", "事项,状态\n采购,待办\n").unwrap();
+        assert_eq!(list_work_dir_core(&root, "").unwrap()[0].name, "清单.csv");
+        assert!(resolve_delegation_workspace_root(&conn, "personal-main")
+            .unwrap()
+            .is_none());
+        assert!(read_file_core(&root, "../data.db").is_err());
+        assert!(write_file_core(&root, "../outside.txt", "no").is_err());
+        for path in [
+            "NUL",
+            "CON.txt",
+            "record.csv:stream",
+            "alias.txt.",
+            "bad\n.txt",
+        ] {
+            assert!(matches!(
+                resolve_and_validate(&root, Path::new(path), false),
+                Err(FileReadError::InvalidPath)
+            ));
+        }
+        assert!(resolve_work_dir_from_connection(&conn, Some("missing")).is_err());
+        drop(conn);
+        let reopened = rusqlite::Connection::open(database).unwrap();
+        assert_eq!(
+            read_file_core(
+                &resolve_work_dir_from_connection(&reopened, Some("personal-main")).unwrap(),
+                "清单.csv"
+            )
+            .unwrap(),
+            "事项,状态\n采购,待办\n"
         );
     }
 
@@ -823,6 +1021,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, unix))]
+    fn rejects_dangling_directory_link_as_new_write_target() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let link = root.join("redirect");
+        crate::tests::create_test_directory_link(&link, &outside);
+        std::fs::remove_dir(&outside).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(!link.try_exists().unwrap());
+        let result = resolve_and_validate(&root, Path::new("redirect"), false);
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        assert!(
+            result.is_err(),
+            "an existing dangling link is not a fresh writable path"
+        );
+        assert!(!outside.exists());
+    }
+
+    #[test]
     fn rejects_absolute_path_outside_work_dir() {
         let dir = tempdir().unwrap();
         let outside = dir.path().parent().unwrap().join("secret.txt");
@@ -857,6 +1080,16 @@ mod tests {
         std::fs::write(dir.path().join("notes.txt"), "ok").unwrap();
         let content = read_file_core(dir.path(), "notes.txt").unwrap();
         assert_eq!(content, "ok");
+        let binary = [0, 255, 1, 128];
+        std::fs::write(dir.path().join("download.bin"), binary).unwrap();
+        assert_eq!(
+            read_file_core(dir.path(), "download.bin").unwrap_err(),
+            "该文件不是 UTF-8 文本，暂不支持文字预览。原文件保留，可另存后用对应应用打开。"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("download.bin")).unwrap(),
+            binary
+        );
     }
 
     #[test]
@@ -888,6 +1121,30 @@ mod tests {
         let written = work_dir.path().join("inside.txt");
         assert!(written.exists());
         assert_eq!(std::fs::read_to_string(&written).unwrap(), "ok");
+    }
+
+    #[test]
+    fn office_reads_are_bounded_and_text_writes_cannot_destroy_packages() {
+        let dir = tempdir().unwrap();
+        for name in ["notes.DOCX", "expenses.xlsx"] {
+            let path = dir.path().join(name);
+            let bytes = b"original Office package";
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_file_core(dir.path(), name).is_err());
+            assert!(write_file_core(dir.path(), name, "replacement")
+                .unwrap_err()
+                .contains("不能用文本写入"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len((MAX_DOCUMENT_BYTES + 1) as u64)
+                .unwrap();
+            assert!(read_file_core(dir.path(), name)
+                .unwrap_err()
+                .contains("4 MiB"));
+        }
+        assert!(write_file_core(dir.path(), "new.docx", "not an Office package").is_err());
+        assert!(!dir.path().join("new.docx").exists());
     }
 
     #[test]
