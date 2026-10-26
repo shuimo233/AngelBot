@@ -2124,6 +2124,11 @@ pub(crate) fn capture_target_probe(
 ) -> Result<crate::window_capture::CaptureTarget, DesktopAdapterError> {
     use std::process::Stdio;
     let script = format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{CAPTURE_WINDOW_SCRIPT}\n{CAPTURE_TARGET_SCRIPT}");
+    #[cfg(feature = "desktop-e2e")]
+    let script = script
+        .replace("$selected = Select-CaptureWindow", "[Console]::Error.WriteLine('[DEBUG-capture] enumeration-done')\n$selected = Select-CaptureWindow")
+        .replace("$pending.Push(@{ element = $root; depth = 0 })", "[Console]::Error.WriteLine('[DEBUG-capture] scan-start')\n$pending.Push(@{ element = $root; depth = 0 })")
+        .replace("$stateAfter = Get-UiaSafetyState $root", "[Console]::Error.WriteLine('[DEBUG-capture] scan-done')\n$stateAfter = Get-UiaSafetyState $root");
     let mut command = desktop_child_command(WindowsDesktopAdapter::system_powershell()?);
     command
         .args([
@@ -4394,6 +4399,8 @@ impl DesktopAdapter for WindowsDesktopAdapter {
         }
         let executable = Self::canonical_executable(executable_path)?;
         let comparison = Self::process_comparison_path(&executable);
+        #[cfg(feature = "desktop-e2e")]
+        eprintln!("[DEBUG-capture] initial-probe-start");
         let target = capture_target_probe(
             &comparison,
             is_cancelled,
@@ -4403,6 +4410,11 @@ impl DesktopAdapter for WindowsDesktopAdapter {
         // read-only observation. A missing mapping returns imageRef=null and
         // cannot enter the independent visual-click confirmation path.
         let bounds = image_click::window_bounds(&target).ok();
+        #[cfg(feature = "desktop-e2e")]
+        eprintln!(
+            "[DEBUG-capture] helper-start elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         let mut image = crate::window_capture::capture_with_control(
             &target,
             is_cancelled,

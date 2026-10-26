@@ -237,6 +237,8 @@ impl GraphicsCaptureApiHandler for OneFrame {
         frame: &mut Frame,
         control: InternalCaptureControl,
     ) -> Result<(), String> {
+        #[cfg(feature = "desktop-e2e")]
+        eprintln!("[DEBUG-capture] frame-arrived");
         let mut result = self
             .0
             .result
@@ -289,6 +291,8 @@ impl GraphicsCaptureApiHandler for OneFrame {
 
 pub(super) fn capture(target: CaptureTarget) -> Result<Vec<u8>, DesktopAdapterError> {
     target.validate()?;
+    #[cfg(feature = "desktop-e2e")]
+    eprintln!("[DEBUG-capture] pre-guard");
     complete_guard(&target)?;
     let _runtime = WinRt::new()?;
     if !GraphicsCaptureApi::is_supported().map_err(|_| error("UNSUPPORTED_PLATFORM"))? {
@@ -348,13 +352,19 @@ pub(super) fn capture(target: CaptureTarget) -> Result<Vec<u8>, DesktopAdapterEr
     );
     // Library init/message loop/join may block. The parent deadline kills/reaps
     // this helper and its UIA probe descendants; dropping a future is not cleanup.
+    #[cfg(feature = "desktop-e2e")]
+    eprintln!("[DEBUG-capture] wgc-start");
     OneFrame::start(settings).map_err(|_| error("CAPTURE_FAILED"))?;
+    #[cfg(feature = "desktop-e2e")]
+    eprintln!("[DEBUG-capture] wgc-done");
     let pixels = result
         .lock()
         .map_err(|_| error("ADAPTER_FAILED"))?
         .take()
         .ok_or_else(|| error("CAPTURE_FAILED"))??;
     complete_guard(&target)?;
+    #[cfg(feature = "desktop-e2e")]
+    eprintln!("[DEBUG-capture] post-guard-done");
     let png = encode_rgba(pixels.width, pixels.height, pixels.rgba)?;
     scalar_guard(&target)?;
     Ok(png)

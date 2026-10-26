@@ -184,6 +184,14 @@ pub(crate) fn capture_with_control(
 
 #[cfg(windows)]
 pub(crate) fn helper_failure(stderr: &[u8]) -> DesktopAdapterError {
+    #[cfg(feature = "desktop-e2e")]
+    let diagnostic_filtered = String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| !capture_debug_phase(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    #[cfg(feature = "desktop-e2e")]
+    let stderr = diagnostic_filtered.as_bytes();
     match std::str::from_utf8(stderr).unwrap_or("").trim() {
         "SCAN_LIMIT" => error("SCAN_LIMIT"),
         "SCAN_TIMEOUT" => error("SCAN_TIMEOUT"),
@@ -200,6 +208,21 @@ pub(crate) fn helper_failure(stderr: &[u8]) -> DesktopAdapterError {
         "UNSUPPORTED_PLATFORM" => error("UNSUPPORTED_PLATFORM"),
         _ => error("ADAPTER_FAILED"),
     }
+}
+
+#[cfg(all(windows, feature = "desktop-e2e"))]
+fn capture_debug_phase(line: &str) -> bool {
+    matches!(
+        line,
+        "[DEBUG-capture] enumeration-done"
+            | "[DEBUG-capture] scan-start"
+            | "[DEBUG-capture] scan-done"
+            | "[DEBUG-capture] pre-guard"
+            | "[DEBUG-capture] wgc-start"
+            | "[DEBUG-capture] frame-arrived"
+            | "[DEBUG-capture] wgc-done"
+            | "[DEBUG-capture] post-guard-done"
+    )
 }
 
 #[cfg(windows)]
@@ -303,6 +326,16 @@ pub(crate) fn run_bounded_child(
     let stdout = out_thread.join().map_err(|_| error("ADAPTER_FAILED"))?;
     let stderr = err_thread.join().map_err(|_| error("ADAPTER_FAILED"))?;
     let written = input_thread.map(|thread| thread.join());
+    #[cfg(feature = "desktop-e2e")]
+    if !outcome.as_ref().is_ok_and(|status| status.success()) {
+        if let Ok(bytes) = &stderr {
+            for line in String::from_utf8_lossy(bytes).lines() {
+                if capture_debug_phase(line) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+    }
     cleanup.map_err(|_| error("ADAPTER_FAILED"))?;
     let status = outcome?;
     if is_cancelled() {
@@ -475,6 +508,11 @@ mod tests {
                 "TARGET_AMBIGUOUS",
             ] {
                 assert_eq!(helper_failure(code.as_bytes()).code, code);
+                #[cfg(feature = "desktop-e2e")]
+                assert_eq!(
+                    helper_failure(format!("[DEBUG-capture] pre-guard\n{code}\n").as_bytes()).code,
+                    code
+                );
             }
             for invalid in [
                 "",
@@ -482,6 +520,7 @@ mod tests {
                 "TARGET_CHANGED\nPRIVATE_CANARY",
                 "TARGET_MINIMIZED\nPRIVATE_CANARY",
                 "FRAME_CHANGED\nPRIVATE_CANARY",
+                "[DEBUG-capture] private-unrecognized\nTARGET_CHANGED",
             ] {
                 let failure = helper_failure(invalid.as_bytes());
                 assert_eq!(failure.code, "ADAPTER_FAILED");
