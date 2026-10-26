@@ -349,7 +349,9 @@ describe('first-run desktop experience', () => {
       automationId: window.__angelbotE2eReminderId,
     }));
     assert.equal(reminderRuns.length, 1);
-    assert.equal(reminderRuns[0].status, 'completed');
+    // Muting consumes the occurrence without claiming notification delivery.
+    assert.equal(reminderRuns[0].status, 'skipped');
+    assert.equal(reminderRuns[0].summary, '通知已关闭，本次提醒未发送；不会自动补发');
     await browser.execute((settings) => { window.__angelbotE2eNotificationSettings = settings; }, notificationSettings);
     await browser.tauri.execute(({ core }) => core.invoke('save_notification_settings', {
       settings: window.__angelbotE2eNotificationSettings,
