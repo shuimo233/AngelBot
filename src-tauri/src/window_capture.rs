@@ -337,6 +337,17 @@ pub(crate) fn run_bounded_child(
         }
     }
     cleanup.map_err(|_| error("ADAPTER_FAILED"))?;
+    #[cfg(feature = "desktop-e2e")]
+    let outcome = outcome.map_err(|mut failure| {
+        let last_phase = stderr
+            .as_ref()
+            .ok()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| text.lines().filter(|line| capture_debug_phase(line)).last())
+            .unwrap_or("[DEBUG-capture] no-phase");
+        failure.message = format!("{last_phase}; elapsed_ms={}", started.elapsed().as_millis());
+        failure
+    });
     let status = outcome?;
     if is_cancelled() {
         return Err(error("SCAN_CANCELLED"));
