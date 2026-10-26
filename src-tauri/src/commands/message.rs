@@ -6727,18 +6727,42 @@ mod tests {
             std::fs::canonicalize(&runner_executable).unwrap(),
             executable
         );
+        let before_capture = read_owned_fixture();
+        // Start with the production adapter, before any UIA warm-up. Separate
+        // discovery/helper budgets can pass while their combined call times out.
+        let started = Instant::now();
+        let image_result = crate::desktop_control::create_runtime_adapter()
+            .capture_trusted_window_with_control(
+                "draft-app",
+                executable.to_str().unwrap(),
+                &|| false,
+                Duration::from_secs(8),
+            );
+        let cold_elapsed = started.elapsed();
+        let cold_code = image_result
+            .as_ref()
+            .map(|_| "OK")
+            .unwrap_or_else(|failure| failure.code.as_str())
+            .to_owned();
+        let probe_started = Instant::now();
         let target = crate::desktop_control::capture_target_probe(
             runner_executable.to_str().unwrap(),
             &|| false,
             Duration::from_secs(8),
         )
-        .unwrap();
+        .unwrap_or_else(|failure| {
+            panic!(
+                "cold={cold_code} ({cold_elapsed:?}); target probe={} ({:?})",
+                failure.code,
+                probe_started.elapsed()
+            )
+        });
+        let probe_elapsed = probe_started.elapsed();
         assert_eq!(target.process_id, process_id);
         assert_eq!(
             std::fs::canonicalize(&target.executable_path).unwrap(),
             executable
         );
-        let before_capture = read_owned_fixture();
         let run_capture_helper = |target: &crate::window_capture::CaptureTarget| {
             use std::process::{Command, Stdio};
             let mut command = Command::new(&capture_binary);
@@ -6750,6 +6774,7 @@ mod tests {
                 .stderr(Stdio::piped());
             // This existing host creates a hidden, bounded process-tree job,
             // drains pipes and reaps the helper and descendants on every exit.
+            let helper_started = Instant::now();
             crate::window_capture::run_bounded_child(
                 &mut command,
                 Some(serde_json::to_vec(target).unwrap()),
@@ -6757,18 +6782,25 @@ mod tests {
                 &|| false,
                 Duration::from_secs(8),
             )
-            .unwrap()
+            .unwrap_or_else(|failure| panic!(
+                "cold={cold_code} ({cold_elapsed:?}); target probe=OK ({probe_elapsed:?}); helper={} ({:?})",
+                failure.code, helper_started.elapsed()
+            ))
         };
-        let captured = run_capture_helper(&target);
-        let failure_code = crate::window_capture::helper_failure(&captured.stderr).code;
-        assert!(
-            captured.status.success(),
-            "owned native WGC helper did not return a PNG: {failure_code}"
-        );
-        assert!(captured.stderr.is_empty());
-        assert!(!captured.stdout.is_empty());
-        assert!(captured.stdout.len() <= crate::window_capture::MAX_PNG_BYTES);
-        let mut reader = png::Decoder::new(std::io::Cursor::new(&captured.stdout))
+        let image = image_result.unwrap_or_else(|failure| {
+            // Read-only phase isolation, never a retry of the production call.
+            // Even if these independent probes succeed, preserve the cold failure.
+            let helper_started = Instant::now();
+            let helper = run_capture_helper(&target);
+            let helper_code = if helper.status.success() { "EXIT_0".to_owned() }
+                else { crate::window_capture::helper_failure(&helper.stderr).code };
+            panic!("cold production capture failed: {} ({cold_elapsed:?}); target probe=OK ({probe_elapsed:?}); helper={helper_code} ({:?})",
+                failure.code, helper_started.elapsed());
+        });
+        let captured = image.png_bytes();
+        assert!(!captured.is_empty());
+        assert!(captured.len() <= crate::window_capture::MAX_PNG_BYTES);
+        let mut reader = png::Decoder::new(std::io::Cursor::new(captured))
             .read_info()
             .unwrap();
         let (width, height) = (reader.info().width, reader.info().height);
