@@ -1,5 +1,5 @@
 import { parseMcpToolIdentity } from './tool-display';
-import type { DesktopActionOperation, DesktopControlAction } from './commands/desktop';
+import type { DesktopActionOperation, DesktopConfirmationOperation, DesktopControlAction } from './commands/desktop';
 
 type ToolArguments = Record<string, unknown>;
 
@@ -7,10 +7,11 @@ type ToolArguments = Record<string, unknown>;
 export function desktopActionOperation(toolName: string, rawArguments?: string | unknown): DesktopActionOperation | null {
   if (toolName === 'prepare_message_draft') return 'draft';
   if (toolName === 'set_trusted_app_text') return 'field';
+  if (toolName === 'click_trusted_app_image') return 'imageclick';
   if (toolName === 'operate_trusted_app_control') {
     const action = parseArguments(rawArguments).action;
-    if (action === 'invoke' || action === 'select' || action === 'expand' || action === 'collapse'
-      || action === 'scrollup' || action === 'scrolldown') return action;
+    if (action === 'invoke' || action === 'select' || action === 'choose' || action === 'expand' || action === 'collapse'
+      || action === 'scrollup' || action === 'scrolldown' || action === 'check' || action === 'uncheck') return action;
   }
   return null;
 }
@@ -21,28 +22,75 @@ export function desktopActionOperation(toolName: string, rawArguments?: string |
  */
 export function requiresDesktopActionPreview(toolName: string): boolean {
   return toolName === 'prepare_message_draft' || toolName === 'set_trusted_app_text'
-    || toolName === 'operate_trusted_app_control' || toolName === 'invoke_trusted_app_control';
+    || toolName === 'operate_trusted_app_control' || toolName === 'invoke_trusted_app_control' || toolName === 'click_trusted_app_image';
 }
 
+/** Image consent shares target review, but never write/action failure semantics. */
+export function desktopConfirmationOperation(toolName: string, rawArguments?: string | unknown): DesktopConfirmationOperation | null {
+  if (toolName === 'observe_trusted_app_window') {
+    return parseArgumentObject(rawArguments)?.mode === 'image' ? 'image' : null;
+  }
+  return desktopActionOperation(toolName, rawArguments);
+}
+
+export function requiresDesktopConfirmationPreview(toolName: string, rawArguments?: string | unknown): boolean {
+  if (requiresDesktopActionPreview(toolName)) return true;
+  if (toolName !== 'observe_trusted_app_window') return false;
+  const args = parseArgumentObject(rawArguments);
+  // Reserve malformed/unknown observation requests rather than allowing a
+  // generic approval fallback. The backend validates the complete arguments.
+  return !args || (args.mode !== undefined && args.mode !== 'controls');
+}
+
+export const WINDOW_IMAGE_CONFIRMATION_SUMMARY = '截取已授权应用的单个窗口图像，发送给当前配置的模型用于本轮理解。窗口可能包含私人内容；AngelBot 不存储截图到磁盘或对话历史，也不授予点击、填写或其他控件操作权限。';
+
 export const DESKTOP_CONTROL_ACTION_LABELS: Record<DesktopControlAction, string> = {
-  invoke: '调用控件', select: '选中控件', expand: '展开控件', collapse: '收起控件',
+  invoke: '调用控件', select: '选中控件', choose: '选择下拉项', expand: '展开控件', collapse: '收起控件',
   scrollup: '向上小幅滚动', scrolldown: '向下小幅滚动',
+  check: '勾选复选框', uncheck: '取消勾选复选框',
 };
 
-function parseArguments(value: string | unknown): ToolArguments {
+function parseArgumentObject(value: string | unknown): ToolArguments | null {
   if (typeof value === 'string') {
     try {
       const parsed = JSON.parse(value) as unknown;
       return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
         ? parsed as ToolArguments
-        : {};
+        : null;
     } catch {
-      return {};
+      return null;
     }
   }
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as ToolArguments
-    : {};
+    : null;
+}
+
+function parseArguments(value: string | unknown): ToolArguments {
+  return parseArgumentObject(value) ?? {};
+}
+
+/** Exact display payload; missing content is not an empty-file request. */
+export function fileWriteContentForPreview(rawArguments: unknown): string | null {
+  const content = parseArgumentObject(rawArguments)?.content;
+  return typeof content === 'string' ? content : null;
+}
+
+/** Optional review aid, not an attestation of a third-party tool's effects. */
+export function mcpArgumentsForPreview(rawArguments: unknown): string | null {
+  const args = parseArgumentObject(rawArguments);
+  if (!args) return null;
+  try {
+    const text = JSON.stringify(args, (key, value) => (
+      /password|passwd|secret|token|authorization|cookie|credential|api.?key/i.test(key)
+        && typeof value !== 'number' && typeof value !== 'boolean'
+        ? '[已隐藏]'
+        : value
+    ), 2);
+    return text.length <= 4_000 ? text : `${text.slice(0, 4_000)}\n… 输入过长，以上不是完整参数；无法核对时请拒绝。`;
+  } catch {
+    return null;
+  }
 }
 
 function textArgument(args: ToolArguments, key: string) {
@@ -171,16 +219,31 @@ export function getToolConfirmationSummary(toolName: string, rawArguments: strin
     }
     case 'cancel_reminder':
       return '取消当前工作区中的这条提醒';
+    case 'pause_automation':
+      return '暂停当前工作区中这项自动化的后续定时；不会停止已开始的执行，也不删除运行记录。';
+    case 'stop_automation_run':
+      return '停止当前工作区中这次受控执行；仅限 AngelBot 持有的脚本或 MAA 运行，不接管其他程序。已发生的操作不会撤回，请等待清理结果；后续计划不会因此自动暂停，异常仍可能需要处理。';
     case 'create_automation': {
       const title = textArgument(args, 'title');
       const schedule = textArgument(args, 'schedule');
-      return `创建自动化${title ? `：${shortened(title, 56)}` : ''}${schedule ? `（${shortened(schedule, 40)}）` : ''}`;
+      const kind = args.executorKind === 'maa' ? 'MAA 自动化' : '自动化';
+      const summary = `创建${kind}${title ? `：${shortened(title, 56)}` : ''}${schedule ? `（${shortened(schedule, 40)}）` : ''}`;
+      if (args.executorKind !== 'maa') return summary;
+      const maaAppId = textArgument(args, 'appId');
+      const emulator = args.launchEmulator === true ? '启动已配置的模拟器'
+        : args.launchEmulator === false || args.launchEmulator === undefined ? '不启动模拟器'
+          : '启动模拟器参数无效，需校验';
+      const timeout = args.timeoutSeconds;
+      const timeoutLabel = timeout === undefined || timeout === null ? '3600 秒（默认）'
+        : typeof timeout === 'number' && Number.isInteger(timeout) && timeout >= 10 && timeout <= 3600
+          ? `${timeout} 秒` : '超时参数无效，需校验';
+      return `${summary}；${maaAppId ? `可信应用 ID：${shortened(maaAppId, 64)}` : '应用待校验'}；${emulator}；最长等待 ${timeoutLabel}。以后按计划无人值守运行 MAA 当前 GUI 勾选队列，按现有消耗设置执行；仅回收本次启动的进程，不接管已打开的 MAA，不会修改游戏任务或消耗设置。创建不是立即运行；到点执行需要 AngelBot 保持运行。`;
     }
     case 'open_trusted_app':
       return appId ? `打开已信任应用：${shortened(appId, 64)}` : '打开一个已信任应用';
     case 'observe_trusted_app_window':
       return args.mode === 'image'
-        ? '截取已授权应用的单个窗口图像，发送给当前配置的模型用于本轮理解。窗口可能包含私人内容；图像仅临时使用，不存储截图，也不授予控件操作权限。'
+        ? WINDOW_IMAGE_CONFIRMATION_SUMMARY
         : '查看已授权应用的窗口控件结构，不截取或发送窗口图像。';
     case 'open_windows_setting': {
       const page = textArgument(args, 'page');
@@ -191,15 +254,17 @@ export function getToolConfirmationSummary(toolName: string, rawArguments: strin
     case 'prepare_message_draft':
       return '在已信任应用中写入草稿。目标窗口和完整内容以实时预检为准；AngelBot 不点击发送，应用可能自动保存或同步。';
     case 'set_trusted_app_text':
-      return '在已信任应用中填写一个输入框。目标窗口、控件和完整内容以实时预检为准；应用可能自动保存或同步。';
+      return '在已信任应用中修改或清空一个输入框。目标窗口、控件和完整内容以实时预检为准；应用可能自动保存或同步。';
     case 'operate_trusted_app_control': {
       const operation = desktopActionOperation(toolName, rawArguments);
-      const actionLabel = operation && operation !== 'draft' && operation !== 'field'
+      const actionLabel = operation && operation !== 'draft' && operation !== 'field' && operation !== 'imageclick'
         ? DESKTOP_CONTROL_ACTION_LABELS[operation] : '操作控件（动作无效）';
       return `在已信任应用中${actionLabel}。目标窗口与控件以实时预检为准；可能触发发送、删除等后果，控件名称不代表安全或授权。请求已发出或控件状态已校验不代表目标已完成。`;
     }
     case 'invoke_trusted_app_control':
       return '旧版控件操作已停用，不能批准；请拒绝并重新发起带有明确动作的请求。';
+    case 'click_trusted_app_image':
+      return '在已授权窗口的实时图像标记处左键点击一次。必须核对预览和位置；可能触发发送、删除或购买，画面变化时拒绝，未知结果不自动重试。';
     case 'import_skill_from_github': {
       const url = textArgument(args, 'url') ?? textArgument(args, 'repo_url');
       return url ? `从 GitHub 导入技能：${shortened(url)}` : '从 GitHub 导入技能';

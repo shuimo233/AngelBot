@@ -19,7 +19,7 @@ use super::{
         DelegationIssuance, DelegationIssuanceOutcome, DelegationRequest, RetryIssuanceOutcome,
         RetryReceiptState,
     },
-    delegation_pump::DelegationPumpHostHandle,
+    delegation_service::DelegationServiceHandle,
     supervision::{
         SupervisorDelegationDispatcher, SupervisorWorkKind, WorkspaceSupervisor,
         WorkspaceSupervisorActor,
@@ -56,7 +56,7 @@ struct RetryDelegatedDeliveryInput {
 struct RetryDelegatedDeliveryHandler {
     issuer: DelegationIssuance,
     identity: ForegroundRunIdentity,
-    pump: DelegationPumpHostHandle,
+    service: DelegationServiceHandle,
 }
 
 fn supervisor_kind(
@@ -314,7 +314,7 @@ impl RetryDelegatedDeliveryHandler {
                 )
             }
         };
-        let continuation = match self.pump.retry_for_session(
+        let continuation = match self.service.retry_for_session(
             &self.identity.session_id,
             &input.delivery_id,
             &input.reason,
@@ -424,7 +424,7 @@ pub fn register(
     identity: ForegroundRunIdentity,
     sandbox_root: PathBuf,
     model_binding: DelegatedModelBindingRequest,
-    delegation_pump: Option<DelegationPumpHostHandle>,
+    delegation_service: Option<DelegationServiceHandle>,
 ) {
     let tool = Tool::new(
         "delegate_work",
@@ -456,7 +456,7 @@ pub fn register(
         network_tool,
         Arc::new(ConfirmedNetworkDelegateWorkHandler { delegate }),
     );
-    let Some(delegation_pump) = delegation_pump else {
+    let Some(service) = delegation_service else {
         return;
     };
     let retry_tool = Tool::new(
@@ -473,7 +473,7 @@ pub fn register(
         Arc::new(RetryDelegatedDeliveryHandler {
             issuer: DelegationIssuance::new(db, sandbox_root, model_binding),
             identity,
-            pump: delegation_pump,
+            service,
         }),
     );
 }
@@ -483,9 +483,8 @@ mod tests {
     use super::*;
     use crate::agent::{
         delegated_network_scope::{ConfirmedNetworkScope, NetworkScopeApprovalProvenance},
-        delegation_pump::{DelegationPumpError, DelegationPumpHandle, DelegationPumpLoop},
-        delegation_service::ServiceReport,
-        delivery_inbox::RetryContinuation,
+        delegation_contract::ContractLimits,
+        delegation_service::test_support::{recording_service, ServiceCall},
         worker_policy::NetworkAction,
         ToolCall, ToolCancellation, ToolExecutionContext, ToolRegistry,
     };
@@ -553,38 +552,6 @@ mod tests {
     fn model_binding() -> DelegatedModelBindingRequest {
         DelegatedModelBindingRequest::new("provider:default", "model:test", "keychain:default", 1)
             .unwrap()
-    }
-
-    struct RetryPumpProbe {
-        calls: Arc<Mutex<usize>>,
-    }
-
-    impl DelegationPumpLoop for RetryPumpProbe {
-        fn start(&mut self) -> Result<ServiceReport, DelegationPumpError> {
-            Ok(ServiceReport::default())
-        }
-
-        fn tick(&mut self) -> Result<ServiceReport, DelegationPumpError> {
-            Ok(ServiceReport::default())
-        }
-
-        fn shutdown(&mut self) -> Result<(), DelegationPumpError> {
-            Ok(())
-        }
-
-        fn retry_for_session(
-            &mut self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<RetryContinuation, DelegationPumpError> {
-            *self.calls.lock().unwrap() += 1;
-            Err(DelegationPumpError::Worker("probe".into()))
-        }
-    }
-
-    fn retry_pump(calls: Arc<Mutex<usize>>) -> DelegationPumpHostHandle {
-        DelegationPumpHostHandle::new(DelegationPumpHandle::new(RetryPumpProbe { calls }))
     }
 
     #[test]
@@ -904,34 +871,35 @@ mod tests {
     }
 
     #[test]
-    fn retry_tool_requires_a_pump_and_rejects_untrusted_boundary_input_before_side_effects() {
+    fn retry_tool_requires_service_and_rejects_untrusted_boundary_input_before_side_effects() {
         let (db, identity, workspace) = setup("retry-tool-registration");
         let sandbox_root = workspace.path().join("sandboxes");
 
-        let mut without_pump = ToolRegistry::new();
+        let mut without_service = ToolRegistry::new();
         register(
-            &mut without_pump,
+            &mut without_service,
             db.clone(),
             identity.clone(),
             sandbox_root.clone(),
             model_binding(),
             None,
         );
-        assert!(!without_pump.contains("retry_delegated_delivery"));
+        assert!(!without_service.contains("retry_delegated_delivery"));
 
-        let calls = Arc::new(Mutex::new(0));
-        let mut with_pump = ToolRegistry::new();
+        let limits = ContractLimits::default();
+        let (service, calls) = recording_service(limits.clone());
+        let mut with_service = ToolRegistry::new();
         register(
-            &mut with_pump,
+            &mut with_service,
             db.clone(),
-            identity,
+            identity.clone(),
             sandbox_root,
             model_binding(),
-            Some(retry_pump(calls.clone())),
+            Some(service),
         );
-        assert!(with_pump.contains("retry_delegated_delivery"));
+        assert!(with_service.contains("retry_delegated_delivery"));
 
-        let result = with_pump.execute(
+        let result = with_service.execute(
             &ToolCall::new(
                 "retry_delegated_delivery".into(),
                 json!({
@@ -945,10 +913,28 @@ mod tests {
         );
         assert!(!result.result.success);
         assert!(result.result.content.contains("工具参数不合法，未执行"));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "untrusted fields must not reach the service"
+        );
+
+        let retry = with_service.execute(
+            &ToolCall::new(
+                "retry_delegated_delivery".into(),
+                json!({"delivery_id": "delivery-1", "reason": "retry after review"}),
+            ),
+            "retry-valid",
+            workspace.path(),
+        );
+        assert!(!retry.result.success);
         assert_eq!(
             *calls.lock().unwrap(),
-            0,
-            "untrusted fields must not reach the pump"
+            vec![ServiceCall::Retry(
+                identity.session_id,
+                "delivery-1".into(),
+                "retry after review".into(),
+                limits
+            )]
         );
 
         let conn = db.lock().unwrap();

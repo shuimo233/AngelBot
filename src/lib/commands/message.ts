@@ -1,8 +1,8 @@
 /**
  * Message commands - typed wrappers around Tauri IPC
  */
-import { invoke } from '../invoke';
-import type { DesktopActionOperation } from './desktop';
+import { invoke, isTauriRuntime } from '../invoke';
+import type { DesktopConfirmationOperation } from './desktop';
 import type {
   Message,
   PendingConfirmationFact,
@@ -14,6 +14,44 @@ import type {
 } from '$types';
 
 type UnknownRecord = Record<string, unknown>;
+
+export type ReplyExportOutcome = { status: 'cancelled' } | { status: 'saved'; name: string; bytes: number };
+
+/** One explicit native picker, no model-selected destination or folder grant. */
+export async function saveMessageReply(sessionId: string, messageId: string): Promise<ReplyExportOutcome> {
+  if (!isTauriRuntime()) throw new Error('请在 AngelBot 桌面应用中保存回复。');
+  const errors: Record<string, string> = {
+    REPLY_UNAVAILABLE: '回复尚未保存或已发生变化，请刷新会话后再试。',
+    REPLY_TOO_LARGE: '回复超过 2 MiB，暂不能保存为文件；原回复未改变。',
+    INVALID_DESTINATION: '请选择 Markdown（.md）或文本（.txt）新文件。',
+    FILE_EXISTS: '目标文件已存在，未覆盖任何内容；请换一个文件名。',
+  };
+  try {
+    const result = await invoke<ReplyExportOutcome>('save_message_reply', { sessionId, messageId });
+    if (result?.status === 'cancelled') return { status: 'cancelled' };
+    if (result?.status === 'saved' && typeof result.name === 'string' && result.name.length > 0
+      && !/[\\/:\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(result.name)
+      && /\.(md|txt)$/i.test(result.name)
+      && Number.isSafeInteger(result.bytes) && result.bytes > 0 && result.bytes <= 2 * 1024 * 1024) {
+      return { status: 'saved', name: result.name, bytes: result.bytes };
+    }
+    throw new Error('Invalid export receipt');
+  } catch (error) {
+    const code = typeof error === 'string' ? error : error instanceof Error ? error.message : '';
+    throw new Error(Object.prototype.hasOwnProperty.call(errors, code) ? errors[code] : '未能确认保存结果，请先检查所选位置；原回复未改变。');
+  }
+}
+
+/** Extract explicitly selected Office bytes into the read-only snapshot contract. */
+export async function extractDocumentText(name: string, dataBase64: string): Promise<TextAttachment> {
+  try {
+    return await invoke('extract_document_text', { req: { name, dataBase64 } });
+  } catch (error) {
+    // Native Tauri rejects with a string; the dev proxy rejects with Error.
+    // Keep the backend's fixed, user-safe explanation in either runtime.
+    throw new Error(typeof error === 'string' ? error : error instanceof Error ? error.message : '文档读取未能完成，请重新选择。');
+  }
+}
 
 function asRecord(value: unknown): UnknownRecord | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -209,22 +247,36 @@ export async function resolveAgentConfirmation(args: {
 /** One-use, short-lived server-attested target for a pending desktop action. */
 export interface DesktopActionPreview {
   previewId: string;
-  operation: DesktopActionOperation;
+  operation: DesktopConfirmationOperation;
   appDisplayName: string;
   executableName: string;
   windowTitle: string | null;
   controlName: string | null;
   text: string | null;
+  /** Exact option bound to the backend preview; only present for choose. */
+  option?: string | null;
+  /** Local-only preview pixels; never a persisted tool result or task fact. */
+  image?: { imageDataUrl: string; width: number; height: number; x: number; y: number } | null;
   /** Unix milliseconds; approvals must be made before this instant. */
   expiresAt: number;
 }
+
+// Live and persisted cards can overlap during one bounded native scan. Share
+// only that unfinished read, never a settled single-use approval preview.
+const pendingDesktopPreflights = new Map<string, Promise<DesktopActionPreview>>();
 
 export async function preflightPendingDesktopAction(args: {
   sessionId: string;
   messageId: string;
   callId: string;
 }): Promise<DesktopActionPreview> {
-  return invoke<DesktopActionPreview>('preflight_pending_desktop_action', args);
+  const key = JSON.stringify([args.sessionId, args.messageId, args.callId]);
+  const active = pendingDesktopPreflights.get(key);
+  if (active) return active;
+  const request: Promise<DesktopActionPreview> = invoke<DesktopActionPreview>('preflight_pending_desktop_action', args)
+    .finally(() => { if (pendingDesktopPreflights.get(key) === request) pendingDesktopPreflights.delete(key); });
+  pendingDesktopPreflights.set(key, request);
+  return request;
 }
 
 /** Start a fresh, bounded follow-up slice from an auditable task run. */

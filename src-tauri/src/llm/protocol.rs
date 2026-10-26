@@ -67,7 +67,7 @@ impl ProtocolContinuation {
         if self.output_items.iter().any(|item| {
             !matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("message" | "reasoning" | "function_call" | "custom_tool_call")
+                Some("message" | "reasoning" | "function_call" | "custom_tool_call" | "compaction")
             )
         }) {
             return Err("Invalid private model continuation: unknown output type".into());

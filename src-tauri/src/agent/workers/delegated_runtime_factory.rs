@@ -11,11 +11,11 @@ use super::{
     change_pipeline::ChangePipeline,
     change_worker_runtime::{ChangeWorkerLauncher, DurableWorktreeAccessResolver},
     concrete_sandbox::ProductionResourceCleanupEffects,
-    delegated_model_host::DeferredKeychainDelegatedModelHostFactory,
+    delegated_model_binding::DelegatedModelHostFactory,
     delegated_network_scope::SharedDbApprovedNetworkScopeLookup,
     delegated_worker_router::RoutedWorkerAdapter,
     delegation_contract::ContractLimits,
-    delegation_pump::{DelegationPump, DelegationPumpHandle, DelegationPumpHostHandle},
+    delegation_pump::DelegationPumpHostHandle,
     delegation_runtime::{DelegationRuntime, FixedAdmissionPolicy, SandboxController, SystemClock},
     delegation_service::{DelegationService, DelegationServiceError, DelegationServiceHandle},
     explorer_plan::ExplorerBindingResolver,
@@ -54,15 +54,18 @@ impl DelegatedRuntimeAssembly {
 pub struct DelegatedRuntimeFactory;
 
 impl DelegatedRuntimeFactory {
-    pub fn build(
+    pub fn build<M>(
         db: SharedDb,
         opt_in: ExplorerOptIn,
         dependencies: ExplorerRuntimeDependencies,
         sandbox: impl SandboxController + Send + 'static,
         cleanup_effects: ProductionResourceCleanupEffects,
         provider: Arc<GitWorktreeProvider>,
-        model_factory: DeferredKeychainDelegatedModelHostFactory,
-    ) -> Result<DelegatedRuntimeAssembly, DelegationServiceError> {
+        model_factory: M,
+    ) -> Result<DelegatedRuntimeAssembly, DelegationServiceError>
+    where
+        M: DelegatedModelHostFactory + Clone + Send + Sync + 'static,
+    {
         Self::build_with_explorer_network_io(
             db,
             opt_in,
@@ -80,20 +83,21 @@ impl DelegatedRuntimeFactory {
     /// adapter.  The adapter is deliberately below the Explorer gateway: plan
     /// binding, source-policy approval, lease checks, bounded evidence, worker
     /// lifecycle, and delivery all stay identical for production and tests.
-    pub(crate) fn build_with_explorer_network_io<T, R>(
+    pub(crate) fn build_with_explorer_network_io<T, R, M>(
         db: SharedDb,
         opt_in: ExplorerOptIn,
         dependencies: ExplorerRuntimeDependencies,
         sandbox: impl SandboxController + Send + 'static,
         cleanup_effects: ProductionResourceCleanupEffects,
         provider: Arc<GitWorktreeProvider>,
-        model_factory: DeferredKeychainDelegatedModelHostFactory,
+        model_factory: M,
         transport: T,
         resolver: R,
     ) -> Result<DelegatedRuntimeAssembly, DelegationServiceError>
     where
         T: NetworkTransport + 'static,
         R: HostResolver + Send + Sync + 'static,
+        M: DelegatedModelHostFactory + Clone + Send + Sync + 'static,
     {
         let review_resolver = BindingReviewModelResolver::new(db.clone(), model_factory.clone());
         let review_executor = Box::new(LlmReviewExecutor::new(Arc::new(review_resolver)));
@@ -118,14 +122,14 @@ impl DelegatedRuntimeFactory {
     /// reviewer, but cannot bypass source policy, leases, sandboxing, delivery
     /// persistence, or the scheduler. Production calls the narrower constructor
     /// above; deterministic desktop verification supplies both adapters here.
-    pub(crate) fn build_with_explorer_runtime_adapters<T, R>(
+    pub(crate) fn build_with_explorer_runtime_adapters<T, R, M>(
         db: SharedDb,
         opt_in: ExplorerOptIn,
         dependencies: ExplorerRuntimeDependencies,
         sandbox: impl SandboxController + Send + 'static,
         cleanup_effects: ProductionResourceCleanupEffects,
         provider: Arc<GitWorktreeProvider>,
-        model_factory: DeferredKeychainDelegatedModelHostFactory,
+        model_factory: M,
         transport: T,
         resolver: R,
         review_executor: Box<dyn ReviewExecutor>,
@@ -133,6 +137,7 @@ impl DelegatedRuntimeFactory {
     where
         T: NetworkTransport + 'static,
         R: HostResolver + Send + Sync + 'static,
+        M: DelegatedModelHostFactory + Clone + Send + Sync + 'static,
     {
         if let ExplorerRuntimeDecision::Disabled(reason) = decide(opt_in, dependencies) {
             return Ok(DelegatedRuntimeAssembly {
@@ -204,11 +209,9 @@ impl DelegatedRuntimeFactory {
         )?
         .with_review(review_coordinator, review_executor)
         .with_change_pipeline(ChangePipeline::new(db.clone(), provider));
-        let service = DelegationServiceHandle::new(service);
-        let pump =
-            DelegationPumpHandle::new(DelegationPump::new(service, ContractLimits::default()));
+        let service = DelegationServiceHandle::new(service, ContractLimits::default());
         Ok(DelegatedRuntimeAssembly {
-            pump: DelegationPumpHostHandle::new(pump),
+            pump: DelegationPumpHostHandle::new(service),
             enabled: true,
             reason: None,
         })
@@ -228,8 +231,7 @@ impl DelegatedRuntimeFactory {
 
 fn fail_closed_pump(db: SharedDb) -> Result<DelegationPumpHostHandle, DelegationServiceError> {
     let service = DelegationServiceHandle::fail_closed(db)?;
-    let pump = DelegationPumpHandle::fail_closed(service, ContractLimits::default());
-    Ok(DelegationPumpHostHandle::new(pump))
+    Ok(DelegationPumpHostHandle::new(service))
 }
 
 fn now_millis() -> i64 {

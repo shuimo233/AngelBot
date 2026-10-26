@@ -10,22 +10,28 @@
 //!   - `llm/*` provides unified LLM provider abstraction
 
 mod agent;
+mod automation_clock;
 mod backup;
 mod bounded_png;
+mod browser_storage;
 mod child_process_env;
 mod child_process_tree;
 mod commands;
 mod db;
 mod desktop_control;
+mod document_text;
 mod file_watcher;
 mod fts;
 mod keychain;
 mod knowledge_graph;
 mod llm;
+mod maa_routine;
 mod mcp_client;
 mod mcp_credentials;
+mod profile_storage;
 mod reranker;
 mod runtime_health;
+mod runtime_instance;
 mod settings_cache;
 mod skill;
 mod vector;
@@ -81,10 +87,23 @@ pub struct AppState {
 #[cfg(feature = "desktop-e2e")]
 const DESKTOP_E2E_DATA_DIR_ENV: &str = "ANGELBOT_DESKTOP_E2E_DATA_DIR";
 
+pub(crate) fn manual_desktop_acceptance() -> bool {
+    cfg!(feature = "desktop-e2e")
+        && std::env::var("ANGELBOT_DESKTOP_E2E_MANUAL").as_deref() == Ok("1")
+}
+
+fn model_recovery_acceptance() -> bool {
+    cfg!(feature = "desktop-e2e")
+        && matches!(
+            std::env::var("ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY").as_deref(),
+            Ok("first" | "reopen")
+        )
+}
+
 fn default_app_data_dir() -> std::path::PathBuf {
     dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("angelbot")
+        .expect("Windows local profile directory")
+        .join(profile_storage::DIRECTORY)
 }
 
 /// Pure E2E root selection seam. Keeping the override out of individual
@@ -101,16 +120,23 @@ pub(crate) fn app_data_dir_from_e2e_override(
 /// isolation. Desktop E2E may replace it with a temporary directory so tests
 /// never read or write the user's local application state.
 pub(crate) fn app_data_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR") {
+        return std::path::PathBuf::from(root).join("runtime");
+    }
     #[cfg(feature = "desktop-e2e")]
     {
-        app_data_dir_from_e2e_override(
-            std::env::var_os(DESKTOP_E2E_DATA_DIR_ENV).map(std::path::PathBuf::from),
-        )
+        let isolated = std::env::var_os(DESKTOP_E2E_DATA_DIR_ENV).map(std::path::PathBuf::from);
+        assert!(
+            !manual_desktop_acceptance() || isolated.is_some(),
+            "Manual native acceptance requires an explicit isolated data directory"
+        );
+        app_data_dir_from_e2e_override(isolated)
     }
 
     #[cfg(not(feature = "desktop-e2e"))]
     {
-        default_app_data_dir()
+        profile_storage::saved_root()
     }
 }
 
@@ -314,6 +340,33 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    pub(crate) fn create_test_directory_link(link: &std::path::Path, target: &std::path::Path) {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $p=[Console]::In.ReadToEnd()|ConvertFrom-Json; New-Item -ItemType Junction -Path $p.link -Target $p.target | Out-Null"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).creation_flags(0x08000000);
+        crate::child_process_env::apply_minimal_child_environment(&mut command);
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::to_string(&serde_json::json!({"link":link,"target":target}))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn create_test_directory_link(link: &std::path::Path, target: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
     pub(crate) fn test_app_state() -> AppState {
         AppState {
             db: std::sync::Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -336,8 +389,23 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn dev_http_cannot_export_or_restore_keychain_bearing_backups() {
+    fn dev_http_refuses_native_only_operations_without_side_effects() {
         let state = test_app_state();
+        {
+            let conn = state.db.lock().unwrap();
+            db::migrate(&conn).unwrap();
+            conn.execute_batch("INSERT INTO automations
+                (id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,
+                 script_args,timeout_seconds,next_run_at,created_at,updated_at,workspace_id)
+                VALUES ('native-reminder','Native reminder','Owned fixture','once',
+                        '1970-01-01T00:00:01Z',1,'','notification','[]',300,1,1,1,'personal');")
+                .unwrap();
+        }
+        let dashboard =
+            handle_dev_command("get_automation_dashboard", &serde_json::json!({}), &state);
+        assert_eq!(dashboard["ok"], true);
+        assert_eq!(dashboard["data"]["items"][0]["id"], "native-reminder");
+        assert!(dashboard["data"]["items"][0]["latestRun"].is_null());
         for (command, args) in [
             (
                 "export_encrypted_data",
@@ -349,6 +417,15 @@ mod tests {
             ),
             ("clear_all_user_data", serde_json::json!({})),
             (
+                "confirm_restored_project_directories",
+                serde_json::json!({"directories":[]}),
+            ),
+            ("run_due_automations", serde_json::json!({})),
+            (
+                "run_automation_now",
+                serde_json::json!({"id":"native-reminder"}),
+            ),
+            (
                 "import_data",
                 serde_json::json!({ "data": "{}", "mode": "replace" }),
             ),
@@ -356,6 +433,20 @@ mod tests {
             let result = handle_dev_command(command, &args, &state);
             assert_eq!(result["ok"], false, "{command}");
         }
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>("SELECT count(*) FROM automation_runs", [], |row| row
+                .get(0))
+                .unwrap(),
+            0
+        );
+        assert!(conn
+            .query_row::<bool, _, _>(
+                "SELECT enabled FROM automations WHERE id='native-reminder'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap());
     }
 
     #[cfg(debug_assertions)]
@@ -404,6 +495,118 @@ mod tests {
         let skills = handle_dev_command("get_skills", &serde_json::Value::Null, &state);
         assert_eq!(skills["ok"], true);
         assert_eq!(skills["data"][0]["name"], "Test Skill");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_http_learned_habits_share_the_owner_memory_store() {
+        let state = test_app_state();
+        {
+            let conn = state.db.lock().unwrap();
+            db::migrate(&conn).unwrap();
+            agent::adaptive_constraints::record_preferences(
+                &conn,
+                Some("s1"),
+                &[agent::evolution::NewMemory {
+                    category: "preference".into(),
+                    content: "喜欢安静简洁的问候".into(),
+                    importance: 8,
+                }],
+                "auto_evolution",
+            )
+            .unwrap();
+        }
+        let listed =
+            handle_dev_command("get_learned_preferences", &serde_json::Value::Null, &state);
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["data"][0]["ready"], false);
+        assert!(listed["data"][0]["updatedAt"].is_number());
+        let missing =
+            handle_dev_command("dismiss_learned_preference", &serde_json::json!({}), &state);
+        assert_eq!(missing["ok"], false);
+        let dismissed = handle_dev_command(
+            "dismiss_learned_preference",
+            &serde_json::json!({"id":listed["data"][0]["id"]}),
+            &state,
+        );
+        assert_eq!(dismissed["ok"], true);
+        assert_eq!(
+            handle_dev_command("get_learned_preferences", &serde_json::Value::Null, &state)["data"],
+            serde_json::json!([])
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_http_controls_share_the_active_run_and_reject_invalid_contracts() {
+        let state = test_app_state();
+        let (_permit, cancellation) = state
+            .steering
+            .try_start_running_run("owned-session")
+            .unwrap();
+        for command in ["pause_agent", "resume_agent"] {
+            assert_eq!(
+                handle_dev_command(
+                    command,
+                    &serde_json::json!({"sessionId":"owned-session"}),
+                    &state
+                )["ok"],
+                true
+            );
+            assert!(!cancellation.is_cancelled());
+        }
+        for mode in ["steer", "follow_up"] {
+            assert_eq!(
+                handle_dev_command(
+                    "submit_in_progress_command",
+                    &serde_json::json!({"sessionId":"owned-session","content":"owned instruction","mode":mode}),
+                    &state
+                )["ok"],
+                true
+            );
+        }
+        assert_eq!(
+            handle_dev_command(
+                "interrupt_agent",
+                &serde_json::json!({"session_id":"owned-session"}),
+                &state
+            )["ok"],
+            false
+        );
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            handle_dev_command(
+                "submit_in_progress_command",
+                &serde_json::json!({"sessionId":"owned-session","content":"","mode":"invalid"}),
+                &state
+            )["ok"],
+            false
+        );
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(
+            handle_dev_command(
+                "interrupt_agent",
+                &serde_json::json!({"sessionId":"owned-session"}),
+                &state
+            )["ok"],
+            true
+        );
+        assert!(cancellation.is_cancelled());
+        drop(_permit);
+        let (_next, next_signal) = state
+            .steering
+            .try_start_running_run("owned-session")
+            .unwrap();
+        assert!(!next_signal.is_cancelled());
+        assert_eq!(
+            handle_dev_command(
+                "submit_in_progress_command",
+                &serde_json::json!({"sessionId":"owned-session","content":"","mode":"abort"}),
+                &state
+            )["ok"],
+            true
+        );
+        assert!(next_signal.is_cancelled());
     }
 
     #[cfg(debug_assertions)]
@@ -463,9 +666,207 @@ mod tests {
         assert_eq!(loaded["ok"], true);
         assert_eq!(loaded["data"], "full_access");
     }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_http_foreground_contracts_preserve_snapshots_and_continuation_shapes() {
+        for wrapped in [false, true] {
+            let state = test_app_state();
+            let request_args = |request: serde_json::Value| {
+                if wrapped {
+                    serde_json::json!({"req": request})
+                } else {
+                    request
+                }
+            };
+            {
+                let conn = state.db.lock().unwrap();
+                db::migrate(&conn).unwrap();
+                conn.execute_batch(
+                    "INSERT INTO sessions (id, title, created_at, updated_at)
+                 VALUES ('session', 'Continuation test', 1, 1);
+                 INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES ('user', 'session', 'user', 'Original task', 1),
+                        ('assistant', 'session', 'assistant', 'Continue after review', 2);
+                 UPDATE messages SET parent_id = 'user' WHERE id = 'assistant';
+                 UPDATE sessions SET leaf_message_id = 'assistant' WHERE id = 'session';",
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE messages SET metadata = ?1 WHERE id = 'user'",
+                    [serde_json::json!({"textAttachments": [{"name": "arrangements.docx", "text": "DOCX body snapshot"}]}).to_string()],
+                ).unwrap();
+            }
+
+            let history = handle_dev_command(
+                "get_messages",
+                &serde_json::json!({"sessionId": "session"}),
+                &state,
+            );
+            assert_eq!(history["ok"], true);
+            assert_eq!(
+                history["data"][0]["textAttachments"][0]["name"],
+                "arrangements.docx"
+            );
+            assert_eq!(
+                history["data"][0]["textAttachments"][0]["text"],
+                "DOCX body snapshot"
+            );
+            let invalid_docx = handle_dev_command(
+                "extract_document_text",
+                &request_args(serde_json::json!({"name": "../private.docx", "dataBase64": "eA=="})),
+                &state,
+            );
+            assert_eq!(invalid_docx["ok"], false);
+            assert!(invalid_docx["error"].as_str().unwrap().contains("名称无效"));
+            assert!(invalid_docx.get("data").is_none());
+
+            let occupied = state.steering.try_start_run("session").unwrap();
+            for (command, args) in [
+                (
+                    "edit_and_resend_message",
+                    request_args(
+                        serde_json::json!({"sessionId": "session", "messageId": "user", "content": "replacement"}),
+                    ),
+                ),
+                ("delete_message", serde_json::json!({"messageId": "user"})),
+                (
+                    "update_message_content",
+                    serde_json::json!({"messageId": "user", "content": "changed"}),
+                ),
+            ] {
+                let result = handle_dev_command(command, &args, &state);
+                assert_eq!(result["ok"], false, "{command}");
+                assert!(result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already running"));
+                assert_eq!(
+                    handle_dev_command(
+                        "get_messages",
+                        &serde_json::json!({"sessionId": "session"}),
+                        &state
+                    ),
+                    history
+                );
+            }
+            drop(occupied);
+            for command in ["delete_message", "update_message_content"] {
+                assert_eq!(
+                    handle_dev_command(
+                        command,
+                        &serde_json::json!({"messageId": "missing", "content": "changed"}),
+                        &state
+                    )["ok"],
+                    false
+                );
+            }
+
+            for request in [
+                serde_json::Value::Null,
+                serde_json::json!({}),
+                serde_json::json!({"sessionId": "session"}),
+                serde_json::json!({"sessionId": 1, "messageId": "assistant"}),
+            ] {
+                let args = request_args(request);
+                let result = handle_dev_command("continue_agent_task", &args, &state);
+                assert_eq!(result["ok"], false);
+                assert!(result["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("invalid continue_agent_task request:"));
+                assert!(result.get("data").is_none());
+            }
+
+            let request = serde_json::json!({"sessionId": "session", "messageId": "assistant"});
+            let args = request_args(request);
+            let result = handle_dev_command("continue_agent_task", &args, &state);
+            assert_eq!(
+                result,
+                serde_json::json!({"ok": false, "error": "Task run not found"})
+            );
+
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute_batch(
+                    "INSERT INTO task_runs (id, session_id, message_id, goal, status, plan,
+                    resumable, continuation_context, created_at, updated_at)
+                 VALUES ('task', 'session', 'assistant', 'Original task', 'needs_attention',
+                    '[]', 1, 'No operation has run.', 1, 2);
+                 ALTER TABLE projects RENAME TO unavailable_projects;",
+                )
+                .unwrap();
+            }
+            // Fail local context preparation after foreground reservation, before any
+            // model or credentials are accessed. Continuation must still not persist
+            // its internal prompt as another user turn, even when that slice fails.
+            let result = handle_dev_command("continue_agent_task", &args, &state);
+            assert_eq!(
+                result,
+                serde_json::json!({"ok": false, "error": "no such table: projects"})
+            );
+            let conn = state.db.lock().unwrap();
+            let user_turns: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE role = 'user'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(user_turns, 1);
+            let incorrect_goals: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_runs WHERE goal != 'Original task'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(incorrect_goals, 0);
+            let leaf: String = conn
+                .query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id = 'session'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_ne!(
+                leaf, "assistant",
+                "the request must reserve and recover a new slice"
+            );
+            drop(conn);
+            assert_eq!(
+                handle_dev_command(
+                    "delete_message",
+                    &serde_json::json!({"messageId": "user"}),
+                    &state
+                )["ok"],
+                true
+            );
+            assert_eq!(
+                handle_dev_command(
+                    "get_messages",
+                    &serde_json::json!({"sessionId": "session"}),
+                    &state
+                )["data"],
+                serde_json::json!([])
+            );
+        }
+    }
 }
 
 // ─── Dev HTTP Server ─────────────────────────────────────────────────────────
+
+fn load_deployment_environment() {
+    // Fixtures must not recover credentials/opt-ins from the developer's .env
+    // after their launcher has deliberately sanitized the child environment.
+    #[cfg(not(any(test, feature = "desktop-e2e")))]
+    {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let _ = dotenvy::from_filename(project_root.join(".env"));
+    }
+}
 
 #[cfg(debug_assertions)]
 fn start_dev_http_server() {
@@ -500,10 +901,7 @@ fn start_dev_http_server() {
         }
     }
     // Load .env before resolving the explicit Explorer environment opt-in.
-    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
-    let _ = dotenvy::from_filename(project_root.join(".env")).ok();
+    load_deployment_environment();
 
     let db = std::sync::Arc::new(Mutex::new(conn));
     let cached_settings = settings_cache::new_cache();
@@ -629,6 +1027,85 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
     use rusqlite::params;
 
     match cmd {
+        "interrupt_agent" | "submit_in_progress_command" | "pause_agent" | "resume_agent" => {
+            // Match the typed frontend's camelCase contract and use the same
+            // run-local signals as native IPC, including during model waits.
+            let result = (|| -> Result<serde_json::Value, String> {
+                let session_id = args
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("invalid control session")?
+                    .to_string();
+                match cmd {
+                    "interrupt_agent" => {
+                        commands::steering::interrupt_agent_impl(&state.steering, session_id)
+                            .and_then(|instruction| {
+                                serde_json::to_value(instruction).map_err(|error| error.to_string())
+                            })
+                    }
+                    "submit_in_progress_command" => {
+                        let content = args
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or("invalid control content")?
+                            .to_string();
+                        let mode = serde_json::from_value(
+                            args.get("mode").cloned().ok_or("invalid control mode")?,
+                        )
+                        .map_err(|_| "invalid control mode")?;
+                        commands::steering::submit_in_progress_command_impl(
+                            &state.steering,
+                            session_id,
+                            content,
+                            mode,
+                        )?;
+                        Ok(serde_json::Value::Null)
+                    }
+                    _ => {
+                        let control = if cmd == "pause_agent" {
+                            agent::steering::AgentControlState::Paused
+                        } else {
+                            agent::steering::AgentControlState::Running
+                        };
+                        state.steering.set_control_state(session_id, control)?;
+                        Ok(serde_json::Value::Null)
+                    }
+                }
+            })();
+            match result {
+                Ok(data) => serde_json::json!({"ok":true,"data":data}),
+                Err(error) => serde_json::json!({"ok":false,"error":error}),
+            }
+        }
+        "get_workspaces" => commands::workspace::get_workspaces_impl(state)
+            .map(|v| serde_json::json!({"ok":true,"data":v}))
+            .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e})),
+        "open_workspace" => commands::workspace::open_workspace_impl(
+            state,
+            args.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+        )
+        .map(|v| serde_json::json!({"ok":true,"data":v}))
+        .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e})),
+        "create_project_workspace" => commands::workspace::create_project_workspace_impl(
+            state,
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            args.get("name").and_then(|v| v.as_str()).map(String::from),
+            args.get("agent_provider")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            args.get("agent_model")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        )
+        .map(|v| serde_json::json!({"ok":true,"data":v}))
+        .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e})),
+        "confirm_restored_project_directories" => {
+            serde_json::json!({"ok":false,"error":"恢复目录的确认需要在 AngelBot 桌面窗口中进行。"})
+        }
         "create_session" => {
             let title = args
                 .get("title")
@@ -723,18 +1200,8 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
             .map(|_| serde_json::json!({"ok": true}))
             .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
         }
-        "send_message" => {
+        "send_message" | "continue_agent_task" | "edit_and_resend_message" => {
             let args = args.get("req").unwrap_or(args);
-            let request: commands::foreground_message_contracts::SendMessageRequest =
-                match serde_json::from_value(args.clone()) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return serde_json::json!({
-                            "ok": false,
-                            "error": format!("invalid send_message request: {error}")
-                        });
-                    }
-                };
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -747,10 +1214,37 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                     });
                 }
             };
-            match runtime.block_on(commands::message::send_message_from_dev_http(
-                state, request,
-            )) {
+            let result = runtime.block_on(async {
+                if cmd == "send_message" {
+                    let request: commands::foreground_message_contracts::SendMessageRequest =
+                        serde_json::from_value(args.clone())
+                            .map_err(|error| format!("invalid {cmd} request: {error}"))?;
+                    commands::message::send_message_from_dev_http(state, request).await
+                } else if cmd == "edit_and_resend_message" {
+                    let request: commands::message::EditAndResendMessageRequest =
+                        serde_json::from_value(args.clone())
+                            .map_err(|error| format!("invalid {cmd} request: {error}"))?;
+                    commands::message::edit_and_resend_message_impl(state, None, request).await
+                } else {
+                    let request: commands::message::ContinueAgentTaskRequest =
+                        serde_json::from_value(args.clone())
+                            .map_err(|error| format!("invalid {cmd} request: {error}"))?;
+                    commands::message::continue_agent_task_impl(state, None, request).await
+                }
+            });
+            match result {
                 Ok(message) => serde_json::json!({"ok": true, "data": message}),
+                Err(error) => serde_json::json!({"ok": false, "error": error}),
+            }
+        }
+        "extract_document_text" => {
+            let result = serde_json::from_value::<
+                commands::foreground_text_attachments::ExtractDocumentRequest,
+            >(args.get("req").unwrap_or(args).clone())
+            .map_err(|_| "文档读取请求无效。".to_string())
+            .and_then(commands::foreground_text_attachments::extract_document_text_impl);
+            match result {
+                Ok(snapshot) => serde_json::json!({"ok": true, "data": snapshot}),
                 Err(error) => serde_json::json!({"ok": false, "error": error}),
             }
         }
@@ -758,63 +1252,22 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
             let session_id = args
                 .get("sessionId")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let conn = state.db.lock().map_err(|e| e.to_string()).unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT id, session_id, role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
-            ).unwrap();
-            let rows: Vec<serde_json::Value> = stmt
-                .query_map(params![session_id], |r| {
-                    Ok(serde_json::json!({
-                        "id": r.get::<_, String>(0).unwrap(),
-                        "sessionId": r.get::<_, String>(1).unwrap(),
-                        "role": r.get::<_, String>(2).unwrap(),
-                        "content": r.get::<_, String>(3).unwrap(),
-                        "createdAt": r.get::<_, i64>(4).unwrap(),
-                    }))
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect();
-            serde_json::json!({"ok": true, "data": rows})
+                .unwrap_or_default();
+            match commands::foreground_run_store::ForegroundRunStore::new(state.db.clone())
+                .project_session(session_id)
+            {
+                Ok(messages) => serde_json::json!({"ok": true, "data": messages}),
+                Err(error) => serde_json::json!({"ok": false, "error": error}),
+            }
         }
         "delete_message" => {
             let message_id = args
                 .get("messageId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let conn = state.db.lock().map_err(|e| e.to_string()).unwrap();
-            conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
-                .map_err(|e| e.to_string())
-                .ok();
-            serde_json::json!({"ok": true})
-        }
-        "continue_agent_task" => {
-            let req = args.get("req").unwrap_or(args);
-            let session_id = req
-                .get("sessionId")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let message_id = req
-                .get("messageId")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-
-            match commands::message::build_task_continuation_prompt(state, session_id, message_id) {
-                Ok(content) => handle_dev_command(
-                    "send_message",
-                    &serde_json::json!({
-                        "req": {
-                            "sessionId": session_id,
-                            "role": "user",
-                            "content": content,
-                        }
-                    }),
-                    state,
-                ),
-                Err(error) => serde_json::json!({"ok": false, "error": error}),
-            }
+            commands::message::delete_message_impl(state, None, message_id)
+                .map(|_| serde_json::json!({"ok": true}))
+                .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
         }
         "cancel_agent_task" => {
             let req = args.get("req").unwrap_or(args);
@@ -839,77 +1292,9 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let conn = state.db.lock().map_err(|e| e.to_string()).unwrap();
-            let rows = conn
-                .execute(
-                    "UPDATE messages SET content = ?1 WHERE id = ?2",
-                    params![content, message_id],
-                )
-                .map_err(|e| e.to_string())
-                .unwrap();
-            if rows == 0 {
-                return serde_json::json!({"ok": false, "error": "Message not found"});
-            }
-            serde_json::json!({"ok": true})
-        }
-        "edit_and_resend_message" => {
-            let args = args.get("req").unwrap_or(args);
-            let session_id = args
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let message_id = args
-                .get("messageId")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if content.trim().is_empty() {
-                return serde_json::json!({"ok": false, "error": "Message content cannot be empty"});
-            }
-            let branch_result: Result<(), String> = (|| {
-                let conn = state.db.lock().map_err(|e| e.to_string())?;
-                let (stored_session_id, role, parent_id): (String, String, Option<String>) = conn
-                    .query_row(
-                        "SELECT session_id, role, parent_id FROM messages WHERE id = ?1",
-                        params![message_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .map_err(|_| "Message not found".to_string())?;
-                if stored_session_id != session_id || role != "user" {
-                    return Err(
-                        "Only a user message in the active session can be edited and resent"
-                            .to_string(),
-                    );
-                }
-                conn.execute(
-                    "UPDATE sessions SET leaf_message_id = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![parent_id, chrono::Utc::now().timestamp(), session_id],
-                )
-                .map_err(|e| e.to_string())?;
-                conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            })();
-            if let Err(error) = branch_result {
-                return serde_json::json!({"ok": false, "error": error});
-            }
-            handle_dev_command(
-                "send_message",
-                &serde_json::json!({
-                    "req": {
-                        "sessionId": session_id,
-                        "role": "user",
-                        "content": content,
-                        "personality": args.get("personality").cloned(),
-                        "preferences": args.get("preferences").cloned(),
-                        "thinkingEffort": args.get("thinkingEffort").cloned(),
-                    }
-                }),
-                state,
-            )
+            commands::message::update_message_content_impl(state, None, message_id, content)
+                .map(|_| serde_json::json!({"ok": true}))
+                .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
         }
         "resolve_agent_confirmation" => {
             // Production Tauri IPC passes the typed request as `{ req: ... }`.
@@ -942,7 +1327,19 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             };
-            commands::message::resolve_agent_confirmation_impl(state, req)
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return serde_json::json!({"ok": false, "error": format!("failed to start foreground runtime: {error}")})
+                }
+            };
+            runtime
+                .block_on(commands::message::resolve_agent_confirmation_and_continue(
+                    state, None, req,
+                ))
                 .map(|v| serde_json::json!({"ok": true, "data": v}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
@@ -1155,6 +1552,32 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .map(|v| serde_json::json!({"ok": true, "data": v}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
+        "save_session_file" => {
+            // The Dev HTTP gateway has no parent native window/picker. Never
+            // accept a destination path or pretend a browser download saved it.
+            serde_json::json!({"ok": false, "error": "文件另存需要在 AngelBot 桌面窗口中选择位置。"})
+        }
+        "preview_browser_cleanup" => crate::browser_storage::cleanup::preview(state)
+            .map(|data| serde_json::json!({"ok": true, "data": data}))
+            .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error})),
+        "clear_browser_temp_files" => serde_json::from_value(
+            args.get("request")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|_| "清理请求格式无效。".to_owned())
+        .and_then(|request| crate::browser_storage::cleanup::execute(state, request))
+        .map(|data| serde_json::json!({"ok": true, "data": data}))
+        .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error})),
+        "prepare_browser_mcp" => {
+            let session_id = args
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            crate::commands::mcp::prepare_browser_mcp_impl(state, session_id)
+                .map(|data| serde_json::json!({"ok": true, "data": data}))
+                .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
+        }
         "list_work_dir" => {
             let session_id = args
                 .get("sessionId")
@@ -1166,8 +1589,7 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            crate::commands::file::resolve_work_dir(state, Some(session_id))
-                .and_then(|work_dir| crate::commands::file::list_work_dir_core(&work_dir, &path))
+            crate::commands::file::list_work_dir_impl(state, session_id, &path)
                 .map(|v| serde_json::json!({"ok": true, "data": v}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
@@ -1218,6 +1640,15 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 "credential_source": "none",
             }})
         }
+        "get_learned_preferences" => commands::memory::get_learned_preferences_impl(state)
+            .map(|v| serde_json::json!({"ok": true, "data": v}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "dismiss_learned_preference" => commands::memory::dismiss_learned_preference_impl(
+            state,
+            args.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+        )
+        .map(|_| serde_json::json!({"ok": true, "data": null}))
+        .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
         "get_memories" => commands::memory::get_memories_impl(state)
             .map(|v| serde_json::json!({"ok": true, "data": v}))
             .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
@@ -1435,9 +1866,21 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .map(|_| serde_json::json!({"ok": true}))
                 .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
         }
+        "get_automation_dashboard" => commands::automation::get_automation_dashboard_impl(state)
+            .map(|v| serde_json::json!({"ok": true, "data": v}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
         "get_automations" => commands::automation::get_automations_impl(state)
             .map(|v| serde_json::json!({"ok": true, "data": v}))
             .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "get_workspace_automation_overview" => {
+            let workspace_id = args
+                .get("workspaceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            commands::automation::get_workspace_automation_overview_impl(state, workspace_id)
+                .map(|v| serde_json::json!({"ok": true, "data": v}))
+                .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
+        }
         "set_automation_enabled" => {
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             let enabled = args
@@ -1446,6 +1889,43 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .unwrap_or(false);
             commands::automation::set_automation_enabled_impl(state, id, enabled)
                 .map(|_| serde_json::json!({"ok": true, "data": null}))
+                .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
+        }
+        "create_maa_automation" => {
+            let timeout_seconds = match args.get("timeoutSeconds") {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| "MAA 超时时间必须是正整数秒".to_string()),
+            };
+            timeout_seconds
+                .and_then(|timeout_seconds| {
+                    commands::automation::create_maa_automation_impl(
+                        state,
+                        args.get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        args.get("triggerValue")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        args.get("workspaceId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        args.get("appId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        args.get("launchEmulator")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        timeout_seconds,
+                    )
+                })
+                .map(|v| serde_json::json!({"ok": true, "data": v}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
         "create_automation" => {
@@ -1511,21 +1991,26 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
             .map(|v| serde_json::json!({"ok": true, "data": v}))
             .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
-        "delete_automation" | "run_automation_now" => {
+        "delete_automation" => {
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let result = if cmd == "delete_automation" {
-                commands::automation::delete_automation_impl(state, id)
-            } else {
-                commands::automation::run_automation_now_impl(state, id)
-            };
-            result
+            commands::automation::delete_automation_impl(state, id)
                 .map(|_| serde_json::json!({"ok": true, "data": null}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
-        "run_due_automations" => {
-            commands::automation::run_due_automations_impl(state, chrono::Utc::now().timestamp())
-                .map(|count| serde_json::json!({"ok": true, "data": count}))
+        "stop_automation_run" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let run_id = args
+                .get("runId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            commands::automation::stop_automation_run_impl(state, id, run_id)
+                .map(|_| serde_json::json!({"ok": true, "data": null}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
+        }
+        "run_due_automations" | "run_automation_now" => {
+            // Dev HTTP has no AppHandle/native notification host. Never consume
+            // an occurrence through the test-only, non-delivering core seam.
+            serde_json::json!({"ok": false, "error": "自动化执行仅可在桌面应用中操作；开发 HTTP 不会消耗日程。"})
         }
         "get_automation_runs" => {
             let id = args
@@ -1694,16 +2179,47 @@ pub fn run() {
         );
     }));
 
-    let app_data_dir = app_data_dir();
-    let mut runtime_health = RuntimeHealthState::default();
-    if let Err(error) = std::fs::create_dir_all(&app_data_dir) {
-        eprintln!("[Startup] app data directory unavailable: {error}");
-        runtime_health.add(RuntimeIssue::ephemeral_storage());
-    }
-
-    // Register sqlite-vec extension globally BEFORE opening any connection
+    // Register sqlite-vec before validating a captured migration database.
     unsafe {
         crate::vector_store::load_extension_globally();
+    }
+    #[cfg(feature = "desktop-e2e")]
+    let storage = std::env::var_os(DESKTOP_E2E_DATA_DIR_ENV)
+        .ok_or_else(|| {
+            std::io::Error::other("Desktop acceptance requires an explicit isolated data root")
+        })
+        .and_then(|_| profile_storage::Lease::isolated(app_data_dir()));
+    #[cfg(not(feature = "desktop-e2e"))]
+    let storage = profile_storage::Paths::system().and_then(|paths| {
+        let args: Vec<_> = std::env::args().collect();
+        profile_storage::open(
+            &paths,
+            args.iter().any(|arg| arg == "--migrate-storage"),
+            args.iter().any(|arg| arg == "--rollback-storage"),
+        )
+    });
+    // Both old and new instance handles stay held for the desktop lifetime.
+    let storage = match storage {
+        Ok(storage) => storage,
+        Err(error) => {
+            runtime_instance::notify_storage_failure(&error);
+            if std::env::args().any(|arg| arg == "--migrate-storage" || arg == "--rollback-storage")
+            {
+                std::process::exit(2);
+            }
+            return;
+        }
+    };
+    #[cfg(not(feature = "desktop-e2e"))]
+    if std::env::args().any(|arg| arg == "--rollback-storage") {
+        eprintln!("[Storage] 迁移已回滚，旧资料已恢复；下次启动使用恢复目录。仅在明确选择后使用 --migrate-storage 重试。");
+        runtime_instance::notify_storage_rollback();
+        return;
+    }
+    let app_data_dir = storage.root.clone();
+    let mut runtime_health = RuntimeHealthState::default();
+    if storage.migrated || storage.legacy_recovery {
+        runtime_health.add(RuntimeIssue::storage_migration(storage.legacy_recovery));
     }
 
     let db_path = app_data_dir.join("data.db");
@@ -1734,7 +2250,8 @@ pub fn run() {
 
     // A foreground run has no process-independent executor.  If the desktop
     // process exited while one was reserved, promote its hidden provisional
-    // reply into a resumable Main-Agent state before the UI loads. Delegated
+    // reply before the UI loads. Older already-visible replies keep their
+    // content and become attention-only, never automatic replays. Delegated
     // attempts recover separately through the single delegation pump below.
     if let Err(error) = commands::foreground_run_store::recover_interrupted_runs_in_conn(
         &mut conn,
@@ -1780,15 +2297,14 @@ pub fn run() {
     // Resolve deployment opt-in before either the debug compatibility thread
     // or the delegated host is started.  This avoids a race where `.env` would
     // be loaded by the debug thread after the production host checked it.
-    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
-    let _ = dotenvy::from_filename(project_root.join(".env")).ok();
+    load_deployment_environment();
 
     // Start dev HTTP server in debug mode
     #[cfg(debug_assertions)]
     {
-        std::thread::spawn(start_dev_http_server);
+        if !manual_desktop_acceptance() {
+            std::thread::spawn(start_dev_http_server);
+        }
     }
 
     let db = std::sync::Arc::new(Mutex::new(conn));
@@ -1838,6 +2354,9 @@ pub fn run() {
             commands::session::get_history_sessions,
             commands::message::send_message,
             commands::message::get_messages,
+            commands::reply_export::save_message_reply,
+            commands::reply_export::save_session_file,
+            commands::foreground_text_attachments::extract_document_text,
             commands::message::resolve_agent_confirmation,
             commands::message::preflight_pending_desktop_action,
             commands::message::continue_agent_task,
@@ -1850,6 +2369,9 @@ pub fn run() {
             commands::message::edit_and_resend_message,
             commands::mcp::get_mcp_servers,
             commands::mcp::save_mcp_server,
+            commands::mcp::prepare_browser_mcp,
+            commands::mcp::preview_browser_cleanup,
+            commands::mcp::clear_browser_temp_files,
             commands::mcp::delete_mcp_server,
             commands::mcp::set_mcp_env_var,
             commands::mcp::remove_mcp_env_var,
@@ -1863,6 +2385,8 @@ pub fn run() {
             commands::mcp::list_mcp_tools,
             commands::mcp::refresh_mcp_tools,
             commands::memory::get_memories,
+            commands::memory::get_learned_preferences,
+            commands::memory::dismiss_learned_preference,
             commands::memory::save_memory,
             commands::memory::update_memory,
             commands::memory::delete_memory,
@@ -1906,6 +2430,7 @@ pub fn run() {
             commands::workspace::get_workspaces,
             commands::workspace::create_project_workspace,
             commands::workspace::open_workspace,
+            commands::workspace::confirm_restored_project_directories,
             commands::project_network_approval::get_project_network_approvals,
             commands::project_network_approval::revoke_project_network_approval,
             commands::settings::load_api_config,
@@ -1978,10 +2503,14 @@ pub fn run() {
             commands::steering::cancel_instruction,
             commands::steering::clear_instructions,
             commands::automation::get_automations,
+            commands::automation::get_automation_dashboard,
+            commands::automation::get_workspace_automation_overview,
             commands::automation::create_automation,
+            commands::automation::create_maa_automation,
             commands::automation::set_automation_enabled,
             commands::automation::delete_automation,
             commands::automation::run_automation_now,
+            commands::automation::stop_automation_run,
             commands::automation::run_due_automations,
             commands::automation::get_automation_runs,
             commands::channel::get_channel_connections,
@@ -2040,6 +2569,9 @@ pub fn run() {
                 .tooltip("AngelBot")
                 .on_menu_event(|app, event| match tray_menu_action(event.id.as_ref()) {
                     TrayMenuAction::Quit => {
+                        if let Some(clock) = app.try_state::<automation_clock::AutomationClock>() {
+                            clock.stop();
+                        }
                         if let Some(state) = app.try_state::<AppState>() {
                             if let Some(pump) = &state.delegation_pump {
                                 let _ = pump.shutdown();
@@ -2060,8 +2592,15 @@ pub fn run() {
             #[cfg(debug_assertions)]
             {
                 let window = app.get_webview_window("main").unwrap();
-                window.open_devtools();
+                if manual_desktop_acceptance() {
+                    window.set_title("AngelBot · 原生隔离验收")?;
+                } else if !model_recovery_acceptance() {
+                    window.open_devtools();
+                }
             }
+            // All startup recovery, managed state and fallible window/tray
+            // setup must succeed before due work may be admitted.
+            automation_clock::AutomationClock::install(app.handle());
             Ok(())
         });
 
@@ -2069,14 +2608,38 @@ pub fn run() {
     let app_builder = app_builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     #[cfg(feature = "desktop-e2e")]
-    let app_builder = app_builder
-        .plugin(tauri_plugin_wdio::init())
-        .plugin(tauri_plugin_wdio_webdriver::init());
+    let app_builder = if manual_desktop_acceptance() {
+        app_builder
+    } else {
+        app_builder
+            .plugin(tauri_plugin_wdio::init())
+            .plugin(tauri_plugin_wdio_webdriver::init())
+    };
 
+    let context = tauri::generate_context!();
+    #[cfg(feature = "desktop-e2e")]
+    let context = {
+        let mut context = context;
+        if model_recovery_acceptance() {
+            for window in &mut context.config_mut().app.windows {
+                window.focus = false;
+                window.title = format!("AngelBot · 恢复隔离验收 {}", std::process::id());
+            }
+        }
+        context
+    };
     app_builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                if let Some(clock) = app.try_state::<automation_clock::AutomationClock>() {
+                    clock.stop();
+                }
+            }
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.mcp_manager.stop_all();

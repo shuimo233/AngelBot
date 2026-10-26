@@ -16,7 +16,7 @@ use super::{
     },
     delegation_runtime::{DelegationRuntime, Heartbeat, SandboxController},
     execution_gateway::CapabilityLease,
-    execution_kernel::{ExecutionHost, ExecutionKernel, KernelRunError},
+    execution_kernel::{ExecutionHost, ExecutionKernel, KernelModelTurnError, KernelRunError},
 };
 
 /// Immutable binding supplied after the Main Agent has issued a policy lease.
@@ -58,6 +58,7 @@ pub enum DelegatedWorkerFailureKind {
     LeaseInactive,
     LeaseExpired,
     ModelFailed,
+    Cancelled,
     BudgetExceeded,
     HostFailed,
     DeliveryRejected,
@@ -245,6 +246,9 @@ fn now_ms() -> i64 {
 fn kernel_failure_kind<E>(error: &KernelRunError<E>) -> DelegatedWorkerFailureKind {
     match error {
         KernelRunError::Host(_) => DelegatedWorkerFailureKind::HostFailed,
+        KernelRunError::Model(KernelModelTurnError::Cancelled) => {
+            DelegatedWorkerFailureKind::Cancelled
+        }
         KernelRunError::Model(_) => DelegatedWorkerFailureKind::ModelFailed,
         KernelRunError::BudgetExceeded(_) => DelegatedWorkerFailureKind::BudgetExceeded,
     }
@@ -335,12 +339,12 @@ mod tests {
             }
         }
     }
-    struct RetryingHost {
+    struct ModelDeliveryHost {
         provider: Arc<dyn LlmProvider>,
         delivery: Option<DelegationDelivery>,
     }
     #[async_trait]
-    impl ExecutionHost for RetryingHost {
+    impl ExecutionHost for ModelDeliveryHost {
         type Output = DelegationDelivery;
         type Error = String;
         async fn next_model_turn(
@@ -396,6 +400,7 @@ mod tests {
     }
     fn delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "x".into(),
             delivery_revision: 1,
@@ -530,11 +535,11 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn maps_kernel_retry_to_one_successful_delivery() {
+    async fn provider_error_fails_attempt_without_retry_or_delivery() {
         let provider = Arc::new(FailsOnce {
             calls: AtomicUsize::new(0),
         });
-        let mut host = RetryingHost {
+        let mut host = ModelDeliveryHost {
             provider: provider.clone(),
             delivery: Some(delivery()),
         };
@@ -542,7 +547,7 @@ mod tests {
             beats: 0,
             deliveries: 0,
         };
-        adapter()
+        let error = adapter()
             .run(
                 &attempt(LeaseStatus::Active, now_ms() + 60_000),
                 &brief(),
@@ -551,8 +556,19 @@ mod tests {
                 |_| {},
             )
             .await
-            .unwrap();
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(sink.deliveries, 1);
+            .unwrap_err();
+        assert_eq!(error.kind, DelegatedWorkerFailureKind::ModelFailed);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.deliveries, 0);
+        assert!(
+            host.delivery.is_some(),
+            "a failed inference cannot consume a prepared delivery"
+        );
+        assert_eq!(
+            kernel_failure_kind(&KernelRunError::<String>::Model(
+                KernelModelTurnError::Cancelled
+            )),
+            DelegatedWorkerFailureKind::Cancelled
+        );
     }
 }

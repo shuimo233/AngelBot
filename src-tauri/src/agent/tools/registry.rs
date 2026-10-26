@@ -12,6 +12,117 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Host-produced rejection, before dispatch/approval. Handler errors use the
+/// separate `Error: ...` envelope and must never be decoded as this receipt.
+pub(crate) fn argument_rejection_output(
+    registry: &ToolRegistry,
+    call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    error: &str,
+) -> String {
+    let mut null_corrections = Vec::new();
+    if let (Some(tool), Some(original)) = (registry.get(tool_name), arguments.as_object()) {
+        let mut omitted = original.clone();
+        if let Some(properties) = tool.parameters.get("properties").and_then(Value::as_object) {
+            for (key, value) in original {
+                let required = tool.parameters["required"]
+                    .as_array()
+                    .is_some_and(|keys| keys.iter().any(|field| field.as_str() == Some(key)));
+                let property = properties.get(key).unwrap_or(&Value::Null);
+                if value.is_null()
+                    && !required
+                    && property["nullable"] != true
+                    && matches!(
+                        property["type"].as_str(),
+                        Some("string" | "number" | "integer" | "boolean" | "array" | "object")
+                    )
+                {
+                    omitted.remove(key);
+                    null_corrections.push(key.clone());
+                }
+            }
+        }
+        if !null_corrections.is_empty()
+            && registry
+                .validate_arguments(tool_name, &Value::Object(omitted))
+                .is_err()
+        {
+            null_corrections.clear();
+        }
+    }
+    serde_json::json!({
+        "code": "HOST_ARGUMENTS_REJECTED", "dispatched": false,
+        "call_id": call_id, "tool_name": tool_name,
+        "null_corrections": null_corrections,
+        "message": format!("Tool call for '{tool_name}' was not executed: {error}. Provide every required argument and retry the tool call.")
+    }).to_string()
+}
+
+/// Resolve only a host rejection whose null fields were subsequently corrected
+/// by a real success. Only schema-proven invalid optional nulls may differ;
+/// explicitly nullable values (including clearing/filtering intent) are kept.
+/// All other originally specified values must be equal;
+/// no new keys/targets may be introduced. This changes completion diagnostics,
+/// never arguments, permissions, dispatch, or unknown-effect recovery.
+pub(crate) fn repairs_argument_rejection(
+    call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    output: &str,
+    corrected: &Value,
+) -> bool {
+    let Ok(receipt) = serde_json::from_str::<Value>(output) else {
+        return false;
+    };
+    if call_id.is_empty()
+        || receipt["code"] != "HOST_ARGUMENTS_REJECTED"
+        || receipt["dispatched"] != false
+        || receipt["call_id"] != call_id
+        || receipt["tool_name"] != tool_name
+    {
+        return false;
+    }
+    let (Some(original), Some(corrected)) = (arguments.as_object(), corrected.as_object()) else {
+        return false;
+    };
+    let Some(corrections) = receipt["null_corrections"].as_array() else {
+        return false;
+    };
+    !corrections.is_empty()
+        && corrections.iter().all(|key| {
+            key.as_str()
+                .is_some_and(|key| original.get(key) == Some(&Value::Null))
+        })
+        && original.iter().all(|(key, value)| {
+            corrections.iter().any(|field| field.as_str() == Some(key))
+                || corrected.get(key) == Some(value)
+        })
+        && corrected.keys().all(|key| original.contains_key(key))
+}
+
+/// The caller supplies a later successful receipt, never a dispatch or proposal.
+/// Shared by live task facts and durable transcript projection.
+pub(crate) fn operation_repair_matches(
+    failed_name: &str,
+    failed_id: &str,
+    failed_args: &Value,
+    failed_output: &str,
+    succeeded_name: &str,
+    succeeded_args: &Value,
+) -> bool {
+    failed_name == succeeded_name
+        && !ToolResult::is_result_unknown(false, failed_output)
+        && (failed_args == succeeded_args
+            || repairs_argument_rejection(
+                failed_id,
+                failed_name,
+                failed_args,
+                failed_output,
+                succeeded_args,
+            ))
+}
+
 /// Result of executing a tool
 #[derive(Debug, Clone)]
 pub struct ToolExecResult {
@@ -80,6 +191,23 @@ impl ToolRegistry {
     pub fn contains(&self, name: &str) -> bool {
         let guard = self.entries.lock().unwrap();
         guard.contains_key(name)
+    }
+
+    /// Remove a capability from a freshly assembled foreground surface. Its
+    /// schema, prompt guidance and handler disappear together.
+    pub(crate) fn unregister(&mut self, name: &str) {
+        self.entries.lock().unwrap().remove(name);
+    }
+
+    /// Host guidance only; keeps the existing handler, schema and approval
+    /// identity intact instead of changing untrusted MCP discovery metadata.
+    pub(crate) fn append_prompt_snippet(&mut self, name: &str, note: &str) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(name) {
+            entry.tool.prompt_snippet = Some(match entry.tool.prompt_snippet.take() {
+                Some(existing) => format!("{existing}\n{note}"),
+                None => note.to_owned(),
+            });
+        }
     }
 
     /// Get all tool schemas for LLM function calling
@@ -361,6 +489,8 @@ pub fn is_side_effect_tool(name: &str) -> bool {
             | "create_automation"
             | "schedule_reminder"
             | "cancel_reminder"
+            | "pause_automation"
+            | "stop_automation_run"
             | "import_skill_from_github"
             | "open_trusted_app"
             | "open_windows_setting"
@@ -368,9 +498,18 @@ pub fn is_side_effect_tool(name: &str) -> bool {
             | "prepare_message_draft"
             | "set_trusted_app_text"
             | "operate_trusted_app_control"
+            | "click_trusted_app_image"
             | "materialize_delegated_change"
             | "delegate_network_exploration"
     ) || name.starts_with("mcp_")
+}
+
+/// Argument-sensitive approval admission shared by the runner and persisted
+/// confirmation resolver. Structural observation remains a read-only tool;
+/// disclosing window pixels follows the user's normal operation permission.
+pub(crate) fn requires_argument_confirmation(name: &str, arguments: &Value) -> bool {
+    name == "observe_trusted_app_window"
+        && arguments.get("mode").and_then(Value::as_str) == Some("image")
 }
 
 /// Actions whose authority must never be inferred from a broad execution
@@ -390,6 +529,7 @@ pub fn requires_immediate_confirmation(name: &str) -> bool {
             | "prepare_message_draft"
             | "set_trusted_app_text"
             | "operate_trusted_app_control"
+            | "click_trusted_app_image"
     )
 }
 
@@ -431,6 +571,7 @@ mod tests {
             "prepare_message_draft",
             "set_trusted_app_text",
             "operate_trusted_app_control",
+            "click_trusted_app_image",
         ] {
             assert!(requires_immediate_confirmation(name), "{name}");
         }

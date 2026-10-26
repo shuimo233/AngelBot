@@ -20,9 +20,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::auth::ModelCredentialSource;
 use super::protocol::{MAX_CONTINUATION_BYTES, MAX_CONTINUATION_ITEMS};
 use super::{
-    LlmProvider, LlmResponse, Message, ModelAuthMode, ModelProtocol, ProtocolContinuation,
-    ProviderConfig, ProviderUsage, StopReason, ThinkingEffort, ThinkingSettings, ToolCall,
-    ToolSchema,
+    LlmFailure, LlmFailureKind, LlmProvider, LlmResponse, Message, ModelAuthMode, ModelProtocol,
+    ProtocolContinuation, ProviderConfig, ProviderUsage, StopReason, ThinkingEffort,
+    ThinkingSettings, ToolCall, ToolSchema,
 };
 
 const PLAN_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -59,6 +59,7 @@ pub struct OpenAiResponsesProvider {
     credentials: Arc<dyn ModelCredentialSource>,
     max_tokens: u32,
     temperature: f64,
+    native_context_threshold: usize,
     last_usage: Mutex<Option<ProviderUsage>>,
 }
 
@@ -100,6 +101,11 @@ impl OpenAiResponsesProvider {
             credentials,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
+            native_context_threshold: (super::context_window_tokens(config)
+                .saturating_sub(config.max_tokens as usize)
+                .saturating_mul(70)
+                / 100)
+                .max(1),
             last_usage: Mutex::new(None),
         })
     }
@@ -180,11 +186,25 @@ impl OpenAiResponsesProvider {
         }
         // With store:false the current API returns encrypted reasoning by
         // default. No previous_response_id or account-crossing storage is used.
-        if serde_json::to_vec(&body)
+        let mut size = serde_json::to_vec(&body)
             .map_err(|_| INVALID_HISTORY)?
-            .len()
-            > MAX_STREAM_BYTES
+            .len();
+        // The public OpenAI route documents this native operation. Compatible
+        // third-party endpoints are not assumed to implement it. UTF-8 bytes
+        // conservatively trigger earlier than a chars/4 estimate (which can
+        // miss Chinese/code input); the service decides using rendered tokens.
+        if self.endpoint.as_str() == PLAN_ENDPOINT
+            && self.auth_mode != ModelAuthMode::None
+            && size >= self.native_context_threshold
         {
+            body["context_management"] = json!([{
+                "type":"compaction", "compact_threshold":self.native_context_threshold,
+            }]);
+            size = serde_json::to_vec(&body)
+                .map_err(|_| INVALID_HISTORY)?
+                .len();
+        }
+        if size > MAX_STREAM_BYTES {
             return Err("Responses 对话历史过大，请缩短上下文后再试。".into());
         }
         Ok(body)
@@ -196,7 +216,7 @@ impl OpenAiResponsesProvider {
         tools: Option<&[ToolSchema]>,
         thinking: Option<&ThinkingSettings>,
         delta_sender: Option<UnboundedSender<String>>,
-    ) -> Result<LlmResponse, String> {
+    ) -> Result<LlmResponse, LlmFailure> {
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let body = self.request_body(messages, tools, thinking)?;
         let mut request = self
@@ -223,6 +243,24 @@ impl OpenAiResponsesProvider {
             request = request.header(AUTHORIZATION, authorization);
         }
         let mut response = request.send().await.map_err(request_transport_error)?;
+        // Opt-in synthetic browser acceptance only. Record the actual wire
+        // offer, never messages, arguments, credentials or schema contents.
+        #[cfg(test)]
+        if std::env::var("ANGELBOT_LIVE_MODEL_TEST").as_deref() == Ok("1")
+            && std::env::var("ANGELBOT_LIVE_MODEL_JOURNEY").as_deref() == Ok("browser-daily")
+        {
+            if let Ok(phase) = std::env::var("ANGELBOT_PRIVATE_LIVE_PHASE") {
+                if matches!(
+                    phase.as_str(),
+                    "browser-write" | "browser-reopen" | "browser-restored"
+                ) {
+                    println!(
+                        "\nLIVE_MODEL_TOOL_OFFER {}",
+                        live_tool_offer_summary(&body, &phase, response.status().as_u16())
+                    );
+                }
+            }
+        }
         if !response.status().is_success() {
             return Err(read_http_error(response).await);
         }
@@ -242,12 +280,14 @@ impl OpenAiResponsesProvider {
             return Err(read_non_sse_error(response).await);
         }
         let status = response.status().as_u16();
-        let transport_error = |error: String| {
+        let transport_error = |mut failure: LlmFailure| {
             if missing_content_type {
-                format!("Responses 响应类型：缺失（HTTP {status}）；{error}")
-            } else {
-                error
+                failure.diagnostic = format!(
+                    "Responses 响应类型：缺失（HTTP {status}）；{}",
+                    failure.diagnostic
+                );
             }
+            failure
         };
         let allowed_tools = tools
             .unwrap_or_default()
@@ -276,15 +316,15 @@ impl OpenAiResponsesProvider {
             } else {
                 "读取中断"
             };
-            transport_error(format!(
-                "Responses 事件流{kind}；未提交工具调用，不会自动重试外部操作。"
-            ))
+            transport_error(
+                format!("Responses 事件流{kind}；未提交工具调用，不会自动重试外部操作。").into(),
+            )
         })? {
             parser
-                .feed(&chunk, delta_sender.as_ref())
+                .feed_classified(&chunk, delta_sender.as_ref())
                 .map_err(&transport_error)?;
             if let Some(completed) = parser.completed.take() {
-                return self.accept_completed(completed);
+                return self.accept_completed(completed).map_err(Into::into);
             }
         }
         if missing_content_type && parser.total_bytes == 0 {
@@ -292,7 +332,9 @@ impl OpenAiResponsesProvider {
                 "Responses 返回空响应；未提交工具调用。".into(),
             ));
         }
-        parser.finish().map_err(transport_error)?;
+        parser
+            .finish()
+            .map_err(|error| transport_error(error.into()))?;
         Err("Responses 事件流结束但没有 response.completed；未提交工具调用。".into())
     }
 
@@ -326,7 +368,9 @@ impl LlmProvider for OpenAiResponsesProvider {
         tools: Option<&[ToolSchema]>,
         thinking: Option<&ThinkingSettings>,
     ) -> Result<LlmResponse, String> {
-        self.request(messages, tools, thinking, None).await
+        self.request(messages, tools, thinking, None)
+            .await
+            .map_err(|failure| failure.diagnostic)
     }
 
     async fn chat_stream(
@@ -336,8 +380,52 @@ impl LlmProvider for OpenAiResponsesProvider {
         thinking: Option<&ThinkingSettings>,
         delta_sender: Option<UnboundedSender<String>>,
     ) -> Result<LlmResponse, String> {
+        self.request(messages, tools, thinking, delta_sender)
+            .await
+            .map_err(|failure| failure.diagnostic)
+    }
+
+    async fn chat_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+    ) -> Result<LlmResponse, LlmFailure> {
+        self.request(messages, tools, thinking, None).await
+    }
+
+    async fn chat_stream_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        delta_sender: Option<UnboundedSender<String>>,
+    ) -> Result<LlmResponse, LlmFailure> {
         self.request(messages, tools, thinking, delta_sender).await
     }
+}
+
+#[cfg(test)]
+fn live_tool_offer_summary(body: &Value, phase: &str, http_status: u16) -> Value {
+    let mut names = Vec::new();
+    for entry in body["tools"].as_array().into_iter().flatten() {
+        let functions = if entry["type"] == "namespace" {
+            entry["tools"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            std::slice::from_ref(entry)
+        };
+        for function in functions {
+            if function["type"] == "function" {
+                if let Some(name) = function["name"].as_str() {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    json!({"phase":phase, "httpStatus":http_status, "toolCount":names.len(), "toolNames":names})
 }
 
 fn responses_endpoint(base: &str, mode: ModelAuthMode) -> Result<reqwest::Url, String> {
@@ -538,6 +626,21 @@ fn parse_output_items(
                 // Keep encrypted_content, summary, IDs and any future opaque
                 // reasoning fields. None are ever streamed to the UI.
             }
+            Some("compaction") => {
+                if !parsed.calls.is_empty()
+                    || !item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_call_id)
+                    || !item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                {
+                    return Err(invalid_response_at("compaction 对象或顺序"));
+                }
+                // Opaque provider context, never visible text or tool authority.
+            }
             Some("function_call") => {
                 let id = item
                     .get("call_id")
@@ -585,6 +688,29 @@ fn same_calls(left: &[ToolCall], right: &[ToolCall]) -> bool {
         })
 }
 
+/// Explicit live acceptance inspects only the shape of the production codec's
+/// initial replay, never returning encrypted continuation data to test logs.
+#[cfg(test)]
+pub(crate) fn native_context_shape(
+    config: &ProviderConfig,
+    messages: &[Message],
+    needle: &str,
+) -> Result<(bool, bool, usize), String> {
+    let (input, instructions) = encode_messages(
+        messages,
+        &config.model,
+        config.credential_ref.as_deref().unwrap_or_default(),
+        config.auth_mode,
+    )?;
+    let bytes = serde_json::to_vec(&json!({"input":input,"instructions":instructions}))
+        .map_err(|_| INVALID_HISTORY)?;
+    Ok((
+        input.iter().any(|item| item["type"] == "compaction"),
+        String::from_utf8_lossy(&bytes).contains(needle),
+        bytes.len(),
+    ))
+}
+
 fn encode_messages(
     messages: &[Message],
     model: &str,
@@ -597,7 +723,26 @@ fn encode_messages(
     let mut pending = HashMap::new();
     let mut image_count = 0usize;
     let mut image_bytes = 0usize;
-    for message in messages {
+    // Only a checkpoint bound to this exact model/account can replace earlier
+    // input. Keep owner instructions; do not delete the durable transcript.
+    let active_start = messages
+        .iter()
+        .rposition(|message| {
+            message.role == "assistant"
+                && message.protocol_state.as_ref().is_some_and(|state| {
+                    state.protocol == ModelProtocol::OpenaiResponses
+                        && state.matches(model, credential_ref)
+                        && state
+                            .output_items
+                            .iter()
+                            .any(|item| item["type"] == "compaction")
+                })
+        })
+        .unwrap_or(0);
+    for (index, message) in messages.iter().enumerate() {
+        if index < active_start && message.role != "system" {
+            continue;
+        }
         if message.role != "assistant"
             && (message.protocol_state.is_some() || message.tool_calls.is_some())
             || message.role != "tool" && message.tool_call_id.is_some()
@@ -635,7 +780,12 @@ fn encode_messages(
                     if !same_calls(&parsed.calls, calls) {
                         return Err(INVALID_HISTORY.into());
                     }
-                    input.extend(parsed.replay);
+                    let start = parsed
+                        .replay
+                        .iter()
+                        .rposition(|item| item["type"] == "compaction")
+                        .unwrap_or(0);
+                    input.extend(parsed.replay.into_iter().skip(start));
                 } else {
                     // A model/account switch MUST NOT copy opaque reasoning,
                     // output IDs, phases or other private protocol state.
@@ -850,11 +1000,21 @@ impl ResponsesStream {
         }
     }
 
+    #[cfg(test)]
     fn feed(
         &mut self,
         chunk: &[u8],
         sender: Option<&UnboundedSender<String>>,
     ) -> Result<(), String> {
+        self.feed_classified(chunk, sender)
+            .map_err(|failure| failure.diagnostic)
+    }
+
+    fn feed_classified(
+        &mut self,
+        chunk: &[u8],
+        sender: Option<&UnboundedSender<String>>,
+    ) -> Result<(), LlmFailure> {
         self.total_bytes = self
             .total_bytes
             .checked_add(chunk.len())
@@ -895,7 +1055,7 @@ impl ResponsesStream {
         Ok(())
     }
 
-    fn consume_line(&mut self, sender: Option<&UnboundedSender<String>>) -> Result<(), String> {
+    fn consume_line(&mut self, sender: Option<&UnboundedSender<String>>) -> Result<(), LlmFailure> {
         let line = std::mem::take(&mut self.line);
         let first_line = std::mem::replace(&mut self.first_line, false);
         if line.is_empty() {
@@ -931,7 +1091,10 @@ impl ResponsesStream {
         Ok(())
     }
 
-    fn consume_event(&mut self, sender: Option<&UnboundedSender<String>>) -> Result<(), String> {
+    fn consume_event(
+        &mut self,
+        sender: Option<&UnboundedSender<String>>,
+    ) -> Result<(), LlmFailure> {
         let event_name = self.event_name.take();
         if self.data.is_empty() {
             return Ok(());
@@ -955,10 +1118,10 @@ impl ResponsesStream {
             .as_deref()
             .is_some_and(|name| !name.is_empty() && name != kind)
         {
-            return Err(invalid_response_at("事件名称"));
+            return Err(invalid_response_at("事件名称").into());
         }
         if self.terminal {
-            return Err(invalid_response_at("终态后事件"));
+            return Err(invalid_response_at("终态后事件").into());
         }
         match kind {
             "response.created" => {
@@ -968,7 +1131,7 @@ impl ResponsesStream {
                         .filter(|id| valid_call_id(id))
                         .ok_or_else(|| invalid_response_at("创建 ID"))?;
                     if self.response_id.as_deref().is_some_and(|prior| prior != id) {
-                        return Err(invalid_response_at("响应 ID 冲突"));
+                        return Err(invalid_response_at("响应 ID 冲突").into());
                     }
                     self.response_id = Some(id.to_string());
                 }
@@ -999,11 +1162,11 @@ impl ResponsesStream {
                         .is_some()
                         || self.done_items.contains_key(&index)
                     {
-                        return Err(invalid_response_at("output item 重复起始"));
+                        return Err(invalid_response_at("output item 重复起始").into());
                     }
                 } else {
                     if self.done_items.contains_key(&index) {
-                        return Err(invalid_response_at("output item 重复完成"));
+                        return Err(invalid_response_at("output item 重复完成").into());
                     }
                     if self
                         .started_items
@@ -1011,7 +1174,7 @@ impl ResponsesStream {
                         .and_then(Option::as_deref)
                         .is_some_and(|started| Some(started) != id)
                     {
-                        return Err(invalid_response_at("output item ID 冲突"));
+                        return Err(invalid_response_at("output item ID 冲突").into());
                     }
                     let size = serde_json::to_vec(item)
                         .map_err(|_| invalid_response_at("output item 编码"))?
@@ -1034,7 +1197,7 @@ impl ResponsesStream {
                     .as_deref()
                     .is_some_and(|id| response.get("id").and_then(Value::as_str) != Some(id))
                 {
-                    return Err(invalid_response_at("响应 ID 冲突"));
+                    return Err(invalid_response_at("响应 ID 冲突").into());
                 }
                 // Like Codex, distinguish full item completion from response
                 // lifecycle completion. Some direct plan streams omit the
@@ -1056,7 +1219,7 @@ impl ResponsesStream {
                             .enumerate()
                             .any(|(expected, index)| expected != *index)
                     {
-                        return Err(invalid_response_at("output item 未完整完成"));
+                        return Err(invalid_response_at("output item 未完整完成").into());
                     }
                     response["output"] =
                         Value::Array(std::mem::take(&mut self.done_items).into_values().collect());
@@ -1082,7 +1245,7 @@ impl ResponsesStream {
                 self.terminal = true;
             }
             "response.failed" => {
-                return Err(structured_error(
+                return Err(structured_failure(
                     event.pointer("/response/error").unwrap_or(&Value::Null),
                     None,
                 ));
@@ -1103,7 +1266,12 @@ impl ResponsesStream {
                     },
                 );
             }
-            "error" => return Err(structured_error(event.get("error").unwrap_or(&event), None)),
+            "error" => {
+                return Err(structured_failure(
+                    event.get("error").unwrap_or(&event),
+                    None,
+                ))
+            }
             "response.output_text.delta" => {
                 let delta = event
                     .get("delta")
@@ -1119,7 +1287,7 @@ impl ResponsesStream {
             // terminal response (including full done-item reconstruction)
             // can yield ToolCall values.
             kind if kind.starts_with("response.") => {}
-            _ => return Err(invalid_response_at("事件类型")),
+            _ => return Err(invalid_response_at("事件类型").into()),
         }
         Ok(())
     }
@@ -1135,14 +1303,22 @@ impl ResponsesStream {
     }
 }
 
-async fn read_http_error(mut response: reqwest::Response) -> String {
+async fn read_http_error(mut response: reqwest::Response) -> LlmFailure {
     let status = response.status().as_u16();
-    let bytes = match read_error_body(&mut response).await {
-        Ok(bytes) => bytes,
-        Err(_) => return structured_error(&Value::Null, Some(status)),
+    let mut failure = match read_error_body(&mut response).await {
+        Ok(bytes) => {
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            structured_failure(value.get("error").unwrap_or(&value), Some(status))
+        }
+        Err(_) => structured_failure(&Value::Null, Some(status)),
     };
-    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    structured_error(value.get("error").unwrap_or(&value), Some(status))
+    // Admission may return only {detail:...}. Preserve its numeric status, not
+    // remote text/headers, and never infer that 401 has confirmed revocation.
+    failure.diagnostic = format!(
+        "Responses 请求失败（HTTP {status}）；{} 未提交工具调用。",
+        failure.diagnostic
+    );
+    failure
 }
 
 async fn read_error_body(response: &mut reqwest::Response) -> Result<Vec<u8>, &'static str> {
@@ -1159,7 +1335,7 @@ async fn read_error_body(response: &mut reqwest::Response) -> Result<Vec<u8>, &'
     }
 }
 
-async fn read_non_sse_error(mut response: reqwest::Response) -> String {
+async fn read_non_sse_error(mut response: reqwest::Response) -> LlmFailure {
     let status = response.status().as_u16();
     // Only fixed categories leave the adapter. Headers and bodies may echo
     // credentials, account information, or conversation content.
@@ -1183,21 +1359,19 @@ async fn read_non_sse_error(mut response: reqwest::Response) -> String {
     let bytes =
         match tokio::time::timeout(Duration::from_secs(5), read_error_body(&mut response)).await {
             Ok(Ok(bytes)) => bytes,
-            Ok(Err(kind)) => return diagnostic(kind),
-            Err(_) => return diagnostic("正文读取超时"),
+            Ok(Err(kind)) => return diagnostic(kind).into(),
+            Err(_) => return diagnostic("正文读取超时").into(),
         };
     if bytes.is_empty() {
-        return diagnostic("空响应");
+        return diagnostic("空响应").into();
     }
     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
             // A JSON error can use a successful HTTP status. Preserve the same
             // allowlisted recovery as non-2xx errors, never its raw message.
-            return format!(
-                "{} {}",
-                diagnostic("JSON 错误"),
-                structured_error(error, Some(status))
-            );
+            let mut failure = structured_failure(error, Some(status));
+            failure.diagnostic = format!("{} {}", diagnostic("JSON 错误"), failure.diagnostic);
+            return failure;
         }
         return diagnostic(
             if value.get("object").and_then(Value::as_str) == Some("response") {
@@ -1205,7 +1379,8 @@ async fn read_non_sse_error(mut response: reqwest::Response) -> String {
             } else {
                 "JSON"
             },
-        );
+        )
+        .into();
     }
     let start = bytes
         .iter()
@@ -1221,6 +1396,7 @@ async fn read_non_sse_error(mut response: reqwest::Response) -> String {
             "无法识别"
         },
     )
+    .into()
 }
 
 fn structured_error(error: &Value, status: Option<u16>) -> String {
@@ -1245,6 +1421,19 @@ fn structured_error(error: &Value, status: Option<u16>) -> String {
             Some(400) => "Responses 拒绝了请求参数，请检查模型与工具配置。".into(),
             _ => "Responses 请求失败；未提交工具调用，不会自动重试或切换到付费 API。".into(),
         },
+    }
+}
+
+fn structured_failure(error: &Value, status: Option<u16>) -> LlmFailure {
+    let kind = match error.get("code").and_then(Value::as_str) {
+        Some("subscription_sharing_usage_limit_exceeded" | "insufficient_quota") => {
+            LlmFailureKind::QuotaExceeded
+        }
+        _ => LlmFailureKind::Unclassified,
+    };
+    LlmFailure {
+        kind,
+        diagnostic: structured_error(error, status),
     }
 }
 

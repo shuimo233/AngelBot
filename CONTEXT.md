@@ -18,7 +18,7 @@ The single user-facing assistant responsible for understanding a request, coordi
 _Avoid_: coding agent, worker manager (when referring to the user's assistant)
 
 **Daily Workspace**:
-The Personal workspace for everyday conversation and affairs that do not need a durable Project. It is not a reduced-capability chat mode and does not own project files.
+The Personal workspace for everyday conversation and affairs that do not need a durable Project. It is not a reduced-capability chat mode and does not own project files. It has one host-owned durable `results/` directory beside the application database, consumed through the existing file tools and workbench. This grants neither project-command nor delegated-workspace authority, nor access to other user directories. Results are retained by default; native Save As authorizes one new destination, not its parent. Existing backups carry the bounded file payload; restore is additive and refuses differing same-name files even in replace mode.
 _Avoid_: simple mode, chat-only mode
 
 **Professional Executor**:
@@ -92,7 +92,7 @@ _Avoid_: completed action, pending tool call
 ## Workspace Supervision
 
 **Workspace**:
-A durable user-facing scope: either Personal, which has no project files, or Project, which owns one canonical project root and one visible Main Agent conversation.
+A durable user-facing scope: either Personal, which has no project files, or Project, which owns one canonical project root and one visible Main Agent conversation. Restoring a Project preserves its directory as information, not authority: new restored projects have `directory_confirmed=0` until the owner confirms one batch of local paths. History remains readable; file, command and delegated-workspace roots remain unavailable before confirmation. Conversation backups retain Main/tree pointers and inert receipts, not execution queues or external project files.
 _Avoid_: Project (when referring to Personal), session, chat
 
 **Main Conversation**:
@@ -207,13 +207,22 @@ history, workspace references, and bounded identifier-only attention cards. It
 does not resolve providers, execute the runner, write terminal state, emit UI
 events, or expose diagnostic evidence payloads.
 
+Saved global user constraints are a separate, source-labelled projection from
+durable storage, not similarity recall or compressed history. Main preparation
+and `check_constraint` share the bounded reader; omissions are explicit. This
+context never authorizes an action or implicitly becomes a child's full memory.
+
 ## Foreground Run Store
 
 The transcript/run consistency module for a Main-Agent foreground turn. It
 creates hidden provisional assistant parents with matching running task runs,
 atomically promotes successful replies with their tool/task protocol, records
 recoverable run status, and projects only visible transcript rows. Terminal
-event publication remains owned by `ForegroundLifecycleControl`.
+event publication remains owned by `ForegroundLifecycleControl`. Startup also
+settles abandoned already-visible running replies without rewriting their text,
+receipts or selected branch, and without enabling replay. A per-data-directory
+Windows instance handle is acquired before opening the database or recovering
+runs; native helper processes and distinct isolated data roots remain separate.
 
 ## Foreground Model Factory
 

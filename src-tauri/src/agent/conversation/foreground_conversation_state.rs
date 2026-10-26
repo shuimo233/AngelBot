@@ -136,8 +136,7 @@ impl ForegroundConversationState {
 /// supplies these facts to a resumed slice.
 pub(crate) fn task_facts_from_steps(user_message: &str, steps: &[AgentStep]) -> TaskFacts {
     let mut facts = TaskFacts::new(user_message);
-    let mut failed_step_tools = Vec::new();
-    let mut successful_tools = std::collections::HashSet::new();
+    let mut failed_operations: Vec<&AgentStep> = Vec::new();
     for step in steps {
         if step.tool_name == "agent_loop_no_progress" {
             facts.no_progress_count = step
@@ -159,12 +158,25 @@ pub(crate) fn task_facts_from_steps(user_message: &str, steps: &[AgentStep]) -> 
         }
 
         if !step.success {
-            facts.failed_steps.push(step.call_id.clone());
-            failed_step_tools.push((step.call_id.clone(), step.tool_name.clone()));
+            failed_operations.push(step);
             continue;
         }
 
-        successful_tools.insert(step.tool_name.as_str());
+        // Only a later success of the same operation repairs a failure. An
+        // earlier success, or one for a different target, is not repair evidence.
+        // A host-rejected null argument may be corrected before any operation
+        // was dispatched; keep that failed receipt, but do not block delivery
+        // after the corresponding real success. Handler errors cannot opt in.
+        failed_operations.retain(|failure| {
+            !crate::agent::registry::operation_repair_matches(
+                &failure.tool_name,
+                &failure.call_id,
+                &failure.arguments,
+                &failure.output,
+                &step.tool_name,
+                &step.arguments,
+            )
+        });
 
         match step.tool_name.as_str() {
             "write_file" | "create_directory" => {
@@ -189,14 +201,10 @@ pub(crate) fn task_facts_from_steps(user_message: &str, steps: &[AgentStep]) -> 
             _ => {}
         }
     }
-    // A later successful invocation of the same tool is an observable repair
-    // attempt. Keep compact call IDs for audit/UI, but do not make an already
-    // recovered failure block the task from its next state.
-    facts.failed_steps.retain(|call_id| {
-        !failed_step_tools.iter().any(|(failed_call_id, tool_name)| {
-            failed_call_id == call_id && successful_tools.contains(tool_name.as_str())
-        })
-    });
+    facts.failed_steps = failed_operations
+        .iter()
+        .map(|failure| failure.call_id.clone())
+        .collect();
     facts
 }
 

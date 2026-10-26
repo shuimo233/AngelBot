@@ -14,6 +14,7 @@ export interface WorkDirEntry {
   name: string;
   isDirectory: boolean;
   size: number | null;
+  temporary?: boolean;
 }
 
 /** Read-only workbench access. File mutation remains a Main-Agent tool action. */
@@ -35,6 +36,20 @@ export async function readSessionFile(sessionId: string, path: string): Promise<
 
 export function listWorkDir(sessionId: string, path = ''): Promise<WorkDirEntry[]> {
   return invoke<WorkDirEntry[]>('list_work_dir', { sessionId, path });
+}
+
+export type FileSaveOutcome = { status: 'cancelled' } | { status: 'saved'; name: string; bytes: number };
+
+/** The native picker authorizes one new file, not access to its parent folder. */
+export async function saveSessionFile(sessionId: string, path: string): Promise<FileSaveOutcome> {
+  const result = await invoke<FileSaveOutcome>('save_session_file', { sessionId, path });
+  if (result?.status === 'cancelled') return { status: 'cancelled' };
+  if (result?.status === 'saved' && typeof result.name === 'string' && result.name.length > 0
+    && !/[\\/:\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(result.name)
+    && Number.isSafeInteger(result.bytes) && result.bytes >= 0 && result.bytes <= 16 * 1024 * 1024) {
+    return { status: 'saved', name: result.name, bytes: result.bytes };
+  }
+  throw new Error('未能确认另存结果，请检查所选位置；原文件未改变。');
 }
 
 /** Session-owned context roots. These are configuration, not a user-facing

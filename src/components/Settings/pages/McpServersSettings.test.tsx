@@ -4,9 +4,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { McpServersSettings } from './McpServersSettings';
 import {
   clearMcpEnv,
+  clearBrowserTempFiles,
   deleteMcpServer,
   getMcpServerStatus,
   getMcpServers,
+  prepareBrowserMcp,
+  previewBrowserCleanup,
   removeMcpEnvVar,
   refreshMcpTools,
   saveMcpServer,
@@ -19,7 +22,10 @@ import type { McpServer } from '$types';
 
 vi.mock('$lib/commands/mcp', () => ({
   clearMcpEnv: vi.fn(),
+  clearBrowserTempFiles: vi.fn(),
   getMcpServers: vi.fn(),
+  prepareBrowserMcp: vi.fn(),
+  previewBrowserCleanup: vi.fn(),
   removeMcpEnvVar: vi.fn(),
   saveMcpServer: vi.fn(),
   setMcpEnvVar: vi.fn(),
@@ -34,6 +40,7 @@ vi.mock('$lib/commands/workspace', () => ({ getWorkspaces: vi.fn() }));
 const server = { id: 'filesystem', name: 'Filesystem', command: 'npx', args: '@modelcontextprotocol/server-filesystem', env: '', envKeys: [], envUnavailable: false, enabled: true, enabledWorkspaceIds: [] };
 const stopped = { server_id: 'filesystem', status: 'stopped' as const, error: null, tools_count: null };
 const running = { server_id: 'filesystem', status: 'running' as const, error: null, tools_count: 1 };
+const browserDraft = { id: 'prepared-browser', name: 'Playwright 浏览器', command: 'npx.cmd', args: JSON.stringify(['-y', '@playwright/mcp@0.0.83', '--browser', 'msedge', '--isolated', '--no-webmcp', '--image-responses', 'omit', '--output-dir', 'C:/Owned User/angelbot/results/browser-runtime-fixture/browser']) };
 
 describe('McpServersSettings', () => {
   beforeEach(() => {
@@ -49,6 +56,9 @@ describe('McpServersSettings', () => {
     vi.mocked(stopMcpServer).mockResolvedValue(stopped);
     vi.mocked(refreshMcpTools).mockResolvedValue([{ name: 'list_files', description: 'List files', inputSchema: {} }]);
     vi.mocked(getWorkspaces).mockResolvedValue([{ id: 'personal', name: 'AngelBot 日常', kind: 'personal', rootPath: '', createdAt: 1, updatedAt: 1, activeSessionId: 'personal-main' }]);
+    vi.mocked(prepareBrowserMcp).mockResolvedValue(browserDraft);
+    vi.mocked(previewBrowserCleanup).mockResolvedValue({cutoff: 1, fingerprint: 'f'.repeat(64), fileCount: 2, bytes: 2048, eligibleFiles: 3, files: ['browser/a.log', 'browser/b.yml']});
+    vi.mocked(clearBrowserTempFiles).mockResolvedValue({deletedFiles: 2, deletedBytes: 2048, remainingFiles: 1, partial: false});
   });
 
   it('loads configuration and keeps a stopped runtime separate from workspace permission', async () => {
@@ -62,6 +72,27 @@ describe('McpServersSettings', () => {
     expect(screen.getByText(/请勿将密钥写入命令或参数/)).toBeInTheDocument();
     expect(screen.getByText(/首次连接可能下载并运行第三方包/)).toBeInTheDocument();
     expect(screen.getByText('环境变量：尚未配置')).toBeInTheDocument();
+    expect(startMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('shows prepared discovery without claiming a running process or starting one', async () => {
+    vi.mocked(getMcpServers).mockResolvedValue([{ ...server, catalogReady: true, enabledWorkspaceIds: ['personal'] }]);
+    render(<McpServersSettings />);
+    expect(await screen.findByText('按需连接 · 目录已准备')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'AngelBot 日常' })).toBeChecked();
+    expect(screen.getByText(/停止连接会结束进程但保留目录/)).toBeInTheDocument();
+    expect(startMcpServer).not.toHaveBeenCalled();
+    expect(refreshMcpTools).not.toHaveBeenCalled();
+  });
+
+  it('keeps a corrupt catalog repairable through explicit connection', async () => {
+    vi.mocked(getMcpServers).mockResolvedValue([{ ...server, catalogReady: false, catalogError: 'MCP 工具目录已损坏，请在设置中重新连接服务' }]);
+    render(<McpServersSettings />);
+    expect(await screen.findByText('目录需重新检查')).toBeInTheDocument();
+    expect(screen.getByText(/MCP 工具目录已损坏/)).toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole('button', { name: '连接并检查' }));
+    expect(await screen.findByText('运行中 · 1 个工具')).toBeInTheDocument();
+    expect(screen.queryByText(/MCP 工具目录已损坏/)).not.toBeInTheDocument();
   });
 
   it('guides Windows npx setup with a separate command and arguments', async () => {
@@ -73,6 +104,56 @@ describe('McpServersSettings', () => {
     expect(screen.getByPlaceholderText('npx.cmd')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('-y @modelcontextprotocol/server-...')).toBeInTheDocument();
     expect(screen.getByText('Windows 下使用 npx 时，命令填写 npx.cmd；-y 和包名填写在参数栏。')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /网页操作（Playwright）/ }));
+    await user.click(screen.getByRole('button', { name: '填入浏览器配置' }));
+    expect(screen.getByRole('textbox', { name: '名称' })).toHaveValue('Playwright 浏览器');
+    expect(screen.getByRole('textbox', { name: '命令' })).toHaveValue('npx.cmd');
+    await waitFor(() => expect(screen.getByRole('textbox', { name: '参数' })).toHaveValue(browserDraft.args));
+    expect(prepareBrowserMcp).toHaveBeenCalledWith('personal-main');
+    expect(screen.getByText(/不随备份/)).toBeInTheDocument();
+    expect(screen.getByText(/不是系统、文件或网络安全沙箱/)).toBeInTheDocument();
+    expect(screen.getByText(/Node.js 20/)).toBeInTheDocument();
+    expect(saveMcpServer).not.toHaveBeenCalled();
+    expect(startMcpServer).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '添加' }));
+    expect(saveMcpServer).toHaveBeenCalledWith(expect.objectContaining({
+      id: browserDraft.id, name: 'Playwright 浏览器', command: 'npx.cmd', enabledWorkspaceIds: [], env: '',
+    }));
+    expect(startMcpServer).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit cleanup preview and confirmation without automatic batches', async () => {
+    const user = userEvent.setup();
+    render(<McpServersSettings />);
+    await screen.findByText('Filesystem');
+    expect(previewBrowserCleanup).not.toHaveBeenCalled();
+    await user.click(screen.getByText('浏览器临时文件管理'));
+    expect(screen.queryByRole('button', {name: '删除本批旧临时文件'})).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', {name: '查看 7 天前文件'}));
+    expect(await screen.findByText(/本批 2 个文件/)).toBeInTheDocument();
+    expect(screen.getByText(/删除不可撤销/)).toBeInTheDocument();
+    expect(clearBrowserTempFiles).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', {name: '删除本批旧临时文件'}));
+    expect(await screen.findByRole('status')).toHaveTextContent('已清理 2 个');
+    expect(clearBrowserTempFiles).toHaveBeenCalledTimes(1);
+    expect(previewBrowserCleanup).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', {name: '删除本批旧临时文件'})).not.toBeInTheDocument();
+  });
+
+  it.each(['stale', 'partial'] as const)('consumes the cleanup preview after a %s outcome', async (outcome) => {
+    if (outcome === 'stale') vi.mocked(clearBrowserTempFiles).mockRejectedValue('临时文件清单已变化，请重新查看后确认；未清理。');
+    else vi.mocked(clearBrowserTempFiles).mockResolvedValue({deletedFiles: 1, deletedBytes: 1024, remainingFiles: 2, partial: true});
+    const user = userEvent.setup();
+    render(<McpServersSettings />);
+    await screen.findByText('Filesystem');
+    await user.click(screen.getByText('浏览器临时文件管理'));
+    await user.click(screen.getByRole('button', {name: '查看 7 天前文件'}));
+    await user.click(await screen.findByRole('button', {name: '删除本批旧临时文件'}));
+    expect(await screen.findByRole('alert')).toHaveTextContent(outcome === 'stale' ? '清单已变化' : '部分文件未能确认');
+    expect(screen.queryByRole('button', {name: '删除本批旧临时文件'})).not.toBeInTheDocument();
+    expect(clearBrowserTempFiles).toHaveBeenCalledTimes(1);
+    expect(previewBrowserCleanup).toHaveBeenCalledTimes(1);
   });
 
   it('persists enablement changes', async () => {
@@ -258,7 +339,8 @@ describe('McpServersSettings', () => {
     expect(startMcpServer).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: '停止' }));
     await waitFor(() => expect(stopMcpServer).toHaveBeenCalledWith('filesystem'));
-    expect(await screen.findByText('未连接')).toBeInTheDocument();
+    expect(await screen.findByText('按需连接 · 目录已准备')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '停止' })).not.toBeInTheDocument();
   });
 
   it('does not claim a connection when startup fails', async () => {

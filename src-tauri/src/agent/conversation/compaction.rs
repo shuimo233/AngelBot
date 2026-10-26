@@ -33,6 +33,8 @@ pub fn checkpoint_prompt(transcript: &str, verified_task_facts: Option<&str>) ->
          Return concise Markdown with exactly these sections:\n\n\
          ## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Verification\n## Relevant Files\n## Next Steps\n\n\
          Preserve only supported facts. Keep unfinished work explicitly unfinished. \
+         When an earlier checkpoint is included, merge it with the newer transcript; \
+         newer evidence supersedes outdated details, and verified task facts remain authoritative. \
          Include absolute paths, commands, errors, and tool outcomes only when they matter \
          for resuming the task.{facts}\n\n<conversation>\n{transcript}\n</conversation>"
     )

@@ -19,6 +19,11 @@ pub(crate) fn apply_minimal_child_environment(command: &mut Command) {
         "APPDATA",
         "LOCALAPPDATA",
         "USERPROFILE",
+        // Standard installation roots are needed by Node/Windows launchers
+        // to discover installed programs, not model or service credentials.
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
     ];
     #[cfg(not(windows))]
     let launch_keys = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
@@ -42,5 +47,17 @@ mod tests {
         assert!(command
             .get_envs()
             .all(|(key, _)| key != "ANGELBOT_MODEL_TEST_SECRET"));
+        #[cfg(windows)]
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Some(expected) = std::env::var_os(key) {
+                assert!(
+                    command.get_envs().any(|(inherited, value)| inherited
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(key)
+                        && value == Some(expected.as_os_str())),
+                    "missing Windows installation root: {key}"
+                );
+            }
+        }
     }
 }

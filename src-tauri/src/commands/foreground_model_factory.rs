@@ -48,14 +48,22 @@ pub(crate) struct ResolvedForegroundModel {
 /// enabled by an environment variable in production builds.
 #[cfg(feature = "desktop-e2e")]
 #[derive(serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DesktopE2eReply {
+    /// Hold one owned inference until Stop drops its streaming future.
+    Pending,
     Text {
         text: String,
+        #[serde(default, rename = "finishReason")]
+        finish_reason: Option<String>,
         #[serde(default, rename = "expectUserContentIncludes")]
         expect_user_content_includes: Vec<String>,
         #[serde(default, rename = "forbiddenToolNames")]
         forbidden_tool_names: Vec<String>,
+        #[serde(default, rename = "expectToolImageCallIds")]
+        expect_tool_image_call_ids: Vec<String>,
+        #[serde(default, rename = "expectCurrentDesktopObservation")]
+        expect_current_desktop_observation: Option<DesktopE2eRegionRequest>,
     },
     ToolCalls {
         calls: Vec<crate::llm::ToolCall>,
@@ -71,6 +79,56 @@ enum DesktopE2eReply {
         #[serde(default)]
         text: Option<String>,
     },
+    DesktopObservedRegion(DesktopE2eRegionRequest),
+    DesktopObservedControl(DesktopE2eControlRequest),
+    AutomationStop {
+        #[serde(rename = "callId")]
+        call_id: String,
+        #[serde(rename = "sourceCallId")]
+        source_call_id: String,
+        title: String,
+    },
+}
+
+#[cfg(feature = "desktop-e2e")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopE2eRegionRequest {
+    call_id: String,
+    source_call_id: String,
+    app_id: String,
+    region_name: String,
+}
+
+#[cfg(feature = "desktop-e2e")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopE2eControlRequest {
+    call_id: String,
+    source_call_id: String,
+    root_call_id: String,
+    app_id: String,
+    region_name: String,
+    control_name: String,
+    action: DesktopE2eCheckboxAction,
+}
+
+#[cfg(feature = "desktop-e2e")]
+#[derive(serde::Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum DesktopE2eCheckboxAction {
+    Check,
+    Uncheck,
+}
+
+#[cfg(feature = "desktop-e2e")]
+impl DesktopE2eCheckboxAction {
+    fn operation(self) -> crate::desktop_control::DesktopControlOperation {
+        match self {
+            Self::Check => crate::desktop_control::DesktopControlOperation::Check,
+            Self::Uncheck => crate::desktop_control::DesktopControlOperation::Uncheck,
+        }
+    }
 }
 
 /// The only Main-Agent outcomes accepted by the desktop E2E review fixture.
@@ -113,12 +171,61 @@ impl LlmProvider for DesktopE2eProvider {
         "desktop-e2e"
     }
 
+    fn supports_tool_images(&self) -> bool {
+        true
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[crate::llm::Message],
+        tools: Option<&[crate::llm::ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        deltas: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<crate::llm::LlmResponse, String> {
+        let index = DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst);
+        if matches!(self.replies.get(index), Some(DesktopE2eReply::Pending))
+            && !desktop_e2e_is_checkpoint_request(messages, tools, thinking)
+            && !desktop_e2e_is_reviewed_delivery_summary(tools)
+        {
+            DESKTOP_E2E_NEXT_REPLY
+                .compare_exchange(
+                    index,
+                    index + 1,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .map_err(|_| "desktop E2E interactive script advanced concurrently".to_string())?;
+            if let Some(deltas) = deltas {
+                let _ = deltas.send("native-model-waiting".into());
+            }
+            return std::future::pending().await;
+        }
+        self.chat(messages, tools, thinking).await
+    }
+
     async fn chat(
         &self,
         messages: &[crate::llm::Message],
         tools: Option<&[crate::llm::ToolSchema]>,
-        _thinking: Option<&ThinkingSettings>,
+        thinking: Option<&ThinkingSettings>,
     ) -> Result<crate::llm::LlmResponse, String> {
+        // Compaction uses this same provider between interactive turns. Model
+        // that separate protocol, rather than consuming a desktop script step.
+        if desktop_e2e_is_checkpoint_request(messages, tools, thinking) {
+            return Ok(crate::llm::LlmResponse::Text {
+                text: "## Goal\nResume the current bounded task from retained recent messages.\n\n\
+                       ## Constraints & Preferences\nUse only the current authorized capabilities.\n\n\
+                       ## Progress\n### Done\nThis deterministic test fixture omits historical content and asserts no completed user work.\n\
+                       ### In Progress\nUnfinished work remains unfinished.\n\
+                       ### Blocked\nConsult retained recent messages for blockers.\n\n\
+                       ## Key Decisions\nRetained messages remain authoritative.\n\n\
+                       ## Verification\nOnly actual tool receipts establish execution; this checkpoint asserts no action result.\n\n\
+                       ## Relevant Files\nNo historical file facts are carried by this test fixture.\n\n\
+                       ## Next Steps\nContinue the current request; obtain fresh observation references after each desktop action."
+                    .to_string(),
+                stop_reason: crate::llm::StopReason::EndTurn,
+            });
+        }
         // A reviewed delivery is an asynchronous system follow-up, so it must
         // not compete with unrelated interactive turns for a global scripted
         // reply cursor. Its one-tool surface is also an unambiguous E2E-only
@@ -137,12 +244,29 @@ impl LlmProvider for DesktopE2eProvider {
                 tools,
             );
         }
-        let index = DESKTOP_E2E_NEXT_REPLY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match self.replies.get(index) {
+        let index = DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst);
+        let reply = self.replies.get(index);
+        let stage = match reply {
+            Some(DesktopE2eReply::Pending) => "pending",
+            Some(DesktopE2eReply::Text { .. }) => "text",
+            Some(DesktopE2eReply::ToolCalls { .. }) => "tool_calls",
+            Some(DesktopE2eReply::DeliveryReview { .. }) => "delivery_review",
+            Some(DesktopE2eReply::DesktopObservedRegion(_)) => "desktop_observed_region",
+            Some(DesktopE2eReply::DesktopObservedControl(_)) => "desktop_observed_control",
+            Some(DesktopE2eReply::AutomationStop { .. }) => "automation_stop",
+            None => "exhausted",
+        };
+        let result = (|| match reply {
+            Some(DesktopE2eReply::Pending) => {
+                Err("desktop E2E pending reply requires streaming".into())
+            }
             Some(DesktopE2eReply::Text {
                 text,
+                finish_reason,
                 expect_user_content_includes,
                 forbidden_tool_names,
+                expect_tool_image_call_ids,
+                expect_current_desktop_observation,
             }) => {
                 desktop_e2e_assert_request(
                     messages,
@@ -150,9 +274,15 @@ impl LlmProvider for DesktopE2eProvider {
                     expect_user_content_includes,
                     forbidden_tool_names,
                 )?;
+                desktop_e2e_assert_tool_images(messages, expect_tool_image_call_ids)?;
+                if let Some(request) = expect_current_desktop_observation {
+                    desktop_e2e_assert_current_observation(messages, request)?;
+                }
                 Ok(crate::llm::LlmResponse::Text {
                     text: text.clone(),
-                    stop_reason: crate::llm::StopReason::EndTurn,
+                    stop_reason: crate::llm::StopReason::from_openai_finish_reason(
+                        finish_reason.as_deref(),
+                    ),
                 })
             }
             Some(DesktopE2eReply::ToolCalls { calls, text }) => {
@@ -165,11 +295,566 @@ impl LlmProvider for DesktopE2eProvider {
             Some(DesktopE2eReply::DeliveryReview { decision, text }) => {
                 desktop_e2e_delivery_review_response(*decision, text.clone(), messages, tools)
             }
+            Some(DesktopE2eReply::DesktopObservedRegion(request)) => {
+                desktop_e2e_observed_region_response(request, messages, tools)
+            }
+            Some(DesktopE2eReply::DesktopObservedControl(request)) => {
+                desktop_e2e_observed_control_response(request, messages, tools)
+            }
+            Some(DesktopE2eReply::AutomationStop {
+                call_id,
+                source_call_id,
+                title,
+            }) => desktop_e2e_automation_stop_response(messages, call_id, source_call_id, title),
             None => Err(format!(
                 "desktop E2E model script exhausted after {index} replies"
             )),
+        })();
+        let response =
+            result.map_err(|error| format!("{error} [desktop-e2e index={index} stage={stage}]"))?;
+        // Validation failures are retried by the real runner. Keep the same
+        // scripted response until it is successfully emitted, preserving the
+        // original failure rather than skipping ahead to script exhaustion.
+        DESKTOP_E2E_NEXT_REPLY
+            .compare_exchange(
+                index,
+                index + 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| "desktop E2E interactive script advanced concurrently".to_string())?;
+        Ok(response)
+    }
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_is_checkpoint_request(
+    messages: &[crate::llm::Message],
+    tools: Option<&[crate::llm::ToolSchema]>,
+    thinking: Option<&ThinkingSettings>,
+) -> bool {
+    let [message] = messages else {
+        return false;
+    };
+    if tools.is_some()
+        || thinking.is_some()
+        || message.role != "user"
+        || message.tool_calls.is_some()
+        || message.tool_call_id.is_some()
+        || !message.tool_images.is_empty()
+        || message.protocol_state.is_some()
+    {
+        return false;
+    }
+    let template = crate::agent::compaction::checkpoint_prompt("", None);
+    let (prefix, _) = template.split_once("\n\n<conversation>\n").unwrap();
+    let Some(mut body) = message.content.strip_prefix(prefix) else {
+        return false;
+    };
+    let facts = if let Some(with_facts) = body.strip_prefix("\n\n<verified-task-facts>\n") {
+        let Some((facts, remaining)) = with_facts.split_once("\n</verified-task-facts>") else {
+            return false;
+        };
+        body = remaining;
+        Some(facts)
+    } else {
+        None
+    };
+    let Some(transcript) = body
+        .strip_prefix("\n\n<conversation>\n")
+        .and_then(|value| value.strip_suffix("\n</conversation>"))
+    else {
+        return false;
+    };
+    message.content == crate::agent::compaction::checkpoint_prompt(transcript, facts)
+}
+
+#[cfg(feature = "desktop-e2e")]
+const DESKTOP_E2E_PROVENANCE_ERROR: &str = "desktop E2E observation provenance assertion failed";
+
+#[cfg(feature = "desktop-e2e")]
+type DesktopE2eCallPosition = (usize, usize);
+
+/// Read only an exact, unique assistant-call/tool-result pair. UI strings and
+/// other message roles never supply dynamic identifiers to this test provider.
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_unique_tool_output<'a>(
+    messages: &'a [crate::llm::Message],
+    call_id: &str,
+    tool_name: &str,
+) -> Result<(DesktopE2eCallPosition, &'a crate::llm::ToolCall, &'a str), String> {
+    let calls: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == "assistant")
+        .flat_map(|(index, message)| {
+            message
+                .tool_calls
+                .iter()
+                .flatten()
+                .enumerate()
+                .map(move |(ordinal, call)| ((index, ordinal), call))
+        })
+        .filter(|(_, call)| call.id == call_id)
+        .collect();
+    let outputs: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.role == "tool" && message.tool_call_id.as_deref() == Some(call_id)
+        })
+        .collect();
+    match (calls.as_slice(), outputs.as_slice()) {
+        ([(call_index, call)], [(output_index, output)])
+            if call_index.0 < *output_index
+                && call.name == tool_name
+                && output.tool_images.is_empty() =>
+        {
+            // Persisted legacy batches aggregate sequential calls on one
+            // assistant row, while their tool rows may be UUID-sorted. The
+            // exact call position, not result-row order, defines this script's
+            // chronology. Native state is checked separately by the E2E host.
+            Ok((*call_index, call, &output.content))
+        }
+        _ => Err(DESKTOP_E2E_PROVENANCE_ERROR.into()),
+    }
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_tool_output<'a>(
+    messages: &'a [crate::llm::Message],
+    call_id: &str,
+    tool_name: &str,
+    app_id: &str,
+) -> Result<(DesktopE2eCallPosition, &'a crate::llm::ToolCall, &'a str), String> {
+    let pair = desktop_e2e_unique_tool_output(messages, call_id, tool_name)?;
+    if pair
+        .1
+        .arguments
+        .get("app_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(app_id)
+    {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    }
+    Ok(pair)
+}
+
+/// The fake model must discover dynamic IDs through the real list tool, never
+/// from UI globals, user text or direct database access.
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_automation_stop_response(
+    messages: &[crate::llm::Message],
+    call_id: &str,
+    source_call_id: &str,
+    title: &str,
+) -> Result<crate::llm::LlmResponse, String> {
+    let (_, _, content) =
+        desktop_e2e_unique_tool_output(messages, source_call_id, "list_automations")?;
+    let value: serde_json::Value =
+        serde_json::from_str(content.strip_prefix("Result: ").unwrap_or(content))
+            .map_err(|_| DESKTOP_E2E_PROVENANCE_ERROR)?;
+    let matching: Vec<_> = value["items"]
+        .as_array()
+        .ok_or(DESKTOP_E2E_PROVENANCE_ERROR)?
+        .iter()
+        .filter(|item| item["title"].as_str() == Some(title))
+        .collect();
+    let [item] = matching.as_slice() else {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    };
+    let id = item["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or(DESKTOP_E2E_PROVENANCE_ERROR)?;
+    let run_id = item["latestRun"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or(DESKTOP_E2E_PROVENANCE_ERROR)?;
+    if item["executorKind"] != "script"
+        || item["latestRun"]["status"] != "running"
+        || item["latestRun"]["stopControl"] != "available"
+    {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    }
+    Ok(crate::llm::LlmResponse::ToolCalls {
+        calls: vec![crate::llm::ToolCall {
+            id: call_id.into(),
+            name: "stop_automation_run".into(),
+            arguments: serde_json::json!({"automation_id": id, "run_id": run_id}),
+        }],
+        text: Some("只停止这次受控脚本；请确认范围，已发生的操作不会撤回。".into()),
+        stop_reason: crate::llm::StopReason::ToolUse,
+    })
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_observation(
+    content: &str,
+) -> Result<crate::desktop_control::DesktopWindowObservation, String> {
+    serde_json::from_str(content.strip_prefix("Result: ").unwrap_or(content))
+        .map_err(|_| DESKTOP_E2E_PROVENANCE_ERROR.into())
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_root_region(
+    messages: &[crate::llm::Message],
+    call_id: &str,
+    app_id: &str,
+    region_name: &str,
+) -> Result<(DesktopE2eCallPosition, String), String> {
+    let (index, call, output) =
+        desktop_e2e_tool_output(messages, call_id, "observe_trusted_app_window", app_id)?;
+    let observation = desktop_e2e_observation(output)?;
+    let regions: Vec<_> = observation
+        .regions
+        .iter()
+        .filter(|region| region.name == region_name)
+        .collect();
+    if call.arguments != serde_json::json!({"app_id":app_id,"mode":"controls"})
+        || observation.app_id != app_id
+        || observation.region_ref.is_some()
+        || regions.len() != 1
+        || regions[0].role != "group"
+    {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    }
+    let reference = regions[0]
+        .region_ref
+        .as_ref()
+        .filter(|value| desktop_e2e_valid_delivery_id(value))
+        .ok_or(DESKTOP_E2E_PROVENANCE_ERROR)?;
+    Ok((index, reference.clone()))
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_scoped_checkbox(
+    messages: &[crate::llm::Message],
+    call_id: &str,
+    app_id: &str,
+    region_ref: &str,
+    control_name: &str,
+    expected_toggle: crate::desktop_control::DesktopToggleState,
+) -> Result<(DesktopE2eCallPosition, String), String> {
+    let (index, call, output) =
+        desktop_e2e_tool_output(messages, call_id, "observe_trusted_app_window", app_id)?;
+    let observation = desktop_e2e_observation(output)?;
+    let controls: Vec<_> = observation
+        .controls
+        .iter()
+        .filter(|control| control.name.as_deref() == Some(control_name))
+        .collect();
+    if call.arguments
+        != serde_json::json!({"app_id":app_id,"mode":"controls","region_ref":region_ref})
+        || observation.app_id != app_id
+        || observation.region_ref.as_deref() != Some(region_ref)
+        || observation.truncated
+        || !observation.diagnostics.is_empty()
+        || controls.len() != 1
+        || controls[0].role != "checkBox"
+        || !controls[0].enabled
+        || controls[0].state.as_ref().and_then(|state| state.toggle) != Some(expected_toggle)
+        || !controls[0]
+            .capabilities
+            .iter()
+            .any(|capability| capability == "toggle")
+    {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    }
+    let reference = controls[0]
+        .control_ref
+        .as_ref()
+        .filter(|value| desktop_e2e_valid_delivery_id(value))
+        .ok_or(DESKTOP_E2E_PROVENANCE_ERROR)?;
+    Ok((index, reference.clone()))
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_require_fresh_refs(
+    messages: &[crate::llm::Message],
+    app_id: &str,
+    root_index: DesktopE2eCallPosition,
+    region_ref: &str,
+    control_ref: Option<&str>,
+) -> Result<(), String> {
+    for call in messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .flat_map(|message| message.tool_calls.iter().flatten())
+    {
+        if call.name == "operate_trusted_app_control"
+            && call
+                .arguments
+                .get("app_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(app_id)
+        {
+            let (index, _, _) = desktop_e2e_tool_output(messages, &call.id, &call.name, app_id)?;
+            if index >= root_index
+                || control_ref.is_some_and(|reference| {
+                    call.arguments
+                        .get("control_ref")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(reference)
+                })
+            {
+                return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+            }
+            // A new root observation after an action must not reuse any region
+            // reference consumed before that action.
+            if messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.role == "assistant")
+                .flat_map(|(message_index, message)| {
+                    message
+                        .tool_calls
+                        .iter()
+                        .flatten()
+                        .enumerate()
+                        .map(move |(ordinal, call)| ((message_index, ordinal), call))
+                })
+                .filter(|(position, _)| *position < index)
+                .map(|(_, call)| call)
+                .any(|prior| {
+                    prior.name == "observe_trusted_app_window"
+                        && prior
+                            .arguments
+                            .get("app_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(app_id)
+                        && prior
+                            .arguments
+                            .get("region_ref")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(region_ref)
+                })
+            {
+                return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+            }
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_dynamic_call(
+    messages: &[crate::llm::Message],
+    tools: Option<&[crate::llm::ToolSchema]>,
+    call_id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<crate::llm::LlmResponse, String> {
+    if !desktop_e2e_valid_delivery_id(call_id)
+        || !tools.is_some_and(|tools| tools.iter().filter(|tool| tool.name == name).count() == 1)
+        || messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some(call_id)
+                || message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .any(|call| call.id == call_id)
+        })
+    {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    }
+    Ok(crate::llm::LlmResponse::ToolCalls {
+        calls: vec![crate::llm::ToolCall {
+            id: call_id.into(),
+            name: name.into(),
+            arguments,
+        }],
+        text: None,
+        stop_reason: crate::llm::StopReason::ToolUse,
+    })
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_observed_region_response(
+    request: &DesktopE2eRegionRequest,
+    messages: &[crate::llm::Message],
+    tools: Option<&[crate::llm::ToolSchema]>,
+) -> Result<crate::llm::LlmResponse, String> {
+    let (index, reference) = desktop_e2e_root_region(
+        messages,
+        &request.source_call_id,
+        &request.app_id,
+        &request.region_name,
+    )
+    .map_err(|error| format!("{error} [root-source]"))?;
+    desktop_e2e_require_fresh_refs(messages, &request.app_id, index, &reference, None)
+        .map_err(|error| format!("{error} [freshness]"))?;
+    desktop_e2e_dynamic_call(
+        messages,
+        tools,
+        &request.call_id,
+        "observe_trusted_app_window",
+        serde_json::json!({"app_id":request.app_id,"mode":"controls","region_ref":reference}),
+    )
+    .map_err(|error| format!("{error} [dynamic-call]"))
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_observed_control_response(
+    request: &DesktopE2eControlRequest,
+    messages: &[crate::llm::Message],
+    tools: Option<&[crate::llm::ToolSchema]>,
+) -> Result<crate::llm::LlmResponse, String> {
+    let (root_index, region_ref) = desktop_e2e_root_region(
+        messages,
+        &request.root_call_id,
+        &request.app_id,
+        &request.region_name,
+    )
+    .map_err(|error| format!("{error} [root-source]"))?;
+    let (index, reference) = desktop_e2e_scoped_checkbox(
+        messages,
+        &request.source_call_id,
+        &request.app_id,
+        &region_ref,
+        &request.control_name,
+        if matches!(request.action, DesktopE2eCheckboxAction::Check) {
+            crate::desktop_control::DesktopToggleState::Off
+        } else {
+            crate::desktop_control::DesktopToggleState::On
+        },
+    )
+    .map_err(|error| format!("{error} [scoped-source]"))?;
+    if index <= root_index {
+        return Err(DESKTOP_E2E_PROVENANCE_ERROR.into());
+    }
+    desktop_e2e_require_fresh_refs(
+        messages,
+        &request.app_id,
+        root_index,
+        &region_ref,
+        Some(&reference),
+    )
+    .map_err(|error| format!("{error} [freshness]"))?;
+    desktop_e2e_dynamic_call(
+        messages,
+        tools,
+        &request.call_id,
+        "operate_trusted_app_control",
+        serde_json::json!({"app_id":request.app_id,"control_ref":reference,"action":request.action.operation()}),
+    )
+    .map_err(|error| format!("{error} [dynamic-call]"))
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_assert_current_observation(
+    messages: &[crate::llm::Message],
+    request: &DesktopE2eRegionRequest,
+) -> Result<(), String> {
+    let (root, region_ref) = desktop_e2e_root_region(
+        messages,
+        &request.source_call_id,
+        &request.app_id,
+        &request.region_name,
+    )
+    .map_err(|error| format!("{error} [current-root-source]"))?;
+    let (scope, control_ref) = desktop_e2e_scoped_checkbox(
+        messages,
+        &request.call_id,
+        &request.app_id,
+        &region_ref,
+        "Region checkbox",
+        crate::desktop_control::DesktopToggleState::Off,
+    )
+    .map_err(|error| format!("{error} [current-scoped-source]"))?;
+    if root >= scope {
+        return Err(format!("{DESKTOP_E2E_PROVENANCE_ERROR} [current-order]"));
+    }
+    let mut latest_root = None;
+    let mut latest_observation = None;
+    for call in messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .flat_map(|message| message.tool_calls.iter().flatten())
+    {
+        if call.name == "observe_trusted_app_window"
+            && call
+                .arguments
+                .get("app_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(request.app_id.as_str())
+        {
+            latest_observation = Some(call.id.as_str());
+            if call.arguments == serde_json::json!({"app_id":request.app_id,"mode":"controls"}) {
+                latest_root = Some(call.id.as_str());
+            }
+        }
+    }
+    if latest_root != Some(request.source_call_id.as_str())
+        || latest_observation != Some(request.call_id.as_str())
+    {
+        return Err(format!("{DESKTOP_E2E_PROVENANCE_ERROR} [current-latest]"));
+    }
+    // This gate proves only the latest pair visible after compaction. The E2E
+    // host validates the full cross-slice journey from durable getMessages.
+    desktop_e2e_require_fresh_refs(
+        messages,
+        &request.app_id,
+        root,
+        &region_ref,
+        Some(&control_ref),
+    )
+    .map_err(|error| format!("{error} [current-freshness]"))
+}
+
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_assert_tool_images(
+    messages: &[crate::llm::Message],
+    expected_call_ids: &[String],
+) -> Result<(), String> {
+    use base64::Engine;
+    let observed: Vec<_> = messages
+        .iter()
+        .filter(|message| !message.tool_images.is_empty())
+        .collect();
+    if observed.len() != expected_call_ids.len() {
+        return Err("desktop E2E transient image count assertion failed".into());
+    }
+    for (message, expected) in observed.iter().zip(expected_call_ids) {
+        if message.role != "tool"
+            || message.tool_call_id.as_deref() != Some(expected.as_str())
+            || message.tool_images.len() != 1
+        {
+            return Err("desktop E2E image call identity assertion failed".into());
+        }
+        let data = message.tool_images[0].data_url();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                data.strip_prefix("data:image/png;base64,")
+                    .unwrap_or_default(),
+            )
+            .map_err(|_| "desktop E2E image encoding assertion failed")?;
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .map_err(|_| "desktop E2E image decode assertion failed")?;
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let frame = reader
+            .next_frame(&mut pixels)
+            .map_err(|_| "desktop E2E image frame assertion failed")?;
+        if frame.color_type != png::ColorType::Rgba || frame.bit_depth != png::BitDepth::Eight {
+            return Err("desktop E2E image pixel format assertion failed".into());
+        }
+        // Only the owned WPF fixture has these two markers. Never log pixels.
+        for marker in [[17u8, 201, 221], [239u8, 31, 177]] {
+            let matches = pixels[..frame.buffer_size()]
+                .chunks_exact(4)
+                .filter(|pixel| {
+                    pixel[3] == 255
+                        && (0..3).all(|channel| pixel[channel].abs_diff(marker[channel]) <= 3)
+                })
+                .take(32)
+                .count();
+            if matches < 32 {
+                return Err("desktop E2E owned-window marker assertion failed".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "desktop-e2e")]
@@ -338,6 +1023,21 @@ impl std::fmt::Display for ModelResolutionError {
 
 impl std::error::Error for ModelResolutionError {}
 
+impl ModelResolutionError {
+    /// Safe guidance for a model that could not be prepared. A local session
+    /// write failure is not a provider problem and keeps ordinary recovery.
+    pub(crate) fn provider_unavailable_message(self) -> Option<&'static str> {
+        Some(match self {
+            Self::InvalidConfiguration => "模型配置无法读取或不完整。请在“模型设置”中检查服务商和模型后发送新消息；不会自动重试已有操作。",
+            Self::MissingCredentials => "尚未配置模型凭据。请在“模型设置”中填写 API Key 或连接 ChatGPT 套餐后发送新消息；不会自动重试已有操作。",
+            Self::CredentialStoreUnavailable => "无法读取已保存的模型凭据。请在“模型设置”中检查连接后发送新消息；不会自动重试已有操作。",
+            Self::InvalidThinkingSettings => "当前模型的思考设置不可用。请在“模型设置”中检查模型与思考设置后发送新消息；不会自动重试已有操作。",
+            Self::ProviderUnavailable => "模型暂时无法启动。请在“模型设置”中检查 API 或 ChatGPT 套餐连接后发送新消息；不会自动重试已有操作。",
+            Self::SessionBindingFailed => return None,
+        })
+    }
+}
+
 /// Deep module for foreground provider resolution.  It does not create
 /// delegations, schedule workers, or expose foreground conversation context.
 pub(crate) struct ForegroundModelFactory<'a> {
@@ -421,15 +1121,31 @@ pub(crate) fn resolve_model_config(
     crate::commands::api_config::load_config_from_file_checked()
         .map_err(|_| ModelResolutionError::InvalidConfiguration)?;
     let file_config = crate::commands::api_config::load_api_config_internal();
-    let credentials = if file_config
-        .as_ref()
-        .is_some_and(|config| config.auth_mode != ModelAuthMode::ApiKey)
-    {
-        Ok(None)
-    } else {
-        read_credentials_safely(app)
-    };
+    let credentials =
+        if requires_keychain_api_credentials(&file_config, crate::manual_desktop_acceptance())? {
+            read_credentials_safely(app)
+        } else {
+            Ok(None)
+        };
     resolve_config_from_sources(file_config, credentials)
+}
+
+/// Decide before reading the credential store. A missing/invalid manual-plan
+/// profile must not fall through to an unrelated API-key account.
+fn requires_keychain_api_credentials(
+    config: &Option<ProviderConfig>,
+    plan_only: bool,
+) -> Result<bool, ModelResolutionError> {
+    if plan_only
+        && !config
+            .as_ref()
+            .is_some_and(|value| value.auth_mode == ModelAuthMode::ChatgptPlan)
+    {
+        return Err(ModelResolutionError::InvalidConfiguration);
+    }
+    Ok(!config
+        .as_ref()
+        .is_some_and(|value| value.auth_mode != ModelAuthMode::ApiKey))
 }
 
 #[cfg(feature = "desktop-e2e")]
@@ -447,8 +1163,11 @@ fn desktop_e2e_replies() -> Result<Option<Vec<DesktopE2eReply>>, ModelResolution
         .map(|text| {
             vec![DesktopE2eReply::Text {
                 text,
+                finish_reason: None,
                 expect_user_content_includes: Vec::new(),
                 forbidden_tool_names: Vec::new(),
+                expect_tool_image_call_ids: Vec::new(),
+                expect_current_desktop_observation: None,
             }]
         }))
 }
@@ -665,6 +1384,23 @@ mod tests {
 
     #[test]
     fn configured_provider_wins_and_keychain_fills_empty_fields() {
+        assert!(requires_keychain_api_credentials(&None, false).unwrap());
+        assert!(matches!(
+            requires_keychain_api_credentials(&None, true),
+            Err(ModelResolutionError::InvalidConfiguration)
+        ));
+        let api = Some(config("openai", "fixture", ""));
+        assert!(requires_keychain_api_credentials(&api, false).unwrap());
+        assert!(matches!(
+            requires_keychain_api_credentials(&api, true),
+            Err(ModelResolutionError::InvalidConfiguration)
+        ));
+        let plan = Some(ProviderConfig {
+            auth_mode: ModelAuthMode::ChatgptPlan,
+            ..config("openai", "saved-plan", "")
+        });
+        assert!(!requires_keychain_api_credentials(&plan, true).unwrap());
+        assert!(!requires_keychain_api_credentials(&plan, false).unwrap());
         let from_file = config("", "", "");
         let credentials = ApiCredentials {
             provider: "anthropic".into(),
@@ -751,6 +1487,22 @@ mod tests {
 
     #[test]
     fn safe_error_does_not_leak_provider_detail_or_credentials() {
+        for error in [
+            ModelResolutionError::InvalidConfiguration,
+            ModelResolutionError::MissingCredentials,
+            ModelResolutionError::CredentialStoreUnavailable,
+            ModelResolutionError::InvalidThinkingSettings,
+            ModelResolutionError::ProviderUnavailable,
+        ] {
+            let guidance = error.provider_unavailable_message().unwrap();
+            assert!(guidance.contains("模型设置"));
+            assert!(guidance.contains("不会自动重试已有操作"));
+            assert!(!guidance.contains("sk-super-secret"));
+            assert!(!guidance.contains("gpt-test"));
+        }
+        assert!(ModelResolutionError::SessionBindingFailed
+            .provider_unavailable_message()
+            .is_none());
         let secret = "sk-super-secret";
         let error = classify_provider_configuration(&config("openai", "gpt-test", ""));
         let text = error.to_string();
@@ -794,8 +1546,115 @@ mod desktop_e2e_tests {
         }
     }
 
-    #[test]
-    fn text_script_assertions_require_actual_user_data_and_forbid_declared_capabilities() {
+    fn desktop_history() -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut pair = |id: &str, name: &str, arguments, content: String| {
+            let mut assistant = message("assistant", "");
+            assistant.tool_calls = Some(vec![crate::llm::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            }]);
+            let mut output = message("tool", &content);
+            output.tool_call_id = Some(id.into());
+            messages.extend([assistant, output]);
+        };
+        for (index, stage) in ["before", "after-check", "after-uncheck"]
+            .into_iter()
+            .enumerate()
+        {
+            let region_ref = format!("region-ref-{index}");
+            let control_ref = format!("control-ref-{index}");
+            pair(
+                &format!("cu-root-{stage}"),
+                "observe_trusted_app_window",
+                json!({"app_id":"desktop-e2e-window","mode":"controls"}),
+                format!(
+                    "Result: {}",
+                    json!({"appId":"desktop-e2e-window","controls":[],"truncated":true,
+                    "regions":[{"role":"group","name":"Fixture region A","regionRef":region_ref}]})
+                ),
+            );
+            pair(
+                &format!("cu-region-{stage}"),
+                "observe_trusted_app_window",
+                json!({"app_id":"desktop-e2e-window","mode":"controls","region_ref":region_ref}),
+                format!(
+                    "Result: {}",
+                    json!({"appId":"desktop-e2e-window","regionRef":region_ref,"truncated":false,
+                    "controls":[{"depth":1,"role":"checkBox","name":"Region checkbox","enabled":true,"capabilities":["toggle"],"controlRef":control_ref,"state":{"toggle":if index == 1 { "on" } else { "off" }}}]})
+                ),
+            );
+            if index < 2 {
+                let action = if index == 0 { "check" } else { "uncheck" };
+                pair(
+                    &format!("cu-{action}"),
+                    "operate_trusted_app_control",
+                    json!({"app_id":"desktop-e2e-window","control_ref":control_ref,"action":action}),
+                    format!(
+                        "Confirmation approved: {}",
+                        json!({"adapter":"windows-uia","status":"verified","target":"desktop-e2e-window","action":action,"detail":"Control state only, not business outcome"})
+                    ),
+                );
+            }
+        }
+        messages
+    }
+
+    fn desktop_legacy_history() -> Vec<Message> {
+        let history = desktop_history();
+        let mut legacy = Vec::new();
+        for range in [0..6, 6..12, 12..16] {
+            let batch = &history[range];
+            let mut assistant = message("assistant", "persisted sequential steps");
+            assistant.tool_calls = Some(
+                batch
+                    .iter()
+                    .flat_map(|item| item.tool_calls.iter().flatten().cloned())
+                    .collect(),
+            );
+            legacy.push(assistant);
+            // Legacy rows are sorted by UUID within a timestamp, not by the
+            // sequential script's call order. Results still pair by call ID.
+            legacy.extend(
+                batch
+                    .iter()
+                    .rev()
+                    .filter(|item| item.role == "tool")
+                    .cloned(),
+            );
+        }
+        legacy
+    }
+
+    #[tokio::test]
+    async fn text_script_assertions_require_actual_user_data_and_forbid_declared_capabilities() {
+        assert!(
+            serde_json::from_value::<DesktopE2eReply>(json!({
+                "type": "desktop_observed_region", "callId": "cu-region-before",
+                "sourceCallId": "cu-root-before", "appId": "desktop-e2e-window",
+                "regionName": "Fixture region A"
+            }))
+            .is_ok(),
+            "the owned desktop script must select a region from its actual observation"
+        );
+        for unknown in [
+            "expectDesktopActionCallIds",
+            "expectDesktopObservationCallIds",
+            "unknownExpectation",
+        ] {
+            let mut reply = json!({"type":"text", "text":"no ignored assertions"});
+            reply[unknown] = json!([]);
+            assert!(
+                serde_json::from_value::<DesktopE2eReply>(reply).is_err(),
+                "{unknown}"
+            );
+        }
+        if let Ok(script) = std::env::var("ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT") {
+            let replies: Vec<DesktopE2eReply> = serde_json::from_str(&script)
+                .expect("the current owned desktop script must parse under the strict contract");
+            assert!(!replies.is_empty());
+        }
         let marker = vec!["snapshot-marker".to_string()];
         let forbidden = vec!["read_file".to_string()];
         assert!(desktop_e2e_assert_request(
@@ -824,6 +1683,252 @@ mod desktop_e2e_tests {
             &forbidden
         )
         .is_err());
+
+        // Live compaction calls this same provider between interactive replies.
+        // It must receive a checkpoint without advancing the desktop journey.
+        let checkpoint = crate::agent::compaction::checkpoint_prompt(
+            "[user]\nEarlier bounded work remains unfinished.",
+            None,
+        );
+        let mut with_call_id = message("user", &checkpoint);
+        with_call_id.tool_call_id = Some("not-a-checkpoint".into());
+        let mut with_calls = message("user", &checkpoint);
+        with_calls.tool_calls = Some(Vec::new());
+        let malformed_requests = vec![
+            vec![message("user", "Please explain CONTEXT CHECKPOINT")],
+            vec![message("user", &checkpoint.replace("## Goal", "## Other"))],
+            vec![message(
+                "user",
+                checkpoint.trim_end_matches("</conversation>"),
+            )],
+            vec![message("user", &checkpoint), message("user", "extra turn")],
+            vec![message("system", &checkpoint)],
+            vec![message("assistant", &checkpoint)],
+            vec![with_call_id],
+            vec![with_calls],
+        ];
+        let start = DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst);
+        let ordinary_requests = malformed_requests.len() + 3;
+        let provider = Arc::new(DesktopE2eProvider {
+            replies: (0..start + ordinary_requests + 1)
+                .map(|index| {
+                    serde_json::from_value(json!({
+                        "type":"text", "text":"interactive reply",
+                        "expectUserContentIncludes": if index == start + ordinary_requests {
+                            vec!["accepted-request"]
+                        } else {
+                            Vec::new()
+                        }
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+        });
+        for facts in [None, Some("unfinished: owned desktop task")] {
+            let response = provider
+                .chat(
+                    &[message(
+                        "user",
+                        &crate::agent::compaction::checkpoint_prompt("earlier transcript", facts),
+                    )],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let crate::llm::LlmResponse::Text { text, .. } = response else {
+                panic!("compaction must return a text checkpoint");
+            };
+            for heading in [
+                "## Goal",
+                "## Constraints & Preferences",
+                "## Progress",
+                "### Done",
+                "### In Progress",
+                "### Blocked",
+                "## Key Decisions",
+                "## Verification",
+                "## Relevant Files",
+                "## Next Steps",
+            ] {
+                assert!(
+                    text.lines().any(|line| line == heading),
+                    "missing {heading}"
+                );
+            }
+            assert_eq!(
+                DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+                start
+            );
+        }
+        use crate::agent::compaction::{CompactionHook, CompactionOutcome, DefaultCompactionHook};
+        let hook = DefaultCompactionHook::with_token_budget(provider.clone(), 32, 4);
+        let mut compacted = vec![
+            message("user", &"Earlier unfinished work. ".repeat(20)),
+            message("user", "Continue current work."),
+        ];
+        assert!(matches!(
+            hook.maybe_compact(&mut compacted).await,
+            CompactionOutcome::Compressed { .. }
+        ));
+        assert_eq!(compacted.len(), 2);
+        assert!(compacted[0]
+            .content
+            .starts_with("[Context checkpoint]\n## Goal"));
+        assert_eq!(compacted[1].content, "Continue current work.");
+        assert_eq!(
+            DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+            start
+        );
+        for request in malformed_requests {
+            assert!(matches!(
+                provider.chat(&request, None, None).await.unwrap(),
+                crate::llm::LlmResponse::Text { text, .. } if text == "interactive reply"
+            ));
+        }
+        for tools in [
+            Some(Vec::new()),
+            Some(vec![ToolSchema {
+                name: "observe_trusted_app_window".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }]),
+        ] {
+            assert!(matches!(
+                provider.chat(&[message("user", &checkpoint)], tools.as_deref(), None).await,
+                Ok(crate::llm::LlmResponse::Text { text, .. }) if text == "interactive reply"
+            ));
+        }
+        let thinking = ThinkingSettings {
+            protocol: crate::llm::ThinkingProtocol::DeepSeek,
+            effort: crate::llm::ThinkingEffort::Medium,
+            budget_tokens: None,
+        };
+        assert!(matches!(
+            provider.chat(&[message("user", &checkpoint)], None, Some(&thinking)).await,
+            Ok(crate::llm::LlmResponse::Text { text, .. }) if text == "interactive reply"
+        ));
+        assert_eq!(
+            DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+            start + ordinary_requests,
+            "only ordinary requests may consume interactive replies"
+        );
+        for _ in 0..2 {
+            assert!(provider
+                .chat(&[message("user", "invalid request")], None, None)
+                .await
+                .is_err());
+            assert_eq!(
+                DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+                start + ordinary_requests,
+                "a failed request must not consume or skip the scripted reply"
+            );
+        }
+        assert!(matches!(
+            provider.chat(&[message("user", "accepted-request")], None, None).await.unwrap(),
+            crate::llm::LlmResponse::Text { text, .. } if text == "interactive reply"
+        ));
+        assert_eq!(
+            DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+            start + ordinary_requests + 1
+        );
+
+        let latest_index = DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst);
+        let latest_provider = DesktopE2eProvider {
+            replies: (0..=latest_index)
+                .map(|_| {
+                    serde_json::from_value(json!({
+                "type":"text", "text":"current observation verified",
+                "expectCurrentDesktopObservation": {
+                    "callId":"cu-region-after-uncheck", "sourceCallId":"cu-root-after-uncheck",
+                    "appId":"desktop-e2e-window", "regionName":"Fixture region A"
+                }
+            })).unwrap()
+                })
+                .collect(),
+        };
+        for scenario in [
+            "missing_root",
+            "missing_scope",
+            "wrong_role",
+            "wrong_app",
+            "wrong_region",
+            "truncated",
+            "disabled",
+            "missing_state",
+            "wrong_state",
+            "duplicate_call",
+            "duplicate_output",
+            "reversed_calls",
+            "stale_action",
+            "reused_control",
+            "newer_root",
+            "later_scope",
+        ] {
+            let mut current = desktop_history()[12..].to_vec();
+            match scenario {
+                "missing_root" => {
+                    current.remove(1);
+                }
+                "missing_scope" => {
+                    current.pop();
+                }
+                "wrong_role" => current[3].role = "user".into(),
+                "wrong_app" => {
+                    current[0].tool_calls.as_mut().unwrap()[0].arguments["app_id"] =
+                        json!("another-app")
+                }
+                "duplicate_call" => current.push(current[2].clone()),
+                "duplicate_output" => current.push(current[3].clone()),
+                "reversed_calls" => {
+                    current = desktop_legacy_history()[8..].to_vec();
+                    current[0].tool_calls.as_mut().unwrap().swap(0, 1);
+                }
+                "stale_action" => current.extend(desktop_history()[10..12].iter().cloned()),
+                "newer_root" => {
+                    let newer = desktop_history()[6..8].to_vec();
+                    current.splice(2..2, newer);
+                }
+                "later_scope" => current.extend(desktop_history()[8..10].iter().cloned()),
+                _ => {
+                    let mut scope = desktop_e2e_observation(&current[3].content).unwrap();
+                    match scenario {
+                        "wrong_region" => scope.region_ref = Some("other-region".into()),
+                        "truncated" => scope.truncated = true,
+                        "disabled" => scope.controls[0].enabled = false,
+                        "missing_state" => scope.controls[0].state = None,
+                        "wrong_state" => {
+                            scope.controls[0].state.as_mut().unwrap().toggle =
+                                Some(crate::desktop_control::DesktopToggleState::On)
+                        }
+                        "reused_control" => {
+                            scope.controls[0].control_ref = Some("control-ref-1".into())
+                        }
+                        _ => unreachable!(),
+                    }
+                    current[3].content = serde_json::to_string(&scope).unwrap();
+                    if scenario == "reused_control" {
+                        current.splice(0..0, desktop_history()[10..12].iter().cloned());
+                    }
+                }
+            }
+            assert!(
+                latest_provider.chat(&current, None, None).await.is_err(),
+                "{scenario}"
+            );
+            assert_eq!(
+                DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+                latest_index
+            );
+        }
+        assert!(matches!(
+            latest_provider.chat(&desktop_legacy_history()[8..], None, None).await.unwrap(),
+            crate::llm::LlmResponse::Text { text, .. } if text == "current observation verified"
+        ));
+        assert_eq!(
+            DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+            latest_index + 1
+        );
     }
 
     #[test]
@@ -852,6 +1957,82 @@ mod desktop_e2e_tests {
                 assert_eq!(text.as_deref(), Some("reviewed summary"));
             }
             other => panic!("expected tool call response, got {other:?}"),
+        }
+
+        let history = desktop_history();
+        let tools =
+            ["observe_trusted_app_window", "operate_trusted_app_control"].map(|name| ToolSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            });
+        let region = DesktopE2eRegionRequest {
+            call_id: "cu-region-before".into(),
+            source_call_id: "cu-root-before".into(),
+            app_id: "desktop-e2e-window".into(),
+            region_name: "Fixture region A".into(),
+        };
+        let response =
+            desktop_e2e_observed_region_response(&region, &history[..2], Some(&tools)).unwrap();
+        assert!(
+            matches!(response, crate::llm::LlmResponse::ToolCalls { calls, .. } if calls[0].arguments == json!({"app_id":"desktop-e2e-window","mode":"controls","region_ref":"region-ref-0"}))
+        );
+        for (action, source, root, length, reference) in [
+            (
+                DesktopE2eCheckboxAction::Check,
+                "cu-region-before",
+                "cu-root-before",
+                4,
+                "control-ref-0",
+            ),
+            (
+                DesktopE2eCheckboxAction::Uncheck,
+                "cu-region-after-check",
+                "cu-root-after-check",
+                10,
+                "control-ref-1",
+            ),
+        ] {
+            let request = DesktopE2eControlRequest {
+                call_id: if length == 4 {
+                    "cu-check"
+                } else {
+                    "cu-uncheck"
+                }
+                .into(),
+                source_call_id: source.into(),
+                root_call_id: root.into(),
+                app_id: "desktop-e2e-window".into(),
+                region_name: "Fixture region A".into(),
+                control_name: "Region checkbox".into(),
+                action,
+            };
+            let response =
+                desktop_e2e_observed_control_response(&request, &history[..length], Some(&tools))
+                    .unwrap();
+            assert!(
+                matches!(response, crate::llm::LlmResponse::ToolCalls { calls, .. } if calls[0].arguments == json!({"app_id":"desktop-e2e-window","control_ref":reference,"action":action.operation()}))
+            );
+            for state in [
+                None,
+                Some(crate::desktop_control::DesktopControlState {
+                    toggle: Some(if matches!(action, DesktopE2eCheckboxAction::Check) {
+                        crate::desktop_control::DesktopToggleState::On
+                    } else {
+                        crate::desktop_control::DesktopToggleState::Off
+                    }),
+                    ..Default::default()
+                }),
+            ] {
+                let mut invalid = history[..length].to_vec();
+                let mut scope = desktop_e2e_observation(&invalid[length - 1].content).unwrap();
+                scope.controls[0].state = state;
+                invalid[length - 1].content = serde_json::to_string(&scope).unwrap();
+                assert!(
+                    desktop_e2e_observed_control_response(&request, &invalid, Some(&tools))
+                        .is_err()
+                );
+            }
         }
     }
 
@@ -905,5 +2086,103 @@ mod desktop_e2e_tests {
         )
         .unwrap_err();
         assert!(err.contains("review_delegated_delivery tool"));
+
+        let tools =
+            ["observe_trusted_app_window", "operate_trusted_app_control"].map(|name| ToolSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: json!({}),
+            });
+        for scenario in [
+            "missing",
+            "wrong_role",
+            "wrong_tool",
+            "wrong_app",
+            "duplicate_output",
+            "duplicate_call",
+            "truncated",
+            "region_mismatch",
+            "ambiguous_region",
+            "wrong_region_role",
+            "ambiguous_control",
+            "unsupported_control",
+            "disabled",
+            "missing_ref",
+            "stale",
+            "replayed",
+            "missing_tool",
+        ] {
+            let mut history = desktop_history()[..if scenario == "stale" { 6 } else { 4 }].to_vec();
+            let mut root = desktop_e2e_observation(&history[1].content).unwrap();
+            let mut scope = desktop_e2e_observation(&history[3].content).unwrap();
+            match scenario {
+                "wrong_app" => scope.app_id = "another-app".into(),
+                "truncated" => scope.truncated = true,
+                "region_mismatch" => scope.region_ref = Some("other-ref".into()),
+                "ambiguous_region" => root.regions.push(root.regions[0].clone()),
+                "wrong_region_role" => root.regions[0].role = "pane".into(),
+                "ambiguous_control" => scope.controls.push(scope.controls[0].clone()),
+                "unsupported_control" => scope.controls[0].capabilities.clear(),
+                "disabled" => scope.controls[0].enabled = false,
+                "missing_ref" => scope.controls[0].control_ref = None,
+                _ => {}
+            }
+            history[1].content = serde_json::to_string(&root).unwrap();
+            history[3].content = serde_json::to_string(&scope).unwrap();
+            match scenario {
+                "missing" => {
+                    history.pop();
+                }
+                "wrong_role" => history[3].role = "user".into(),
+                "wrong_tool" => {
+                    history[2].tool_calls.as_mut().unwrap()[0].name = "read_file".into()
+                }
+                "duplicate_output" => history.push(history[3].clone()),
+                "duplicate_call" => history.push(history[2].clone()),
+                _ => {}
+            }
+            let request = DesktopE2eControlRequest {
+                call_id: if scenario == "replayed" {
+                    "cu-root-before"
+                } else {
+                    "cu-new-check"
+                }
+                .into(),
+                source_call_id: "cu-region-before".into(),
+                root_call_id: "cu-root-before".into(),
+                app_id: "desktop-e2e-window".into(),
+                region_name: "Fixture region A".into(),
+                control_name: "Region checkbox".into(),
+                action: DesktopE2eCheckboxAction::Check,
+            };
+            assert!(
+                desktop_e2e_observed_control_response(
+                    &request,
+                    &history,
+                    if scenario == "missing_tool" {
+                        None
+                    } else {
+                        Some(&tools)
+                    }
+                )
+                .is_err(),
+                "{scenario}"
+            );
+        }
+        let mut replayed = desktop_history()[..10].to_vec();
+        let mut scope = desktop_e2e_observation(&replayed[9].content).unwrap();
+        scope.controls[0].control_ref = Some("control-ref-0".into());
+        replayed[9].content = serde_json::to_string(&scope).unwrap();
+        let request = DesktopE2eControlRequest {
+            call_id: "cu-uncheck".into(),
+            source_call_id: "cu-region-after-check".into(),
+            root_call_id: "cu-root-after-check".into(),
+            app_id: "desktop-e2e-window".into(),
+            region_name: "Fixture region A".into(),
+            control_name: "Region checkbox".into(),
+            action: DesktopE2eCheckboxAction::Uncheck,
+        };
+        assert!(desktop_e2e_observed_control_response(&request, &replayed, Some(&tools)).is_err());
+        assert!(serde_json::from_value::<DesktopE2eReply>(json!({"type":"desktop_observed_control","callId":"cu-check","sourceCallId":"cu-region-before","rootCallId":"cu-root-before","appId":"desktop-e2e-window","regionName":"Fixture region A","controlName":"Region checkbox","action":"toggle"})).is_err());
     }
 }

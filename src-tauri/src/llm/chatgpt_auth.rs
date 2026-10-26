@@ -21,8 +21,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
-    path::PathBuf,
+    io::{Read, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -30,7 +30,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tauri_plugin_keyring_store::KeyringExt;
+use tauri_plugin_keyring_store::{KeyringExt, KeyringStore};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
@@ -180,26 +180,145 @@ trait CredentialStore: Send + Sync {
 }
 
 struct ProtectedStore {
-    app: tauri::AppHandle,
+    vault: Arc<KeyringStore>,
     path: PathBuf,
     key_account: String,
+    // A manual acceptance client must not renew a retired credential path.
+    _profile_access: File,
+}
+
+// The key identity survives an owned-storage move. The header contains only a
+// SHA256 key identifier, never a key/token; ciphertext and its AAD are unchanged.
+const BLOB_MAGIC: &[u8] = b"AngelBotPlanV2\0\0\0";
+const KEY_PREFIX: &str = "chatgpt_plan_v1_key_";
+const BLOB_HEADER: usize = BLOB_MAGIC.len() + 64;
+pub(crate) const MAX_CREDENTIAL_FILE_BYTES: usize = BLOB_HEADER + MAX_RECORD_BYTES;
+
+fn path_key_account(path: &Path) -> String {
+    format!(
+        "{KEY_PREFIX}{}",
+        hex::encode(Sha256::digest(path.to_string_lossy().as_bytes()))
+    )
+}
+
+fn credential_binding<'a>(bytes: &'a [u8], default: &str) -> Result<(String, &'a [u8]), String> {
+    if !bytes.starts_with(BLOB_MAGIC) {
+        if !(28..=MAX_RECORD_BYTES).contains(&bytes.len()) {
+            return Err(STORE_ERROR.into());
+        }
+        return Ok((default.to_owned(), bytes));
+    }
+    if bytes.len() < BLOB_HEADER + 28 || bytes.len() > BLOB_HEADER + MAX_RECORD_BYTES {
+        return Err(STORE_ERROR.into());
+    }
+    let namespace = &bytes[BLOB_MAGIC.len()..BLOB_HEADER];
+    if !namespace
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return Err(STORE_ERROR.into());
+    }
+    let namespace = std::str::from_utf8(namespace).map_err(|_| STORE_ERROR)?;
+    Ok((format!("{KEY_PREFIX}{namespace}"), &bytes[BLOB_HEADER..]))
+}
+
+fn bound_credential_blob(account: &str, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    let digest = account.strip_prefix(KEY_PREFIX).ok_or(STORE_ERROR)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(STORE_ERROR.into());
+    }
+    let mut bytes = Vec::with_capacity(BLOB_HEADER + ciphertext.len());
+    bytes.extend_from_slice(BLOB_MAGIC);
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes.extend_from_slice(ciphertext);
+    credential_binding(&bytes, account)?;
+    Ok(bytes)
+}
+
+/// Rebind a legacy encrypted file to its existing vault identity, without
+/// opening a vault, decrypting a record, or following arbitrary key references.
+pub(crate) fn relocate_credential_blob(bytes: &[u8], source: &Path) -> Result<Vec<u8>, String> {
+    let (account, ciphertext) = credential_binding(bytes, &path_key_account(source))?;
+    bound_credential_blob(&account, ciphertext)
+}
+
+fn credential_blob_for_write(
+    account: &str,
+    ciphertext: &[u8],
+    unified_root: bool,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    // Borrowing the saved account for manual acceptance is not a cutover.
+    // The still-running old desktop must be able to read a refreshed token.
+    if unified_root || previous.is_some_and(|bytes| bytes.starts_with(BLOB_MAGIC)) {
+        bound_credential_blob(account, ciphertext)
+    } else {
+        Ok(ciphertext.to_vec())
+    }
+}
+
+// Keep automated E2E away from owner credentials. Live native acceptance may
+// borrow the existing protected store, but never the owner's application DB.
+fn credential_root_for_mode(
+    runtime_root: PathBuf,
+    saved_root: PathBuf,
+    desktop_e2e: bool,
+    manual: bool,
+) -> Option<PathBuf> {
+    if !desktop_e2e {
+        Some(runtime_root)
+    } else if manual {
+        Some(saved_root)
+    } else {
+        None
+    }
 }
 
 impl ProtectedStore {
-    fn new(app: &tauri::AppHandle) -> Self {
-        let path = crate::app_data_dir().join("chatgpt-plan.credentials");
-        let namespace = hex::encode(Sha256::digest(path.to_string_lossy().as_bytes()));
-        Self {
-            app: app.clone(),
+    fn new(app: &tauri::AppHandle) -> Result<Self, String> {
+        let root = credential_root_for_mode(
+            crate::app_data_dir(),
+            if cfg!(feature = "desktop-e2e") && crate::manual_desktop_acceptance() {
+                crate::profile_storage::saved_root()
+            } else {
+                crate::default_app_data_dir()
+            },
+            cfg!(feature = "desktop-e2e"),
+            crate::manual_desktop_acceptance(),
+        )
+        .ok_or("自动化测试不读取真实 ChatGPT 凭据。")?;
+        #[cfg(test)]
+        let isolated = std::env::var_os("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR").is_some();
+        #[cfg(not(test))]
+        let isolated = false;
+        let profile_access = if isolated {
+            crate::profile_storage::borrow(&root).map_err(|_| STORE_ERROR.to_string())?
+        } else {
+            let (current, guard) = crate::profile_storage::borrow_saved()
+                .map_err(|_| "资料正在迁移或需要恢复，请先处理后再连接 ChatGPT。".to_string())?;
+            if root != current {
+                return Err("资料目录已切换，请重新连接模型。".into());
+            }
+            guard
+        };
+        let path = root.join("chatgpt-plan.credentials");
+        let key_account = path_key_account(&path);
+        Ok(Self {
+            vault: app.keyring().store.clone(),
             path,
-            key_account: format!("chatgpt_plan_v1_key_{namespace}"),
-        }
+            key_account,
+            _profile_access: profile_access,
+        })
     }
 
-    fn encryption_key(&self, create: bool) -> Result<Vec<u8>, String> {
-        let vault = &self.app.keyring().store;
+    fn encryption_key(&self, account: &str, create: bool) -> Result<Vec<u8>, String> {
+        let vault = &self.vault;
         match vault
-            .get_password(&self.key_account)
+            .get_password(account)
             .map_err(|_| STORE_ERROR.to_string())?
         {
             Some(encoded) => {
@@ -215,12 +334,23 @@ impl ProtectedStore {
                 let mut key = vec![0; 32];
                 OsRng.fill_bytes(&mut key);
                 vault
-                    .set_password(&self.key_account, &STANDARD.encode(&key))
+                    .set_password(account, &STANDARD.encode(&key))
                     .map_err(|_| STORE_ERROR.to_string())?;
                 Ok(key)
             }
             None => Err(STORE_ERROR.into()),
         }
+    }
+
+    fn read_blob(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        File::open(&self.path)
+            .map_err(|_| STORE_ERROR)?
+            .take((MAX_RECORD_BYTES + BLOB_HEADER + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| STORE_ERROR)?;
+        credential_binding(&bytes, &self.key_account)?;
+        Ok(bytes)
     }
 }
 
@@ -230,11 +360,12 @@ impl CredentialStore for ProtectedStore {
             return Ok(None);
         }
         let metadata = std::fs::metadata(&self.path).map_err(|_| STORE_ERROR.to_string())?;
-        if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES as u64 {
+        if !metadata.is_file() || metadata.len() > (MAX_RECORD_BYTES + BLOB_HEADER) as u64 {
             return Err(STORE_ERROR.into());
         }
-        let bytes = std::fs::read(&self.path).map_err(|_| STORE_ERROR.to_string())?;
-        let plaintext = decrypt_record(&self.encryption_key(false)?, &bytes)?;
+        let bytes = self.read_blob()?;
+        let (account, ciphertext) = credential_binding(&bytes, &self.key_account)?;
+        let plaintext = decrypt_record(&self.encryption_key(&account, false)?, ciphertext)?;
         let record: Record =
             serde_json::from_slice(&plaintext).map_err(|_| STORE_ERROR.to_string())?;
         record.validate()?;
@@ -246,7 +377,19 @@ impl CredentialStore for ProtectedStore {
         let parent = self.path.parent().ok_or(STORE_ERROR)?;
         std::fs::create_dir_all(parent).map_err(|_| STORE_ERROR.to_string())?;
         let plaintext = serde_json::to_vec(record).map_err(|_| STORE_ERROR.to_string())?;
-        let bytes = encrypt_record(&self.encryption_key(true)?, &plaintext)?;
+        let previous = self.path.exists().then(|| self.read_blob()).transpose()?;
+        let account = if let Some(bytes) = &previous {
+            credential_binding(bytes, &self.key_account)?.0
+        } else {
+            self.key_account.clone()
+        };
+        let ciphertext = encrypt_record(&self.encryption_key(&account, true)?, &plaintext)?;
+        let bytes = credential_blob_for_write(
+            &account,
+            &ciphertext,
+            parent == crate::default_app_data_dir().as_path(),
+            previous.as_deref(),
+        )?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).map_err(|_| STORE_ERROR.to_string())?;
         #[cfg(unix)]
@@ -976,6 +1119,7 @@ async fn listen_for_callback(
     .map_err(|_| "ChatGPT 本地回调已停止。".to_string())?
 }
 
+#[derive(Clone)]
 struct Session {
     store: Arc<dyn CredentialStore>,
     transport: Arc<dyn AuthTransport>,
@@ -999,11 +1143,13 @@ impl AccountMode {
 }
 impl Session {
     fn production(app: &tauri::AppHandle) -> Result<Self, String> {
+        let store = ProtectedStore::new(app)?;
+        let lock_path = store.path.with_extension("lock");
         Ok(Self {
-            store: Arc::new(ProtectedStore::new(app)),
+            store: Arc::new(store),
             transport: Arc::new(OfficialTransport::new()?),
             gate: process_gate(),
-            lock_path: Some(crate::app_data_dir().join("chatgpt-plan.lock")),
+            lock_path: Some(lock_path),
         })
     }
 
@@ -1188,6 +1334,25 @@ impl Session {
         authorization_epoch: Option<u64>,
     ) -> Result<String, String> {
         validate_reference(credential_ref)?;
+        // A model request may be cancelled while a rotating refresh is in
+        // flight. Only credential resolution is shielded: keep its existing
+        // locks until the replacement is persisted, never detach inference.
+        let session = self.clone();
+        let credential_ref = credential_ref.to_owned();
+        tokio::spawn(async move {
+            session
+                .resolve_bearer_at_epoch(&credential_ref, authorization_epoch)
+                .await
+        })
+        .await
+        .map_err(|_| "ChatGPT 凭据更新未完成，请重试连接。".to_string())?
+    }
+
+    async fn resolve_bearer_at_epoch(
+        &self,
+        credential_ref: &str,
+        authorization_epoch: Option<u64>,
+    ) -> Result<String, String> {
         let _gate = self.gate.lock().await;
         let _process = cross_process_lock(self.lock_path.clone()).await?;
         let mut record = self.store.load()?.ok_or(SIGN_IN_REQUIRED)?;
@@ -1380,7 +1545,12 @@ async fn sign_in_with_mode(
     #[cfg(feature = "desktop-e2e")]
     {
         let _ = (app, mode);
-        return Err("自动化测试不启动真实 ChatGPT 登录。".into());
+        return Err(if crate::manual_desktop_acceptance() {
+            "隔离验收仅复用已有授权；如需登录或更换账号，请停止验收并在普通 AngelBot 中操作。"
+        } else {
+            "自动化测试不启动真实 ChatGPT 登录。"
+        }
+        .into());
     }
     #[cfg(not(feature = "desktop-e2e"))]
     {
@@ -1463,13 +1633,10 @@ async fn sign_in_with_mode(
 }
 
 pub fn status(app: &tauri::AppHandle) -> Result<ChatGptPlanStatus, String> {
-    #[cfg(feature = "desktop-e2e")]
-    {
-        let _ = app;
+    if cfg!(feature = "desktop-e2e") && !crate::manual_desktop_acceptance() {
         return Ok(Record::new().status());
     }
-    #[cfg(not(feature = "desktop-e2e"))]
-    Ok(ProtectedStore::new(app)
+    Ok(ProtectedStore::new(app)?
         .load()?
         .unwrap_or_else(Record::new)
         .status())
@@ -1480,6 +1647,9 @@ pub async fn disconnect(app: &tauri::AppHandle) -> Result<ChatGptPlanStatus, Str
     #[cfg(feature = "desktop-e2e")]
     {
         let _ = app;
+        if crate::manual_desktop_acceptance() {
+            return Err("隔离验收不能断开共享的 ChatGPT 授权，请在普通 AngelBot 中操作。".into());
+        }
         return Ok(Record::new().status());
     }
     #[cfg(not(feature = "desktop-e2e"))]
@@ -1512,29 +1682,21 @@ pub fn credential_source(
     opaque_ref: &str,
 ) -> Result<Arc<dyn ModelCredentialSource>, String> {
     validate_reference(opaque_ref)?;
-    #[cfg(feature = "desktop-e2e")]
+    let session = Session::production(app)?;
+    let record = session.store.load()?.ok_or(SIGN_IN_REQUIRED)?;
+    if record
+        .registration
+        .as_ref()
+        .is_none_or(|registration| registration.credential_ref != opaque_ref)
     {
-        let _ = app;
-        return Err("自动化测试不读取真实 ChatGPT 凭据。".into());
+        return Err(SIGN_IN_REQUIRED.into());
     }
-    #[cfg(not(feature = "desktop-e2e"))]
-    {
-        let session = Session::production(app)?;
-        let record = session.store.load()?.ok_or(SIGN_IN_REQUIRED)?;
-        if record
-            .registration
-            .as_ref()
-            .is_none_or(|registration| registration.credential_ref != opaque_ref)
-        {
-            return Err(SIGN_IN_REQUIRED.into());
-        }
-        session.validate_source(opaque_ref, record.authorization_epoch)?;
-        Ok(Arc::new(PlanCredentialSource {
-            session,
-            credential_ref: opaque_ref.to_string(),
-            authorization_epoch: record.authorization_epoch,
-        }))
-    }
+    session.validate_source(opaque_ref, record.authorization_epoch)?;
+    Ok(Arc::new(PlanCredentialSource {
+        session,
+        credential_ref: opaque_ref.to_string(),
+        authorization_epoch: record.authorization_epoch,
+    }))
 }
 
 #[cfg(test)]

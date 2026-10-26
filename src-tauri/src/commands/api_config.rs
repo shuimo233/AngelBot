@@ -110,33 +110,56 @@ impl From<StoredApiProviderConfig> for ApiProviderConfig {
     }
 }
 
+#[cfg(any(test, feature = "desktop-e2e"))]
+fn desktop_e2e_config_dir(data_root: PathBuf, manual: bool, pid: u32) -> PathBuf {
+    if manual {
+        data_root.join("model-config")
+    } else {
+        std::env::temp_dir().join(format!("angelbot-desktop-e2e-config-{pid}"))
+    }
+}
+
 pub fn get_config_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR") {
+        let dir = PathBuf::from(root);
+        assert!(
+            dir.is_absolute(),
+            "verification config root must be absolute"
+        );
+        return dir;
+    }
     #[cfg(feature = "desktop-e2e")]
     {
-        let dir = std::env::temp_dir().join(format!(
-            "angelbot-desktop-e2e-config-{}",
-            std::process::id()
-        ));
-        if !dir.exists() {
-            let _ = fs::create_dir_all(&dir);
-        }
+        let dir = desktop_e2e_config_dir(
+            crate::app_data_dir(),
+            crate::manual_desktop_acceptance(),
+            std::process::id(),
+        );
         return dir;
     }
 
     #[cfg(not(feature = "desktop-e2e"))]
-    let dir = dirs::config_dir()
-        .unwrap_or_else(|| std::env::current_dir().unwrap())
-        .join("AngelBot");
-    #[cfg(not(feature = "desktop-e2e"))]
-    if !dir.exists() {
-        let _ = fs::create_dir_all(&dir);
-    }
+    let dir = crate::profile_storage::config_directory();
     #[cfg(not(feature = "desktop-e2e"))]
     dir
 }
 
 pub fn get_config_path() -> PathBuf {
     get_config_dir().join(CONFIG_FILE_NAME)
+}
+
+fn config_access() -> Result<(PathBuf, Option<fs::File>), String> {
+    #[cfg(test)]
+    if std::env::var_os("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR").is_some() {
+        return Ok((get_config_path(), None));
+    }
+    #[cfg(feature = "desktop-e2e")]
+    return Ok((get_config_path(), None));
+    #[cfg(not(feature = "desktop-e2e"))]
+    crate::profile_storage::borrow_config()
+        .map(|(directory, guard)| (directory.join(CONFIG_FILE_NAME), Some(guard)))
+        .map_err(|_| "资料正在迁移或需要恢复，未读取或修改模型配置。".into())
 }
 
 pub fn load_config_from_file() -> ApiProviderConfig {
@@ -160,7 +183,8 @@ fn parse_model_config(content: &str) -> Result<ApiProviderConfig, String> {
 }
 
 pub(crate) fn load_config_from_file_checked() -> Result<ApiProviderConfig, String> {
-    match fs::read_to_string(get_config_path()) {
+    let (path, _guard) = config_access()?;
+    match fs::read_to_string(path) {
         Ok(content) => parse_model_config(&content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(ApiProviderConfig::default())
@@ -170,7 +194,8 @@ pub(crate) fn load_config_from_file_checked() -> Result<ApiProviderConfig, Strin
 }
 
 fn legacy_file_api_key() -> Option<String> {
-    let content = fs::read_to_string(get_config_path()).ok()?;
+    let (path, _guard) = config_access().ok()?;
+    let content = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     value
         .get("api_key")?
@@ -181,9 +206,21 @@ fn legacy_file_api_key() -> Option<String> {
 }
 
 pub fn save_config_to_file(config: &ApiProviderConfig) -> Result<(), String> {
+    use std::io::Write;
+    let (path, _guard) = config_access()?;
     let json = serde_json::to_string_pretty(&StoredApiProviderConfig::from(config))
         .map_err(|error| format!("serialize model config: {error}"))?;
-    fs::write(get_config_path(), json).map_err(|error| format!("write model config: {error}"))
+    let parent = path.parent().ok_or("模型配置位置无效")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create model config directory: {error}"))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("prepare model config: {error}"))?;
+    file.write_all(json.as_bytes())
+        .and_then(|_| file.as_file().sync_all())
+        .map_err(|error| format!("write model config: {error}"))?;
+    file.persist(path)
+        .map_err(|error| format!("save model config: {}", error.error))?;
+    Ok(())
 }
 
 pub(crate) fn api_key_from_environment(provider: &str) -> Option<String> {
@@ -217,12 +254,35 @@ pub(crate) fn provider_requires_key(provider: &str) -> bool {
     provider != "ollama"
 }
 
+#[cfg(any(test, feature = "desktop-e2e"))]
+fn desktop_e2e_model_config(
+    manual: bool,
+    load: impl FnOnce() -> Result<ApiProviderConfig, String>,
+) -> Option<ApiProviderConfig> {
+    if manual {
+        load().ok().filter(|config| {
+            config.provider == "openai"
+                && config.auth_mode == ModelAuthMode::ChatgptPlan
+                && !config.model.trim().is_empty()
+                && config
+                    .credential_ref
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+    } else {
+        Some(ApiProviderConfig::default())
+    }
+}
+
 /// Load non-secret provider configuration plus a provider-matched environment
 /// key. Keychain credentials are resolved by the model factory.
 pub fn load_api_config_internal() -> Option<ProviderConfig> {
     #[cfg(feature = "desktop-e2e")]
     {
-        let config = ApiProviderConfig::default();
+        let config = desktop_e2e_model_config(
+            crate::manual_desktop_acceptance(),
+            load_config_from_file_checked,
+        )?;
         return Some(ProviderConfig {
             provider: config.provider,
             model: config.model,
@@ -303,7 +363,19 @@ pub fn load_api_config_internal() -> Option<ProviderConfig> {
 }
 
 pub fn load_full_config(app: &tauri::AppHandle) -> ApiProviderConfig {
-    let runtime = load_api_config_internal().unwrap_or_default();
+    let runtime = load_api_config_internal();
+    if crate::manual_desktop_acceptance() && runtime.is_none() {
+        // Settings may display an unconfigured plan, never unrelated API-key
+        // credentials. Foreground requests report InvalidConfiguration instead.
+        return ApiProviderConfig {
+            provider: "openai".into(),
+            model: String::new(),
+            base_url: String::new(),
+            auth_mode: ModelAuthMode::ChatgptPlan,
+            ..ApiProviderConfig::default()
+        };
+    }
+    let runtime = runtime.unwrap_or_default();
     if runtime.auth_mode != ModelAuthMode::ApiKey {
         let plan = crate::llm::chatgpt_auth::status(app).ok();
         let matches = plan
@@ -480,6 +552,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn verification_config_root_isolated_from_user_settings() {
+        const ROOT: &str = "ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR";
+        const PROBE: &str = "ANGELBOT_PRIVATE_VERIFY_CONFIG_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let expected = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            assert!(
+                get_config_dir() == expected,
+                "verification must not resolve the ordinary model configuration directory"
+            );
+            let config = ApiProviderConfig {
+                model: "owned-verification-model".into(),
+                ..ApiProviderConfig::default()
+            };
+            save_config_to_file(&config).unwrap();
+            assert_eq!(load_config_from_file_checked().unwrap().model, config.model);
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "commands::api_config::tests::verification_config_root_isolated_from_user_settings",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(ROOT, directory.path())
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn stored_config_never_serializes_api_key() {
         let config = ApiProviderConfig {
             api_key: "secret-value".into(),
@@ -499,6 +607,37 @@ mod tests {
         assert!(!provider_requires_key("ollama"));
         assert!(provider_requires_key("anthropic"));
         assert!(provider_requires_key("custom"));
+    }
+
+    #[test]
+    fn e2e_model_and_path_selection_keep_scripted_and_live_sources_separate() {
+        let root = PathBuf::from("isolated-data");
+        assert_eq!(
+            desktop_e2e_config_dir(root.clone(), true, 123),
+            root.join("model-config")
+        );
+        assert_eq!(
+            desktop_e2e_config_dir(root, false, 123),
+            std::env::temp_dir().join("angelbot-desktop-e2e-config-123")
+        );
+        let saved = ApiProviderConfig {
+            provider: "openai".into(),
+            model: "saved-fixture".into(),
+            auth_mode: ModelAuthMode::ChatgptPlan,
+            credential_ref: Some("opaque-handle".into()),
+            ..ApiProviderConfig::default()
+        };
+        let loaded = desktop_e2e_model_config(true, || Ok(saved)).unwrap();
+        assert_eq!(loaded.model, "saved-fixture");
+        assert_eq!(loaded.auth_mode, ModelAuthMode::ChatgptPlan);
+        assert_eq!(loaded.credential_ref.as_deref(), Some("opaque-handle"));
+        assert!(desktop_e2e_model_config(true, || Err("unreadable".into())).is_none());
+        assert!(desktop_e2e_model_config(true, || Ok(ApiProviderConfig::default())).is_none());
+        let scripted = desktop_e2e_model_config(false, || {
+            panic!("scripted E2E must never read the owner's profile")
+        })
+        .unwrap();
+        assert_eq!(scripted.model, ApiProviderConfig::default().model);
     }
 
     #[test]

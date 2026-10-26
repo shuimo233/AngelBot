@@ -6,15 +6,18 @@ Examples:
   python scripts/verify.py full
   python scripts/verify.py backend
   python scripts/verify.py frontend
+  python scripts/verify.py native-storage  # Windows only; synthetic OS-vault entries
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +38,7 @@ CHECKS = {
         Check("diff hygiene", ("git", "diff", "--check")),
         Check("staged diff hygiene", ("git", "diff", "--cached", "--check")),
         Check("release preflight", (sys.executable, "scripts/release.py", "check")),
+        Check("desktop build isolation", (sys.executable, "scripts/test_desktop_e2e.py")),
     ),
     "frontend": (
         Check("frontend unit tests", ("npm", "test", "--", "--run")),
@@ -57,7 +61,23 @@ PROFILES = {
     "frontend": CHECKS["frontend"],
     "backend": CHECKS["backend"],
     "full": CHECKS["workspace"] + CHECKS["frontend"] + CHECKS["backend"],
+    # Explicit opt-in: never append native credential I/O to backend/full/CI.
+    "native-storage": (
+        Check("native Windows storage credentials", (
+            "cargo", "test", "--manifest-path", TAURI_MANIFEST, "--lib",
+            "llm::chatgpt_auth::tests::native_profile_cutover_keeps_windows_vault_binding",
+            "--", "--exact", "--ignored", "--nocapture", "--test-threads=1",
+        )),
+    ),
 }
+
+
+def isolated_environment() -> dict[str, str]:
+    """Keep compiler/system configuration, never pass live model credentials."""
+    sensitive = re.compile(r"TOKEN|API.?KEY|SECRET|PASSWORD|CREDENTIAL|(?:^|_)KEY(?:_|$)", re.IGNORECASE)
+    env = {name: value for name, value in os.environ.items() if not sensitive.search(name)}
+    env.update({"CARGO_NET_OFFLINE": "true", "NPM_CONFIG_OFFLINE": "true"})
+    return env
 
 
 def executable_available(command: str) -> bool:
@@ -89,9 +109,15 @@ def run_check(check: Check, fail_fast: bool) -> bool:
     print(f"\n==> {check.name}\n    {' '.join(check.command)}")
     started = time.monotonic()
     try:
-        result = subprocess.run(platform_command(check.command), cwd=ROOT, check=False)
+        with tempfile.TemporaryDirectory(prefix="angelbot-verify-config-") as config_root:
+            env = {key: value for key, value in isolated_environment().items()
+                   if not key.startswith(("ANGELBOT_", "VITE_ANGELBOT_"))}
+            # The Rust override is cfg(test) only: normal builds ignore it.
+            # Its lifecycle belongs to this parent, including failed checks.
+            env["ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR"] = config_root
+            result = subprocess.run(platform_command(check.command), cwd=ROOT, check=False, env=env)
     except OSError as error:
-        print(f"<== {check.name}: FAIL (could not start: {error})")
+        print(f"<== {check.name}: FAIL (could not execute or clean up: {error})")
         return False
     elapsed = time.monotonic() - started
     outcome = "PASS" if result.returncode == 0 else f"FAIL ({result.returncode})"
@@ -104,6 +130,8 @@ def main() -> int:
     parser.add_argument("profile", choices=PROFILES, nargs="?", default="quick")
     parser.add_argument("--fail-fast", action="store_true", help="stop after the first failed check")
     args = parser.parse_args()
+    if args.profile == "native-storage" and os.name != "nt":
+        parser.error("native-storage requires Windows; it must not pass with zero native tests")
 
     checks = PROFILES[args.profile]
     print(f"AngelBot verification profile: {args.profile} ({len(checks)} checks)")

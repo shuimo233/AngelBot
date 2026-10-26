@@ -205,7 +205,7 @@ impl ForegroundAutomationPump {
     /// Remember that this session needs one retry when its current foreground
     /// turn releases its execution slot. Call only after the durable input has
     /// been returned to the queue; this method never schedules work itself.
-    fn defer_until_session_release(&self, session_id: &str) {
+    pub(super) fn defer_until_session_release(&self, session_id: &str) {
         self.deferred_session_releases
             .lock()
             .expect("foreground follow-up deferred session lock poisoned")
@@ -221,7 +221,7 @@ impl ForegroundAutomationPump {
         }
     }
 
-    fn take_deferred_session_release(&self, session_id: &str) -> bool {
+    pub(super) fn take_deferred_session_release(&self, session_id: &str) -> bool {
         self.deferred_session_releases
             .lock()
             .expect("foreground follow-up deferred session lock poisoned")

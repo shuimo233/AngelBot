@@ -16,6 +16,7 @@
         "width": 1200,
         "height": 800,
         "resizable": true,
+        "dragDropEnabled": false,
         "fullscreen": false
       }
     ],
@@ -28,6 +29,7 @@
     "active": true,
     "resources": ["../LICENSE", "../THIRD_PARTY_NOTICES.txt"],
     "targets": ["nsis"],
+    "windows": { "allowDowngrades": false, "nsis": { "installMode": "currentUser" } },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -4,21 +4,23 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import type { LiveBlock } from '$stores/messages';
-import { desktopActionOperation, getToolConfirmationSummary, requiresDesktopActionPreview } from '$lib/tool-confirmation';
-import { desktopActionReceipt } from '$lib/desktop-action-result';
+import { desktopConfirmationOperation, requiresDesktopConfirmationPreview } from '$lib/tool-confirmation';
+import { toolActionReceipt } from '$lib/tool-action-result';
 import { getToolDisplayName } from '$lib/tool-display';
-import { DesktopActionApproval } from './DesktopActionApproval';
+import { DesktopActionApproval, type DesktopApprovalRecheck, type DesktopApprovalResolution } from './DesktopActionApproval';
+import { ToolActionApproval } from './ToolActionApproval';
 import '../styles/content-block-renderer.css';
 
 interface ContentBlockRendererProps {
   blocks: LiveBlock[];
   sessionId?: string;
   messageId?: string;
+  desktopRecheck?: DesktopApprovalRecheck;
   onResolveConfirmation?: (
     callId: string,
     decision: 'approved' | 'rejected',
     previewId?: string,
-  ) => void;
+  ) => DesktopApprovalResolution | Promise<DesktopApprovalResolution>;
 }
 
 /**
@@ -145,9 +147,9 @@ function actionLabel(action: ToolAction): string {
   }
 }
 
-function liveDesktopReceipt(tool: Extract<LiveBlock, { kind: 'tool_call' }>) {
+function liveActionReceipt(tool: Extract<LiveBlock, { kind: 'tool_call' }>) {
   if (tool.status === 'running' || tool.status === 'needs_approval') return null;
-  return desktopActionReceipt(tool.toolName, {
+  return toolActionReceipt(tool.toolName, {
     success: tool.status === 'completed',
     output: tool.output ?? '',
     error: tool.error,
@@ -169,10 +171,13 @@ export function ContentBlockRenderer({
   blocks,
   sessionId,
   messageId,
+  desktopRecheck,
   onResolveConfirmation,
 }: ContentBlockRendererProps) {
   if (blocks.length === 0) return null;
   const segments = groupBlocksIntoSegments(blocks);
+  const approvalBlocked = blocks.some((block) => block.kind === 'tool_call'
+    && liveActionReceipt(block)?.status === 'result_unknown');
   return (
     <div className="content-block-stream">
       {segments.map((segment, i) =>
@@ -182,8 +187,10 @@ export function ContentBlockRenderer({
           <ToolSlice
             key={`slice-${segment.tools[0]?.index ?? segment.iterationId}-${i}`}
             segment={segment}
+            approvalBlocked={approvalBlocked}
             sessionId={sessionId}
             messageId={messageId}
+            desktopRecheck={desktopRecheck}
             onResolveConfirmation={onResolveConfirmation}
           />
         ),
@@ -224,18 +231,25 @@ function TextSegment({ segment }: { segment: Extract<Segment, { kind: 'text' }> 
 
 function ToolSlice({
   segment,
+  approvalBlocked,
   sessionId,
   messageId,
+  desktopRecheck,
   onResolveConfirmation,
 }: {
   segment: Extract<Segment, { kind: 'slice' }>;
+  approvalBlocked: boolean;
   sessionId?: string;
   messageId?: string;
-  onResolveConfirmation?: (callId: string, decision: 'approved' | 'rejected', previewId?: string) => void;
+  desktopRecheck?: DesktopApprovalRecheck;
+  onResolveConfirmation?: (callId: string, decision: 'approved' | 'rejected', previewId?: string) => DesktopApprovalResolution | Promise<DesktopApprovalResolution>;
 }) {
   const status = aggregateStatus(segment.tools);
-  const receipts = segment.tools.map(liveDesktopReceipt);
-  const hasUnknownDesktop = receipts.some((receipt) => receipt?.status === 'result_unknown');
+  const receipts = segment.tools.map(liveActionReceipt);
+  const hasUnknownAction = receipts.some((receipt) => receipt?.status === 'result_unknown');
+  const hasFailedObservation = segment.tools.some((tool, index) =>
+    tool.toolName === 'observe_trusted_app_window' && receipts[index]?.status === 'failed');
+  const needsReview = hasUnknownAction || hasFailedObservation;
   const allDesktopDispatched = segment.action === 'desktop' && status === 'completed'
     && receipts.every((receipt) => receipt?.status === 'dispatched');
   const allDesktopVerified = segment.action === 'desktop' && status === 'completed'
@@ -243,26 +257,28 @@ function ToolSlice({
   const hasVerifiedControl = allDesktopVerified
     && segment.tools.some((tool) => tool.toolName === 'operate_trusted_app_control');
   // Keep completed work compact. A running or approval-gated slice remains
-  // open so progress and its action are immediately visible.
+  // open so progress and its action are immediately visible. Observation
+  // failures and uncertain actions keep their safe recovery explanation open.
   const [open, setOpen] = useState(
-    status === 'needs_approval' || status === 'running' || hasUnknownDesktop,
+    status === 'needs_approval' || status === 'running' || needsReview,
   );
   useEffect(() => {
     // Live work stays visible. Once a batch reaches a terminal state it
-    // returns to the compact Codex-style summary, while details remain one
-    // click away.
-    setOpen(status === 'needs_approval' || status === 'running' || hasUnknownDesktop);
-  }, [status, hasUnknownDesktop]);
+    // returns to the compact summary unless its recovery needs review.
+    setOpen(status === 'needs_approval' || status === 'running' || needsReview);
+  }, [status, needsReview]);
   const label = aggregateLabel(segment.tools);
-  const title = hasUnknownDesktop
-    ? '桌面操作结果待核对'
-    : allDesktopDispatched
-      ? '已发出桌面请求'
-      : allDesktopVerified
+  const title = hasUnknownAction
+    ? segment.action === 'desktop' ? '桌面操作结果待核对' : '操作结果待核对'
+    : hasFailedObservation
+      ? '未取得窗口图像'
+      : allDesktopDispatched
+        ? '已发出桌面请求'
+        : allDesktopVerified
           ? hasVerifiedControl ? '控件状态已确认，任务结果待检查' : '输入内容已填写并校验'
-        : segment.action === 'desktop' && status === 'completed'
-          ? '桌面操作状态未确认'
-          : sliceTitle(status, segment.action);
+          : segment.action === 'desktop' && status === 'completed'
+            ? '桌面操作状态未确认'
+            : sliceTitle(status, segment.action);
 
   return (
     <div className={`content-block-slice content-block-slice--${status}`} aria-live="polite">
@@ -287,8 +303,10 @@ function ToolSlice({
             <div key={`${tool.callId}-${i}`} role="listitem">
               <InlineToolRow
                 tool={tool}
+                approvalBlocked={approvalBlocked}
                 sessionId={sessionId}
                 messageId={messageId}
+                desktopRecheck={desktopRecheck}
                 onResolveConfirmation={onResolveConfirmation}
               />
             </div>
@@ -301,22 +319,26 @@ function ToolSlice({
 
 function InlineToolRow({
   tool,
+  approvalBlocked,
   sessionId,
   messageId,
+  desktopRecheck,
   onResolveConfirmation,
 }: {
   tool: Extract<LiveBlock, { kind: 'tool_call' }>;
+  approvalBlocked: boolean;
   sessionId?: string;
   messageId?: string;
-  onResolveConfirmation?: (callId: string, decision: 'approved' | 'rejected', previewId?: string) => void;
+  desktopRecheck?: DesktopApprovalRecheck;
+  onResolveConfirmation?: (callId: string, decision: 'approved' | 'rejected', previewId?: string) => DesktopApprovalResolution | Promise<DesktopApprovalResolution>;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const verb = verbForTool(tool.toolName);
   const needsApproval = tool.status === 'needs_approval';
-  const desktopOperation = desktopActionOperation(tool.toolName, tool.arguments);
-  const needsDesktopPreview = requiresDesktopActionPreview(tool.toolName);
+  const desktopOperation = desktopConfirmationOperation(tool.toolName, tool.arguments);
+  const needsDesktopPreview = requiresDesktopConfirmationPreview(tool.toolName, tool.arguments);
   const hasDetails = Boolean(tool.error || tool.output);
-  const receipt = liveDesktopReceipt(tool);
+  const receipt = liveActionReceipt(tool);
 
   return (
     <div className={`content-block-tool content-block-tool--${tool.status}`}>
@@ -345,33 +367,20 @@ function InlineToolRow({
           callId={tool.callId}
           operation={desktopOperation}
           layout="stream"
+          recheck={desktopRecheck}
+          approvalBlocked={approvalBlocked}
           onResolve={(decision, previewId) => onResolveConfirmation(tool.callId, decision, previewId)}
         />
       )}
       {needsApproval && onResolveConfirmation && !needsDesktopPreview && (
-        <div className="content-block-tool-confirmation">
-          <span className="content-block-tool-confirmation-summary">
-            {getToolConfirmationSummary(tool.toolName, tool.arguments)}
-          </span>
-          <div className="content-block-tool-actions">
-            <button
-              type="button"
-              className="content-block-tool-btn content-block-tool-btn--approve"
-              onClick={() => onResolveConfirmation(tool.callId, 'approved')}
-              title={tool.reason}
-            >
-              允许
-            </button>
-            <button
-              type="button"
-              className="content-block-tool-btn content-block-tool-btn--reject"
-              onClick={() => onResolveConfirmation(tool.callId, 'rejected')}
-              title={tool.reason}
-            >
-              拒绝
-            </button>
-          </div>
-        </div>
+        <ToolActionApproval
+          toolName={tool.toolName}
+          arguments={tool.arguments}
+          layout="stream"
+          reason={tool.reason}
+          approvalBlocked={approvalBlocked}
+          onResolve={(decision) => onResolveConfirmation(tool.callId, decision)}
+        />
       )}
       {detailsOpen && (tool.error || tool.output) && (
         <pre className="content-block-tool-details">{tool.error ?? tool.output}</pre>
@@ -474,7 +483,7 @@ function InlineStatusIcon({
 function actionForTool(tool: Extract<LiveBlock, { kind: 'tool_call' }>): ToolAction {
   // Classify completed legacy receipts for rendering, without enabling their
   // retired pending actions or treating dispatch as a completed business task.
-  if (liveDesktopReceipt(tool)) return 'desktop';
+  if (!tool.toolName.startsWith('mcp_') && liveActionReceipt(tool)) return 'desktop';
   switch (tool.toolName) {
     case 'list_dir':
     case 'read_file':
@@ -503,6 +512,7 @@ function actionForTool(tool: Extract<LiveBlock, { kind: 'tool_call' }>): ToolAct
     case 'prepare_message_draft':
     case 'set_trusted_app_text':
     case 'operate_trusted_app_control':
+    case 'click_trusted_app_image':
       return 'desktop';
     default:
       return 'general';

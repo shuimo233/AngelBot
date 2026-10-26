@@ -9,8 +9,9 @@ const plan = { ...legacy, model: 'authorized-model', protocol: 'openai_responses
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 describe('model configuration IPC mapping', () => {
@@ -114,16 +115,51 @@ describe('saved runtime configuration versus settings draft', () => {
     expect(useSettingsStore.getState().activeApiConfig.model).toBe(legacy.model);
   });
 
-  it('ignores an old load that completes after the new plan was saved', async () => {
+  it.each([
+    { refresh: false, fails: false },
+    { refresh: true, fails: false },
+    { refresh: true, fails: true },
+  ])('ignores an old configuration read after the new plan was saved ($refresh/$fails)', async ({ refresh, fails }) => {
     const oldRead = deferred<typeof legacy>();
     vi.mocked(loadApiConfig).mockReturnValueOnce(oldRead.promise).mockResolvedValueOnce(plan);
-    const pending = useSettingsStore.getState().loadApiConfig();
+    const pending = refresh
+      ? useSettingsStore.getState().refreshApiConfigReadiness()
+      : useSettingsStore.getState().loadApiConfig();
     useSettingsStore.getState().updateApiConfig(fromRustConfig(plan));
     await useSettingsStore.getState().persistApiConfig();
-    oldRead.resolve(legacy);
+    if (fails) oldRead.reject(new Error('stale background failure'));
+    else oldRead.resolve(legacy);
     await pending;
     expect(useSettingsStore.getState().activeApiConfig).toEqual(fromRustConfig(plan));
     expect(useSettingsStore.getState().apiConfig).toEqual(fromRustConfig(plan));
+    expect(useSettingsStore.getState().apiConfigLoadError).toBeNull();
+  });
+
+  it('does not let a background readiness read supersede an in-flight save', async () => {
+    const saving = deferred<void>();
+    vi.mocked(saveApiConfig).mockReturnValue(saving.promise);
+    vi.mocked(loadApiConfig).mockResolvedValueOnce(legacy).mockResolvedValueOnce(plan);
+    const draft = fromRustConfig(plan);
+    useSettingsStore.getState().updateApiConfig(draft);
+    const pendingSave = useSettingsStore.getState().persistApiConfig();
+    await useSettingsStore.getState().refreshApiConfigReadiness();
+    expect(useSettingsStore.getState().apiConfig).toEqual(draft);
+    saving.resolve(undefined);
+    await pendingSave;
+    expect(useSettingsStore.getState().activeApiConfig).toEqual(fromRustConfig(plan));
+    expect(useSettingsStore.getState().apiConfigLoadError).toBeNull();
+  });
+
+  it.each([legacy, { ...plan, credential_ref: 'replacement-account' }])('does not activate another connection during a readiness read ($model/$credential_ref)', async (other) => {
+    const saved = fromRustConfig(plan);
+    const draft = { ...saved, model: 'unsaved-model' };
+    useSettingsStore.setState({ activeApiConfig: saved, apiConfig: draft });
+    vi.mocked(loadApiConfig).mockResolvedValue(other);
+    await useSettingsStore.getState().refreshApiConfigReadiness();
+    expect(useSettingsStore.getState().activeApiConfig).toBe(saved);
+    expect(useSettingsStore.getState().apiConfig).toBe(draft);
+    expect(useSettingsStore.getState().apiConfigLoadError).toContain('连接已变化');
+    expect(saveApiConfig).not.toHaveBeenCalled();
   });
 
   it('preserves a newer model selection made during save and readback', async () => {
@@ -142,11 +178,25 @@ describe('saved runtime configuration versus settings draft', () => {
     expect(useSettingsStore.getState().apiConfig.model).toBe('next-draft-model');
   });
 
-  it('keeps an existing active configuration when a later load fails', async () => {
+  it.each([false, true])('keeps an existing active configuration when a later read fails (%s)', async (refresh) => {
     const saved = useSettingsStore.getState().activeApiConfig;
     vi.mocked(loadApiConfig).mockRejectedValue(new Error('offline fixture read failed'));
-    await useSettingsStore.getState().loadApiConfig();
+    if (refresh) await useSettingsStore.getState().refreshApiConfigReadiness();
+    else await useSettingsStore.getState().loadApiConfig();
     expect(useSettingsStore.getState().activeApiConfig).toBe(saved);
+    expect(useSettingsStore.getState().apiConfigLoadError).toBe('offline fixture read failed');
+  });
+
+  it('leaves initial hydration and an existing save error to explicit settings operations', async () => {
+    const saved = useSettingsStore.getState().activeApiConfig;
+    useSettingsStore.setState({ apiConfigLoaded: false });
+    await useSettingsStore.getState().refreshApiConfigReadiness();
+    expect(loadApiConfig).not.toHaveBeenCalled();
+    useSettingsStore.setState({ apiConfigLoaded: true, apiConfigLoadError: 'Save needs verification' });
+    vi.mocked(loadApiConfig).mockResolvedValue(legacy);
+    await useSettingsStore.getState().refreshApiConfigReadiness();
+    expect(useSettingsStore.getState().activeApiConfig).toEqual(saved);
+    expect(useSettingsStore.getState().apiConfigLoadError).toBe('Save needs verification');
   });
 
   it.each(['replacement-account', null])('invalidates a stale plan binding without activating a replacement: %s', (ref) => {

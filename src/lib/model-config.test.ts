@@ -35,9 +35,12 @@ describe('model configuration readiness', () => {
     }, true)).toEqual({ kind: 'ready' });
   });
 
-  it('turns backend credential errors into an actionable conversation message', () => {
+  it('preserves controlled quota notices while guiding missing backend credentials', () => {
     expect(formatModelSendError(new Error('LLM provider credentials are not configured')))
       .toContain('模型设置');
+    const notice = '当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。';
+    expect(formatModelSendError(notice)).toBe(`发送失败：${notice}`);
+    expect(formatModelSendError(new Error(notice))).toBe(`发送失败：${notice}`);
   });
 
   it('requires plan permission and an opaque account reference instead of an API key', () => {

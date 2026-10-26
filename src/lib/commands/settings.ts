@@ -77,7 +77,7 @@ export interface ApiProviderConfig {
   max_tokens: number;
   temperature: number;
   has_api_key?: boolean;
-  credential_source?: 'none' | 'keychain' | 'environment';
+  credential_source?: 'none' | 'keychain' | 'environment' | 'chatgpt_plan';
   protocol?: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages';
   auth_mode?: 'api_key' | 'none' | 'chatgpt_plan';
   credential_ref?: string | null;
@@ -96,13 +96,16 @@ export interface ChatgptPlanStatus {
 
 export interface ChatgptPlanModel { id: string; name: string }
 
+export type ToolRoundTrip = 'verified' | 'notObserved' | 'invalidCall' | 'invalidResult' | 'requestFailed' | 'timedOut';
+export interface ModelConnectionReport { toolRoundTrip: ToolRoundTrip }
+
 export const chatgptPlanStatus = () => invoke<ChatgptPlanStatus>('chatgpt_plan_status');
 export const chatgptPlanSignIn = () => invoke<ChatgptPlanStatus>('chatgpt_plan_sign_in');
 export const chatgptPlanChangeAccount = () => invoke<ChatgptPlanStatus>('chatgpt_plan_change_account');
 export const chatgptPlanCancelSignIn = () => invoke<void>('chatgpt_plan_cancel_sign_in');
 export const chatgptPlanDisconnect = () => invoke<ChatgptPlanStatus>('chatgpt_plan_disconnect');
 export const chatgptPlanModels = () => invoke<ChatgptPlanModel[]>('chatgpt_plan_models');
-export const testModelConnection = (config: ApiProviderConfig) => invoke<boolean>('test_model_connection', { config });
+export const testModelConnection = (config: ApiProviderConfig) => invoke<ModelConnectionReport>('test_model_connection', { config });
 
 export async function loadApiConfig(): Promise<ApiProviderConfig> {
   return invoke<ApiProviderConfig>('load_api_config');

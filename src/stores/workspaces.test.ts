@@ -50,6 +50,12 @@ const createProjectWorkspaceMock = vi.mocked(createProjectWorkspace);
 const getWorkspacesMock = vi.mocked(getWorkspaces);
 const openWorkspaceMock = vi.mocked(openWorkspace);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe('workspace store', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -112,6 +118,57 @@ describe('workspace store', () => {
     expect(useWorkspacesStore.getState().activeWorkspaceId).toBe(created.id);
     expect(useSessionsStore.getState().sessions).toEqual([opened(created).session]);
     expect(useSessionsStore.getState().activeSessionId).toBe(created.activeSessionId);
+  });
+
+  it.each([true, false])('keeps the newer workspace selection when requests finish out of order (older first: %s)', async (olderFirst) => {
+    const older = deferred<OpenWorkspace>();
+    const newer = deferred<OpenWorkspace>();
+    useWorkspacesStore.setState({ workspaces: [personal, project] });
+    openWorkspaceMock.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+    const openingProject = useWorkspacesStore.getState().openWorkspace(project.id);
+    const openingPersonal = useWorkspacesStore.getState().openWorkspace(personal.id);
+    if (olderFirst) {
+      older.resolve(opened(project));
+      expect(await openingProject).toBe(false);
+      expect(useSessionsStore.getState().activeSessionId).not.toBe(project.activeSessionId);
+    }
+    newer.resolve(opened(personal));
+    expect(await openingPersonal).toBe(true);
+    if (!olderFirst) { older.resolve(opened(project)); expect(await openingProject).toBe(false); }
+    expect(useWorkspacesStore.getState().activeWorkspaceId).toBe(personal.id);
+    expect(useSessionsStore.getState().activeSessionId).toBe(personal.activeSessionId);
+    expect(openWorkspaceMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let an older catalogue refresh reselect a workspace after the user switched', async () => {
+    const catalog = deferred<Workspace[]>();
+    useWorkspacesStore.setState({ workspaces: [personal, project] });
+    getWorkspacesMock.mockReturnValueOnce(catalog.promise);
+    const loading = useWorkspacesStore.getState().loadWorkspaces();
+    openWorkspaceMock.mockResolvedValueOnce(opened(project));
+    await useWorkspacesStore.getState().openWorkspace(project.id);
+    catalog.resolve([personal]);
+    await loading;
+    expect(useWorkspacesStore.getState().activeWorkspaceId).toBe(project.id);
+    expect(useWorkspacesStore.getState().workspaces).toContainEqual(project);
+    expect(useSessionsStore.getState().activeSessionId).toBe(project.activeSessionId);
+    expect(openWorkspaceMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('retains a created project without hijacking a newer selection or metadata (known: %s)', async (known) => {
+    const creating = deferred<OpenWorkspace>();
+    const knownProject = { ...project, name: 'Project A renamed' };
+    useWorkspacesStore.setState({ workspaces: [personal, ...(known ? [knownProject] : [])] });
+    createProjectWorkspaceMock.mockReturnValueOnce(creating.promise);
+    const created = useWorkspacesStore.getState().createProject(project.rootPath!);
+    openWorkspaceMock.mockResolvedValueOnce(opened(personal));
+    await useWorkspacesStore.getState().openWorkspace(personal.id);
+    creating.resolve(opened(project));
+    expect(await created).toBe(false);
+    expect(useWorkspacesStore.getState().workspaces).toContainEqual(known ? knownProject : project);
+    expect(useWorkspacesStore.getState().activeWorkspaceId).toBe(personal.id);
+    expect(useSessionsStore.getState().activeSessionId).toBe(personal.activeSessionId);
+    expect(createProjectWorkspaceMock).toHaveBeenCalledTimes(1);
   });
 
   it('routes only an explicit Personal-space project mention to one known project', () => {

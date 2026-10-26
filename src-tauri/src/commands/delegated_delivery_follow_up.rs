@@ -1,4 +1,4 @@
-//! Command-layer lifecycle for one reviewed Explorer delivery summary.
+//! Command-layer lifecycle for one reviewed delegated-delivery summary.
 //!
 //! The agent-layer queue owns source binding and eligibility. This module owns
 //! only the foreground-run boundary: claim a generic supervisor input, reserve
@@ -219,6 +219,17 @@ fn settle_terminal_reviewed_delivery_in_tx(
         foreground_run_id,
     )?;
     let settlement = match source_state {
+        ReviewedDeliverySourceState::Pending
+            if successful_text_summary_in_tx(
+                transaction,
+                session_id,
+                delivery_id,
+                delivery_revision,
+                foreground_run_id,
+            )? =>
+        {
+            ReviewedDeliveryTerminalSettlement::Summarized
+        }
         ReviewedDeliverySourceState::TerminalDelivery if has_scoped_success => {
             ReviewedDeliveryTerminalSettlement::Summarized
         }
@@ -313,6 +324,39 @@ fn reviewed_delivery_source_state_in_tx(
         return Ok(ReviewedDeliverySourceState::NoLongerSummarizable);
     }
     Ok(ReviewedDeliverySourceState::Pending)
+}
+
+fn successful_text_summary_in_tx(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    delivery_id: &str,
+    revision: i64,
+    run_id: &str,
+) -> Result<bool, String> {
+    if !DelegatedDeliveryFollowUpQueue::summary_is_text_only(transaction, session_id, delivery_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(false);
+    }
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_runs run
+         JOIN messages reply ON reply.id=run.message_id AND reply.session_id=run.session_id
+         JOIN delegation_review_jobs review ON review.delivery_id=?3 AND review.delivery_revision=?4
+         LEFT JOIN delegation_change_handoffs handoff ON handoff.delivery_id=review.delivery_id
+           AND handoff.delivery_revision=review.delivery_revision
+         WHERE run.id=?1 AND run.session_id=?2 AND run.status='completed'
+           AND reply.role='assistant' AND reply.is_provisional=0
+           AND length(trim(reply.content))>0
+           AND (reply.tool_calls IS NULL OR reply.tool_calls='[]')
+           AND NOT EXISTS(SELECT 1 FROM agent_steps step
+             WHERE step.session_id=reply.session_id AND step.created_at=reply.created_at)
+           AND (review.status IN ('failed','needs_decision')
+             OR (handoff.status='ready' AND review.status='passed')))",
+            params![run_id, session_id, delivery_id, revision],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn successful_scoped_review_step_in_tx(
@@ -715,6 +759,39 @@ mod tests {
                 .unwrap();
         }
         connection
+    }
+
+    #[test]
+    fn failed_reviews_are_explained_without_acceptance_and_incomplete_summaries_requeue() {
+        for review_status in ["failed", "needs_decision"] {
+            for (task_status, content, expected) in [
+                ("completed", "Review found missing evidence.", "summarized"),
+                ("completed", "", "queued"),
+                ("provider_unavailable", "Service failed.", "queued"),
+            ] {
+                let mut connection = running_follow_up_connection(
+                    task_status,
+                    None,
+                    "submitted",
+                    "awaiting_summary",
+                );
+                connection
+                    .execute("DELETE FROM delegation_review_jobs WHERE id='review'", [])
+                    .unwrap();
+                connection.execute("INSERT INTO delegation_review_jobs(id,implementation_attempt_id,delivery_id,delivery_revision,subject_json,status,reviewer_attempt_id,outcome_json,created_at,updated_at,started_at,ended_at) VALUES ('review','attempt','delivery',1,'{}',?1,'reviewer','{}',2,2,2,2)",[review_status]).unwrap();
+                connection
+                    .execute(
+                        "UPDATE messages SET content=?1 WHERE id='summary-message'",
+                        [content],
+                    )
+                    .unwrap();
+                recover_interrupted_reviewed_delivery_follow_ups_in_conn(&mut connection, 20)
+                    .unwrap();
+                let state:(String,String)=connection.query_row(
+                    "SELECT follow_up.status,delivery.acceptance_status FROM delegated_delivery_follow_ups follow_up JOIN delegation_deliveries delivery ON delivery.id=follow_up.delivery_id WHERE delivery.id='delivery'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+                assert_eq!(state, (expected.into(), "submitted".into()));
+            }
+        }
     }
 
     #[test]

@@ -7,15 +7,19 @@ updater plugin and creates signed update artifacts.
 
 ## Repository workflow
 
-- `dev` is the current default/integration branch. Use short-lived
-  `codex/<change>` branches and open PRs targeting `dev`; do not commit or push
-  directly to it. Community contributors can use their own fork/branch names.
-  `main` is reserved for stable promotions; it does not exist on the remote yet.
-  Do not publish the unrelated old local `main` branch as part of this setup.
+- `main` is the default/integration branch (renamed from public `dev` on
+  2026-10-26 at the owner's request). Use short-lived `codex/<change>` branches
+  and open PRs targeting `main`; do not commit or push directly to it. Community
+  contributors can use their own fork/branch names. There is no separate `dev`
+  promotion lane. Never reconstruct public `main` from private archive history.
 - Commit a complete, buildable change, including its frontend/backend contract,
   tests, migrations and necessary documentation. Do not split coupled changes
   merely to make commits smaller. Run `python scripts/verify.py full` before a
-  checkpoint; automated verification must not need model credentials or user data.
+  code checkpoint; automated verification must not need model credentials or user data.
+  During implementation, use focused regressions and layer/integration checks
+  as described in `AGENTS.md`; passing them does not require a user handoff.
+  Documentation/instruction-only work may use its documented local checks instead
+  of an app rebuild; this does not waive any PR merge or release check below.
 - Use `npm ci` and `package-lock.json` for frontend dependencies, and keep
   `src-tauri/Cargo.lock` for the application. Do not introduce a second package
   manager lockfile or update dependencies as part of unrelated cleanup.
@@ -35,10 +39,9 @@ updater plugin and creates signed update artifacts.
   compatibility/recovery risks and reviewer findings. Review naming, module
   boundaries, reuse, duplication, obsolete paths and sensitive/generated files;
   tests do not replace this review. AI review is supplementary, not human approval.
-- Squash short-lived feature PRs into `dev`, using the reviewed PR title as the
-  final commit subject. Promote `dev` to `main` with a merge commit so ancestry
-  remains intact. Keep squash and merge enabled; do not require linear history
-  for the long-lived promotion branch or enable automatic merging.
+- Squash short-lived feature PRs into `main`, using the reviewed PR title as the
+  final commit subject. A development merge is not a release; publishing tags or
+  installers still requires explicit authorization. Do not enable automatic merging.
 - The merge checks are `Windows full verification`, `Windows desktop smoke test`
   and `PR policy`. The latter handles title edits without rerunning Windows builds.
   Setup fetches locked dependencies; test execution is offline and isolated.
@@ -47,7 +50,7 @@ updater plugin and creates signed update artifacts.
 - One maintainer cannot approve their own PR: use zero mandatory approvals until
   another eligible reviewer joins, while still requiring explicit maintainer
   review/merge and resolved conversations. Do not require all-tree CODEOWNERS.
-- The public repository's active `Integration PR gates` ruleset protects `dev`:
+- The public repository's active `Integration PR gates` ruleset protects `main`:
   require PRs and resolved conversations, block force pushes/deletions, and leave
   bypass actors empty. GitHub settings are remote, not enabled by these files.
   During bootstrap, attach the three required checks with their observed GitHub
@@ -55,8 +58,8 @@ updater plugin and creates signed update artifacts.
   an up-to-date base; verify all three requirements by reading the ruleset back.
   Do not claim a required-check gate from a workflow file alone. Keep one ruleset,
   not overlapping classic protections. Reference: `PR-WORKFLOW-REFERENCE.md`.
-  When a stable `main` is explicitly established from tested public `dev`, extend
-  this same ruleset to it. Do not create `main` from the old local archive branch.
+  The branch rename retained the same ruleset and three required checks; its
+  `refs/heads/main` condition and active enforcement were read back after retargeting.
 - Local automatic post-commit pushing is disabled. The previous hook is retained
   at `.git/hooks/post-commit.autopush-disabled` for recovery, not execution. Hooks
   are local metadata: inspect existing hooks before each first commit in a checkout;
@@ -118,6 +121,12 @@ public, warning-free download.
 
 ## Release procedure
 
+Before running a generated installer, resolve the current installation blockers
+in [the unified roadmap](../docs/current-roadmap.md). `release:check` and a
+successful build do not prove runtime-directory alignment, data preservation,
+uninstall behavior or clean-account installation; do not run a quarantined
+artifact or treat those checks as installer acceptance.
+
 1. Update the same SemVer version in `package.json`, `src-tauri/Cargo.toml`, and
    `src-tauri/tauri.conf.json`.
 2. Run:
@@ -139,6 +148,41 @@ public, warning-free download.
    served by the `releases/latest/download/latest.json` updater endpoint.
 
 ## Recovery
+
+For changes to profile cutover or encrypted model storage, explicitly run
+`python scripts/verify.py native-storage` on Windows. This exercises the real
+credential manager through the production store, using only a unique fixture
+namespace, temporary files and one owned child process; it removes its test
+keys. It does not use an owner account, window, model or network. It is excluded
+from `quick`, `backend`, `full` and default CI; their offline contract is unchanged.
+This proves synthetic vault persistence, not owner OAuth renewal or installation.
+
+Normal Windows builds use `%LOCALAPPDATA%\com.angelbot.desktop` for owned
+profile data, separate from the per-user `AngelBot` program directory. Before
+startup recovery or scheduling, the storage owner locks both old and new roots,
+stages the known legacy data and configuration, checks SQLite/WAL, and preserves
+the original encrypted credential binding. It does not move project directories,
+unknown files or active delegated worktrees. Do not manually merge the roots or
+copy a ChatGPT credential file without its binding header.
+Manual acceptance borrowing a pre-migration account keeps legacy-compatible
+credential writes; borrowing alone does not convert the owner's record format.
+
+After closing all AngelBot and manual acceptance clients, the **new** executable
+supports `--rollback-storage` to restore an unchanged cutover and exit without
+starting tasks. A normal subsequent launch stays on that recovered profile;
+`--migrate-storage` explicitly retries the migration. Do not pass both flags.
+Interrupted rollback resumes before startup. If new data, old data or a backup
+has changed, recovery refuses to overwrite it; retain both roots and use an
+explicit backup/recovery plan instead. This is not automatic downgrade support
+or a guarantee against power loss or disk corruption.
+
+Reconnect the official browser service after migration to discover its updated
+tool contract. Only its recognized output-directory field is rewritten;
+detected legacy absolute arguments suspend custom services. Review custom
+commands, environment variables and script-internal paths separately before
+enabling them. Migration does not start services or replay previous tool calls.
+Do not select the installer's **delete application data** option to troubleshoot
+a migration: the retained migration backup is inside the new data directory.
 
 Do not silently downgrade an installed application. If a draft is broken,
 delete or replace it before publishing. If a published build is broken, mark

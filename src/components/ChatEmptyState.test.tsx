@@ -11,31 +11,32 @@ import {
 import { useKnowledgeStore } from '$stores/knowledge';
 import { useNavigationStore } from '$stores/navigation';
 import { useWorkspacesStore } from '$stores/workspaces';
-import type { Automation } from '$lib/commands/automation';
+import type { WorkspaceAutomationStatus } from '$lib/commands/automation';
 
 vi.mock('$lib/commands/automation', () => ({
-  getAutomations: vi.fn(),
+  getWorkspaceAutomationOverview: vi.fn(),
 }));
 vi.mock('$lib/commands/memory', () => ({
   getMemories: vi.fn().mockResolvedValue([]),
 }));
 
-import { getAutomations } from '$lib/commands/automation';
+import { getWorkspaceAutomationOverview } from '$lib/commands/automation';
 
-const getAutomationsMock = getAutomations as ReturnType<typeof vi.fn>;
+const getAutomationsMock = vi.mocked(getWorkspaceAutomationOverview);
 
-const makeAutomation = (overrides: Partial<Automation>): Automation => ({
+const makeAutomation = (overrides: Partial<WorkspaceAutomationStatus>): WorkspaceAutomationStatus => ({
   id: 'a1',
   title: '整理笔记',
-  prompt: '',
   triggerKind: 'schedule',
   triggerValue: '每天 21:00',
   enabled: true,
-  permissionSummary: '每次运行前询问',
   executorKind: 'agent',
   workspaceId: 'personal',
-  scriptArgs: [],
-  timeoutSeconds: 300,
+  nextRunAt: null,
+  lastRunAt: null,
+  latestRun: null,
+  lastSkippedAt: null,
+  maaConfig: null,
   ...overrides,
 });
 
@@ -55,12 +56,12 @@ describe('greetingForHour', () => {
 
 describe('pickTodayAutomations', () => {
   it('只保留启用且下次运行在今天的任务，最多 3 条并按时间排序', () => {
-    const items: Automation[] = [
+    const items: WorkspaceAutomationStatus[] = [
       makeAutomation({ id: 'late', title: '晚间任务', nextRunAt: todayAt(21) }),
       makeAutomation({ id: 'early', title: '早间任务', nextRunAt: todayAt(8) }),
       makeAutomation({ id: 'disabled', title: '已暂停', enabled: false, nextRunAt: todayAt(9) }),
       makeAutomation({ id: 'tomorrow', title: '明天任务', nextRunAt: todayAt(9) + 86400 }),
-      makeAutomation({ id: 'no-run', title: '未排期', nextRunAt: undefined }),
+      makeAutomation({ id: 'no-run', title: '未排期', nextRunAt: null }),
       makeAutomation({ id: 'mid', title: '午间任务', nextRunAt: todayAt(12) }),
       makeAutomation({ id: 'extra', title: '第四条', nextRunAt: todayAt(23) }),
     ];
@@ -104,7 +105,7 @@ describe('ChatEmptyState', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
-    getAutomationsMock.mockResolvedValue([]);
+    getAutomationsMock.mockResolvedValue({ items: [], truncated: false });
     useWorkspacesStore.setState({
       workspaces: [{ id: 'personal', kind: 'personal', name: 'Personal', activeSessionId: 's1', createdAt: 1, updatedAt: 1 }],
       activeWorkspaceId: 'personal',
@@ -160,11 +161,11 @@ describe('ChatEmptyState', () => {
 
   it('使用共享事项回看展示当前空间的待执行事项', async () => {
     const user = userEvent.setup();
-    getAutomationsMock.mockResolvedValue([
+    getAutomationsMock.mockResolvedValue({ items: [
       makeAutomation({ id: 'a1', title: '整理笔记', triggerValue: '每天 21:00', workspaceId: 'personal', nextRunAt: todayAt(21) }),
       makeAutomation({ id: 'a2', title: '已暂停任务', enabled: false, nextRunAt: todayAt(9) }),
       makeAutomation({ id: 'a3', title: '明天的任务', nextRunAt: todayAt(9) + 86400 }),
-    ]);
+    ], truncated: false });
     render(<ChatEmptyState />);
 
     await user.click(await screen.findByText('事项回看'));
@@ -174,14 +175,15 @@ describe('ChatEmptyState', () => {
     expect(screen.getByText('明天的任务')).toBeInTheDocument();
   });
 
-  it('自动化加载失败时静默降级为问候和引导', async () => {
+  it('自动化加载失败仍保留问候和引导，并提供不阻断聊天的重试入口', async () => {
     getAutomationsMock.mockRejectedValue(new Error('ipc down'));
     render(<ChatEmptyState />);
 
     await waitFor(() => expect(getAutomationsMock).toHaveBeenCalled());
     expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
     expect(screen.getByText(/直接说出想处理的事/)).toBeInTheDocument();
-    expect(screen.queryByText('事项回看')).not.toBeInTheDocument();
+    expect(screen.getByText('事项回看')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '刷新' })).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 

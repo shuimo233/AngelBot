@@ -11,6 +11,8 @@ src-tauri/*.manifest.xml
 !src-tauri/AngelBot.test.manifest.xml
 target/
 *.log
+# Local diagnostics and their recovery manifests are never published.
+/logs/
 .env
 .env.*
 !.env.example
@@ -35,19 +37,19 @@ output/
 tmp/
 .docker/
 .superpowers/
-# Historical design material stays local. Keep only the canonical product,
-# architecture, release, and primary-source research documents under version
-# control so the repository does not accumulate superseded plans.
+# Keep canonical docs, selected research, and one frozen evidence archive.
+# Other local historical design material stays ignored, not an active plan.
 docs/*
+!docs/README.md
 !docs/current-roadmap.md
 !docs/design-philosophy.md
 !docs/desktop-beta-checklist.md
-!docs/adr/
-!docs/adr/**
+!docs/architecture-decisions.md
 !docs/delegated-agent-framework-spec.md
 !docs/delegated-network-capability-spec.md
-!docs/wayfinder/
-!docs/wayfinder/**
+!docs/archive/
+docs/archive/*
+!docs/archive/implementation-evidence-2026-10-17.md
 !docs/research/
 docs/research/*
 !docs/research/connected-services-windows.md
@@ -62,6 +64,8 @@ docs/research/*
 !docs/research/luna-daily-capability-validation-2026-10-07.md
 !docs/research/tool-image-bridge-2026-10-07.md
 !docs/research/single-window-observation-2026-10-07.md
+!docs/research/maa-local-routines-2026-10-08.md
+!docs/research/hermes-long-term-learning-2026-10-15.md
 /issues/
 /tools/
 # Keep the repository's verification guidance available to every coding agent.

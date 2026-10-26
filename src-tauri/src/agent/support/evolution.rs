@@ -1,13 +1,13 @@
 //! Self-evolution review engine
 //!
-//! Implements the Hermes KEPA (Knowledge-Enhanced Prompt Adaptation) pattern:
+//! Bounded declarative-memory adaptation, not model training or skill learning:
 //! 1. Review agent examines conversation transcripts
 //! 2. Extracts candidate facts and preferences into structured output
 //! 3. Keeps automatic learning bounded to repeated, low-priority preferences;
 //!    permanent memory and profile changes require an explicit user review.
 //!
-//! Design: Explicit trigger only (user-initiated or scheduled), not automatic
-//! in the chat loop. This keeps chat latency predictable.
+//! Manual reviews create proposals; optional incremental reviews run only after
+//! a completed foreground reply, outside its latency-critical path.
 //!
 //! Issue #50: Structured output with JSON Schema and multi-layer parsing.
 
@@ -140,6 +140,10 @@ pub fn build_extraction_prompt(
 - 不要提取瞬时情绪、倾诉、健康/创伤细节、关系评价或其他敏感内容为记忆或偏好
 - 不能因为用户在一次对话中表达感受，就推断其长期人格、兴趣或行为规则
 - 偏好必须是用户明确表达的可执行偏好（例如回答风格、话题取舍、工作方式）
+- 当前任务的文件范围、禁止联网或工具、临时输出格式、核对代号等只约束本任务，不能转成长期偏好；只有用户明确表达的长期交流或相处选择才属于偏好
+- 工具权限、要求确认、允许或禁止自动操作等授权与安全边界不是个人习惯，即使用户强调也不要放入 memories；由独立权限体系执行，不能作为自动适应的对象。例如“先给简短结论”可提取，“不要把偏好当成操作授权”不可提取
+- 重点了解用户明确说过的轻微日常习惯、称呼和相处偏好，让交流更舒适连贯；不要求优化工作流程
+- 不根据聊天时间、消息长短、一次情绪或助手自己的推断猜测作息和人格；记住习惯也不等于获得提醒、跟踪或操作应用的授权
 - 如果没有提取到任何有用信息， memories 返回空数组 []
 - importance 评分：姓名/工作/关键事实=8-10，一般偏好=4-7，轻微偏好=1-3
 - summary 总结你从对话中学到的最重要信息
@@ -404,6 +408,42 @@ pub fn parse_evolution_response(response: &str) -> Result<EvolutionResult, Strin
     Ok(extract_result.to_evolution_result())
 }
 
+/// Incremental learning acknowledges source messages only after a valid
+/// structured review. Legacy/manual leniency must not turn parse failures into
+/// successful empty results and permanently skip those messages.
+pub(crate) fn parse_automatic_review_response(response: &str) -> Result<EvolutionResult, String> {
+    let value: Value = serde_json::from_str(extract_json(response).unwrap_or(response))
+        .map_err(|_| "Automatic review returned invalid JSON")?;
+    if !value["memories"].is_array() || !value["summary"].is_string() {
+        return Err("Automatic review is missing its structured result".into());
+    }
+    let extracted: ExtractedMemories = serde_json::from_value(value)
+        .map_err(|_| "Automatic review contains invalid memory fields")?;
+    if extracted.memories.iter().any(|memory| {
+        memory.content.trim().is_empty()
+            || !(1..=10).contains(&memory.importance)
+            || !matches!(
+                memory.category.as_str(),
+                "fact" | "preference" | "event" | "knowledge" | "personality"
+            )
+    }) {
+        return Err("Automatic review contains invalid memory values".into());
+    }
+    Ok(EvolutionResult {
+        new_memories: extracted
+            .memories
+            .into_iter()
+            .map(|memory| NewMemory {
+                content: memory.content,
+                category: memory.category,
+                importance: memory.importance,
+            })
+            .collect(),
+        preferences_json: None,
+        summary: extracted.summary,
+    })
+}
+
 /// Extract JSON string from potential markdown code block
 fn extract_json(text: &str) -> Option<&str> {
     let text = text.trim();
@@ -462,6 +502,30 @@ mod tests {
         assert_eq!(result.memories[0].content, "用户喜欢Rust");
         assert_eq!(result.memories[0].category, "preference");
         assert_eq!(result.memories[0].importance, 8);
+        assert_eq!(
+            parse_automatic_review_response(response)
+                .unwrap()
+                .new_memories
+                .len(),
+            1
+        );
+        assert!(
+            parse_automatic_review_response(r#"{"memories":[],"summary":"没有新习惯"}"#)
+                .unwrap()
+                .new_memories
+                .is_empty()
+        );
+        for invalid in [
+            "not JSON",
+            "null",
+            "{}",
+            r#"{"summary":"missing memories"}"#,
+            r#"{"memories":[{"content":"", "category":"preference"}],"summary":"invalid"}"#,
+            r#"{"memories":[{"content":"test", "category":"authorization"}],"summary":"invalid"}"#,
+            r#"{"memories":[{"content":"test", "category":"preference", "importance":11}],"summary":"invalid"}"#,
+        ] {
+            assert!(parse_automatic_review_response(invalid).is_err());
+        }
     }
 
     #[test]
@@ -485,6 +549,12 @@ mod tests {
         assert!(prompt.contains("不要提取瞬时情绪"));
         assert!(prompt.contains("不要从助手的话语推断用户信息"));
         assert!(prompt.contains("偏好必须是用户明确表达的可执行偏好"));
+        assert!(prompt.contains("让交流更舒适连贯；不要求优化工作流程"));
+        assert!(prompt.contains("不根据聊天时间、消息长短"));
+        assert!(prompt.contains("不等于获得提醒、跟踪或操作应用的授权"));
+        assert!(prompt.contains("当前任务的文件范围"));
+        assert!(prompt.contains("不能转成长期偏好"));
+        assert!(prompt.contains("授权与安全边界不是个人习惯"));
     }
 
     #[test]

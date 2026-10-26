@@ -65,6 +65,9 @@ pub struct Tool {
     pub parameters: Value,
     /// Whether this tool requires user confirmation before execution
     pub requires_confirmation: bool,
+    /// A server's read-only claim affects only soft budget accounting. It must
+    /// not relax confirmation, execution scope or unknown-outcome recovery.
+    pub(crate) read_only_budget_hint: bool,
     /// Execution mode for this tool
     pub execution_mode: ToolExecutionMode,
     /// Category for loading strategy (Issue #095)
@@ -91,6 +94,7 @@ impl std::fmt::Debug for Tool {
             .field("description", &self.description)
             .field("parameters", &self.parameters)
             .field("requires_confirmation", &self.requires_confirmation)
+            .field("read_only_budget_hint", &self.read_only_budget_hint)
             .field("execution_mode", &self.execution_mode)
             .field("category", &self.category)
             .field("post_call_verifier.set", &self.post_call_verifier.is_some())
@@ -107,6 +111,7 @@ impl Tool {
             description: description.into(),
             parameters,
             requires_confirmation: false,
+            read_only_budget_hint: false,
             execution_mode: ToolExecutionMode::default(),
             category: ToolCategory::default(),
             post_call_verifier: None,
@@ -121,6 +126,11 @@ impl Tool {
 
     pub fn with_confirmation(mut self, requires: bool) -> Self {
         self.requires_confirmation = requires;
+        self
+    }
+
+    pub(crate) fn with_read_only_budget_hint(mut self, hint: bool) -> Self {
+        self.read_only_budget_hint = hint;
         self
     }
 
@@ -573,6 +583,9 @@ pub struct ToolExecutionContext {
     expected_definition_revision: Option<String>,
     /// Backend-attested UIA target for a reviewed desktop draft. Never model input.
     desktop_expected_target: Option<crate::desktop_control::DesktopDraftTargetIdentity>,
+    /// Exact approved image scope, including its monotonically advanced revision.
+    desktop_expected_image_scope: Option<crate::commands::desktop::TrustedDesktopApp>,
+    desktop_expected_image_click: Option<crate::desktop_control::DesktopImageClickTarget>,
     deadline: Option<Instant>,
     /// Optional callback for emitting ToolExecutionProgress events from
     /// long-running tools (e.g. run_project_command, search_files).
@@ -592,6 +605,8 @@ impl ToolExecutionContext {
             confirmation_approval: false,
             expected_definition_revision: None,
             desktop_expected_target: None,
+            desktop_expected_image_scope: None,
+            desktop_expected_image_click: None,
             deadline: None,
             progress_callback: std::sync::Arc::new(None),
             accepting_updates: std::sync::Arc::new(AtomicBool::new(true)),
@@ -632,6 +647,33 @@ impl ToolExecutionContext {
         &self,
     ) -> Option<&crate::desktop_control::DesktopDraftTargetIdentity> {
         self.desktop_expected_target.as_ref()
+    }
+
+    pub(crate) fn with_desktop_expected_image_scope(
+        mut self,
+        scope: crate::commands::desktop::TrustedDesktopApp,
+    ) -> Self {
+        self.desktop_expected_image_scope = Some(scope);
+        self
+    }
+
+    pub(crate) fn desktop_expected_image_scope(
+        &self,
+    ) -> Option<&crate::commands::desktop::TrustedDesktopApp> {
+        self.desktop_expected_image_scope.as_ref()
+    }
+
+    pub(crate) fn with_desktop_expected_image_click(
+        mut self,
+        target: crate::desktop_control::DesktopImageClickTarget,
+    ) -> Self {
+        self.desktop_expected_image_click = Some(target);
+        self
+    }
+    pub(crate) fn desktop_expected_image_click(
+        &self,
+    ) -> Option<&crate::desktop_control::DesktopImageClickTarget> {
+        self.desktop_expected_image_click.as_ref()
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -746,13 +788,16 @@ impl ToolResult {
     /// acknowledgement is lost. Pause the agent instead of letting another
     /// model turn automatically repeat the action.
     pub fn requires_user_review(&self) -> bool {
-        if self.success || !self.terminate_batch {
+        self.terminate_batch && Self::is_result_unknown(self.success, &self.content)
+    }
+
+    /// Shared classification for live execution and persisted task projections.
+    /// A structured failure pauses continuation; free text is not a receipt.
+    pub(crate) fn is_result_unknown(success: bool, content: &str) -> bool {
+        if success {
             return false;
         }
-        let content = self
-            .content
-            .strip_prefix("Error: ")
-            .unwrap_or(&self.content);
+        let content = content.strip_prefix("Error: ").unwrap_or(content);
         let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
             return false;
         };
@@ -797,7 +842,7 @@ pub mod schemas {
                 "path": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "The path to the file to read, relative to the work directory"
+                    "description": "The path to a text file or a read-only DOCX/XLSX text snapshot, relative to the work directory"
                 }
             },
             "additionalProperties": false,
@@ -816,7 +861,7 @@ pub mod schemas {
                 },
                 "content": {
                     "type": "string",
-                    "description": "The content to write to the file"
+                    "description": "Plain text content; DOCX/XLSX creation or overwrite is not supported"
                 }
             },
             "additionalProperties": false,

@@ -7,11 +7,20 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+mod image_click;
+pub use image_click::{
+    DesktopImageClickDisplay, DesktopImageClickPreview, DesktopImageClickRequest,
+    DesktopImageClickTarget, DesktopImageReference,
+};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DesktopControlOperation {
     Invoke,
     Select,
+    Choose,
+    Check,
+    Uncheck,
     Expand,
     Collapse,
     ScrollUp,
@@ -23,12 +32,59 @@ impl DesktopControlOperation {
         match self {
             Self::Invoke => "invoke",
             Self::Select => "select",
+            Self::Choose => "choose",
+            Self::Check => "check",
+            Self::Uncheck => "uncheck",
             Self::Expand => "expand",
             Self::Collapse => "collapse",
             Self::ScrollUp => "scrollup",
             Self::ScrollDown => "scrolldown",
         }
     }
+}
+
+/// One bounded control request, shared by live preview and execution.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopControlRequest {
+    pub app_id: String,
+    pub control_ref: String,
+    pub action: DesktopControlOperation,
+    pub option: Option<String>,
+}
+
+impl DesktopControlRequest {
+    pub(crate) fn validate(&self) -> Result<(), DesktopAdapterError> {
+        if self.control_ref.is_empty() || self.control_ref.len() > 128 {
+            return Err(DesktopAdapterError::new(
+                "INVALID_ARGUMENT",
+                "Control reference is invalid",
+            ));
+        }
+        validate_control_option(self.action, self.option.as_deref())
+    }
+}
+
+fn validate_control_option(
+    operation: DesktopControlOperation,
+    option: Option<&str>,
+) -> Result<(), DesktopAdapterError> {
+    let valid = if operation == DesktopControlOperation::Choose {
+        option.is_some_and(|value| {
+            !value.trim().is_empty()
+                && valid_observation_label(value)
+                && value.encode_utf16().count() <= 80
+        })
+    } else {
+        option.is_none()
+    };
+    if !valid {
+        return Err(DesktopAdapterError::new(
+            "INVALID_ARGUMENT",
+            "Only choose accepts a required exact option label of at most 80 characters",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +125,8 @@ pub enum DesktopAction {
         display_name: String,
         executable_path: String,
         operation: DesktopControlOperation,
+        /// Exact option bound to the pending request and its single-use preview.
+        option: Option<String>,
         /// Backend-attested identity bound to the observed control lease.
         expected_target: Option<DesktopDraftTargetIdentity>,
     },
@@ -86,6 +144,18 @@ pub struct DesktopActionResult {
     /// Backend-attested operation; verified refers only to this control state.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub action: Option<DesktopControlOperation>,
+    /// Only emitted after the exact approved ComboBox selection and collapse
+    /// were verified. Echoes approved data, not a hidden Name/Value read.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub choice: Option<DesktopChoiceReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopChoiceReceipt {
+    pub control_name: String,
+    pub option: String,
+    pub expanded: bool,
 }
 
 /// Settings-only discovery. A candidate is an exact UIA Name, not a control
@@ -114,8 +184,8 @@ pub struct DesktopDraftTargetIdentity {
     pub process_id: u32,
     pub window_handle: u64,
     pub control_runtime_id: Vec<i32>,
-    /// Exact AutomationId for a field, or opaque lease key for a control operation.
-    /// The named-draft path leaves it absent; this is never model-supplied.
+    /// Opaque generic field/control lease key. The configured named-draft path
+    /// leaves it absent; this is never model-supplied.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub automation_id: Option<String>,
     /// Exact operation that was preflighted, never visible to the model.
@@ -161,18 +231,23 @@ struct TextTargetPayload {
 #[cfg(windows)]
 fn parse_text_target_payload(
     app_id: &str,
+    field_ref: &str,
     lease: &FieldRefLease,
     raw: &[u8],
 ) -> Result<DesktopTextTargetPreview, DesktopAdapterError> {
-    parse_control_target_payload(
+    let mut preview = parse_control_target_payload(
         app_id,
         &lease.control_label,
         DesktopDraftTargetIdentity {
-            automation_id: Some(lease.control_label.clone()),
+            automation_id: Some(field_ref.to_string()),
             ..lease.identity.clone()
         },
         raw,
-    )
+    )?;
+    if let Some(scope) = &lease.scope {
+        preview.control_label = format!("{} / {}", scope.label(), preview.control_label);
+    }
+    Ok(preview)
 }
 
 #[cfg(windows)]
@@ -267,10 +342,11 @@ fn parse_draft_target_payload(
 
 /// Read-only UI Automation metadata from one already-trusted application window.
 /// Text/Value patterns, control handles, and password controls are never included.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DesktopObservedControl {
-    /// UIA Control View depth below the trusted window (1 is a direct child).
+    /// Control View depth relative to the selected window/region; a selected
+    /// region's own actionable root is depth 1.
     pub depth: u8,
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,7 +354,12 @@ pub struct DesktopObservedControl {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automation_id: Option<String>,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// Read-only provider state at observation time, not business completion or
+    /// authority to act. Missing state is unknown, never a default value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<DesktopControlState>,
     /// Ephemeral selection hint, not an authorization grant or UIA identity.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub field_ref: Option<String>,
@@ -287,16 +368,63 @@ pub struct DesktopObservedControl {
     pub control_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopControlState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toggle: Option<DesktopToggleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+    /// Visible SelectionItem container kind, not a selector or action grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_container_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<DesktopExpansionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_scroll_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DesktopToggleState {
+    Off,
+    On,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DesktopExpansionState {
+    Collapsed,
+    Expanded,
+    PartiallyExpanded,
+    LeafNode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DesktopWindowObservation {
     pub app_id: String,
     pub controls: Vec<DesktopObservedControl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<DesktopObservedRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_ref: Option<String>,
     /// True when a budget or provider access failure left the observation partial.
     pub truncated: bool,
     /// Bounded reasons for a partial observation; never provider error text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DesktopObservationDiagnostic>,
+}
+
+/// Read-only hint for a bounded section of this same trusted application window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopObservedRegion {
+    pub role: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -313,6 +441,8 @@ pub enum DesktopObservationDiagnostic {
 #[serde(deny_unknown_fields)]
 struct ObservationPayload {
     controls: Vec<DesktopObservedControl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    regions: Vec<DesktopObservedRegion>,
     truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<DesktopObservationDiagnostic>,
@@ -334,19 +464,61 @@ struct PrivateObservationPayload {
     truncated: bool,
     targets: Vec<PrivateObservedTarget>,
     #[serde(default)]
+    regions: Vec<DesktopObservedRegion>,
+    #[serde(default)]
+    region_targets: Vec<PrivateObservedRegion>,
+    #[serde(default)]
     diagnostics: Vec<DesktopObservationDiagnostic>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrivateObservedRegion {
+    index: usize,
+    scope: RegionScope,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RegionScope {
+    identity: DesktopDraftTargetIdentity,
+    role: String,
+    name: String,
+    /// Absolute Control View sibling indices, including filtered siblings.
+    path: Vec<u16>,
+}
+
+#[cfg(windows)]
+impl RegionScope {
+    fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.role
+        } else {
+            &self.name
+        }
+    }
 }
 
 const MAX_OBSERVED_CONTROLS: usize = 32;
 const MAX_OBSERVATION_BYTES: usize = 3072;
 const MAX_OBSERVATION_DIAGNOSTICS: usize = 5;
+const MAX_OBSERVED_REGIONS: usize = 8;
 #[cfg(windows)]
 const MAX_PRIVATE_OBSERVATION_BYTES: usize = 8192;
 
 #[cfg(windows)]
 fn parse_private_observation_payload(
     raw: &[u8],
-) -> Result<(ObservationPayload, Vec<PrivateObservedTarget>), DesktopAdapterError> {
+) -> Result<
+    (
+        ObservationPayload,
+        Vec<PrivateObservedTarget>,
+        Vec<PrivateObservedRegion>,
+    ),
+    DesktopAdapterError,
+> {
     if raw.len() > MAX_PRIVATE_OBSERVATION_BYTES {
         return Err(DesktopAdapterError::new(
             "SCAN_LIMIT",
@@ -361,6 +533,7 @@ fn parse_private_observation_payload(
     })?;
     let public = serde_json::to_vec(&ObservationPayload {
         controls: private.controls,
+        regions: private.regions,
         truncated: private.truncated,
         diagnostics: private.diagnostics,
     })
@@ -396,7 +569,120 @@ fn parse_private_observation_payload(
             ));
         }
     }
-    Ok((public, private.targets))
+    let mut region_indices = std::collections::HashSet::new();
+    if private.region_targets.len() > public.regions.len() {
+        return Err(DesktopAdapterError::new(
+            "ADAPTER_FAILED",
+            "Invalid desktop regions",
+        ));
+    }
+    for target in &private.region_targets {
+        let region = public.regions.get(target.index).ok_or_else(|| {
+            DesktopAdapterError::new("ADAPTER_FAILED", "Invalid desktop region index")
+        })?;
+        if !region_indices.insert(target.index)
+            || target.scope.role != region.role
+            || target.scope.name != region.name
+            || !valid_region_scope(&target.scope)
+        {
+            return Err(DesktopAdapterError::new(
+                "ADAPTER_FAILED",
+                "Invalid desktop region identity",
+            ));
+        }
+    }
+    Ok((public, private.targets, private.region_targets))
+}
+
+#[cfg(windows)]
+fn valid_region_scope(scope: &RegionScope) -> bool {
+    valid_draft_identity(&scope.identity)
+        && scope.identity.automation_id.is_none()
+        && scope.identity.control_operation.is_none()
+        && matches!(scope.role.as_str(), "pane" | "document" | "list" | "group")
+        && (scope.name.is_empty() || valid_observation_label(&scope.name))
+        && (1..=12).contains(&scope.path.len())
+        && scope
+            .path
+            .iter()
+            .map(|index| usize::from(*index) + 1)
+            .sum::<usize>()
+            < 256
+}
+
+#[cfg(windows)]
+fn region_scope_environment(scope: Option<&RegionScope>) -> Result<String, DesktopAdapterError> {
+    scope
+        .map(serde_json::to_string)
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+        .map_err(|_| {
+            DesktopAdapterError::new("ADAPTER_FAILED", "Region identity could not be encoded")
+        })
+}
+
+#[cfg(windows)]
+fn fit_observation_projection(
+    app_id: &str,
+    region_ref: Option<&str>,
+    payload: &mut ObservationPayload,
+) -> Result<(), DesktopAdapterError> {
+    let projected_size = |payload: &ObservationPayload, action_refs: bool| {
+        let mut controls = payload.controls.clone();
+        if action_refs {
+            for control in &mut controls {
+                if control.role == "edit"
+                    && control.enabled
+                    && control.automation_id.is_some()
+                    && control.capabilities.iter().any(|value| value == "setValue")
+                {
+                    control.field_ref = Some(format!("field_{}", "0".repeat(32)));
+                }
+                if !supported_control_operations(control).is_empty() {
+                    control.control_ref = Some(format!("control_{}", "0".repeat(32)));
+                }
+            }
+        }
+        let mut regions = payload.regions.clone();
+        for region in &mut regions {
+            region.region_ref = Some(format!("region_{}", "0".repeat(32)));
+        }
+        serde_json::to_vec(&DesktopWindowObservation {
+            app_id: app_id.to_string(),
+            controls,
+            regions,
+            region_ref: region_ref.map(str::to_string),
+            truncated: payload.truncated,
+            // Native scanning is complete. Reference issuance below performs
+            // no provider reads and either succeeds or returns an error, so
+            // only diagnostics already present belong to this final budget.
+            diagnostics: payload.diagnostics.clone(),
+        })
+        .map(|bytes| bytes.len())
+        .map_err(|_| {
+            DesktopAdapterError::new("ADAPTER_FAILED", "Desktop observation could not be encoded")
+        })
+    };
+    if projected_size(payload, !payload.truncated)? > MAX_OBSERVATION_BYTES {
+        payload.truncated = true;
+        if !payload
+            .diagnostics
+            .contains(&DesktopObservationDiagnostic::OutputLimit)
+        {
+            payload
+                .diagnostics
+                .push(DesktopObservationDiagnostic::OutputLimit);
+        }
+        while projected_size(payload, false)? > MAX_OBSERVATION_BYTES {
+            if payload.controls.pop().is_none() {
+                return Err(DesktopAdapterError::new(
+                    "SCAN_LIMIT",
+                    "Desktop region metadata exceeds its output budget",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_observation_payload(raw: &[u8]) -> Result<ObservationPayload, DesktopAdapterError> {
@@ -412,6 +698,18 @@ fn parse_observation_payload(raw: &[u8]) -> Result<ObservationPayload, DesktopAd
             "Windows UI Automation returned an invalid observation",
         )
     })?;
+    if payload.regions.len() > MAX_OBSERVED_REGIONS
+        || payload.regions.iter().any(|region| {
+            !matches!(region.role.as_str(), "pane" | "document" | "list" | "group")
+                || (!region.name.is_empty() && !valid_observation_label(&region.name))
+                || region.region_ref.is_some()
+        })
+    {
+        return Err(DesktopAdapterError::new(
+            "ADAPTER_FAILED",
+            "Invalid desktop region metadata",
+        ));
+    }
     if payload.controls.len() > MAX_OBSERVED_CONTROLS {
         return Err(DesktopAdapterError::new(
             "SCAN_LIMIT",
@@ -447,6 +745,7 @@ fn parse_observation_payload(raw: &[u8]) -> Result<ObservationPayload, DesktopAd
                     | "pane"
                     | "document"
                     | "list"
+                    | "text"
             )
             || control.name.as_ref().is_some_and(|name| {
                 !matches!(
@@ -454,12 +753,15 @@ fn parse_observation_payload(raw: &[u8]) -> Result<ObservationPayload, DesktopAd
                     "button"
                         | "checkBox"
                         | "radioButton"
+                        | "comboBox"
+                        | "listItem"
                         | "tabItem"
                         | "menuItem"
                         | "hyperlink"
                         | "pane"
                         | "document"
                         | "list"
+                        | "text"
                 ) || !valid_observation_label(name)
             })
             || control
@@ -488,15 +790,41 @@ fn parse_observation_payload(raw: &[u8]) -> Result<ObservationPayload, DesktopAd
                 ("button" | "hyperlink", "invoke")
                     | ("checkBox", "toggle")
                     | ("radioButton" | "listItem" | "tabItem", "select")
-                    | ("comboBox", "expandCollapse")
+                    | ("comboBox", "expandCollapse" | "selectOption")
                     | ("edit", "setValue")
                     | ("menuItem", "invoke" | "toggle" | "expandCollapse")
                     | ("pane" | "document" | "list", "scroll")
             );
-            if !supported || !capabilities.insert(capability) {
+            if !supported || !capabilities.insert(capability.as_str()) {
                 return Err(DesktopAdapterError::new(
                     "ADAPTER_FAILED",
                     "Windows UI Automation returned invalid control capabilities",
+                ));
+            }
+        }
+        if let Some(state) = &control.state {
+            if *state == DesktopControlState::default()
+                || (state.toggle.is_some() && !capabilities.contains("toggle"))
+                || (state.selected.is_some() && !capabilities.contains("select"))
+                || state
+                    .selection_container_role
+                    .as_deref()
+                    .is_some_and(|role| {
+                        control.role != "listItem"
+                            || !capabilities.contains("select")
+                            || state.selected.is_none()
+                            || !matches!(role, "list" | "comboBox")
+                    })
+                || (state.expansion.is_some() && !capabilities.contains("expandCollapse"))
+                || state.vertical_scroll_percent.is_some_and(|value| {
+                    !capabilities.contains("scroll")
+                        || !value.is_finite()
+                        || !(0.0..=100.0).contains(&value)
+                })
+            {
+                return Err(DesktopAdapterError::new(
+                    "ADAPTER_FAILED",
+                    "Windows UI Automation returned invalid control state",
                 ));
             }
         }
@@ -524,17 +852,28 @@ fn supported_control_operations(control: &DesktopObservedControl) -> Vec<Desktop
             DesktopControlOperation::Invoke,
         ),
         (
-            &["radioButton", "tabItem"][..],
+            &["radioButton", "tabItem", "listItem"][..],
             "select",
             DesktopControlOperation::Select,
         ),
         (
-            &["menuItem"][..],
+            &["comboBox"][..],
+            "selectOption",
+            DesktopControlOperation::Choose,
+        ),
+        (&["checkBox"][..], "toggle", DesktopControlOperation::Check),
+        (
+            &["checkBox"][..],
+            "toggle",
+            DesktopControlOperation::Uncheck,
+        ),
+        (
+            &["menuItem", "comboBox"][..],
             "expandCollapse",
             DesktopControlOperation::Expand,
         ),
         (
-            &["menuItem"][..],
+            &["menuItem", "comboBox"][..],
             "expandCollapse",
             DesktopControlOperation::Collapse,
         ),
@@ -632,15 +971,23 @@ impl std::error::Error for DesktopAdapterError {}
 /// model messages and cannot be serialized into IPC, history, or diagnostics.
 pub struct DesktopWindowImage {
     png_bytes: Vec<u8>,
+    image_ref: Option<DesktopImageReference>,
 }
 
 impl DesktopWindowImage {
     pub(crate) fn from_png_bytes(png_bytes: Vec<u8>) -> Self {
-        Self { png_bytes }
+        Self {
+            png_bytes,
+            image_ref: None,
+        }
     }
 
     pub(crate) fn png_bytes(&self) -> &[u8] {
         &self.png_bytes
+    }
+
+    pub(crate) fn image_ref(&self) -> Option<&DesktopImageReference> {
+        self.image_ref.as_ref()
     }
 }
 
@@ -654,6 +1001,30 @@ impl std::fmt::Debug for DesktopWindowImage {
 
 pub trait DesktopAdapter: Send + Sync {
     fn name(&self) -> &str;
+    fn preflight_image_click(
+        &self,
+        _request: &DesktopImageClickRequest,
+        _executable_path: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<DesktopImageClickPreview, DesktopAdapterError> {
+        Err(DesktopAdapterError::new(
+            "UNSUPPORTED_PLATFORM",
+            "Visual click preview is unavailable",
+        ))
+    }
+    fn click_image_with_control(
+        &self,
+        _request: &DesktopImageClickRequest,
+        _executable_path: &str,
+        _target: &DesktopImageClickTarget,
+        _is_cancelled: &dyn Fn() -> bool,
+        _timeout: std::time::Duration,
+    ) -> Result<DesktopActionResult, DesktopAdapterError> {
+        Err(DesktopAdapterError::new(
+            "UNSUPPORTED_PLATFORM",
+            "Visual click is unavailable",
+        ))
+    }
     fn execute(&self, action: &DesktopAction) -> Result<DesktopActionResult, DesktopAdapterError>;
     /// Read-only settings discovery for an already saved trusted executable.
     /// This is not registered as a model-visible tool and grants no capability.
@@ -695,13 +1066,23 @@ pub trait DesktopAdapter: Send + Sync {
         executable_path: &str,
     ) -> Result<DesktopWindowObservation, DesktopAdapterError>;
 
+    /// `allow_action_labels` is host-derived from the current interaction
+    /// capability, never a model argument; it permits short ComboBox/ListItem Names.
     fn observe_trusted_window_with_control(
         &self,
         app_id: &str,
         executable_path: &str,
+        region_ref: Option<&str>,
+        _allow_action_labels: bool,
         is_cancelled: &dyn Fn() -> bool,
         _timeout: std::time::Duration,
     ) -> Result<DesktopWindowObservation, DesktopAdapterError> {
+        if region_ref.is_some() {
+            return Err(DesktopAdapterError::new(
+                "UNSUPPORTED_CONTROL",
+                "Scoped observation is unavailable through this adapter",
+            ));
+        }
         if is_cancelled() {
             return Err(DesktopAdapterError::new(
                 "SCAN_CANCELLED",
@@ -741,11 +1122,19 @@ pub trait DesktopAdapter: Send + Sync {
 #[derive(Default)]
 pub struct MockDesktopAdapter {
     actions: Mutex<Vec<DesktopAction>>,
+    #[cfg(test)]
+    next_execution_error: Mutex<Option<DesktopAdapterError>>,
     observed_apps: Mutex<std::collections::HashSet<(String, String)>>,
+    observed_regions: Mutex<std::collections::HashSet<(String, String)>>,
     available_control_apps: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 impl MockDesktopAdapter {
+    #[cfg(test)]
+    pub(crate) fn fail_next_action_before_dispatch(&self, error: DesktopAdapterError) {
+        *self.next_execution_error.lock().unwrap() = Some(error);
+    }
+
     #[cfg(test)]
     pub fn actions(&self) -> Vec<DesktopAction> {
         self.actions.lock().map(|v| v.clone()).unwrap_or_default()
@@ -757,6 +1146,15 @@ impl MockDesktopAdapter {
         match control_ref {
             "mock-control-ref" => Some(("mockButton", 2, &[DesktopControlOperation::Invoke])),
             "mock-select-ref" => Some(("mockOption", 3, &[DesktopControlOperation::Select])),
+            "mock-choice-ref" => Some(("mockChoice", 7, &[DesktopControlOperation::Choose])),
+            "mock-toggle-ref" => Some((
+                "Test checkbox",
+                6,
+                &[
+                    DesktopControlOperation::Check,
+                    DesktopControlOperation::Uncheck,
+                ],
+            )),
             "mock-expand-ref" => Some((
                 "mockMenu",
                 4,
@@ -798,6 +1196,10 @@ impl DesktopAdapter for MockDesktopAdapter {
     }
 
     fn execute(&self, action: &DesktopAction) -> Result<DesktopActionResult, DesktopAdapterError> {
+        #[cfg(test)]
+        if let Some(error) = self.next_execution_error.lock().unwrap().take() {
+            return Err(error);
+        }
         if let DesktopAction::SetText {
             expected_target, ..
         } = action
@@ -805,7 +1207,7 @@ impl DesktopAdapter for MockDesktopAdapter {
             if expected_target
                 .as_ref()
                 .and_then(|target| target.automation_id.as_deref())
-                != Some("mockField")
+                != Some("mock-field-ref")
             {
                 return Err(DesktopAdapterError::new(
                     "TARGET_CHANGED",
@@ -818,9 +1220,11 @@ impl DesktopAdapter for MockDesktopAdapter {
             executable_path,
             expected_target,
             operation,
+            option,
             ..
         } = action
         {
+            validate_control_option(*operation, option.as_deref())?;
             let mut observed = self.observed_apps.lock().map_err(|_| {
                 DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
             })?;
@@ -887,7 +1291,7 @@ impl DesktopAdapter for MockDesktopAdapter {
                 ("verified", app_id, "Mock draft fill verified")
             }
             DesktopAction::SetText { app_id, .. } => {
-                ("verified", app_id, "Mock text fill verified")
+                ("verified", app_id, "Mock field replacement verified")
             }
             DesktopAction::OperateControl {
                 app_id,
@@ -909,12 +1313,26 @@ impl DesktopAdapter for MockDesktopAdapter {
             ),
             DesktopAction::OperateControl {
                 app_id,
+                operation: DesktopControlOperation::Choose,
+                ..
+            } => ("verified", app_id, "Mock dropdown selection and collapsed state verified; task outcome is not verified"),
+            DesktopAction::OperateControl {
+                app_id,
                 operation: DesktopControlOperation::Expand,
                 ..
             } => (
                 "verified",
                 app_id,
                 "Mock control Expanded state verified; task outcome is not verified",
+            ),
+            DesktopAction::OperateControl {
+                app_id,
+                operation: DesktopControlOperation::Check | DesktopControlOperation::Uncheck,
+                ..
+            } => (
+                "verified",
+                app_id,
+                "Mock control requested checkbox state verified; task outcome is not verified",
             ),
             DesktopAction::OperateControl {
                 app_id,
@@ -943,6 +1361,18 @@ impl DesktopAdapter for MockDesktopAdapter {
             process_id: None,
             action: match action {
                 DesktopAction::OperateControl { operation, .. } => Some(*operation),
+                _ => None,
+            },
+            choice: match action {
+                DesktopAction::OperateControl {
+                    operation: DesktopControlOperation::Choose,
+                    option: Some(option),
+                    ..
+                } => Some(DesktopChoiceReceipt {
+                    control_name: "mockChoice".into(),
+                    option: option.clone(),
+                    expanded: false,
+                }),
                 _ => None,
             },
         })
@@ -990,12 +1420,23 @@ impl DesktopAdapter for MockDesktopAdapter {
         Ok(DesktopTextTargetPreview {
             app_id: app_id.to_string(),
             window_title: Some("Mock window".into()),
-            control_label: "mockField".into(),
+            control_label: if self
+                .observed_regions
+                .lock()
+                .map_err(|_| {
+                    DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
+                })?
+                .contains(&(app_id.to_string(), executable_path.to_string()))
+            {
+                "Mock region / mockField".into()
+            } else {
+                "mockField".into()
+            },
             identity: DesktopDraftTargetIdentity {
                 process_id: 1,
                 window_handle: 1,
                 control_runtime_id: vec![1],
-                automation_id: Some("mockField".into()),
+                automation_id: Some("mock-field-ref".into()),
                 control_operation: None,
             },
         })
@@ -1006,6 +1447,12 @@ impl DesktopAdapter for MockDesktopAdapter {
         app_id: &str,
         executable_path: &str,
     ) -> Result<DesktopWindowObservation, DesktopAdapterError> {
+        self.observed_regions
+            .lock()
+            .map_err(|_| {
+                DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
+            })?
+            .remove(&(app_id.to_string(), executable_path.to_string()));
         self.observed_apps
             .lock()
             .map_err(|_| {
@@ -1018,8 +1465,51 @@ impl DesktopAdapter for MockDesktopAdapter {
                 DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
             })?
             .insert((app_id.to_string(), executable_path.to_string()));
+        let mut toggle = DesktopToggleState::Off;
+        let mut selected = false;
+        let mut expansion = DesktopExpansionState::Collapsed;
+        let mut scroll: f64 = 50.0;
+        for action in self
+            .actions
+            .lock()
+            .map_err(|_| {
+                DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
+            })?
+            .iter()
+        {
+            if let DesktopAction::OperateControl {
+                app_id: target_app,
+                executable_path: target_exe,
+                operation,
+                ..
+            } = action
+            {
+                if target_app != app_id || target_exe != executable_path {
+                    continue;
+                }
+                match operation {
+                    DesktopControlOperation::Check => toggle = DesktopToggleState::On,
+                    DesktopControlOperation::Uncheck => toggle = DesktopToggleState::Off,
+                    DesktopControlOperation::Select => selected = true,
+                    DesktopControlOperation::Choose => {}
+                    DesktopControlOperation::Expand => expansion = DesktopExpansionState::Expanded,
+                    DesktopControlOperation::Collapse => {
+                        expansion = DesktopExpansionState::Collapsed
+                    }
+                    DesktopControlOperation::ScrollUp => scroll = (scroll - 10.0).max(0.0),
+                    DesktopControlOperation::ScrollDown => scroll = (scroll + 10.0).min(100.0),
+                    DesktopControlOperation::Invoke => {}
+                }
+            }
+        }
         Ok(DesktopWindowObservation {
             app_id: app_id.to_string(),
+            regions: vec![DesktopObservedRegion {
+                role: "group".into(),
+                name: "Mock region".into(),
+                region_ref: Some("mock-region-ref".into()),
+            }],
+            region_ref: None,
             controls: vec![
                 DesktopObservedControl {
                     depth: 1,
@@ -1028,6 +1518,7 @@ impl DesktopAdapter for MockDesktopAdapter {
                     automation_id: Some("mockField".into()),
                     enabled: true,
                     capabilities: vec!["setValue".into()],
+                    state: None,
                     field_ref: Some("mock-field-ref".into()),
                     control_ref: None,
                 },
@@ -1038,6 +1529,7 @@ impl DesktopAdapter for MockDesktopAdapter {
                     automation_id: None,
                     enabled: true,
                     capabilities: vec!["invoke".into()],
+                    state: None,
                     field_ref: None,
                     control_ref: Some("mock-control-ref".into()),
                 },
@@ -1048,6 +1540,10 @@ impl DesktopAdapter for MockDesktopAdapter {
                     automation_id: None,
                     enabled: true,
                     capabilities: vec!["select".into()],
+                    state: Some(DesktopControlState {
+                        selected: Some(selected),
+                        ..Default::default()
+                    }),
                     field_ref: None,
                     control_ref: Some("mock-select-ref".into()),
                 },
@@ -1058,6 +1554,10 @@ impl DesktopAdapter for MockDesktopAdapter {
                     automation_id: None,
                     enabled: true,
                     capabilities: vec!["expandCollapse".into()],
+                    state: Some(DesktopControlState {
+                        expansion: Some(expansion),
+                        ..Default::default()
+                    }),
                     field_ref: None,
                     control_ref: Some("mock-expand-ref".into()),
                 },
@@ -1068,13 +1568,80 @@ impl DesktopAdapter for MockDesktopAdapter {
                     automation_id: None,
                     enabled: true,
                     capabilities: vec!["scroll".into()],
+                    state: Some(DesktopControlState {
+                        vertical_scroll_percent: Some(scroll),
+                        ..Default::default()
+                    }),
                     field_ref: None,
                     control_ref: Some("mock-scroll-ref".into()),
+                },
+                DesktopObservedControl {
+                    depth: 1,
+                    role: "checkBox".into(),
+                    name: Some("Test checkbox".into()),
+                    automation_id: None,
+                    enabled: true,
+                    capabilities: vec!["toggle".into()],
+                    state: Some(DesktopControlState {
+                        toggle: Some(toggle),
+                        ..Default::default()
+                    }),
+                    field_ref: None,
+                    control_ref: Some("mock-toggle-ref".into()),
+                },
+                DesktopObservedControl {
+                    depth: 1,
+                    role: "comboBox".into(),
+                    name: Some("mockChoice".into()),
+                    automation_id: None,
+                    enabled: true,
+                    capabilities: vec!["selectOption".into()],
+                    state: None,
+                    field_ref: None,
+                    control_ref: Some("mock-choice-ref".into()),
                 },
             ],
             truncated: false,
             diagnostics: vec![],
         })
+    }
+
+    fn observe_trusted_window_with_control(
+        &self,
+        app_id: &str,
+        executable_path: &str,
+        region_ref: Option<&str>,
+        _allow_action_labels: bool,
+        is_cancelled: &dyn Fn() -> bool,
+        timeout: std::time::Duration,
+    ) -> Result<DesktopWindowObservation, DesktopAdapterError> {
+        if is_cancelled() || timeout.is_zero() {
+            return Err(DesktopAdapterError::new(
+                "SCAN_CANCELLED",
+                "Desktop observation was cancelled",
+            ));
+        }
+        if region_ref.is_some_and(|reference| reference != "mock-region-ref") {
+            return Err(DesktopAdapterError::new(
+                "TARGET_CHANGED",
+                "Region reference is unavailable",
+            ));
+        }
+        let mut observation = self.observe_trusted_window(app_id, executable_path)?;
+        if let Some(reference) = region_ref {
+            self.observed_regions
+                .lock()
+                .map_err(|_| {
+                    DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
+                })?
+                .insert((app_id.to_string(), executable_path.to_string()));
+            observation
+                .controls
+                .retain(|control| matches!(control.role.as_str(), "edit" | "checkBox" | "pane"));
+            observation.regions.clear();
+            observation.region_ref = Some(reference.to_string());
+        }
+        Ok(observation)
     }
 
     fn preflight_control_ref(
@@ -1121,7 +1688,18 @@ impl DesktopAdapter for MockDesktopAdapter {
         Ok(DesktopTextTargetPreview {
             app_id: app_id.into(),
             window_title: Some("Mock window".into()),
-            control_label: label.into(),
+            control_label: if self
+                .observed_regions
+                .lock()
+                .map_err(|_| {
+                    DesktopAdapterError::new("ADAPTER_FAILED", "Mock adapter lock is poisoned")
+                })?
+                .contains(&(app_id.to_string(), executable_path.to_string()))
+            {
+                format!("Mock region / {label}")
+            } else {
+                label.into()
+            },
             identity: DesktopDraftTargetIdentity {
                 process_id: 1,
                 window_handle: 1,
@@ -1229,6 +1807,7 @@ struct FieldRefLease {
     executable: std::path::PathBuf,
     control_label: String,
     identity: DesktopDraftTargetIdentity,
+    scope: Option<RegionScope>,
     expires_at: std::time::Instant,
 }
 
@@ -1241,6 +1820,16 @@ struct ControlRefLease {
     role: String,
     supported_operations: Vec<DesktopControlOperation>,
     identity: DesktopDraftTargetIdentity,
+    scope: Option<RegionScope>,
+    expires_at: std::time::Instant,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct RegionRefLease {
+    app_id: String,
+    executable: std::path::PathBuf,
+    scope: RegionScope,
     expires_at: std::time::Instant,
 }
 
@@ -1252,6 +1841,8 @@ pub struct WindowsDesktopAdapter {
     uia_gate: Mutex<()>,
     field_refs: Mutex<std::collections::HashMap<String, FieldRefLease>>,
     control_refs: Mutex<std::collections::HashMap<String, ControlRefLease>>,
+    region_refs: Mutex<std::collections::HashMap<String, RegionRefLease>>,
+    image_refs: image_click::ImageReferenceStore,
 }
 
 #[cfg(windows)]
@@ -1300,29 +1891,153 @@ function Get-UiaRuntimeId($element) {
   } catch { throw 'TARGET_UNAVAILABLE|The control has no stable UI Automation identity' }
   return ,$runtimeId
 }
+$script:uiaNodeCount = 0
+$script:uiaScope = $null
+if ($env:ANGELBOT_REGION_SCOPE) {
+  try { $script:uiaScope = $env:ANGELBOT_REGION_SCOPE | ConvertFrom-Json -ErrorAction Stop }
+  catch { throw 'TARGET_CHANGED|The selected region identity is invalid' }
+}
+function Use-UiaNodeBudget {
+  $script:uiaNodeCount++
+  if ($script:uiaNodeCount -gt 256) { throw 'SCAN_LIMIT|The shared control traversal limit was reached' }
+}
+function Get-UiaScopeWalker {
+  if ($null -ne $script:uiaWalker) { return $script:uiaWalker }
+  return [Windows.Automation.TreeWalker]::ControlViewWalker
+}
+function Assert-UiaScopeNode($element, [int]$processId) {
+  Use-UiaNodeBudget
+  $state = Get-UiaSafetyState $element
+  if ($state.password -or $state.offscreen -or $state.processId -ne $processId) {
+    throw 'TARGET_CHANGED|The selected region path is no longer safe'
+  }
+  return $state
+}
+function Get-UiaScopeRoot {
+  if ($null -eq $script:uiaScope) { return $root }
+  try {
+    $scope = $script:uiaScope
+    $scopeProcessId = [int]$scope.identity.processId
+    $process = Get-Process -Id $scopeProcessId -ErrorAction Stop
+    if ([IO.Path]::GetFullPath($process.Path) -ine $expected -or
+        (Get-UiaWindowProcessId ([IntPtr]::new([long]$scope.identity.windowHandle))) -ne $scopeProcessId -or
+        [long]$windows[0].ToInt64() -ne [long]$scope.identity.windowHandle) { throw 'Window changed' }
+    $null = Assert-UiaScopeNode $root $scopeProcessId
+    $scopeWalker = Get-UiaScopeWalker
+    $element = $root
+    foreach ($siblingIndex in $scope.path) {
+      $element = $scopeWalker.GetFirstChild($element)
+      if ($null -eq $element) { throw 'Path changed' }
+      for ($sibling = 0; $sibling -lt [int]$siblingIndex; $sibling++) {
+        # Skipped siblings are navigation only, never inspected or descended.
+        Use-UiaNodeBudget
+        $element = $scopeWalker.GetNextSibling($element)
+        if ($null -eq $element) { throw 'Path changed' }
+      }
+      $null = Assert-UiaScopeNode $element $scopeProcessId
+    }
+    $state = Get-UiaSafetyState $element
+    $expectedRole = switch ([string]$scope.role) { 'pane' {'ControlType.Pane'} 'document' {'ControlType.Document'} 'list' {'ControlType.List'} 'group' {'ControlType.Group'} default {throw 'Role changed'} }
+    if ([string]$state.current.Name -cne [string]$scope.name -or
+        [string]$state.current.ControlType.ProgrammaticName -cne $expectedRole -or
+        ((Get-UiaRuntimeId $element) -join ',') -cne ($scope.identity.controlRuntimeId -join ',')) { throw 'Region changed' }
+    return $element
+  } catch {
+    if ($_.Exception.Message -like 'SCAN_LIMIT|*') { throw }
+    throw 'TARGET_CHANGED|The selected region path or identity has changed'
+  }
+}
+function Assert-UiaTargetInScope($element) {
+  if ($null -eq $script:uiaScope) { return }
+  $scopeRoot = Get-UiaScopeRoot
+  $scopeRuntime = (Get-UiaRuntimeId $scopeRoot) -join ','
+  $scopeWalker = Get-UiaScopeWalker
+  for ($ancestor = 0; $ancestor -le 12 -and $null -ne $element; $ancestor++) {
+    $null = Assert-UiaScopeNode $element ([int]$script:uiaScope.identity.processId)
+    if (((Get-UiaRuntimeId $element) -join ',') -ceq $scopeRuntime) { return }
+    $element = $scopeWalker.GetParent($element)
+  }
+  throw 'TARGET_CHANGED|The selected control is no longer inside its observed region'
+}
+function Find-UiaScopedRuntimeTarget([string]$expectedRuntimeId, $walker) {
+  $script:uiaWalker = $walker
+  $scopeRoot = Get-UiaScopeRoot
+  $pending = New-Object 'System.Collections.Generic.Stack[object]'
+  if ($null -ne $script:uiaScope) { $pending.Push(@{ element = $scopeRoot; depth = 1; sibling = $false }) }
+  else {
+    try { $first = $walker.GetFirstChild($scopeRoot) }
+    catch { throw 'TARGET_CHANGED|The selected control tree is unavailable' }
+    if ($null -ne $first) { $pending.Push(@{ element = $first; depth = 1; sibling = $true }) }
+  }
+  $found = $null
+  while ($pending.Count -gt 0) {
+    $entry = $pending.Pop()
+    $candidate = $entry.element
+    Use-UiaNodeBudget
+    try {
+      $state = Get-UiaSafetyState $candidate
+      if ($entry.sibling) {
+        $sibling = $walker.GetNextSibling($candidate)
+        if ($null -ne $sibling) { $pending.Push(@{ element = $sibling; depth = $entry.depth; sibling = $true }) }
+      }
+      if ($state.password -or $state.offscreen) { continue }
+      if (((Get-UiaRuntimeId $candidate) -join ',') -ceq $expectedRuntimeId) {
+        if ($null -ne $found) { throw 'TARGET_AMBIGUOUS|The selected control identity is duplicated' }
+        $found = $candidate
+      }
+      $child = $walker.GetFirstChild($candidate)
+    } catch { throw 'TARGET_CHANGED|The selected control tree is unavailable' }
+    if ($null -ne $child) {
+      if ($entry.depth -ge 12) { throw 'SCAN_LIMIT|The selected control tree depth limit was reached' }
+      $pending.Push(@{ element = $child; depth = ($entry.depth + 1); sibling = $true })
+    }
+  }
+  if ($null -eq $found) { throw 'TARGET_CHANGED|The selected control is no longer available' }
+  return $found
+}
 "#;
 
 #[cfg(windows)]
-const TRUSTED_WINDOW_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
+const TRUSTED_WINDOW_SCRIPT: &str = concat!(
+    include_str!("desktop_control/window_identity.ps1"),
+    r#"
 $expected = [IO.Path]::GetFullPath($env:ANGELBOT_TARGET_EXE)
-$windows = New-Object System.Collections.Generic.List[System.IntPtr]
-Get-Process | ForEach-Object {
-  try {
-    if ($_.MainWindowHandle -ne 0 -and [IO.Path]::GetFullPath($_.Path) -ieq $expected) {
-      $windows.Add($_.MainWindowHandle)
-    }
-  } catch {}
+$readiness = [Diagnostics.Stopwatch]::StartNew()
+while ($true) {
+  $windows = @(Get-UiaControlWindows $expected)
+  if ($windows.Count -gt 0) { break }
+  $remaining = [int]$script:uiaWindowReadinessWaitMs - $readiness.ElapsedMilliseconds
+  if ($remaining -le 0) { throw 'TARGET_NOT_FOUND|The trusted application has no eligible control window' }
+  Start-Sleep -Milliseconds ([Math]::Min(100, $remaining))
 }
-if ($windows.Count -eq 0) { throw 'TARGET_NOT_FOUND|The trusted application has no open main window' }
-if ($windows.Count -ne 1) { throw 'TARGET_AMBIGUOUS|The trusted application has multiple main windows' }
+if ($windows.Count -ne 1) { throw 'TARGET_AMBIGUOUS|The trusted application has multiple eligible control windows' }
 $root = [Windows.Automation.AutomationElement]::FromHandle($windows[0])
 if ($null -eq $root) { throw 'TARGET_UNAVAILABLE|The trusted application window is unavailable' }
-"#;
+$windowProcessId = Get-UiaWindowProcessId $windows[0]
+$windowProcess = Get-Process -Id $windowProcessId -ErrorAction Stop
+if ([IO.Path]::GetFullPath($windowProcess.Path) -ine $expected -or
+    (Get-UiaSafetyState $root).processId -ne $windowProcessId) {
+  throw 'TARGET_CHANGED|The trusted control window identity changed'
+}
+"#
+);
 
-/// Capture alone needs every eligible HWND, including several windows in one
-/// process. Legacy control observation keeps its existing main-window selector.
+#[cfg(windows)]
+fn control_observation_script(has_region_scope: bool) -> String {
+    // Only a new root observation may wait for a just-launched app's first
+    // window. Leased targets and every effect retain strict one-shot selection.
+    let readiness = if has_region_scope {
+        ""
+    } else {
+        "$script:uiaWindowReadinessWaitMs = 1500"
+    };
+    format!(
+        "{UIA_SAFETY_HELPERS_SCRIPT}\n{readiness}\n{TRUSTED_WINDOW_SCRIPT}\n{OBSERVATION_SCRIPT}"
+    )
+}
+
+/// Capture remains limited to top-level HWNDs. Controls can additionally use
+/// the exact trusted process's own HWND inside a separate Windows app host.
 #[cfg(windows)]
 const CAPTURE_WINDOW_SELECTION_SCRIPT: &str = r#"
 function Select-CaptureWindow($candidates, $expected) {
@@ -1337,29 +2052,9 @@ function Select-CaptureWindow($candidates, $expected) {
 "#;
 
 #[cfg(windows)]
-const CAPTURE_WINDOW_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public static class AngelBotCaptureWindows {
-  private delegate bool EnumCallback(IntPtr hwnd, IntPtr param);
-  [DllImport("user32.dll")] private static extern bool EnumWindows(EnumCallback callback, IntPtr param);
-  [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
-  [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
-  public static long[] EligibleWindows() {
-    var result = new List<long>();
-    if (!EnumWindows((hwnd, unused) => {
-      if (IsWindowVisible(hwnd) && GetWindow(hwnd, 4) == IntPtr.Zero) result.Add(hwnd.ToInt64());
-      return true;
-    }, IntPtr.Zero)) throw new InvalidOperationException();
-    return result.ToArray();
-  }
-}
-'@
+const CAPTURE_WINDOW_SCRIPT: &str = concat!(
+    include_str!("desktop_control/window_identity.ps1"),
+    r#"
 $expected = [IO.Path]::GetFullPath($env:ANGELBOT_TARGET_EXE)
 $candidates = @([AngelBotCaptureWindows]::EligibleWindows() | ForEach-Object {
   $handle = [IntPtr]::new([long]$_)
@@ -1375,15 +2070,18 @@ $candidates = @([AngelBotCaptureWindows]::EligibleWindows() | ForEach-Object {
 })
 $selected = Select-CaptureWindow $candidates $expected
 $windows = @([IntPtr]::new([long]$selected.windowHandle))
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 $root = [Windows.Automation.AutomationElement]::FromHandle($windows[0])
 if ($null -eq $root) { throw 'TARGET_UNAVAILABLE|The trusted application window is unavailable' }
 if ((Get-UiaSafetyState $root).processId -ne $selected.processId) { throw 'TARGET_CHANGED|The trusted window identity changed' }
-"#;
+"#
+);
 
 /// Existing UIA safety metadata, bounded walk. No field values or names exit.
 #[cfg(windows)]
 const CAPTURE_TARGET_SCRIPT: &str = r#"
 $rootState = Get-UiaSafetyState $root
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 if ($rootState.offscreen -or $rootState.password) { throw 'SENSITIVE_SURFACE|The trusted window cannot be captured' }
 $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
 $pending = New-Object System.Collections.Stack
@@ -1406,6 +2104,7 @@ while ($pending.Count -gt 0) {
   }
 }
 $stateAfter = Get-UiaSafetyState $root
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 if ($stateAfter.password -or $stateAfter.offscreen -or $stateAfter.processId -ne $rootState.processId) {
   throw 'TARGET_CHANGED|The trusted application window changed'
 }
@@ -1505,36 +2204,23 @@ try {
   $rootState = Get-UiaSafetyState $root
 } catch { throw 'TARGET_CHANGED|The selected application is no longer available' }
 if ($currentPath -ine $expected -or
-    [long]$currentProcess.MainWindowHandle.ToInt64() -ne $expectedWindowHandle -or
+    (Get-UiaWindowProcessId ([IntPtr]::new($expectedWindowHandle))) -ne $expectedProcessId -or
     [long]$windows[0].ToInt64() -ne $expectedWindowHandle -or
     $rootState.processId -ne $expectedProcessId -or
     $rootState.offscreen -or $rootState.password) {
   throw 'TARGET_CHANGED|The selected application window has changed'
 }
-$condition = New-Object Windows.Automation.PropertyCondition(
-  [Windows.Automation.AutomationElement]::ControlTypeProperty,
-  [Windows.Automation.ControlType]::Edit
-)
-$edits = $root.FindAll([Windows.Automation.TreeScope]::Descendants, $condition)
-if ($edits.Count -gt 256) { throw 'SCAN_LIMIT|Too many edit controls were found' }
-$target = $null
-for ($i = 0; $i -lt $edits.Count; $i++) {
-  $candidate = $edits.Item($i)
-  try { $runtimeId = Get-UiaRuntimeId $candidate }
-  catch { continue }
-  if (($runtimeId -join ',') -ceq $expectedRuntimeId) {
-    if ($null -ne $target) { throw 'TARGET_AMBIGUOUS|Selected field identity is duplicated' }
-    $target = $candidate
-  }
-}
-if ($null -eq $target) { throw 'TARGET_CHANGED|The selected field is no longer available' }
+$walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+$target = Find-UiaScopedRuntimeTarget $expectedRuntimeId $walker
+Assert-UiaTargetInScope $target
 try { $targetState = Get-UiaSafetyState $target }
 catch { throw 'TARGET_CHANGED|The selected field is no longer available' }
 if ($targetState.password) { throw 'SENSITIVE_SURFACE|Password controls cannot be automated' }
 $currentLabel = $targetState.current.AutomationId
 if ($targetState.offscreen -or -not $targetState.enabled -or
     $targetState.processId -ne $expectedProcessId -or $null -eq $currentLabel -or
-    [string]$currentLabel -cne $fieldLabel) {
+    [string]$currentLabel -cne $fieldLabel -or
+    [string]$targetState.current.ControlType.ProgrammaticName -cne 'ControlType.Edit') {
   throw 'TARGET_CHANGED|The selected field has changed'
 }
 $pattern = $null
@@ -1554,9 +2240,12 @@ $controlOperation = [string]$env:ANGELBOT_CONTROL_OPERATION
 $controlRole = [string]$env:ANGELBOT_CONTROL_ROLE
 $operationSupported = switch ($controlOperation) {
   'invoke' { $controlRole -in @('button', 'hyperlink', 'menuItem') }
-  'select' { $controlRole -in @('radioButton', 'tabItem') }
-  'expand' { $controlRole -ceq 'menuItem' }
-  'collapse' { $controlRole -ceq 'menuItem' }
+  'select' { $controlRole -in @('radioButton', 'tabItem', 'listItem') }
+  'choose' { $controlRole -ceq 'comboBox' }
+  'check' { $controlRole -ceq 'checkBox' }
+  'uncheck' { $controlRole -ceq 'checkBox' }
+  'expand' { $controlRole -in @('menuItem', 'comboBox') }
+  'collapse' { $controlRole -in @('menuItem', 'comboBox') }
   'scrollup' { $controlRole -in @('pane', 'document', 'list') }
   'scrolldown' { $controlRole -in @('pane', 'document', 'list') }
   default { $false }
@@ -1567,13 +2256,17 @@ $expectedRoleName = switch ([string]$env:ANGELBOT_CONTROL_ROLE) {
   'hyperlink' { 'ControlType.Hyperlink' }
   'menuItem' { 'ControlType.MenuItem' }
   'radioButton' { 'ControlType.RadioButton' }
+  'checkBox' { 'ControlType.CheckBox' }
   'tabItem' { 'ControlType.TabItem' }
+  'listItem' { 'ControlType.ListItem' }
+  'comboBox' { 'ControlType.ComboBox' }
   'pane' { 'ControlType.Pane' }
   'document' { 'ControlType.Document' }
   'list' { 'ControlType.List' }
   default { throw 'UNSUPPORTED_CONTROL|The selected control role is unsupported' }
 }
 function Assert-UiaControlTarget($element) {
+  Assert-UiaTargetInScope $element
   try {
     $currentProcess = Get-Process -Id $expectedProcessId -ErrorAction Stop
     $currentPath = [IO.Path]::GetFullPath($currentProcess.Path)
@@ -1584,7 +2277,7 @@ function Assert-UiaControlTarget($element) {
     $currentRole = $targetState.current.ControlType.ProgrammaticName
   } catch { throw 'TARGET_CHANGED|The selected control is no longer available' }
   if ($currentPath -ine $expected -or
-      [long]$currentProcess.MainWindowHandle.ToInt64() -ne $expectedWindowHandle -or
+      (Get-UiaWindowProcessId ([IntPtr]::new($expectedWindowHandle))) -ne $expectedProcessId -or
       [long]$windows[0].ToInt64() -ne $expectedWindowHandle -or
       $rootState.processId -ne $expectedProcessId -or
       $rootState.password -or $rootState.offscreen -or
@@ -1598,6 +2291,8 @@ function Assert-UiaControlTarget($element) {
   $patternKind = switch ($controlOperation) {
     'invoke' { [Windows.Automation.InvokePattern]::Pattern }
     'select' { [Windows.Automation.SelectionItemPattern]::Pattern }
+    'check' { [Windows.Automation.TogglePattern]::Pattern }
+    'uncheck' { [Windows.Automation.TogglePattern]::Pattern }
     'scrollup' { [Windows.Automation.ScrollPattern]::Pattern }
     'scrolldown' { [Windows.Automation.ScrollPattern]::Pattern }
     default { [Windows.Automation.ExpandCollapsePattern]::Pattern }
@@ -1629,48 +2324,33 @@ function Get-UiaControlOperationState($operationPattern) {
     }
     if ($controlOperation -ceq 'select') {
       $selected = $patternCurrent.IsSelected
-      if ($null -eq $selected) { throw 'Unavailable selected state' }
-      return [bool]$selected
+      if ($selected -isnot [bool]) { throw 'Unavailable selected state' }
+      return $selected
     }
-    $expandState = $patternCurrent.ExpandCollapseState
-    if ($null -eq $expandState -or [string]$expandState -cnotin @('Collapsed', 'Expanded', 'PartiallyExpanded', 'LeafNode')) {
-      throw 'Unavailable expand state'
+    if ($controlOperation -in @('check', 'uncheck')) {
+      $toggleState = $patternCurrent.ToggleState
+      if ($null -eq $toggleState -or [string]$toggleState -cnotin @('On', 'Off', 'Indeterminate')) {
+        throw 'Unavailable checkbox state'
+      }
+    } else {
+      $expandState = $patternCurrent.ExpandCollapseState
+      if ($null -eq $expandState -or [string]$expandState -cnotin @('Collapsed', 'Expanded', 'PartiallyExpanded', 'LeafNode')) {
+        throw 'Unavailable expand state'
+      }
     }
   } catch { throw 'TARGET_UNAVAILABLE|The selected control state is unavailable' }
+  if ($controlOperation -in @('check', 'uncheck')) {
+    # TogglePattern cycles states, it does not set one. Refuse tri-state input
+    # rather than applying a second effect under the same confirmation.
+    if ([string]$toggleState -ceq 'Indeterminate') { throw 'UNSUPPORTED_CONTROL|Indeterminate checkboxes cannot be automated' }
+    return [string]$toggleState
+  }
   if ([string]$expandState -ceq 'LeafNode') { throw 'UNSUPPORTED_CONTROL|Leaf nodes cannot expand or collapse' }
   return [string]$expandState
 }
 # Locate only the observed RuntimeId, with the same bounded Control View walk.
 $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
-$stack = New-Object 'System.Collections.Generic.Stack[object]'
-$target = $null
-$visited = 0
-try { $first = $walker.GetFirstChild($root) }
-catch { throw 'TARGET_CHANGED|The selected control tree is unavailable' }
-if ($null -ne $first) { $stack.Push(@{ element = $first; depth = 1 }) }
-while ($stack.Count -gt 0) {
-  $entry = $stack.Pop()
-  $candidate = $entry.element
-  $visited++
-  if ($visited -gt 256) { throw 'SCAN_LIMIT|The control tree scan limit was reached' }
-  try {
-    $candidateState = Get-UiaSafetyState $candidate
-    $sibling = $walker.GetNextSibling($candidate)
-    if ($null -ne $sibling) { $stack.Push(@{ element = $sibling; depth = $entry.depth }) }
-    if ($candidateState.password -or $candidateState.offscreen) { continue }
-    $runtimeId = Get-UiaRuntimeId $candidate
-    if (($runtimeId -join ',') -ceq $expectedRuntimeId) {
-      if ($null -ne $target) { throw 'TARGET_AMBIGUOUS|The selected control identity is duplicated' }
-      $target = $candidate
-    }
-    $child = $walker.GetFirstChild($candidate)
-  } catch { throw 'TARGET_CHANGED|The selected control tree is unavailable' }
-  if ($null -ne $child) {
-    if ($entry.depth -ge 12) { throw 'SCAN_LIMIT|The control tree depth limit was reached' }
-    $stack.Push(@{ element = $child; depth = ($entry.depth + 1) })
-  }
-}
-if ($null -eq $target) { throw 'TARGET_CHANGED|The selected control is no longer available' }
+$target = Find-UiaScopedRuntimeTarget $expectedRuntimeId $walker
 $pattern = Assert-UiaControlTarget $target
 $preflightState = Get-UiaControlOperationState $pattern
 "#;
@@ -1683,6 +2363,8 @@ $pattern = Assert-UiaControlTarget $target
 $beforeState = Get-UiaControlOperationState $pattern
 $desiredState = switch ($controlOperation) {
   'select' { $true }
+  'check' { 'On' }
+  'uncheck' { 'Off' }
   'expand' { 'Expanded' }
   'collapse' { 'Collapsed' }
   'scrollup' { [double]0 }
@@ -1695,6 +2377,8 @@ try {
     switch ($controlOperation) {
       'invoke' { $pattern.Invoke() }
       'select' { $pattern.Select() }
+      'check' { $pattern.Toggle() }
+      'uncheck' { $pattern.Toggle() }
       'expand' { $pattern.Expand() }
       'collapse' { $pattern.Collapse() }
       'scrollup' { $pattern.Scroll([Windows.Automation.ScrollAmount]::NoAmount, [Windows.Automation.ScrollAmount]::SmallDecrement) }
@@ -1708,14 +2392,18 @@ try {
     # Reacquire fresh pattern/state after the operation. An exact state is
     # evidence about this control only, never evidence of a completed task.
     # Providers may publish state after the call returns. Retry only fresh
-    # read-only state mismatches, never the effect or identity/safety failures.
-    $matched = $false
+    # unavailable state reads/mismatches, never the effect or identity/safety failures.
     for ($read = 0; $read -lt 11; $read++) {
       $freshPattern = Assert-UiaControlTarget $target
-      $afterState = Get-UiaControlOperationState $freshPattern
-      $matched = if ($controlOperation -ceq 'scrollup' -and -not $alreadyDesired) { $afterState -lt $beforeState }
-                 elseif ($controlOperation -ceq 'scrolldown' -and -not $alreadyDesired) { $afterState -gt $beforeState }
-                 else { $afterState -ceq $desiredState }
+      $matched = $false
+      try {
+        $afterState = Get-UiaControlOperationState $freshPattern
+        $matched = if ($controlOperation -ceq 'scrollup' -and -not $alreadyDesired) { $afterState -lt $beforeState }
+                   elseif ($controlOperation -ceq 'scrolldown' -and -not $alreadyDesired) { $afterState -gt $beforeState }
+                   else { $afterState -ceq $desiredState }
+      } catch {
+        if (-not $_.Exception.Message.StartsWith('TARGET_UNAVAILABLE|', [StringComparison]::Ordinal)) { throw }
+      }
       if ($matched) { break }
       if ($read -lt 10) { Start-Sleep -Milliseconds 25 }
     }
@@ -1734,14 +2422,20 @@ try {
 "#;
 
 #[cfg(windows)]
+const CHOOSE_OPTION_SCRIPT: &str = include_str!("desktop_control/choose_option.ps1");
+
+#[cfg(windows)]
 const VERIFIED_SET_VALUE_SCRIPT: &str = r#"
-$text = $env:ANGELBOT_DRAFT_TEXT
+# Windows can omit an empty environment variable; clearing must still pass
+# an exact empty string to SetValue and compare it ordinally during readback.
+$text = [string]$env:ANGELBOT_DRAFT_TEXT
 $expectedProcessId = [int]$env:ANGELBOT_DRAFT_EXPECTED_PID
 $expectedWindowHandle = [long]$env:ANGELBOT_DRAFT_EXPECTED_HWND
 $expectedRuntimeId = [string]$env:ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID
 # Recheck identity immediately before SetValue; a stale approval cannot be
 # redirected to a different process, window or UIA element.
 try {
+  Assert-UiaTargetInScope $target
   $currentProcess = Get-Process -Id $expectedProcessId -ErrorAction Stop
   $currentPath = [IO.Path]::GetFullPath($currentProcess.Path)
   $actualRuntimeId = Get-UiaRuntimeId $target
@@ -1749,7 +2443,7 @@ try {
   $targetState = Get-UiaSafetyState $target
 } catch { throw 'TARGET_CHANGED|The preflighted field is no longer available' }
 if ($currentPath -ine $expected -or
-    [long]$currentProcess.MainWindowHandle.ToInt64() -ne $expectedWindowHandle -or
+    (Get-UiaWindowProcessId ([IntPtr]::new($expectedWindowHandle))) -ne $expectedProcessId -or
     [long]$windows[0].ToInt64() -ne $expectedWindowHandle -or
     $rootState.processId -ne $expectedProcessId -or
     $targetState.processId -ne $expectedProcessId -or
@@ -1762,14 +2456,31 @@ if ($currentPath -ine $expected -or
 if (Get-UiaValuePatternReadOnly $pattern) { throw 'TARGET_UNAVAILABLE|The selected field is read-only' }
 try {
   $pattern.SetValue($text)
-  $actual = $pattern.Current.Value
+  Assert-UiaTargetInScope $target
+  $currentProcess = Get-Process -Id $expectedProcessId -ErrorAction Stop
+  $freshRootState = Get-UiaSafetyState $root
+  $freshTargetState = Get-UiaSafetyState $target
+  if ([IO.Path]::GetFullPath($currentProcess.Path) -ine $expected -or
+      (Get-UiaWindowProcessId ([IntPtr]::new($expectedWindowHandle))) -ne $expectedProcessId -or
+      [long]$windows[0].ToInt64() -ne $expectedWindowHandle -or
+      $freshRootState.processId -ne $expectedProcessId -or $freshRootState.password -or $freshRootState.offscreen -or
+      $freshTargetState.processId -ne $expectedProcessId -or $freshTargetState.password -or $freshTargetState.offscreen -or -not $freshTargetState.enabled -or
+      [string]$freshTargetState.current.ControlType.ProgrammaticName -cne 'ControlType.Edit' -or
+      ((Get-UiaRuntimeId $target) -join ',') -cne $expectedRuntimeId -or
+      ($env:ANGELBOT_FIELD_LABEL -and [string]$freshTargetState.current.AutomationId -cne [string]$env:ANGELBOT_FIELD_LABEL)) {
+    throw 'Readback field identity changed'
+  }
+  $freshPattern = $null
+  if (-not $target.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$freshPattern) -or
+      $null -eq $freshPattern -or (Get-UiaValuePatternReadOnly $freshPattern)) { throw 'Readback field pattern changed' }
+  $actual = $freshPattern.Current.Value
   if ($null -eq $actual -or -not [string]::Equals($actual, $text, [StringComparison]::Ordinal)) {
     throw 'VERIFICATION_FAILED|The field value did not match the requested text'
   }
 } catch {
   throw 'RESULT_UNKNOWN|The field may have changed but verification was not completed'
 }
-@{ status = 'verified'; detail = 'Text was filled and verified through Windows UI Automation' } | ConvertTo-Json -Compress
+@{ status = 'verified'; detail = 'Field content was replaced and verified through Windows UI Automation; task outcome is not verified' } | ConvertTo-Json -Compress
 "#;
 
 #[cfg(windows)]
@@ -1786,33 +2497,62 @@ try {
 catch { throw 'TARGET_UNAVAILABLE|The trusted application window cannot be inspected' }
 if (-not $rootVisible) { throw 'TARGET_UNAVAILABLE|The trusted application window is not visible' }
 $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+$script:uiaWalker = $walker
+$scopeRoot = Get-UiaScopeRoot
 $stack = New-Object 'System.Collections.Generic.Stack[object]'
 $controls = New-Object 'System.Collections.Generic.List[object]'
 $targets = New-Object 'System.Collections.Generic.List[object]'
+$regions = New-Object 'System.Collections.Generic.List[object]'
+$regionTargets = New-Object 'System.Collections.Generic.List[object]'
 $diagnostics = New-Object 'System.Collections.Generic.List[string]'
 # Reserve the complete bounded diagnostic array so later provider failures
 # cannot push an otherwise valid public payload over its output budget.
 $budgetDiagnostics = @('controlLimit', 'outputLimit', 'nodeLimit', 'depthLimit', 'providerUnavailable')
-$visited = 0
 $truncated = $false
 $metadataLimitReached = $false
 function Mark-ObservationPartial([string]$reason) {
   $script:truncated = $true
   if (-not $diagnostics.Contains($reason)) { $diagnostics.Add($reason) }
 }
-$first = $null
-try { $first = $walker.GetFirstChild($root) }
-catch { Mark-ObservationPartial 'providerUnavailable' }
-if ($null -ne $first) { $stack.Push(@{ element = $first; depth = 1 }) }
+function Test-ObservationStaticText($element) {
+  # A Text child of an editor/choice field can mirror its private value.
+  # Check every ancestor without reading any ancestor's Name or text patterns.
+  $rootId = (Get-UiaRuntimeId $root) -join ','
+  $scopeId = $script:uiaScope.identity.controlRuntimeId -join ','
+  $insideScope = $false
+  for ($ancestor = 0; $ancestor -le 24 -and $null -ne $element; $ancestor++) {
+    $state = Assert-UiaScopeNode $element ([int]$script:uiaScope.identity.processId)
+    $ancestorRole = [string]$state.current.ControlType.ProgrammaticName
+    if ([string]::IsNullOrEmpty($ancestorRole)) { throw 'TARGET_UNAVAILABLE|Ancestor role is unavailable' }
+    if ($ancestor -eq 0 -and $ancestorRole -cne 'ControlType.Text') { return $false }
+    if ($ancestorRole -in @('ControlType.Edit', 'ControlType.ComboBox', 'ControlType.ListItem')) { return $false }
+    $runtimeId = (Get-UiaRuntimeId $element) -join ','
+    if ($runtimeId -ceq $scopeId) { $insideScope = $true }
+    if ($runtimeId -ceq $rootId -and $insideScope) { return $true }
+    $element = $walker.GetParent($element)
+  }
+  throw 'TARGET_CHANGED|Static text is outside the observed window'
+}
+if ($null -ne $script:uiaScope) {
+  $stack.Push(@{ element = $scopeRoot; depth = 1; path = [int[]]@($script:uiaScope.path); self = $true })
+} else {
+  $first = $null
+  try { $first = $walker.GetFirstChild($scopeRoot) }
+  catch { Mark-ObservationPartial 'providerUnavailable' }
+  if ($null -ne $first) { $stack.Push(@{ element = $first; depth = 1; path = [int[]]@(0); self = $false }) }
+}
 while ($stack.Count -gt 0) {
   $entry = $stack.Pop()
   $element = $entry.element
-  $visited++
-  if ($visited -gt 256) { Mark-ObservationPartial 'nodeLimit'; break }
+  try { Use-UiaNodeBudget } catch { Mark-ObservationPartial 'nodeLimit'; break }
   $sibling = $null
-  try { $sibling = $walker.GetNextSibling($element) }
+  try { if (-not $entry.self) { $sibling = $walker.GetNextSibling($element) } }
   catch { Mark-ObservationPartial 'providerUnavailable' }
-  if ($null -ne $sibling) { $stack.Push(@{ element = $sibling; depth = $entry.depth }) }
+  if ($null -ne $sibling) {
+    $siblingPath = [int[]]@($entry.path)
+    $siblingPath[-1]++
+    $stack.Push(@{ element = $sibling; depth = $entry.depth; path = $siblingPath; self = $false })
+  }
   # A provider that cannot report visibility or password state is not safe to descend into.
   try {
     $current = $element.Current
@@ -1831,6 +2571,37 @@ while ($stack.Count -gt 0) {
     if ([string]::IsNullOrEmpty([string]$roleName)) { Mark-ObservationPartial 'providerUnavailable' }
   }
   catch { Mark-ObservationPartial 'providerUnavailable'; $roleName = '' }
+  $regionRole = switch ($roleName) {
+    'ControlType.Pane' { 'pane' } 'ControlType.Document' { 'document' }
+    'ControlType.List' { 'list' } 'ControlType.Group' { 'group' } default { $null }
+  }
+  if ($null -ne $regionRole -and -not $entry.self -and $regions.Count -lt 8 -and $entry.path.Count -le 12 -and
+      (($entry.path | Measure-Object -Sum).Sum + $entry.path.Count) -lt 256) {
+    try {
+      $regionName = $current.Name
+      if ($null -ne $regionName -and $regionName.Length -le 80 -and
+          $regionName -ceq $regionName.Trim() -and $regionName -notmatch '\p{Cc}') {
+        $regionProcessId = $current.ProcessId
+        $windowProcessId = $root.Current.ProcessId
+        if ($null -eq $regionProcessId -or $null -eq $windowProcessId) { throw 'Unavailable region process' }
+        if ([int]$regionProcessId -gt 0 -and [int]$regionProcessId -eq [int]$windowProcessId) {
+          $regionRuntimeId = Get-UiaRuntimeId $element
+          $regions.Add(@{ role = $regionRole; name = [string]$regionName })
+          $regionTargets.Add(@{ index = [int]($regions.Count - 1); scope = @{
+            role = $regionRole; name = [string]$regionName; path = [int[]]@($entry.path)
+            identity = @{ processId = [int]$windowProcessId; windowHandle = [long]$windows[0].ToInt64(); controlRuntimeId = $regionRuntimeId }
+          } })
+          $regionProbe = @{ controls = @($controls.ToArray()); regions = @($regions.ToArray()); truncated = $true; diagnostics = $budgetDiagnostics } | ConvertTo-Json -Compress -Depth 5
+          while ([Text.Encoding]::UTF8.GetByteCount($regionProbe) -gt 3072 -and $controls.Count -gt 0) {
+            $controls.RemoveAt($controls.Count - 1)
+            Mark-ObservationPartial 'outputLimit'
+            $metadataLimitReached = $true
+            $regionProbe = @{ controls = @($controls.ToArray()); regions = @($regions.ToArray()); truncated = $true; diagnostics = $budgetDiagnostics } | ConvertTo-Json -Compress -Depth 5
+          }
+        }
+      }
+    } catch { Mark-ObservationPartial 'providerUnavailable' }
+  }
   $role = switch ($roleName) {
     'ControlType.Button' { 'button' }
     'ControlType.CheckBox' { 'checkBox' }
@@ -1844,7 +2615,16 @@ while ($stack.Count -gt 0) {
     'ControlType.Pane' { 'pane' }
     'ControlType.Document' { 'document' }
     'ControlType.List' { 'list' }
+    'ControlType.Text' { if ($null -ne $script:uiaScope) { 'text' } }
     default { $null }
+  }
+  if ($role -eq 'text') {
+    try { if (-not (Test-ObservationStaticText $element)) { $role = $null } }
+    catch {
+      if ($_.Exception.Message -like 'SCAN_LIMIT|*') { Mark-ObservationPartial 'nodeLimit' }
+      else { Mark-ObservationPartial 'providerUnavailable' }
+      $role = $null
+    }
   }
   # Ordinary layout containers must not exhaust the actionable metadata budget.
   # Only retain a named, enabled container with a usable vertical ScrollPattern.
@@ -1876,8 +2656,11 @@ while ($stack.Count -gt 0) {
       $metadataLimitReached = $true
     } else {
     $name = $null
-    # Edit, ComboBox and ListItem names can mirror user data rather than labels.
-    if ($role -in @('button', 'checkBox', 'radioButton', 'tabItem', 'menuItem', 'hyperlink', 'pane', 'document', 'list')) {
+    # ComboBox/ListItem names can mirror user data. Only the host's explicit
+    # interaction capability permits their short action labels, never Value.
+    # Edit names stay hidden independently of that capability.
+    if ($role -in @('button', 'checkBox', 'radioButton', 'tabItem', 'menuItem', 'hyperlink', 'pane', 'document', 'list') -or
+        ($env:ANGELBOT_ACTION_LABELS -ceq '1' -and $role -in @('comboBox', 'listItem')) -or $role -eq 'text') {
       try {
         $rawName = $current.Name
         if ($null -eq $rawName) { Mark-ObservationPartial 'providerUnavailable' }
@@ -1885,9 +2668,13 @@ while ($stack.Count -gt 0) {
         if ($candidate.Length -gt 0 -and $candidate.Length -le 80 -and
             $candidate -ceq $candidate.Trim() -and $candidate -notmatch '\p{Cc}') {
           $name = $candidate
+        } elseif ($role -eq 'text' -and $candidate.Length -gt 0) {
+          Mark-ObservationPartial 'providerUnavailable'
         }
       } catch { Mark-ObservationPartial 'providerUnavailable' }
     }
+    # Do not return an empty or shortened business result as readable text.
+    if ($role -eq 'text' -and $null -eq $name) { continue }
     $automationId = $null
     try {
       $rawAutomationId = $current.AutomationId
@@ -1905,8 +2692,9 @@ while ($stack.Count -gt 0) {
     }
     catch { Mark-ObservationPartial 'providerUnavailable'; $enabled = $false }
     $capabilities = @()
+    $state = @{}
     if ($enabled) {
-      if ($isScrollContainer) { $capabilities += 'scroll' }
+      if ($isScrollContainer) { $capabilities += 'scroll'; $state.verticalScrollPercent = $position }
       try {
         $pattern = $null
         if ($role -in @('button', 'hyperlink', 'menuItem') -and
@@ -1919,6 +2707,12 @@ while ($stack.Count -gt 0) {
         if ($role -in @('checkBox', 'menuItem') -and
             $element.TryGetCurrentPattern([Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
           $capabilities += 'toggle'
+          $toggle = $pattern.Current.ToggleState
+          if ($null -eq $toggle) { throw 'Unavailable toggle state' }
+          $state.toggle = switch -CaseSensitive ($toggle.ToString()) {
+            'Off' { 'off' }; 'On' { 'on' }; 'Indeterminate' { 'indeterminate' }
+            default { throw 'Unavailable toggle state' }
+          }
         }
       } catch { Mark-ObservationPartial 'providerUnavailable' }
       try {
@@ -1926,6 +2720,23 @@ while ($stack.Count -gt 0) {
         if ($role -in @('radioButton', 'listItem', 'tabItem') -and
             $element.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
           $capabilities += 'select'
+          $selected = $pattern.Current.IsSelected
+          if ($selected -isnot [bool]) { throw 'Unavailable selection state' }
+          $state.selected = $selected
+          # Container type disambiguates same-name items without reading a
+          # parent Name, hidden option or field Value/Text. It grants no action.
+          if ($env:ANGELBOT_ACTION_LABELS -ceq '1' -and $role -ceq 'listItem') {
+            $container = $pattern.Current.SelectionContainer
+            if ($null -ne $container) {
+              $containerState = Get-UiaSafetyState $container
+              if ($containerState.processId -eq $windowProcessId -and -not $containerState.offscreen -and -not $containerState.password) {
+                switch -CaseSensitive ($containerState.current.ControlType.ProgrammaticName) {
+                  'ControlType.List' { $state.selectionContainerRole = 'list' }
+                  'ControlType.ComboBox' { $state.selectionContainerRole = 'comboBox' }
+                }
+              }
+            }
+          }
         }
       } catch { Mark-ObservationPartial 'providerUnavailable' }
       try {
@@ -1933,6 +2744,22 @@ while ($stack.Count -gt 0) {
         if ($role -in @('comboBox', 'menuItem') -and
             $element.TryGetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$pattern)) {
           $capabilities += 'expandCollapse'
+          $expansion = $pattern.Current.ExpandCollapseState
+          if ($null -eq $expansion) { throw 'Unavailable expansion state' }
+          $state.expansion = switch -CaseSensitive ($expansion.ToString()) {
+            'Collapsed' { 'collapsed' }; 'Expanded' { 'expanded' }
+            'PartiallyExpanded' { 'partiallyExpanded' }; 'LeafNode' { 'leafNode' }
+            default { throw 'Unavailable expansion state' }
+          }
+        }
+      } catch { Mark-ObservationPartial 'providerUnavailable' }
+      try {
+        $pattern = $null
+        if ($role -ceq 'comboBox' -and $capabilities -contains 'expandCollapse' -and
+            $element.TryGetCurrentPattern([Windows.Automation.SelectionPattern]::Pattern, [ref]$pattern)) {
+          $multiple = $pattern.Current.CanSelectMultiple
+          if ($multiple -isnot [bool]) { throw 'Unavailable selection mode' }
+          if (-not $multiple) { $capabilities += 'selectOption' }
         }
       } catch { Mark-ObservationPartial 'providerUnavailable' }
       try {
@@ -1943,16 +2770,24 @@ while ($stack.Count -gt 0) {
         }
       } catch { Mark-ObservationPartial 'providerUnavailable' }
     }
-    $controls.Add(@{ depth = [int]$entry.depth; role = $role; name = $name; automationId = $automationId; enabled = $enabled; capabilities = @($capabilities) })
-    $probe = @{ controls = @($controls.ToArray()); truncated = $false; diagnostics = $budgetDiagnostics } | ConvertTo-Json -Compress -Depth 5
+    # Match the Rust projection: absent optional metadata costs no payload
+    # space. Null placeholders must not exhaust the unchanged metadata budget.
+    $control = @{ depth = [int]$entry.depth; role = $role; enabled = $enabled }
+    if ($null -ne $name) { $control.name = $name }
+    if ($null -ne $automationId) { $control.automationId = $automationId }
+    if ($capabilities.Count -gt 0) { $control.capabilities = @($capabilities) }
+    if ($state.Count -gt 0) { $control.state = $state }
+    $controls.Add($control)
+    $probe = @{ controls = @($controls.ToArray()); regions = @($regions.ToArray()); truncated = $false; diagnostics = $budgetDiagnostics } | ConvertTo-Json -Compress -Depth 5
     if ([Text.Encoding]::UTF8.GetByteCount($probe) -gt 3072) {
       $controls.RemoveAt($controls.Count - 1)
       Mark-ObservationPartial 'outputLimit'
       $metadataLimitReached = $true
     } elseif (($role -eq 'edit' -and $enabled -and $capabilities -contains 'setValue' -and $null -ne $automationId) -or
               ($role -in @('button', 'hyperlink', 'menuItem') -and $enabled -and $capabilities -contains 'invoke' -and $null -ne $name) -or
-              ($role -in @('radioButton', 'tabItem') -and $enabled -and $capabilities -contains 'select' -and $null -ne $name) -or
-              ($role -eq 'menuItem' -and $enabled -and $capabilities -contains 'expandCollapse' -and $null -ne $name) -or
+              ($role -in @('radioButton', 'tabItem', 'listItem') -and $enabled -and $capabilities -contains 'select' -and $null -ne $name) -or
+              ($role -eq 'checkBox' -and $enabled -and $capabilities -contains 'toggle' -and $null -ne $name) -or
+              ($role -in @('menuItem', 'comboBox') -and $enabled -and $capabilities -contains 'expandCollapse' -and $null -ne $name) -or
               ($isScrollContainer -and $enabled -and $capabilities -contains 'scroll' -and $null -ne $name)) {
       # Field Value is deliberately not collected. The runtime identity
       # remains in the native adapter and never reaches the model.
@@ -1982,10 +2817,10 @@ while ($stack.Count -gt 0) {
   catch { Mark-ObservationPartial 'providerUnavailable' }
   if ($null -ne $child) {
     if ($entry.depth -ge 12) { Mark-ObservationPartial 'depthLimit' }
-    else { $stack.Push(@{ element = $child; depth = ($entry.depth + 1) }) }
+    else { $stack.Push(@{ element = $child; depth = ($entry.depth + 1); path = [int[]](@($entry.path) + @(0)); self = $false }) }
   }
 }
-$json = @{ controls = @($controls.ToArray()); truncated = $truncated; diagnostics = @($diagnostics.ToArray()); targets = @($targets.ToArray()) } | ConvertTo-Json -Compress -Depth 7
+$json = @{ controls = @($controls.ToArray()); regions = @($regions.ToArray()); truncated = $truncated; diagnostics = @($diagnostics.ToArray()); targets = @($targets.ToArray() | Where-Object { $_.index -lt $controls.Count }); region_targets = @($regionTargets.ToArray()) } | ConvertTo-Json -Compress -Depth 8
 $bytes = [Text.Encoding]::UTF8.GetBytes($json)
 if ($bytes.Length -gt 8192) { throw 'SCAN_LIMIT|Desktop observation is too large' }
 $stdout = [Console]::OpenStandardOutput()
@@ -2102,6 +2937,7 @@ fn parse_uia_helper_error(stderr: &[u8]) -> DesktopAdapterError {
         "TARGET_AMBIGUOUS",
         "TARGET_UNAVAILABLE",
         "TARGET_CHANGED",
+        "TARGET_MINIMIZED",
         "SENSITIVE_SURFACE",
         "UNSUPPORTED_CONTROL",
         "VERIFICATION_FAILED",
@@ -2217,6 +3053,7 @@ fn classify_control_helper_result(
 #[cfg(windows)]
 impl WindowsDesktopAdapter {
     fn begin_uia_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, DesktopAdapterError> {
+        // TARGET_BUSY is a pre-dispatch refusal, never a post-action result.
         self.uia_gate.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => DesktopAdapterError::new(
                 "TARGET_BUSY",
@@ -2236,6 +3073,7 @@ impl WindowsDesktopAdapter {
         truncated: bool,
         controls: &mut [DesktopObservedControl],
         targets: Vec<PrivateObservedTarget>,
+        scope: Option<&RegionScope>,
     ) -> Result<(), DesktopAdapterError> {
         // A partial tree cannot establish that an AutomationId is unique in
         // the window. Preserve read-only metadata, but issue no write refs.
@@ -2288,6 +3126,7 @@ impl WindowsDesktopAdapter {
                     executable: executable.to_path_buf(),
                     control_label: label.to_string(),
                     identity: target.identity,
+                    scope: scope.cloned(),
                     expires_at: now + FIELD_REF_TTL,
                 },
             );
@@ -2338,6 +3177,7 @@ impl WindowsDesktopAdapter {
         truncated: bool,
         controls: &mut [DesktopObservedControl],
         targets: &[PrivateObservedTarget],
+        scope: Option<&RegionScope>,
     ) -> Result<(), DesktopAdapterError> {
         // No actionable reference may escape any incomplete/provider-failed scan.
         if truncated {
@@ -2399,6 +3239,7 @@ impl WindowsDesktopAdapter {
                     role: control.role.clone(),
                     supported_operations,
                     identity,
+                    scope: scope.cloned(),
                     expires_at: now + FIELD_REF_TTL,
                 },
             );
@@ -2483,9 +3324,107 @@ impl WindowsDesktopAdapter {
                 "Desktop control reference store is unavailable",
             )
         })?;
+        let mut regions = self.region_refs.lock().map_err(|_| {
+            DesktopAdapterError::new(
+                "ADAPTER_FAILED",
+                "Desktop region reference store is unavailable",
+            )
+        })?;
         fields.retain(|_, lease| lease.app_id != app_id || lease.executable != executable);
         controls.retain(|_, lease| lease.app_id != app_id || lease.executable != executable);
+        regions.retain(|_, lease| lease.app_id != app_id || lease.executable != executable);
+        self.image_refs.revoke(app_id)?;
         Ok(())
+    }
+
+    fn issue_region_refs(
+        &self,
+        app_id: &str,
+        executable: &std::path::Path,
+        regions: &mut [DesktopObservedRegion],
+        targets: &[PrivateObservedRegion],
+    ) -> Result<(), DesktopAdapterError> {
+        let now = std::time::Instant::now();
+        let mut refs = self.region_refs.lock().map_err(|_| {
+            DesktopAdapterError::new(
+                "ADAPTER_FAILED",
+                "Desktop region reference store is unavailable",
+            )
+        })?;
+        refs.retain(|_, lease| lease.expires_at > now);
+        if refs.len().saturating_add(targets.len()) > MAX_FIELD_REFS {
+            return Err(DesktopAdapterError::new(
+                "SCAN_LIMIT",
+                "Too many active desktop region references",
+            ));
+        }
+        let mut identities = std::collections::HashMap::new();
+        for target in targets {
+            *identities
+                .entry((
+                    target.scope.identity.process_id,
+                    target.scope.identity.window_handle,
+                    target.scope.identity.control_runtime_id.clone(),
+                ))
+                .or_insert(0usize) += 1;
+        }
+        for target in targets {
+            if identities.get(&(
+                target.scope.identity.process_id,
+                target.scope.identity.window_handle,
+                target.scope.identity.control_runtime_id.clone(),
+            )) != Some(&1)
+            {
+                continue;
+            }
+            let reference = format!("region_{}", uuid::Uuid::new_v4().simple());
+            refs.insert(
+                reference.clone(),
+                RegionRefLease {
+                    app_id: app_id.to_string(),
+                    executable: executable.to_path_buf(),
+                    scope: target.scope.clone(),
+                    expires_at: now + FIELD_REF_TTL,
+                },
+            );
+            regions[target.index].region_ref = Some(reference);
+        }
+        Ok(())
+    }
+
+    fn resolve_region_ref(
+        &self,
+        app_id: &str,
+        executable: &std::path::Path,
+        reference: &str,
+    ) -> Result<RegionScope, DesktopAdapterError> {
+        if reference.len() != 39
+            || !reference.starts_with("region_")
+            || !reference[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(DesktopAdapterError::new(
+                "TARGET_CHANGED",
+                "Region reference is invalid",
+            ));
+        }
+        let mut refs = self.region_refs.lock().map_err(|_| {
+            DesktopAdapterError::new(
+                "ADAPTER_FAILED",
+                "Desktop region reference store is unavailable",
+            )
+        })?;
+        let now = std::time::Instant::now();
+        refs.retain(|_, lease| lease.expires_at > now);
+        let lease = refs.get(reference).ok_or_else(|| {
+            DesktopAdapterError::new("TARGET_CHANGED", "Region reference expired or changed")
+        })?;
+        if lease.app_id != app_id || lease.executable != executable {
+            return Err(DesktopAdapterError::new(
+                "TARGET_CHANGED",
+                "Region reference belongs to another trusted application",
+            ));
+        }
+        Ok(lease.scope.clone())
     }
 
     fn process_comparison_path(path: &std::path::Path) -> String {
@@ -2760,6 +3699,10 @@ $stdout.Flush()
             )
             .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", expected_runtime_id)
             .env("ANGELBOT_FIELD_LABEL", &lease.control_label)
+            .env(
+                "ANGELBOT_REGION_SCOPE",
+                region_scope_environment(lease.scope.as_ref())?,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2785,7 +3728,8 @@ $stdout.Flush()
         if !output.status.success() {
             return Err(parse_uia_helper_error(&output.stderr));
         }
-        parse_text_target_payload(app_id, &lease, &output.stdout)
+        self.resolve_field_ref(app_id, &executable, field_ref)?;
+        parse_text_target_payload(app_id, field_ref, &lease, &output.stdout)
     }
 
     fn control_target_command(
@@ -2831,6 +3775,10 @@ $stdout.Flush()
             .env("ANGELBOT_CONTROL_LABEL", &lease.control_label)
             .env("ANGELBOT_CONTROL_ROLE", &lease.role)
             .env("ANGELBOT_CONTROL_OPERATION", operation.as_str())
+            .env(
+                "ANGELBOT_REGION_SCOPE",
+                region_scope_environment(lease.scope.as_ref())?,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2896,7 +3844,7 @@ $stdout.Flush()
         }
         // Do not return a preflight for a reference that expired while scanning.
         self.resolve_control_ref(app_id, &executable, control_ref, None)?;
-        parse_control_target_payload(
+        let mut preview = parse_control_target_payload(
             app_id,
             &lease.control_label,
             DesktopDraftTargetIdentity {
@@ -2904,7 +3852,11 @@ $stdout.Flush()
                 ..lease.identity
             },
             &output.stdout,
-        )
+        )?;
+        if let Some(scope) = &lease.scope {
+            preview.control_label = format!("{} / {}", scope.label(), preview.control_label);
+        }
+        Ok(preview)
     }
 
     fn operate_control(
@@ -2912,6 +3864,7 @@ $stdout.Flush()
         app_id: &str,
         executable_path: &str,
         operation: DesktopControlOperation,
+        option: Option<&str>,
         expected_target: Option<&DesktopDraftTargetIdentity>,
         is_cancelled: &dyn Fn() -> bool,
         timeout: std::time::Duration,
@@ -2923,6 +3876,7 @@ $stdout.Flush()
                 "Control action was cancelled before starting",
             ));
         }
+        validate_control_option(operation, option)?;
         let identity = expected_target
             .filter(|identity| valid_draft_identity(identity))
             .ok_or_else(|| {
@@ -2944,8 +3898,14 @@ $stdout.Flush()
         let lease = self.resolve_control_ref(app_id, &executable, control_ref, Some(identity))?;
         // Controls can change descendants, including text-field identities.
         self.invalidate_application_refs(app_id, &executable)?;
+        let ending_script = if operation == DesktopControlOperation::Choose {
+            CHOOSE_OPTION_SCRIPT
+        } else {
+            CONTROL_OPERATION_SCRIPT
+        };
         let mut child =
-            Self::control_target_command(&executable, &lease, operation, CONTROL_OPERATION_SCRIPT)?
+            Self::control_target_command(&executable, &lease, operation, ending_script)?
+                .env("ANGELBOT_CHOICE_OPTION", option.unwrap_or_default())
                 .spawn()
                 .map_err(|error| {
                     DesktopAdapterError::new(
@@ -2974,6 +3934,13 @@ $stdout.Flush()
                 detail,
                 process_id: None,
                 action: Some(operation),
+                choice: (operation == DesktopControlOperation::Choose).then(|| {
+                    DesktopChoiceReceipt {
+                        control_name: lease.control_label.clone(),
+                        option: option.unwrap_or_default().into(),
+                        expanded: false,
+                    }
+                }),
             })
         })();
         // Also invalidate references from observations that raced the helper.
@@ -3092,6 +4059,7 @@ $stdout.Flush()
             detail,
             process_id: None,
             action: None,
+            choice: None,
         })
     }
 
@@ -3113,10 +4081,10 @@ $stdout.Flush()
                 "Text action was cancelled before starting",
             ));
         }
-        if text.is_empty() || text.contains('\0') || text.len() > 20_000 {
+        if text.contains('\0') || text.len() > 20_000 {
             return Err(DesktopAdapterError::new(
                 "INVALID_ARGUMENT",
-                "Text must contain 1 to 20,000 bytes and no NUL characters",
+                "Text must contain at most 20,000 bytes and no NUL characters",
             ));
         }
         let expected_target = expected_target
@@ -3129,17 +4097,23 @@ $stdout.Flush()
                     "Text target preflight is missing or no longer valid",
                 )
             })?;
-        let field_label = expected_target
-            .automation_id
-            .as_deref()
-            .filter(|label| valid_observation_label(label))
-            .ok_or_else(|| {
-                DesktopAdapterError::new(
-                    "TARGET_CHANGED",
-                    "Text target label is missing or no longer valid",
-                )
-            })?;
+        let field_ref = expected_target.automation_id.as_deref().ok_or_else(|| {
+            DesktopAdapterError::new(
+                "TARGET_CHANGED",
+                "Text target reference is missing or no longer valid",
+            )
+        })?;
         let executable = Self::canonical_executable(executable_path)?;
+        let lease = self.resolve_field_ref(app_id, &executable, field_ref)?;
+        let mut observed_identity = expected_target.clone();
+        observed_identity.automation_id = None;
+        if observed_identity != lease.identity {
+            return Err(DesktopAdapterError::new(
+                "TARGET_CHANGED",
+                "Text target differs from its observed reference",
+            ));
+        }
+        self.invalidate_application_refs(app_id, &executable)?;
         let script =
             format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{TRUSTED_WINDOW_SCRIPT}\n{TEXT_TARGET_SCRIPT}\n{VERIFIED_SET_VALUE_SCRIPT}");
         let expected_runtime_id = expected_target
@@ -3172,7 +4146,11 @@ $stdout.Flush()
                 expected_target.window_handle.to_string(),
             )
             .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", expected_runtime_id)
-            .env("ANGELBOT_FIELD_LABEL", field_label)
+            .env("ANGELBOT_FIELD_LABEL", &lease.control_label)
+            .env(
+                "ANGELBOT_REGION_SCOPE",
+                region_scope_environment(lease.scope.as_ref())?,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3199,6 +4177,7 @@ $stdout.Flush()
             detail,
             process_id: None,
             action: None,
+            choice: None,
         })
     }
 }
@@ -3260,6 +4239,8 @@ impl DesktopAdapter for WindowsDesktopAdapter {
         self.observe_trusted_window_with_control(
             app_id,
             executable_path,
+            None,
+            false,
             &|| false,
             DISCOVERY_TIMEOUT,
         )
@@ -3269,6 +4250,8 @@ impl DesktopAdapter for WindowsDesktopAdapter {
         &self,
         app_id: &str,
         executable_path: &str,
+        region_ref: Option<&str>,
+        allow_action_labels: bool,
         is_cancelled: &dyn Fn() -> bool,
         timeout: std::time::Duration,
     ) -> Result<DesktopWindowObservation, DesktopAdapterError> {
@@ -3281,10 +4264,13 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                 "Desktop observation was cancelled",
             ));
         }
+        let started = std::time::Instant::now();
         let executable = Self::canonical_executable(executable_path)?;
+        let scope = region_ref
+            .map(|reference| self.resolve_region_ref(app_id, &executable, reference))
+            .transpose()?;
         let process_executable = Self::process_comparison_path(&executable);
-        let script =
-            format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{TRUSTED_WINDOW_SCRIPT}\n{OBSERVATION_SCRIPT}");
+        let script = control_observation_script(scope.is_some());
         let mut child = desktop_child_command(Self::system_powershell()?)
             .args([
                 "-NoLogo",
@@ -3296,6 +4282,14 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                 &script,
             ])
             .env("ANGELBOT_TARGET_EXE", process_executable)
+            .env(
+                "ANGELBOT_ACTION_LABELS",
+                if allow_action_labels { "1" } else { "0" },
+            )
+            .env(
+                "ANGELBOT_REGION_SCOPE",
+                region_scope_environment(scope.as_ref())?,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3310,7 +4304,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
             &mut child,
             "Desktop observation",
             is_cancelled,
-            timeout,
+            timeout.saturating_sub(started.elapsed()),
         )?;
         let output = child.wait_with_output().map_err(|error| {
             DesktopAdapterError::new(
@@ -3327,13 +4321,41 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                 "Desktop observation was cancelled",
             ));
         }
-        let (mut payload, targets) = parse_private_observation_payload(&output.stdout)?;
+        let (mut payload, mut targets, region_targets) =
+            parse_private_observation_payload(&output.stdout)?;
+        if scope.is_none()
+            && payload
+                .controls
+                .iter()
+                .any(|control| control.role == "text")
+        {
+            return Err(DesktopAdapterError::new(
+                "ADAPTER_FAILED",
+                "Static text requires an explicitly selected region",
+            ));
+        }
+        if let Some(scope) = &scope {
+            if region_targets.iter().any(|target| {
+                target.scope.path.len() <= scope.path.len()
+                    || !target.scope.path.starts_with(&scope.path)
+                    || target.scope.identity.process_id != scope.identity.process_id
+                    || target.scope.identity.window_handle != scope.identity.window_handle
+            }) {
+                return Err(DesktopAdapterError::new(
+                    "ADAPTER_FAILED",
+                    "Nested region escaped its selected scope",
+                ));
+            }
+        }
+        fit_observation_projection(app_id, region_ref, &mut payload)?;
+        targets.retain(|target| target.index < payload.controls.len());
         self.issue_field_refs(
             app_id,
             &executable,
             payload.truncated,
             &mut payload.controls,
             targets.clone(),
+            scope.as_ref(),
         )?;
         self.issue_control_refs(
             app_id,
@@ -3341,10 +4363,14 @@ impl DesktopAdapter for WindowsDesktopAdapter {
             payload.truncated,
             &mut payload.controls,
             &targets,
+            scope.as_ref(),
         )?;
+        self.issue_region_refs(app_id, &executable, &mut payload.regions, &region_targets)?;
         Ok(DesktopWindowObservation {
             app_id: app_id.to_string(),
             controls: payload.controls,
+            regions: payload.regions,
+            region_ref: region_ref.map(str::to_string),
             truncated: payload.truncated,
             diagnostics: payload.diagnostics,
         })
@@ -3352,7 +4378,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
 
     fn capture_trusted_window_with_control(
         &self,
-        _app_id: &str,
+        app_id: &str,
         executable_path: &str,
         is_cancelled: &dyn Fn() -> bool,
         timeout: std::time::Duration,
@@ -3373,7 +4399,11 @@ impl DesktopAdapter for WindowsDesktopAdapter {
             is_cancelled,
             timeout.saturating_sub(started.elapsed()),
         )?;
-        let image = crate::window_capture::capture_with_control(
+        // Pixel-to-screen mapping is optional metadata, not a prerequisite for
+        // read-only observation. A missing mapping returns imageRef=null and
+        // cannot enter the independent visual-click confirmation path.
+        let bounds = image_click::window_bounds(&target).ok();
+        let mut image = crate::window_capture::capture_with_control(
             &target,
             is_cancelled,
             timeout.saturating_sub(started.elapsed()),
@@ -3381,8 +4411,68 @@ impl DesktopAdapter for WindowsDesktopAdapter {
         if is_cancelled() {
             return Err(crate::window_capture::error("SCAN_CANCELLED"));
         }
-        // No control lease is issued. Successful capture is only an observation.
+        // A reference identifies an observation, never input authority. The
+        // separate click requires a live image preview and one-use approval.
+        image.image_ref = match bounds {
+            Some(bounds) if image_click::window_bounds(&target).ok() == Some(bounds) => self
+                .image_refs
+                .issue(app_id, target, bounds, image.png_bytes())?,
+            _ => None,
+        };
         Ok(image)
+    }
+
+    fn preflight_image_click(
+        &self,
+        request: &DesktopImageClickRequest,
+        executable_path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<DesktopImageClickPreview, DesktopAdapterError> {
+        let _operation = self.begin_uia_operation()?;
+        let executable = Self::canonical_executable(executable_path)?;
+        let target = self
+            .image_refs
+            .resolve(request, &Self::process_comparison_path(&executable))?;
+        let image = image_click::recheck(&target, &|| false, timeout)?;
+        use base64::Engine;
+        Ok(DesktopImageClickPreview {
+            image: DesktopImageClickDisplay {
+                image_data_url: format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(image.png_bytes())
+                ),
+                width: target.width(),
+                height: target.height(),
+                x: request.x,
+                y: request.y,
+            },
+            target,
+        })
+    }
+
+    fn click_image_with_control(
+        &self,
+        request: &DesktopImageClickRequest,
+        executable_path: &str,
+        target: &DesktopImageClickTarget,
+        is_cancelled: &dyn Fn() -> bool,
+        timeout: std::time::Duration,
+    ) -> Result<DesktopActionResult, DesktopAdapterError> {
+        let _operation = self.begin_uia_operation()?;
+        let executable = Self::canonical_executable(executable_path)?;
+        let current = self
+            .image_refs
+            .resolve(request, &Self::process_comparison_path(&executable))?;
+        if !target.same_observation(&current) {
+            return Err(crate::window_capture::error("TARGET_CHANGED"));
+        }
+        self.invalidate_application_refs(&request.app_id, &executable)?;
+        image_click::click(target, is_cancelled, timeout)?;
+        Ok(DesktopActionResult {
+            adapter: self.name().into(), status: "dispatched".into(), target: request.app_id.clone(),
+            detail: "One approved left click was dispatched; observe fresh state to verify the business result".into(),
+            process_id: None, action: None, choice: None,
+        })
     }
 
     fn execute(&self, action: &DesktopAction) -> Result<DesktopActionResult, DesktopAdapterError> {
@@ -3407,6 +4497,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                     detail: "Trusted application launch was dispatched".into(),
                     process_id: Some(child.id()),
                     action: None,
+                    choice: None,
                 })
             }
             DesktopAction::OpenSettings { page, uri } => {
@@ -3424,6 +4515,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                     detail: "Windows Settings launch was dispatched".into(),
                     process_id: Some(child.id()),
                     action: None,
+                    choice: None,
                 })
             }
             DesktopAction::RevealPath { path, is_directory } => {
@@ -3453,6 +4545,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                     detail: "Windows File Explorer reveal was dispatched".into(),
                     process_id: Some(child.id()),
                     action: None,
+                    choice: None,
                 })
             }
             DesktopAction::PrepareDraft {
@@ -3490,11 +4583,13 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                 executable_path,
                 expected_target,
                 operation,
+                option,
                 ..
             } => self.operate_control(
                 app_id,
                 executable_path,
                 *operation,
+                option.as_deref(),
                 expected_target.as_ref(),
                 &|| false,
                 DRAFT_TIMEOUT,
@@ -3544,11 +4639,13 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                 executable_path,
                 expected_target,
                 operation,
+                option,
                 ..
             } => self.operate_control(
                 app_id,
                 executable_path,
                 *operation,
+                option.as_deref(),
                 expected_target.as_ref(),
                 is_cancelled,
                 timeout,
@@ -3589,6 +4686,7 @@ mod tests {
     #[cfg(windows)]
     fn run_fixture_commands(
         mut commands: Vec<std::process::Command>,
+        script: Option<&str>,
     ) -> Vec<crate::window_capture::BoundedChildOutput> {
         // Overlap slow PowerShell/CLR startup, keeping each fixture process-local.
         // The canonical runner serializes Rust tests, so batches do not overlap.
@@ -3599,13 +4697,20 @@ mod tests {
                     .iter_mut()
                     .map(|command| {
                         scope.spawn(move || {
+                            // Large synthetic providers must not hit Windows'
+                            // command-line limit. Reuse the bounded child's
+                            // stdin writer; no script file or user data is used.
+                            if script.is_some() {
+                                command.args(["-Mta", "-NoProfile", "-NonInteractive", "-Command",
+                                    "[Console]::InputEncoding = New-Object Text.UTF8Encoding($false); $ErrorActionPreference = 'Stop'; . ([scriptblock]::Create([Console]::In.ReadToEnd()))"]);
+                            }
                             command
-                                .stdin(std::process::Stdio::null())
+                                .stdin(if script.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
                                 .stdout(std::process::Stdio::piped())
                                 .stderr(std::process::Stdio::piped());
                             crate::window_capture::run_bounded_child(
                                 command,
-                                None,
+                                script.map(|value| value.as_bytes().to_vec()),
                                 8192,
                                 &|| false,
                                 FIXTURE_TIMEOUT,
@@ -3623,16 +4728,98 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn capture_window_selector_enumerates_hwnds_without_changing_control_observation() {
+    fn window_selection_uses_exact_hwnd_ownership_without_main_window_heuristics() {
         assert!(CAPTURE_WINDOW_SCRIPT.contains("EnumWindows("));
         assert!(CAPTURE_WINDOW_SCRIPT.contains("IsWindowVisible(hwnd)"));
         assert!(CAPTURE_WINDOW_SCRIPT.contains("GetWindow(hwnd, 4) == IntPtr.Zero"));
         assert!(CAPTURE_WINDOW_SCRIPT.contains("GetWindowThreadProcessId"));
         assert!(!CAPTURE_WINDOW_SCRIPT.contains("MainWindowHandle"));
         assert!(!CAPTURE_WINDOW_SCRIPT.contains("MainWindowTitle"));
-        assert!(TRUSTED_WINDOW_SCRIPT.contains("MainWindowHandle"));
+        assert!(TRUSTED_WINDOW_SCRIPT.contains("EligibleControlWindows"));
+        for script in [
+            UIA_SAFETY_HELPERS_SCRIPT,
+            TRUSTED_WINDOW_SCRIPT,
+            TEXT_TARGET_SCRIPT,
+            CONTROL_TARGET_SCRIPT,
+            VERIFIED_SET_VALUE_SCRIPT,
+        ] {
+            assert!(!script.contains("MainWindowHandle"));
+        }
         assert!(CAPTURE_WINDOW_SELECTION_SCRIPT.contains("$matches.Count -ne 1"));
         assert!(!CAPTURE_WINDOW_SELECTION_SCRIPT.contains("Select-Object -First"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dense_region_projection_preserves_static_text_and_action_reference_budget() {
+        let control = |value| serde_json::from_value::<DesktopObservedControl>(value).unwrap();
+        let mut controls = vec![
+            control(
+                serde_json::json!({"depth":1,"role":"text","name":"Fixture region A","enabled":true,"capabilities":[]}),
+            ),
+            control(
+                serde_json::json!({"depth":2,"role":"edit","automationId":"regionField","enabled":true,"capabilities":["setValue"]}),
+            ),
+            control(
+                serde_json::json!({"depth":2,"role":"checkBox","name":"Region checkbox","automationId":"regionCheckbox","enabled":true,"capabilities":["toggle"],"state":{"toggle":"off"}}),
+            ),
+            control(
+                serde_json::json!({"depth":3,"role":"text","name":"Region checkbox","enabled":true,"capabilities":[]}),
+            ),
+        ];
+        for index in 1..=10 {
+            controls.push(control(serde_json::json!({"depth":2,"role":"button","name":format!("Region button {index}"),"automationId":format!("regionButton{}",index-1),"enabled":true,"capabilities":["invoke"]})));
+            controls.push(control(serde_json::json!({"depth":3,"role":"text","name":format!("Action {index}"),"enabled":true,"capabilities":[]})));
+        }
+        let original = controls.clone();
+        let mut payload = ObservationPayload {
+            controls,
+            regions: vec![],
+            truncated: false,
+            diagnostics: vec![],
+        };
+        let region_ref = format!("region_{}", "0".repeat(32));
+        fit_observation_projection("draft-app", Some(&region_ref), &mut payload).unwrap();
+        assert!(
+            !payload.truncated,
+            "a real dense region lost action references: {:?}",
+            payload.diagnostics
+        );
+        assert_eq!(
+            payload.controls, original,
+            "formatting must not discard captions or controls"
+        );
+        for control in &mut payload.controls {
+            if control.role == "edit" {
+                control.field_ref = Some(format!("field_{}", "0".repeat(32)));
+            } else if !supported_control_operations(control).is_empty() {
+                control.control_ref = Some(format!("control_{}", "0".repeat(32)));
+            }
+        }
+        let public = DesktopWindowObservation {
+            app_id: "draft-app".into(),
+            controls: payload.controls,
+            regions: vec![],
+            region_ref: Some(region_ref),
+            truncated: false,
+            diagnostics: payload.diagnostics,
+        };
+        assert_eq!(
+            public
+                .controls
+                .iter()
+                .filter(|control| control.role == "text")
+                .count(),
+            12
+        );
+        let bytes = serde_json::to_vec(&public).unwrap();
+        assert!(bytes.len() <= MAX_OBSERVATION_BYTES);
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"capabilities\":[]"));
+        let restored: DesktopWindowObservation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            restored.controls, public.controls,
+            "compact metadata must round-trip without data loss"
+        );
     }
 
     #[cfg(windows)]
@@ -3652,13 +4839,29 @@ function Test-Selection($candidates) {
     return [long]$selected.windowHandle
   } catch { return $_.Exception.Message.Split('|')[0] }
 }
+$normalRoot = [AngelBotControlWindowCandidate]::new(100, 42, 0, $true)
+$auxiliary = [AngelBotControlWindowCandidate]::new(200, 42, 0x08000080, $true)
+$secondRoot = [AngelBotControlWindowCandidate]::new(300, 42, 0, $true)
+$otherInstanceAux = [AngelBotControlWindowCandidate]::new(400, 99, 0x08000080, $true)
+$interactiveTool = [AngelBotControlWindowCandidate]::new(500, 42, 0x00000080, $true)
+$explicitApp = [AngelBotControlWindowCandidate]::new(600, 42, 0x08040080, $true)
+$unknownStyle = [AngelBotControlWindowCandidate]::new(700, 42, 0, $false)
 @{
   sameProcess = Test-Selection @($first, $second, $other)
   unique = Test-Selection @($first, $other, $hidden, $owned)
   otherOnly = Test-Selection @($other, $hidden, $owned)
+  rootWithAux = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $auxiliary)))
+  reverseOrder = @([AngelBotCaptureWindows]::SelectControlRoots(@($auxiliary, $normalRoot)))
+  twoRoots = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $auxiliary, $secondRoot)))
+  otherInstance = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $otherInstanceAux)))
+  interactiveTool = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $interactiveTool)))
+  explicitApp = @([AngelBotCaptureWindows]::SelectControlRoots(@($normalRoot, $explicitApp)))
+  unknownStyle = @([AngelBotCaptureWindows]::SelectControlRoots(@($unknownStyle, $auxiliary)))
+  auxOnly = @([AngelBotCaptureWindows]::SelectControlRoots(@($auxiliary, $otherInstanceAux)))
 } | ConvertTo-Json -Compress
 "#;
-        let script = format!("{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{fixture}");
+        let identity = include_str!("desktop_control/window_identity.ps1");
+        let script = format!("{identity}\n{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{fixture}");
         let mut command =
             desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
         command
@@ -3680,6 +4883,14 @@ function Test-Selection($candidates) {
         assert_eq!(result["sameProcess"], "TARGET_AMBIGUOUS");
         assert_eq!(result["unique"], 100);
         assert_eq!(result["otherOnly"], "TARGET_NOT_FOUND");
+        assert_eq!(result["rootWithAux"], serde_json::json!([100]));
+        assert_eq!(result["reverseOrder"], serde_json::json!([100]));
+        assert_eq!(result["twoRoots"], serde_json::json!([100, 300]));
+        assert_eq!(result["otherInstance"], serde_json::json!([100, 400]));
+        assert_eq!(result["interactiveTool"], serde_json::json!([100, 500]));
+        assert_eq!(result["explicitApp"], serde_json::json!([100, 600]));
+        assert_eq!(result["unknownStyle"], serde_json::json!([700, 200]));
+        assert_eq!(result["auxOnly"], serde_json::json!([200, 400]));
     }
 
     #[test]
@@ -3693,8 +4904,114 @@ function Test-Selection($candidates) {
         assert_eq!(payload.controls[1].depth, 2);
         assert_eq!(payload.controls[0].name.as_deref(), Some("Send"));
         assert_eq!(payload.controls[1].name, None);
+        assert!(payload.controls[1].state.is_none());
         assert!(payload.truncated);
+        let text = parse_observation_payload(
+            br#"{"controls":[{"depth":1,"role":"text","name":"141","enabled":true,"capabilities":[]}],"truncated":false}"#,
+        )
+        .unwrap();
+        assert_eq!(text.controls[0].name.as_deref(), Some("141"));
+        #[cfg(windows)]
+        assert!(supported_control_operations(&text.controls[0]).is_empty());
+        for (role, capability, states) in [
+            (
+                "checkBox",
+                "toggle",
+                vec![
+                    serde_json::json!({"toggle":"off"}),
+                    serde_json::json!({"toggle":"on"}),
+                    serde_json::json!({"toggle":"indeterminate"}),
+                ],
+            ),
+            (
+                "radioButton",
+                "select",
+                vec![
+                    serde_json::json!({"selected":false}),
+                    serde_json::json!({"selected":true}),
+                ],
+            ),
+            (
+                "tabItem",
+                "select",
+                vec![serde_json::json!({"selected":true})],
+            ),
+            (
+                "listItem",
+                "select",
+                vec![
+                    serde_json::json!({"selected":false}),
+                    serde_json::json!({"selected":false,"selectionContainerRole":"list"}),
+                    serde_json::json!({"selected":true,"selectionContainerRole":"comboBox"}),
+                ],
+            ),
+            (
+                "menuItem",
+                "expandCollapse",
+                vec![
+                    serde_json::json!({"expansion":"expanded"}),
+                    serde_json::json!({"expansion":"collapsed"}),
+                    serde_json::json!({"expansion":"partiallyExpanded"}),
+                    serde_json::json!({"expansion":"leafNode"}),
+                ],
+            ),
+            (
+                "comboBox",
+                "expandCollapse",
+                vec![serde_json::json!({"expansion":"collapsed"})],
+            ),
+            (
+                "pane",
+                "scroll",
+                vec![
+                    serde_json::json!({"verticalScrollPercent":0.0}),
+                    serde_json::json!({"verticalScrollPercent":50.125}),
+                    serde_json::json!({"verticalScrollPercent":100.0}),
+                ],
+            ),
+        ] {
+            for state in states {
+                let raw = serde_json::json!({"controls":[{"depth":1,"role":role,"enabled":true,"capabilities":[capability],"state":state}],"truncated":false});
+                let parsed = parse_observation_payload(raw.to_string().as_bytes()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(parsed).unwrap()["controls"][0]["state"],
+                    state
+                );
+            }
+        }
+        let state_base = serde_json::json!({"controls":[{"depth":1,"role":"checkBox","enabled":true,"capabilities":["toggle"]}],"truncated":false});
+        for state in [
+            serde_json::json!({}),
+            serde_json::json!({"toggle":"unknown"}),
+            serde_json::json!({"toggle":true}),
+            serde_json::json!({"toggle":"On"}),
+            serde_json::json!({"selected":false}),
+            serde_json::json!({"expansion":"expanded"}),
+            serde_json::json!({"verticalScrollPercent":0}),
+            serde_json::json!({"value":"private"}),
+            serde_json::json!({"toggle":"on","selected":true}),
+            serde_json::json!({"toggle":"off","selectionContainerRole":"list"}),
+        ] {
+            let mut invalid = state_base.clone();
+            invalid["controls"][0]["state"] = state;
+            assert!(parse_observation_payload(invalid.to_string().as_bytes()).is_err());
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(100.1),
+            serde_json::json!("50"),
+            serde_json::json!(true),
+        ] {
+            let raw = serde_json::json!({"controls":[{"depth":1,"role":"pane","enabled":true,"capabilities":["scroll"],"state":{"verticalScrollPercent":value}}],"truncated":false});
+            assert!(parse_observation_payload(raw.to_string().as_bytes()).is_err());
+        }
+        let mut disabled = state_base.clone();
+        disabled["controls"][0]["enabled"] = serde_json::json!(false);
+        disabled["controls"][0]["capabilities"] = serde_json::json!([]);
+        disabled["controls"][0]["state"] = serde_json::json!({"toggle":"off"});
+        assert!(parse_observation_payload(disabled.to_string().as_bytes()).is_err());
         for raw in [
+            br#"{"controls":[{"depth":1,"role":"text","name":"141","enabled":true,"capabilities":["invoke"]}],"truncated":false}"#.as_slice(),
             br#"{"controls":[{"depth":1,"role":"edit","name":"private text","enabled":true,"capabilities":[]}],"truncated":false}"#.as_slice(),
             br#"{"controls":[{"depth":1,"role":"button","value":"private text","enabled":true,"capabilities":[]}],"truncated":false}"#.as_slice(),
             br#"{"controls":[{"depth":1,"role":"button","isPassword":true,"enabled":true,"capabilities":[]}],"truncated":false}"#.as_slice(),
@@ -3727,6 +5044,25 @@ function Test-Selection($candidates) {
                 .code,
             "SCAN_LIMIT"
         );
+        let regions = serde_json::json!({"controls": [], "truncated": false,
+            "regions": [{"role":"group","name":"Section"}]});
+        let parsed = parse_observation_payload(regions.to_string().as_bytes()).unwrap();
+        assert_eq!(parsed.regions[0].name, "Section");
+        let unnamed = serde_json::json!({"controls": [], "truncated": false,
+            "regions": [{"role":"pane","name":""}]});
+        assert!(parse_observation_payload(unnamed.to_string().as_bytes()).is_ok());
+        for invalid_regions in [
+            serde_json::json!([{"role":"button","name":"Section"}]),
+            serde_json::json!([{"role":"group","name":" "}]),
+            serde_json::json!([{"role":"group","name":"Section","regionRef":"injected"}]),
+            serde_json::json!((0..=MAX_OBSERVED_REGIONS)
+                .map(|_| serde_json::json!({"role":"group","name":"Section"}))
+                .collect::<Vec<_>>()),
+        ] {
+            let mut invalid = regions.clone();
+            invalid["regions"] = invalid_regions;
+            assert!(parse_observation_payload(invalid.to_string().as_bytes()).is_err());
+        }
     }
 
     #[test]
@@ -3784,7 +5120,7 @@ function Test-Selection($candidates) {
             .observe_trusted_window("trusted-chat", r"C:\trusted\chat.exe")
             .unwrap();
         assert_eq!(snapshot.app_id, "trusted-chat");
-        assert_eq!(snapshot.controls.len(), 5);
+        assert_eq!(snapshot.controls.len(), 7);
         assert_eq!(
             snapshot.controls[0].field_ref.as_deref(),
             Some("mock-field-ref")
@@ -3796,6 +5132,19 @@ function Test-Selection($candidates) {
             Some("mock-control-ref")
         );
         assert_eq!(snapshot.controls[1].field_ref, None);
+        assert_eq!(snapshot.controls[5].role, "checkBox");
+        assert_eq!(snapshot.controls[5].name.as_deref(), Some("Test checkbox"));
+        assert_eq!(snapshot.controls[5].capabilities, vec!["toggle"]);
+        assert_eq!(snapshot.controls[6].role, "comboBox");
+        assert_eq!(snapshot.controls[6].capabilities, vec!["selectOption"]);
+        assert_eq!(
+            snapshot.controls[6].control_ref.as_deref(),
+            Some("mock-choice-ref")
+        );
+        assert_eq!(
+            snapshot.controls[5].control_ref.as_deref(),
+            Some("mock-toggle-ref")
+        );
         assert!(!snapshot.truncated);
         assert!(snapshot.diagnostics.is_empty());
         let public = serde_json::to_string(&snapshot).unwrap();
@@ -3803,6 +5152,37 @@ function Test-Selection($candidates) {
         assert!(!public.contains("processId"));
         assert!(!public.contains("runtimeId"));
         assert!(adapter.actions().is_empty());
+        assert_eq!(
+            snapshot.regions[0].region_ref.as_deref(),
+            Some("mock-region-ref")
+        );
+        let scoped = adapter
+            .observe_trusted_window_with_control(
+                "trusted-chat",
+                r"C:\trusted\chat.exe",
+                Some("mock-region-ref"),
+                false,
+                &|| false,
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(scoped.region_ref.as_deref(), Some("mock-region-ref"));
+        assert_eq!(scoped.controls.len(), 3);
+        assert!(scoped.regions.is_empty());
+        assert_eq!(
+            adapter
+                .observe_trusted_window_with_control(
+                    "trusted-chat",
+                    r"C:\trusted\chat.exe",
+                    Some("unknown"),
+                    false,
+                    &|| false,
+                    std::time::Duration::from_secs(1)
+                )
+                .unwrap_err()
+                .code,
+            "TARGET_CHANGED"
+        );
     }
 
     #[test]
@@ -3831,7 +5211,10 @@ function Test-Selection($candidates) {
             .unwrap();
         assert_eq!(preview.app_id, "chat");
         assert_eq!(preview.control_label, "mockField");
-        assert_eq!(preview.identity.automation_id.as_deref(), Some("mockField"));
+        assert_eq!(
+            preview.identity.automation_id.as_deref(),
+            Some("mock-field-ref")
+        );
         let mut action = DesktopAction::SetText {
             app_id: "chat".into(),
             display_name: "Chat".into(),
@@ -3911,6 +5294,7 @@ function Test-Selection($candidates) {
             display_name: "Application".into(),
             executable_path: "app.exe".into(),
             operation: DesktopControlOperation::Invoke,
+            option: None,
             expected_target: None,
         };
         assert_eq!(adapter.execute(&action).unwrap_err().code, "TARGET_CHANGED");
@@ -3959,7 +5343,7 @@ function Test-Selection($candidates) {
 
     #[cfg(windows)]
     #[test]
-    fn invoke_refs_bind_exact_observed_role_name_and_single_use_identity() {
+    fn control_refs_bind_exact_observed_role_name_and_single_use_identity() {
         let raw = serde_json::json!({
             "controls": [
                 {"depth":1,"role":"button","name":"Apply","enabled":true,"capabilities":["invoke"]},
@@ -3971,29 +5355,41 @@ function Test-Selection($candidates) {
                 {"depth":1,"role":"checkBox","name":"Other role","enabled":true,"capabilities":["toggle"]},
             ],
             "truncated": false,
-            "targets": (0..3).map(|index| serde_json::json!({"index":index,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[index as i32 + 1]}})).collect::<Vec<_>>()
+            "targets": ([0, 1, 2, 6]).into_iter().map(|index| serde_json::json!({"index":index,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[index + 1]}})).collect::<Vec<_>>()
         });
-        let (mut payload, targets) =
+        let (mut payload, targets, _) =
             parse_private_observation_payload(raw.to_string().as_bytes()).unwrap();
         let adapter = WindowsDesktopAdapter::default();
         let exe = std::path::Path::new(r"C:\trusted\app.exe");
         adapter
-            .issue_field_refs("app", exe, false, &mut payload.controls, targets.clone())
+            .issue_field_refs(
+                "app",
+                exe,
+                false,
+                &mut payload.controls,
+                targets.clone(),
+                None,
+            )
             .unwrap();
         adapter
-            .issue_control_refs("app", exe, false, &mut payload.controls, &targets)
+            .issue_control_refs("app", exe, false, &mut payload.controls, &targets, None)
             .unwrap();
         assert!(payload
             .controls
             .iter()
             .all(|control| control.field_ref.is_none()));
-        for (index, expected_role) in ["button", "hyperlink", "menuItem"].iter().enumerate() {
+        for (index, expected_role, operation) in [
+            (0, "button", DesktopControlOperation::Invoke),
+            (1, "hyperlink", DesktopControlOperation::Invoke),
+            (2, "menuItem", DesktopControlOperation::Invoke),
+            (6, "checkBox", DesktopControlOperation::Check),
+        ] {
             let reference = payload.controls[index].control_ref.as_deref().unwrap();
             assert_eq!(reference.len(), 40);
             let lease = adapter
                 .resolve_control_ref("app", exe, reference, None)
                 .unwrap();
-            assert_eq!(&lease.role, expected_role);
+            assert_eq!(lease.role, expected_role);
             assert_eq!(
                 Some(&lease.control_label),
                 payload.controls[index].name.as_ref()
@@ -4014,7 +5410,7 @@ function Test-Selection($candidates) {
                 "TARGET_CHANGED"
             );
             let mut changed = lease.identity.clone();
-            changed.control_operation = Some(DesktopControlOperation::Invoke);
+            changed.control_operation = Some(operation);
             changed.window_handle += 1;
             assert_eq!(
                 adapter
@@ -4024,7 +5420,7 @@ function Test-Selection($candidates) {
                 "TARGET_CHANGED"
             );
             let attested = DesktopDraftTargetIdentity {
-                control_operation: Some(DesktopControlOperation::Invoke),
+                control_operation: Some(operation),
                 ..lease.identity
             };
             adapter
@@ -4038,14 +5434,16 @@ function Test-Selection($candidates) {
                 "TARGET_CHANGED"
             );
         }
-        assert!(payload.controls[3..]
+        assert!(payload.controls[3..6]
             .iter()
             .all(|control| control.control_ref.is_none()));
         for index in 0..7 {
             let mut invalid = raw.clone();
             invalid["targets"] = serde_json::json!([{"index":index,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}}]);
-            if index >= 3 {
+            if (3..6).contains(&index) {
                 assert!(parse_private_observation_payload(invalid.to_string().as_bytes()).is_err());
+            } else {
+                assert!(parse_private_observation_payload(invalid.to_string().as_bytes()).is_ok());
             }
         }
     }
@@ -4063,7 +5461,7 @@ function Test-Selection($candidates) {
             "providerUnavailable",
         ] {
             let raw = serde_json::json!({"controls":[{"depth":1,"role":"button","name":"Apply","enabled":true,"capabilities":["invoke"]}],"truncated":true,"diagnostics":[reason],"targets":[{"index":0,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}}]});
-            let (mut payload, targets) =
+            let (mut payload, targets, _) =
                 parse_private_observation_payload(raw.to_string().as_bytes()).unwrap();
             adapter
                 .issue_control_refs(
@@ -4072,15 +5470,16 @@ function Test-Selection($candidates) {
                     payload.truncated,
                     &mut payload.controls,
                     &targets,
+                    None,
                 )
                 .unwrap();
             assert!(payload.controls[0].control_ref.is_none(), "{reason}");
         }
         assert!(adapter.control_refs.lock().unwrap().is_empty());
         let raw = br#"{"controls":[{"depth":1,"role":"button","name":"Apply","enabled":true,"capabilities":["invoke"]},{"depth":1,"role":"menuItem","name":"Apply","enabled":true,"capabilities":["invoke"]}],"truncated":false,"targets":[{"index":0,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}},{"index":1,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}}]}"#;
-        let (mut payload, mut targets) = parse_private_observation_payload(raw).unwrap();
+        let (mut payload, mut targets, _) = parse_private_observation_payload(raw).unwrap();
         adapter
-            .issue_control_refs("app", exe, false, &mut payload.controls, &targets)
+            .issue_control_refs("app", exe, false, &mut payload.controls, &targets, None)
             .unwrap();
         assert!(payload
             .controls
@@ -4088,7 +5487,7 @@ function Test-Selection($candidates) {
             .all(|control| control.control_ref.is_none()));
         targets.pop();
         adapter
-            .issue_control_refs("app", exe, false, &mut payload.controls, &targets)
+            .issue_control_refs("app", exe, false, &mut payload.controls, &targets, None)
             .unwrap();
         let reference = payload.controls[0].control_ref.clone().unwrap();
         adapter
@@ -4114,12 +5513,19 @@ function Test-Selection($candidates) {
         let adapter = Arc::new(WindowsDesktopAdapter::default());
         let exe = std::path::Path::new("fixture.exe");
         let raw = br#"{"controls":[{"depth":1,"role":"edit","automationId":"field","enabled":true,"capabilities":["setValue"]},{"depth":1,"role":"menuItem","name":"Menu","enabled":true,"capabilities":["invoke","expandCollapse"]}],"truncated":false,"targets":[{"index":0,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}},{"index":1,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[2]}}]}"#;
-        let (mut payload, targets) = parse_private_observation_payload(raw).unwrap();
+        let (mut payload, targets, _) = parse_private_observation_payload(raw).unwrap();
         adapter
-            .issue_field_refs("app", exe, false, &mut payload.controls, targets.clone())
+            .issue_field_refs(
+                "app",
+                exe,
+                false,
+                &mut payload.controls,
+                targets.clone(),
+                None,
+            )
             .unwrap();
         adapter
-            .issue_control_refs("app", exe, false, &mut payload.controls, &targets)
+            .issue_control_refs("app", exe, false, &mut payload.controls, &targets, None)
             .unwrap();
         let field_ref = payload.controls[0].field_ref.clone().unwrap();
         let control_ref = payload.controls[1].control_ref.clone().unwrap();
@@ -4157,7 +5563,14 @@ function Test-Selection($candidates) {
         );
         busy(
             adapter
-                .observe_trusted_window_with_control("app", "fixture.exe", &|| false, timeout)
+                .observe_trusted_window_with_control(
+                    "app",
+                    "fixture.exe",
+                    None,
+                    false,
+                    &|| false,
+                    timeout,
+                )
                 .unwrap_err(),
         );
         busy(
@@ -4210,6 +5623,7 @@ function Test-Selection($candidates) {
                 display_name: "App".into(),
                 executable_path: "fixture.exe".into(),
                 operation: DesktopControlOperation::Invoke,
+                option: None,
                 expected_target: Some(DesktopDraftTargetIdentity {
                     control_operation: Some(DesktopControlOperation::Invoke),
                     ..control_lease.identity.clone()
@@ -4282,6 +5696,16 @@ function Test-Selection($candidates) {
                 vec![DesktopControlOperation::Select],
             ),
             (
+                "checkBox",
+                vec!["toggle"],
+                vec![
+                    DesktopControlOperation::Check,
+                    DesktopControlOperation::Uncheck,
+                ],
+            ),
+            ("checkBox", vec![], vec![]),
+            ("menuItem", vec!["toggle"], vec![]),
+            (
                 "menuItem",
                 vec!["invoke", "expandCollapse"],
                 vec![
@@ -4290,8 +5714,28 @@ function Test-Selection($candidates) {
                     DesktopControlOperation::Collapse,
                 ],
             ),
-            ("listItem", vec!["select"], vec![]),
-            ("comboBox", vec!["expandCollapse"], vec![]),
+            (
+                "listItem",
+                vec!["select"],
+                vec![DesktopControlOperation::Select],
+            ),
+            (
+                "comboBox",
+                vec!["expandCollapse"],
+                vec![
+                    DesktopControlOperation::Expand,
+                    DesktopControlOperation::Collapse,
+                ],
+            ),
+            (
+                "comboBox",
+                vec!["expandCollapse", "selectOption"],
+                vec![
+                    DesktopControlOperation::Choose,
+                    DesktopControlOperation::Expand,
+                    DesktopControlOperation::Collapse,
+                ],
+            ),
             (
                 "pane",
                 vec!["scroll"],
@@ -4325,20 +5769,44 @@ function Test-Selection($candidates) {
                 automation_id: None,
                 enabled: true,
                 capabilities: capabilities.into_iter().map(str::to_string).collect(),
+                state: None,
                 field_ref: None,
                 control_ref: None,
             };
             assert_eq!(supported_control_operations(&control), expected, "{role}");
+            for unavailable in [
+                DesktopObservedControl {
+                    enabled: false,
+                    ..control.clone()
+                },
+                DesktopObservedControl {
+                    name: None,
+                    ..control.clone()
+                },
+                DesktopObservedControl {
+                    name: Some(" ".into()),
+                    ..control.clone()
+                },
+            ] {
+                assert!(supported_control_operations(&unavailable).is_empty());
+            }
         }
         let raw = br#"{"controls":[{"depth":1,"role":"edit","automationId":"field","enabled":true,"capabilities":["setValue"]},{"depth":1,"role":"menuItem","name":"Menu","enabled":true,"capabilities":["invoke","expandCollapse"]}],"truncated":false,"targets":[{"index":0,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}},{"index":1,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[2]}}]}"#;
-        let (mut payload, targets) = parse_private_observation_payload(raw).unwrap();
+        let (mut payload, targets, _) = parse_private_observation_payload(raw).unwrap();
         let adapter = WindowsDesktopAdapter::default();
         let exe = std::path::Path::new("fixture.exe");
         adapter
-            .issue_field_refs("app", exe, false, &mut payload.controls, targets.clone())
+            .issue_field_refs(
+                "app",
+                exe,
+                false,
+                &mut payload.controls,
+                targets.clone(),
+                None,
+            )
             .unwrap();
         adapter
-            .issue_control_refs("app", exe, false, &mut payload.controls, &targets)
+            .issue_control_refs("app", exe, false, &mut payload.controls, &targets, None)
             .unwrap();
         let field_ref = payload.controls[0].field_ref.clone().unwrap();
         let control_ref = payload.controls[1].control_ref.clone().unwrap();
@@ -4385,6 +5853,175 @@ function Test-Selection($candidates) {
         let mut invalid: serde_json::Value = serde_json::from_slice(raw).unwrap();
         invalid["targets"][1]["identity"]["controlOperation"] = serde_json::json!("invoke");
         assert!(parse_private_observation_payload(invalid.to_string().as_bytes()).is_err());
+
+        let scope = RegionScope {
+            identity: DesktopDraftTargetIdentity {
+                process_id: 42,
+                window_handle: 1234,
+                control_runtime_id: vec![9],
+                automation_id: None,
+                control_operation: None,
+            },
+            role: "group".into(),
+            name: "Region".into(),
+            path: vec![2],
+        };
+        let mut scoped_raw: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        scoped_raw["regions"] = serde_json::json!([{"role":"group","name":"Region"}]);
+        scoped_raw["region_targets"] = serde_json::json!([{"index":0,"scope":scope}]);
+        let (mut scoped, targets, region_targets) =
+            parse_private_observation_payload(scoped_raw.to_string().as_bytes()).unwrap();
+        adapter
+            .issue_region_refs("app", exe, &mut scoped.regions, &region_targets)
+            .unwrap();
+        let region_ref = scoped.regions[0].region_ref.clone().unwrap();
+        assert_eq!(
+            adapter.resolve_region_ref("app", exe, &region_ref).unwrap(),
+            scope
+        );
+        assert_eq!(
+            adapter
+                .resolve_region_ref("other", exe, &region_ref)
+                .unwrap_err()
+                .code,
+            "TARGET_CHANGED"
+        );
+        assert_eq!(
+            adapter
+                .resolve_region_ref("app", std::path::Path::new("other.exe"), &region_ref)
+                .unwrap_err()
+                .code,
+            "TARGET_CHANGED"
+        );
+        adapter
+            .issue_field_refs(
+                "app",
+                exe,
+                false,
+                &mut scoped.controls,
+                targets.clone(),
+                Some(&scope),
+            )
+            .unwrap();
+        adapter
+            .issue_control_refs(
+                "app",
+                exe,
+                false,
+                &mut scoped.controls,
+                &targets,
+                Some(&scope),
+            )
+            .unwrap();
+        let field_ref = scoped.controls[0].field_ref.clone().unwrap();
+        let control_ref = scoped.controls[1].control_ref.clone().unwrap();
+        let field = adapter.resolve_field_ref("app", exe, &field_ref).unwrap();
+        assert_eq!(field.scope.as_ref(), Some(&scope));
+        assert_eq!(
+            adapter
+                .resolve_control_ref("app", exe, &control_ref, None)
+                .unwrap()
+                .scope
+                .as_ref(),
+            Some(&scope)
+        );
+        let preview_raw =
+            serde_json::json!({"windowTitle":"Fixture", "controlLabel":field.control_label});
+        let preview = parse_text_target_payload(
+            "app",
+            &field_ref,
+            &field,
+            preview_raw.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            preview.control_label,
+            format!("Region / {}", field.control_label)
+        );
+        assert_eq!(
+            preview.identity.automation_id.as_deref(),
+            Some(field_ref.as_str())
+        );
+        adapter
+            .region_refs
+            .lock()
+            .unwrap()
+            .get_mut(&region_ref)
+            .unwrap()
+            .expires_at = std::time::Instant::now();
+        assert_eq!(
+            adapter
+                .resolve_region_ref("app", exe, &region_ref)
+                .unwrap_err()
+                .code,
+            "TARGET_CHANGED"
+        );
+        assert_eq!(
+            adapter
+                .resolve_field_ref("app", exe, &field_ref)
+                .unwrap()
+                .scope
+                .as_ref(),
+            Some(&scope),
+            "action leases own their scope, not a live region lookup"
+        );
+        adapter.invalidate_application_refs("app", exe).unwrap();
+        assert!(adapter.region_refs.lock().unwrap().is_empty());
+        assert!(adapter.resolve_field_ref("app", exe, &field_ref).is_err());
+        assert!(adapter
+            .resolve_control_ref("app", exe, &control_ref, None)
+            .is_err());
+        for path in [vec![], vec![0; 13], vec![256]] {
+            let mut invalid = scoped_raw.clone();
+            invalid["region_targets"][0]["scope"]["path"] = serde_json::json!(path);
+            assert!(parse_private_observation_payload(invalid.to_string().as_bytes()).is_err());
+        }
+        let mut budget = ObservationPayload {
+            controls: vec![scoped.controls[0].clone(); 32],
+            regions: (0..MAX_OBSERVED_REGIONS)
+                .map(|_| DesktopObservedRegion {
+                    role: "group".into(),
+                    name: "区".repeat(80),
+                    region_ref: None,
+                })
+                .collect(),
+            truncated: false,
+            diagnostics: vec![],
+        };
+        for control in &mut budget.controls {
+            control.field_ref = None;
+            control.control_ref = None;
+        }
+        fit_observation_projection(
+            "app",
+            Some("region_00000000000000000000000000000000"),
+            &mut budget,
+        )
+        .unwrap();
+        assert!(budget.truncated);
+        assert!(budget
+            .diagnostics
+            .contains(&DesktopObservationDiagnostic::OutputLimit));
+        assert_eq!(
+            budget.regions.len(),
+            MAX_OBSERVED_REGIONS,
+            "readonly region hints survive control output exhaustion"
+        );
+        assert!(budget
+            .controls
+            .iter()
+            .all(|control| control.field_ref.is_none() && control.control_ref.is_none()));
+        let public = serde_json::to_value(DesktopWindowObservation {
+            app_id: "app".into(),
+            controls: budget.controls,
+            regions: budget.regions,
+            region_ref: Some("region_00000000000000000000000000000000".into()),
+            truncated: budget.truncated,
+            diagnostics: budget.diagnostics,
+        })
+        .unwrap();
+        assert!(serde_json::to_vec(&public).unwrap().len() <= MAX_OBSERVATION_BYTES);
+        assert!(!public.to_string().contains("processId"));
     }
 
     #[test]
@@ -4393,6 +6030,8 @@ function Test-Selection($candidates) {
         let timeout = std::time::Duration::from_secs(1);
         for (operation, reference) in [
             (DesktopControlOperation::Select, "mock-select-ref"),
+            (DesktopControlOperation::Check, "mock-toggle-ref"),
+            (DesktopControlOperation::Uncheck, "mock-toggle-ref"),
             (DesktopControlOperation::Expand, "mock-expand-ref"),
             (DesktopControlOperation::Collapse, "mock-expand-ref"),
             (DesktopControlOperation::ScrollUp, "mock-scroll-ref"),
@@ -4404,16 +6043,18 @@ function Test-Selection($candidates) {
                 .preflight_control_ref("app", "app.exe", reference, operation, timeout)
                 .unwrap();
             assert_eq!(preview.identity.control_operation, Some(operation));
-            let wrong_operation = if operation == DesktopControlOperation::Expand {
-                DesktopControlOperation::Collapse
-            } else {
-                DesktopControlOperation::Expand
+            let wrong_operation = match operation {
+                DesktopControlOperation::Expand => DesktopControlOperation::Collapse,
+                DesktopControlOperation::Check => DesktopControlOperation::Uncheck,
+                DesktopControlOperation::Uncheck => DesktopControlOperation::Check,
+                _ => DesktopControlOperation::Expand,
             };
             let mut action = DesktopAction::OperateControl {
                 app_id: "app".into(),
                 display_name: "App".into(),
                 executable_path: "app.exe".into(),
                 operation: wrong_operation,
+                option: None,
                 expected_target: Some(preview.identity),
             };
             assert!(matches!(
@@ -4443,6 +6084,46 @@ function Test-Selection($candidates) {
                     .unwrap_err()
                     .code,
                 "TARGET_CHANGED"
+            );
+            let observation = adapter.observe_trusted_window("app", "app.exe").unwrap();
+            let state = observation
+                .controls
+                .iter()
+                .find(|control| control.control_ref.as_deref() == Some(reference))
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap();
+            match operation {
+                DesktopControlOperation::Select => assert_eq!(state.selected, Some(true)),
+                DesktopControlOperation::Check => {
+                    assert_eq!(state.toggle, Some(DesktopToggleState::On))
+                }
+                DesktopControlOperation::Uncheck => {
+                    assert_eq!(state.toggle, Some(DesktopToggleState::Off))
+                }
+                DesktopControlOperation::Expand => {
+                    assert_eq!(state.expansion, Some(DesktopExpansionState::Expanded))
+                }
+                DesktopControlOperation::Collapse => {
+                    assert_eq!(state.expansion, Some(DesktopExpansionState::Collapsed))
+                }
+                DesktopControlOperation::ScrollUp => {
+                    assert_eq!(state.vertical_scroll_percent, Some(40.0))
+                }
+                DesktopControlOperation::ScrollDown => {
+                    assert_eq!(state.vertical_scroll_percent, Some(50.0))
+                }
+                DesktopControlOperation::Invoke | DesktopControlOperation::Choose => unreachable!(),
+            }
+            let other = adapter.observe_trusted_window("other", "app.exe").unwrap();
+            assert_eq!(
+                other.controls[5].state.as_ref().unwrap().toggle,
+                Some(DesktopToggleState::Off)
+            );
+            assert_eq!(
+                other.controls[2].state.as_ref().unwrap().selected,
+                Some(false)
             );
         }
         assert!(serde_json::from_str::<DesktopControlOperation>("\"toggle\"").is_err());
@@ -4497,6 +6178,8 @@ function Test-Selection($candidates) {
         assert!(result.1.contains("not verified"));
         for operation in [
             DesktopControlOperation::Select,
+            DesktopControlOperation::Check,
+            DesktopControlOperation::Uncheck,
             DesktopControlOperation::Expand,
             DesktopControlOperation::Collapse,
             DesktopControlOperation::ScrollUp,
@@ -4526,10 +6209,10 @@ function Test-Selection($candidates) {
     #[test]
     fn private_observation_issues_refs_only_for_unique_labeled_edits() {
         let raw = br#"{"controls":[{"depth":1,"role":"edit","automationId":"subject","enabled":true,"capabilities":["setValue"]},{"depth":1,"role":"edit","automationId":"same","enabled":true,"capabilities":["setValue"]},{"depth":1,"role":"edit","automationId":"same","enabled":true,"capabilities":["setValue"]},{"depth":1,"role":"edit","enabled":true,"capabilities":["setValue"]}],"truncated":false,"targets":[{"index":0,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[1]}},{"index":1,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[2]}},{"index":2,"identity":{"processId":42,"windowHandle":1234,"controlRuntimeId":[3]}}]}"#;
-        let (mut public, targets) = parse_private_observation_payload(raw).unwrap();
+        let (mut public, targets, _) = parse_private_observation_payload(raw).unwrap();
         let adapter = WindowsDesktopAdapter::default();
         let exe = std::path::Path::new(r"C:\trusted\app.exe");
-        let (mut partial, partial_targets) = parse_private_observation_payload(raw).unwrap();
+        let (mut partial, partial_targets, _) = parse_private_observation_payload(raw).unwrap();
         partial.truncated = true;
         adapter
             .issue_field_refs(
@@ -4538,6 +6221,7 @@ function Test-Selection($candidates) {
                 partial.truncated,
                 &mut partial.controls,
                 partial_targets,
+                None,
             )
             .unwrap();
         assert!(partial
@@ -4545,7 +6229,7 @@ function Test-Selection($candidates) {
             .iter()
             .all(|control| control.field_ref.is_none()));
         adapter
-            .issue_field_refs("app", exe, false, &mut public.controls, targets)
+            .issue_field_refs("app", exe, false, &mut public.controls, targets, None)
             .unwrap();
         let issued = public.controls[0].field_ref.clone().unwrap();
         assert!(issued.starts_with("field_"));
@@ -4596,7 +6280,7 @@ function Test-Selection($candidates) {
                     "identity": {"processId": 42, "windowHandle": 1234, "controlRuntimeId": [1]},
                 }],
             });
-            let (mut partial, targets) =
+            let (mut partial, targets, _) =
                 parse_private_observation_payload(raw.to_string().as_bytes()).unwrap();
             assert_eq!(partial.diagnostics.len(), 1);
             adapter
@@ -4606,6 +6290,7 @@ function Test-Selection($candidates) {
                     partial.truncated,
                     &mut partial.controls,
                     targets,
+                    None,
                 )
                 .unwrap();
             assert!(partial.controls[0].field_ref.is_none(), "reason: {reason}");
@@ -4616,7 +6301,8 @@ function Test-Selection($candidates) {
     #[cfg(windows)]
     #[test]
     fn observation_script_uses_bounded_read_only_traversal() {
-        assert!(OBSERVATION_SCRIPT.contains("$visited -gt 256"));
+        assert!(OBSERVATION_SCRIPT.contains("Use-UiaNodeBudget"));
+        assert!(UIA_SAFETY_HELPERS_SCRIPT.contains("$script:uiaNodeCount -gt 256"));
         assert!(OBSERVATION_SCRIPT.contains("$entry.depth -ge 12"));
         assert!(OBSERVATION_SCRIPT.contains("$bytes.Length -gt 8192"));
         assert!(OBSERVATION_SCRIPT.contains("$targets"));
@@ -4637,6 +6323,102 @@ function Test-Selection($candidates) {
         assert!(!OBSERVATION_SCRIPT.contains("TextPattern"));
         assert!(!OBSERVATION_SCRIPT.contains(".Current.Value"));
         assert!(!OBSERVATION_SCRIPT.contains("SetValue("));
+
+        let root_readiness = "$script:uiaWindowReadinessWaitMs = 1500";
+        assert!(control_observation_script(false).contains(root_readiness));
+        assert!(!control_observation_script(true).contains(root_readiness));
+        for strict_script in [
+            TRUSTED_WINDOW_SCRIPT,
+            DRAFT_TARGET_SCRIPT,
+            TEXT_TARGET_SCRIPT,
+            CONTROL_TARGET_SCRIPT,
+            CONTROL_OPERATION_SCRIPT,
+            VERIFIED_SET_VALUE_SCRIPT,
+            CAPTURE_WINDOW_SCRIPT,
+            CAPTURE_TARGET_SCRIPT,
+        ] {
+            assert!(!strict_script.contains(root_readiness));
+        }
+
+        // Fake only clock/process enumeration and the owned provider. Selection
+        // and readiness use the same production script, without real windows.
+        let setup = r#"
+$fixtureRoot = $root
+$script:readinessClock = [pscustomobject]@{ ElapsedMilliseconds = 0 }
+$script:processReads = 0
+$script:sleeps = 0
+$mode = $env:ANGELBOT_TEST_READINESS
+function Start-Sleep {
+  param([int]$Milliseconds)
+  $script:sleeps++
+  $script:readinessClock.ElapsedMilliseconds += $Milliseconds
+}
+function Get-UiaControlWindows {
+  param([string]$expected)
+  $script:processReads++
+  if ($mode -eq 'provider') { throw 'TARGET_UNAVAILABLE|private provider details' }
+  if ($mode -eq 'missing' -or ($mode -eq 'delayed' -and $script:processReads -le 2) -or
+      ($mode -in @('ambiguous', 'unsafe') -and $script:processReads -eq 1)) { return }
+  [IntPtr]::new(1234)
+  if ($mode -eq 'ambiguous') {
+    [IntPtr]::new(5678)
+  }
+}
+function Get-Process { param([int]$Id); return [pscustomobject]@{ Path = $env:ANGELBOT_TARGET_EXE; MainWindowHandle = [IntPtr]::Zero } }
+if ($mode -eq 'unsafe') { $root.Failure = 'password' }
+"#;
+        let cases = [
+            ("immediate", false, "ready", 1, 0, 0),
+            ("delayed", false, "ready", 3, 2, 200),
+            ("ambiguous", false, "TARGET_AMBIGUOUS", 2, 1, 100),
+            ("missing", false, "TARGET_NOT_FOUND", 16, 15, 1500),
+            ("delayed", true, "TARGET_NOT_FOUND", 1, 0, 0),
+            ("unsafe", false, "TARGET_UNAVAILABLE", 2, 1, 100),
+            ("provider", false, "TARGET_UNAVAILABLE", 1, 0, 0),
+        ];
+        let commands = cases
+            .iter()
+            .map(|(mode, scoped, ..)| {
+                let observation = control_observation_script(*scoped)
+                    .replace(include_str!("desktop_control/window_identity.ps1"), "")
+                    .replace("[Diagnostics.Stopwatch]::StartNew()", "$script:readinessClock")
+                    .replace(
+                        "[Windows.Automation.AutomationElement]::FromHandle($windows[0])",
+                        "$fixtureRoot",
+                    )
+                    .replace(OBSERVATION_SCRIPT, "$null = Get-UiaSafetyState $root");
+                let script = format!(
+                    "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{setup}\n$code = 'ready'; try {{\n{observation}\n}} catch {{ $code = $_.Exception.Message.Split('|')[0] }}\n@{{ code = $code; processReads = $script:processReads; sleeps = $script:sleeps; elapsed = $script:readinessClock.ElapsedMilliseconds; mutationCount = $firstControl.MutationCount; invoked = $firstControl.Invoked; written = $firstControl.Written }} | ConvertTo-Json -Compress"
+                );
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .env("ANGELBOT_TARGET_EXE", "C:\\fixture\\trusted.exe")
+                    .env("ANGELBOT_TEST_FAILURE", "none")
+                    .env("ANGELBOT_TEST_READINESS", mode);
+                command
+            })
+            .collect();
+        for ((mode, scoped, code, reads, sleeps, elapsed), output) in
+            cases.into_iter().zip(run_fixture_commands(commands, None))
+        {
+            assert!(
+                output.status.success(),
+                "readiness {mode}/{scoped}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty(), "readiness {mode}/{scoped}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["code"], code, "readiness {mode}/{scoped}");
+            assert_eq!(result["processReads"], reads, "readiness {mode}/{scoped}");
+            assert_eq!(result["sleeps"], sleeps, "readiness {mode}/{scoped}");
+            assert_eq!(result["elapsed"], elapsed, "readiness {mode}/{scoped}");
+            assert_eq!(result["mutationCount"], 0, "readiness {mode}/{scoped}");
+            assert_eq!(result["invoked"], false, "readiness {mode}/{scoped}");
+            assert_eq!(result["written"], false, "readiness {mode}/{scoped}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("private provider details"));
+        }
     }
 
     #[cfg(windows)]
@@ -4673,7 +6455,14 @@ public class ObservationTestValuePattern {
       return new ObservationTestValueInfo(element);
     }
   }
-  public void SetValue(string value) { element.Written = true; element.Value = value; }
+  public void SetValue(string value) {
+    element.MutationCount++;
+    element.Written = true; element.Value = value;
+    if (element.Failure == "postFieldIdentity") { element.RuntimeId++; }
+    if (element.Failure == "postFieldLabel") { element.Identifier = "changed"; }
+    if (element.Failure == "postFieldScopeName") { element.Parent.Identifier = "Changed region"; }
+    if (element.Failure == "postFieldScopeMove") { element.Parent = element.Parent.Parent; }
+  }
 }
 public class ObservationTestInvokePattern {
   private ObservationTestElement element;
@@ -4686,9 +6475,20 @@ public class ObservationTestInvokePattern {
 public class ObservationTestControlPatternInfo {
   private ObservationTestElement element;
   public ObservationTestControlPatternInfo(ObservationTestElement element) { this.element = element; }
-  public bool IsSelected {
+  public ObservationTestElement SelectionContainer { get { return element.Parent; } }
+  public object CanSelectMultiple {
+    get {
+      if (element.Failure == "selectionModeUnavailable") { throw new System.Exception("private provider details"); }
+      if (element.Failure == "selectionModeNull") { return null; }
+      return element.Failure == "multipleSelection";
+    }
+  }
+  public object IsSelected {
     get {
       if (element.Failure == "stateUnavailable") { throw new System.Exception("private provider details"); }
+      if (element.Failure == "stateNull") { return null; }
+      if (element.Failure == "invalidState" || element.Failure == "initialInvalidState" ||
+          (element.Failure == "postSelectedInvalid" && element.Applied)) { return "false"; }
       if (element.Failure == "delayedState" && element.Applied && ++element.StateReadCount <= 2) { return element.PreviousSelected; }
       return element.Failure == "wrongState" && element.Applied ? false : element.Selected;
     }
@@ -4696,10 +6496,22 @@ public class ObservationTestControlPatternInfo {
   public string ExpandCollapseState {
     get {
       if (element.Failure == "stateUnavailable") { throw new System.Exception("private provider details"); }
+      if (element.Failure == "stateNull") { return null; }
+      if (element.Failure == "invalidState") { return "Unknown"; }
       if (element.Failure == "leaf") { return "LeafNode"; }
       if (element.Failure == "wrongState" && element.Applied) { return "PartiallyExpanded"; }
       if (element.Failure == "delayedState" && element.Applied && ++element.StateReadCount <= 2) { return element.PreviousExpandState; }
       return element.ExpandState;
+    }
+  }
+  public string ToggleState {
+    get {
+      if (element.Failure == "stateUnavailable") { throw new System.Exception("private provider details"); }
+      if (element.Failure == "stateNull" || element.Failure == "initialStateNull") { return null; }
+      if (element.Failure == "invalidState" || element.Failure == "initialInvalidState") { return "Unknown"; }
+      if (element.Failure == "indeterminate" || element.Failure == "initialIndeterminate" || (element.Failure == "postIndeterminate" && element.Applied)) { return "Indeterminate"; }
+      if (element.Applied && (element.Failure == "wrongState" || (element.Failure == "delayedState" && ++element.StateReadCount <= 2))) { return element.PreviousToggleState; }
+      return element.ToggleState;
     }
   }
   public bool VerticallyScrollable {
@@ -4721,6 +6533,13 @@ public class ObservationTestControlPattern {
   public ObservationTestControlPatternInfo Current {
     get {
       if (element.Failure == "postStateUnavailable" && element.Applied) { throw new System.Exception("private provider details"); }
+      // A control can publish a transient unavailable state before its stale
+      // value and then the requested value. Keep the existing delayed-readback
+      // scenarios exercising both kinds of lag, without adding fixture runs.
+      if (element.Failure == "delayedState" && element.Applied && element.StateReadCount == 0) {
+        element.StateReadCount++;
+        throw new System.Exception("private provider details");
+      }
       return new ObservationTestControlPatternInfo(element);
     }
   }
@@ -4728,13 +6547,17 @@ public class ObservationTestControlPattern {
     element.MutationCount++;
     element.PreviousSelected = element.Selected;
     element.PreviousExpandState = element.ExpandState;
+    element.PreviousToggleState = element.ToggleState;
     element.PreviousScrollPosition = element.ScrollPosition;
     element.Applied = true;
+    if (element.Failure == "postScopeName") { element.Parent.Identifier = "Changed region"; }
+    if (element.Failure == "postScopeMoved") { element.Parent = element.Parent.Parent; }
     if (element.Failure == "mutationThrows") { throw new System.Exception("private provider details"); }
   }
   public void Select() { Applied(); element.Selected = true; }
   public void Expand() { Applied(); element.ExpandState = "Expanded"; }
   public void Collapse() { Applied(); element.ExpandState = "Collapsed"; }
+  public void Toggle() { Applied(); element.ToggleState = element.ToggleState == "On" ? "Off" : "On"; }
   public void Scroll(object horizontal, object vertical) {
     if (horizontal.ToString() != "NoAmount") { throw new System.Exception("Unexpected horizontal scroll"); }
     string amount = vertical.ToString();
@@ -4805,6 +6628,7 @@ public class ObservationTestElement {
   public bool Selected;
   public bool PreviousSelected;
   public string PreviousExpandState;
+  public string PreviousToggleState;
   public int StateReadCount;
   public int MutationCount;
   public double ScrollPosition = 50;
@@ -4812,7 +6636,10 @@ public class ObservationTestElement {
   public string ControlOperation;
   public string RoleOverride;
   public string ExpandState = "Collapsed";
+  public string ToggleState = "Off";
   public string Value;
+  public int RuntimeId = 1;
+  public ObservationTestElement Parent;
   public ObservationTestElement FirstChild;
   public ObservationTestElement NextSibling;
   public ObservationTestInfo Current {
@@ -4840,10 +6667,12 @@ public class ObservationTestElement {
     if (Failure == "runtimeError") { throw new System.Exception("private provider details"); }
     if (Failure == "runtimeNegative") { return new int[] { 7, -2 }; }
     if (Failure == "differentRuntime") { return new int[] { 2 }; }
-    return new int[] { 1 };
+    if (Failure == "postRuntimeChanged" && Applied) { return new int[] { 2 }; }
+    return new int[] { RuntimeId };
   }
 }
 public class ObservationTestWalker {
+  public ObservationTestElement GetParent(ObservationTestElement element) { return element.Parent; }
   public ObservationTestElement GetFirstChild(ObservationTestElement element) {
     if (element.Failure == "child") { throw new System.Exception("private provider details"); }
     return element.FirstChild;
@@ -4873,6 +6702,12 @@ elseif ($failure -eq 'rootVisibility') { $root.Failure = 'visibility' }
 elseif ($failure -eq 'rootPassword') { $root.Failure = 'password' }
 elseif ($failure -eq 'rootProcessId') { $root.Failure = 'processId' }
 else { $firstControl.Failure = $failure }
+function Get-UiaWindowProcessId([IntPtr]$handle) {
+  if ($handle.ToInt64() -ne 1234) { return 0 }
+  if ($firstControl.Failure -eq 'windowOwnerChanged' -or
+      ($failure -eq 'postWindowOwnerChanged' -and $firstControl.Written)) { return 99 }
+  return 42
+}
 "#;
 
     #[cfg(windows)]
@@ -4919,14 +6754,13 @@ else { $firstControl.Failure = $failure }
             .map(|(failure, _)| {
                 let mut command =
                     desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
-                command
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                    .env("ANGELBOT_TEST_FAILURE", failure);
+                command.env("ANGELBOT_TEST_FAILURE", failure);
                 command
             })
             .collect();
-        for ((failure, expected_controls), output) in
-            cases.into_iter().zip(run_fixture_commands(commands))
+        for ((failure, expected_controls), output) in cases
+            .into_iter()
+            .zip(run_fixture_commands(commands, Some(&script)))
         {
             if matches!(failure, "rootCurrent" | "rootVisibility" | "rootPassword") {
                 assert!(!output.status.success(), "fixture {failure}");
@@ -4942,7 +6776,7 @@ else { $firstControl.Failure = $failure }
                 "fixture {failure}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let (mut payload, targets) = parse_private_observation_payload(&output.stdout)
+            let (mut payload, targets, _) = parse_private_observation_payload(&output.stdout)
                 .unwrap_or_else(|error| panic!("fixture {failure}: {error}"));
             assert_eq!(
                 payload.controls.len(),
@@ -4989,6 +6823,7 @@ else { $firstControl.Failure = $failure }
                     payload.truncated,
                     &mut payload.controls,
                     targets,
+                    None,
                 )
                 .unwrap();
             if matches!(failure, "healthyEdit" | "runtimeNegative") {
@@ -5008,56 +6843,229 @@ else { $firstControl.Failure = $failure }
 
     #[cfg(windows)]
     #[test]
-    fn scroll_observation_retains_only_named_usable_containers_without_reading_values() {
+    fn static_text_observation_requires_a_safe_selected_region_and_never_issues_actions() {
+        let observation = OBSERVATION_SCRIPT.replace(
+            "$walker = [Windows.Automation.TreeWalker]::ControlViewWalker",
+            "$walker = New-Object ObservationTestWalker",
+        );
+        let setup = r#"
+$firstControl.RoleOverride = 'ControlType.Text'
+$firstControl.Identifier = '141'
+$firstControl.NextSibling = $null
+$root.RuntimeId = 99
+$region = New-Object ObservationTestElement
+$region.Identifier = 'Display'
+$region.RoleOverride = 'ControlType.Group'
+$region.RuntimeId = 10
+$region.Parent = $root
+$region.FirstChild = $firstControl
+$firstControl.Parent = $region
+$root.FirstChild = $region
+if ($failure -eq 'longName') { $firstControl.Identifier = 'x' * 81 }
+if ($failure -eq 'controlName') { $firstControl.Identifier = "private`ntext" }
+if ($failure -in @('editAncestor', 'choiceAncestor', 'ancestorRoleUnavailable')) {
+  $edit = New-Object ObservationTestElement
+  $edit.Identifier = 'ordinaryField'
+  $edit.RoleOverride = 'ControlType.Edit'
+  if ($failure -eq 'choiceAncestor') { $edit.RoleOverride = 'ControlType.ComboBox' }
+  if ($failure -eq 'ancestorRoleUnavailable') { $edit.Failure = 'role' }
+  $edit.Parent = $region
+  $edit.FirstChild = $firstControl
+  $firstControl.Parent = $edit
+  $region.FirstChild = $edit
+}
+if ($failure -eq 'outsideRegion') { $firstControl.Parent = $root }
+if ($failure -in @('unnamedRegion', 'unnamedDiscovery')) { $region.Identifier = '' }
+if ($failure -notin @('unscoped', 'unnamedDiscovery')) {
+  $script:uiaScope = @{ role = 'group'; name = 'Display'; path = @(0); identity = @{ processId = 42; windowHandle = 1234; controlRuntimeId = @(10) } }
+  $script:uiaScope.name = $region.Identifier
+}
+$expected = 'C:\trusted\fixture.exe'
+function Get-Process { param([int]$Id) return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe' } }
+"#;
+        let script = format!("{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\n{observation}");
+        let cases = [
+            "none",
+            "unscoped",
+            "unnamedRegion",
+            "unnamedDiscovery",
+            "hidden",
+            "sensitive",
+            "differentProcess",
+            "editAncestor",
+            "choiceAncestor",
+            "ancestorRoleUnavailable",
+            "outsideRegion",
+            "longName",
+            "controlName",
+        ];
+        let commands = cases
+            .iter()
+            .map(|failure| {
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env("ANGELBOT_ACTION_LABELS", "0");
+                command
+            })
+            .collect();
+        for (failure, output) in cases
+            .into_iter()
+            .zip(run_fixture_commands(commands, Some(&script)))
+        {
+            assert!(
+                output.status.success(),
+                "{failure}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let (payload, targets, _) = parse_private_observation_payload(&output.stdout).unwrap();
+            let text: Vec<_> = payload
+                .controls
+                .iter()
+                .filter(|c| c.role == "text")
+                .collect();
+            assert_eq!(
+                text.len(),
+                usize::from(matches!(failure, "none" | "unnamedRegion")),
+                "{failure}"
+            );
+            if failure == "unnamedDiscovery" {
+                assert_eq!(payload.regions.len(), 1);
+                assert_eq!(payload.regions[0].name, "");
+                assert!(payload.controls.is_empty());
+            }
+            for control in text {
+                assert_eq!(control.name.as_deref(), Some("141"));
+                assert!(control.capabilities.is_empty());
+                assert!(control.state.is_none());
+                assert!(control.field_ref.is_none() && control.control_ref.is_none());
+                assert!(supported_control_operations(control).is_empty());
+            }
+            assert!(targets.is_empty(), "{failure}");
+            assert_eq!(
+                payload.truncated,
+                matches!(
+                    failure,
+                    "differentProcess"
+                        | "outsideRegion"
+                        | "ancestorRoleUnavailable"
+                        | "longName"
+                        | "controlName"
+                ),
+                "{failure}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("private provider details"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_observation_reads_bounded_states_without_mutating_or_reading_values() {
         let observation = OBSERVATION_SCRIPT.replace(
             "$walker = [Windows.Automation.TreeWalker]::ControlViewWalker",
             "$walker = New-Object ObservationTestWalker",
         );
         let setup = r#"
 $firstControl.Invokable = $true
-$firstControl.ControlOperation = 'scrolldown'
+$firstControl.ControlOperation = $env:ANGELBOT_TEST_OPERATION
 $firstControl.RoleOverride = $env:ANGELBOT_TEST_ROLE
 $firstControl.NextSibling = $null
+$firstControl.Selected = $failure -eq 'selected'
+if ($failure -eq 'on') { $firstControl.ToggleState = 'On' }
+if ($failure -eq 'expanded') { $firstControl.ExpandState = 'Expanded' }
+if ($failure -eq 'partial') { $firstControl.ExpandState = 'PartiallyExpanded' }
+if ($env:ANGELBOT_TEST_ROLE -ceq 'ControlType.ListItem' -and $failure -eq 'labelsAllowed') {
+  $root.RoleOverride = 'ControlType.List'
+  $firstControl.Parent = $root
+  $windowProcessId = $root.Current.ProcessId
+}
 "#;
-        let script = format!("{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\n{observation}");
+        let script = format!("{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\n{observation}\nif ($firstControl.MutationCount -ne 0 -or $firstControl.Written -or $firstControl.Invoked) {{ throw 'Read-only observation mutated a control' }}");
         let cases = [
-            ("Pane", "none"),
-            ("Document", "none"),
-            ("List", "none"),
-            ("Pane", "nonScrollable"),
-            ("Document", "missingPattern"),
-            ("List", "invalidPosition"),
-            ("Pane", "emptyName"),
-            ("Pane", "disabled"),
+            ("Pane", "scrolldown", "none", false),
+            ("Document", "scrolldown", "none", false),
+            ("List", "scrolldown", "none", false),
+            ("Pane", "scrolldown", "nonScrollable", false),
+            ("Document", "scrolldown", "missingPattern", false),
+            ("List", "scrolldown", "invalidPosition", true),
+            ("Pane", "scrolldown", "emptyName", false),
+            ("Pane", "scrolldown", "disabled", false),
+            ("CheckBox", "check", "none", false),
+            ("CheckBox", "check", "on", false),
+            ("CheckBox", "check", "indeterminate", false),
+            ("CheckBox", "check", "stateUnavailable", true),
+            ("CheckBox", "check", "stateNull", true),
+            ("CheckBox", "check", "invalidState", true),
+            ("CheckBox", "check", "hidden", false),
+            ("CheckBox", "check", "sensitive", false),
+            ("RadioButton", "select", "none", false),
+            ("RadioButton", "select", "selected", false),
+            ("RadioButton", "select", "stateNull", true),
+            ("RadioButton", "select", "invalidState", true),
+            ("TabItem", "select", "selected", false),
+            ("ListItem", "select", "none", false),
+            ("ListItem", "select", "labelsAllowed", false),
+            ("MenuItem", "expand", "none", false),
+            ("MenuItem", "expand", "expanded", false),
+            ("MenuItem", "expand", "partial", false),
+            ("MenuItem", "expand", "leaf", false),
+            ("MenuItem", "expand", "stateUnavailable", true),
+            ("ComboBox", "expand", "none", false),
+            ("ComboBox", "expand", "labelsAllowed", false),
+            ("ComboBox", "expand", "multipleSelection", false),
+            ("ComboBox", "expand", "selectionModeNull", true),
+            ("ComboBox", "expand", "selectionModeUnavailable", true),
+            ("ComboBox", "expand", "stateNull", true),
+            ("ComboBox", "expand", "invalidState", true),
         ];
         let commands = cases
             .iter()
-            .map(|(role, failure)| {
+            .map(|(role, operation, failure, _)| {
                 let mut command =
                     desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
                 command
-                    .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
                     .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env(
+                        "ANGELBOT_ACTION_LABELS",
+                        if *failure == "labelsAllowed" {
+                            "1"
+                        } else {
+                            "0"
+                        },
+                    )
+                    .env("ANGELBOT_TEST_OPERATION", operation)
                     .env("ANGELBOT_TEST_ROLE", format!("ControlType.{role}"));
                 command
             })
             .collect();
-        for ((role, failure), output) in cases.into_iter().zip(run_fixture_commands(commands)) {
+        for ((role, operation, failure, partial), output) in cases
+            .into_iter()
+            .zip(run_fixture_commands(commands, Some(&script)))
+        {
             assert!(
                 output.status.success(),
                 "{role}/{failure}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let (mut payload, targets) = parse_private_observation_payload(&output.stdout).unwrap();
+            let (mut payload, targets, _) =
+                parse_private_observation_payload(&output.stdout).unwrap();
+            let retained = if operation == "scrolldown" {
+                failure == "none"
+            } else {
+                !matches!(failure, "hidden" | "sensitive")
+            };
             assert_eq!(
                 payload.controls.len(),
-                usize::from(failure == "none"),
+                usize::from(retained),
                 "{role}/{failure}"
             );
+            assert_eq!(payload.truncated, partial, "{role}/{failure}");
             assert_eq!(
-                payload.truncated,
-                failure == "invalidPosition",
-                "{role}/{failure}"
+                payload
+                    .diagnostics
+                    .contains(&DesktopObservationDiagnostic::ProviderUnavailable),
+                partial
             );
             let adapter = WindowsDesktopAdapter::default();
             let exe = std::path::Path::new("fixture.exe");
@@ -5068,19 +7076,79 @@ $firstControl.NextSibling = $null
                     payload.truncated,
                     &mut payload.controls,
                     &targets,
+                    None,
                 )
                 .unwrap();
-            if failure == "none" {
+            if retained && !partial {
                 let control = &payload.controls[0];
-                assert_eq!(control.capabilities, vec!["scroll"]);
-                assert!(control.control_ref.is_some());
+                let state = serde_json::to_value(control.state.as_ref().unwrap()).unwrap();
+                let (key, expected) = match operation {
+                    "scrolldown" => ("verticalScrollPercent", serde_json::json!(50.0)),
+                    "check" => (
+                        "toggle",
+                        serde_json::json!(match failure {
+                            "on" => "on",
+                            "indeterminate" => "indeterminate",
+                            _ => "off",
+                        }),
+                    ),
+                    "select" => ("selected", serde_json::json!(failure == "selected")),
+                    "expand" => (
+                        "expansion",
+                        serde_json::json!(match failure {
+                            "expanded" => "expanded",
+                            "partial" => "partiallyExpanded",
+                            "leaf" => "leafNode",
+                            _ => "collapsed",
+                        }),
+                    ),
+                    _ => unreachable!(),
+                };
+                assert_eq!(state[key], expected, "{role}/{failure}");
+                if role == "ListItem" && failure == "labelsAllowed" {
+                    assert_eq!(state["selectionContainerRole"], "list");
+                } else {
+                    assert!(state.get("selectionContainerRole").is_none());
+                }
+                if role == "ComboBox" {
+                    assert_eq!(
+                        control.capabilities.iter().any(|c| c == "selectOption"),
+                        failure != "multipleSelection"
+                    );
+                }
+                assert_eq!(
+                    control.control_ref.is_some(),
+                    !matches!(role, "ComboBox" | "ListItem") || failure == "labelsAllowed"
+                );
+                if matches!(role, "ComboBox" | "ListItem") {
+                    assert_eq!(
+                        control.name.as_deref(),
+                        (failure == "labelsAllowed").then_some("first")
+                    );
+                }
                 assert!(control.field_ref.is_none());
-            } else {
+            } else if !retained {
                 assert!(targets.is_empty());
+            } else {
+                if matches!(failure, "selectionModeNull" | "selectionModeUnavailable") {
+                    assert_eq!(
+                        payload.controls[0].state.as_ref().unwrap().expansion,
+                        Some(DesktopExpansionState::Collapsed)
+                    );
+                    assert!(!payload.controls[0]
+                        .capabilities
+                        .iter()
+                        .any(|c| c == "selectOption"));
+                } else {
+                    assert!(payload.controls[0].state.is_none(), "{role}/{failure}");
+                }
+                assert!(payload.controls[0].control_ref.is_none());
             }
             let raw = String::from_utf8_lossy(&output.stdout);
             assert!(!raw.contains("private provider details"));
             assert!(!raw.contains("\"value\""));
+            assert!(!raw.contains("\"name\":null"));
+            assert!(!raw.contains("\"automationId\":null"));
         }
     }
 
@@ -5091,14 +7159,27 @@ $firstControl.NextSibling = $null
 $firstControl.Editable = $true
 $target = $firstControl
 $pattern = New-Object ObservationTestValuePattern -ArgumentList $target
+$script:uiaWalker = New-Object ObservationTestWalker
+if ($failure -in @('postFieldScopeName', 'postFieldScopeMove')) {
+  $region = New-Object ObservationTestElement
+  $region.Identifier = 'Region'
+  $region.RoleOverride = 'ControlType.Group'
+  $region.RuntimeId = 10
+  $region.Invokable = $true
+  $region.FirstChild = $firstControl
+  $region.Parent = $root
+  $firstControl.Parent = $region
+  $root.FirstChild = $region
+  $script:uiaScope = @{ role = 'group'; name = 'Region'; path = @(0); identity = @{ processId = 42; windowHandle = 1234; controlRuntimeId = @(10) } }
+}
 $expected = 'C:\trusted\fixture.exe'
 function Get-Process {
   param([int]$Id)
-  return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe'; MainWindowHandle = [System.IntPtr]::new(1234) }
+  return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe'; MainWindowHandle = [System.IntPtr]::Zero }
 }
 "#;
         let script = format!(
-            "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\ntry {{\n{VERIFIED_SET_VALUE_SCRIPT}\n}} catch {{ @{{ code = ($_.Exception.Message -split '\\|')[0]; written = $firstControl.Written }} | ConvertTo-Json -Compress }}"
+            "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n{UIA_SAFETY_HELPERS_SCRIPT}\n{setup}\ntry {{\n$receipt = . {{ {VERIFIED_SET_VALUE_SCRIPT} }}\n@{{ status = ($receipt | ConvertFrom-Json).status; value = $firstControl.Value; written = $firstControl.Written; mutationCount = $firstControl.MutationCount }} | ConvertTo-Json -Compress\n}} catch {{ @{{ code = ($_.Exception.Message -split '\\|')[0]; written = $firstControl.Written; mutationCount = $firstControl.MutationCount }} | ConvertTo-Json -Compress }}"
         );
         let failures = [
             "current",
@@ -5119,25 +7200,48 @@ function Get-Process {
             "readOnly",
             "readBackCase",
             "readBackNull",
+            "windowOwnerChanged",
+            "postWindowOwnerChanged",
+            "postFieldIdentity",
+            "postFieldLabel",
+            "postFieldScopeName",
+            "postFieldScopeMove",
             "none",
         ];
-        let commands = failures
+        let mut cases = failures
             .iter()
-            .map(|failure| {
+            .map(|failure| (*failure, Some("Exact Case")))
+            .collect::<Vec<_>>();
+        cases.extend([
+            ("none", Some("")),
+            ("none", None),
+            ("readBackNull", None),
+            ("postFieldIdentity", Some("")),
+            ("readOnly", Some("")),
+        ]);
+        let commands = cases
+            .iter()
+            .map(|(failure, text)| {
                 let mut command =
                     desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
                 command
-                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                     .env("ANGELBOT_TEST_FAILURE", failure)
                     .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
                     .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
                     .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
-                    .env("ANGELBOT_FIELD_LABEL", "first")
-                    .env("ANGELBOT_DRAFT_TEXT", "Exact Case");
+                    .env("ANGELBOT_FIELD_LABEL", "first");
+                if let Some(text) = text {
+                    command.env("ANGELBOT_DRAFT_TEXT", text);
+                } else {
+                    command.env_remove("ANGELBOT_DRAFT_TEXT");
+                }
                 command
             })
             .collect();
-        for (failure, output) in failures.into_iter().zip(run_fixture_commands(commands)) {
+        for ((failure, text), output) in cases
+            .into_iter()
+            .zip(run_fixture_commands(commands, Some(&script)))
+        {
             assert!(
                 output.status.success(),
                 "fixture {failure}: {}",
@@ -5147,9 +7251,22 @@ function Get-Process {
                 .unwrap_or_else(|error| panic!("fixture {failure}: {error}"));
             if failure == "none" {
                 assert_eq!(result["status"], "verified");
-            } else if matches!(failure, "readBackCase" | "readBackNull") {
+                assert_eq!(result["value"], text.unwrap_or(""));
+                assert_eq!(result["written"], true);
+                assert_eq!(result["mutationCount"], 1);
+            } else if matches!(
+                failure,
+                "readBackCase"
+                    | "readBackNull"
+                    | "postWindowOwnerChanged"
+                    | "postFieldIdentity"
+                    | "postFieldLabel"
+                    | "postFieldScopeName"
+                    | "postFieldScopeMove"
+            ) {
                 assert_eq!(result["code"], "RESULT_UNKNOWN", "fixture {failure}");
                 assert_eq!(result["written"], true, "fixture {failure}");
+                assert_eq!(result["mutationCount"], 1, "fixture {failure}");
             } else {
                 assert!(
                     matches!(
@@ -5175,7 +7292,7 @@ $root.Failure = 'none'
 $expected = 'C:\trusted\fixture.exe'
 function Get-Process {
   param([int]$Id)
-  return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe'; MainWindowHandle = [System.IntPtr]::new(1234) }
+  return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe'; MainWindowHandle = [System.IntPtr]::Zero }
 }
 "#;
         let target_script = CONTROL_TARGET_SCRIPT.replace(
@@ -5193,6 +7310,7 @@ else { $firstControl.Failure = $failure }
         );
         let failures = [
             "renamed",
+            "windowOwnerChanged",
             "changedRole",
             "disabled",
             "hidden",
@@ -5222,7 +7340,6 @@ else { $firstControl.Failure = $failure }
                 let mut command =
                     desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
                 command
-                    .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
                     .env("ANGELBOT_TEST_FAILURE", failure)
                     .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
                     .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
@@ -5233,7 +7350,10 @@ else { $firstControl.Failure = $failure }
                 command
             })
             .collect();
-        for (failure, output) in failures.into_iter().zip(run_fixture_commands(commands)) {
+        for (failure, output) in failures
+            .into_iter()
+            .zip(run_fixture_commands(commands, Some(&script)))
+        {
             assert!(
                 output.status.success(),
                 "fixture {failure}: {}",
@@ -5272,22 +7392,56 @@ else { $firstControl.Failure = $failure }
 $firstControl.Editable = $false
 $firstControl.Invokable = $true
 $firstControl.ControlOperation = $env:ANGELBOT_CONTROL_OPERATION
-$firstControl.RoleOverride = $(if ($firstControl.ControlOperation -ceq 'select') { 'ControlType.RadioButton' } elseif ($firstControl.ControlOperation -in @('scrollup', 'scrolldown')) { 'ControlType.Pane' } else { 'ControlType.MenuItem' })
+$firstControl.RoleOverride = $(if ($firstControl.ControlOperation -ceq 'select') { 'ControlType.RadioButton' } elseif ($firstControl.ControlOperation -in @('check', 'uncheck')) { 'ControlType.CheckBox' } elseif ($firstControl.ControlOperation -in @('scrollup', 'scrolldown')) { 'ControlType.Pane' } else { 'ControlType.MenuItem' })
+if ($env:ANGELBOT_TEST_ROLE) { $firstControl.RoleOverride = $env:ANGELBOT_TEST_ROLE }
 $firstControl.ExpandState = $(if ($firstControl.ControlOperation -ceq 'collapse') { 'Expanded' } else { 'Collapsed' })
-$firstControl.Failure = 'none'
+$firstControl.ToggleState = $(if ($firstControl.ControlOperation -ceq 'uncheck') { 'On' } else { 'Off' })
+$firstControl.Failure = $(if ($failure.StartsWith('initial')) { $failure } else { 'none' })
 $firstControl.NextSibling = $null
 $root.Failure = 'none'
+$region = $null
+if ($env:ANGELBOT_TEST_SCOPE -ceq 'true') {
+  $region = New-Object ObservationTestElement
+  $region.Identifier = 'Region'
+  $region.RoleOverride = 'ControlType.Group'
+  $region.RuntimeId = 10
+  $region.Invokable = $true
+  $region.FirstChild = $firstControl
+  $region.Parent = $root
+  $firstControl.Parent = $region
+  $root.FirstChild = $region
+  $script:uiaScope = @{ role = 'group'; name = 'Region'; path = @(0); identity = @{ processId = 42; windowHandle = 1234; controlRuntimeId = @(10) } }
+  if ($failure -in @('scopePrecedingHidden', 'scopePrecedingSensitive')) {
+    $excluded = New-Object ObservationTestElement
+    $excluded.Failure = $(if ($failure -ceq 'scopePrecedingHidden') { 'hidden' } else { 'sensitive' })
+    $excluded.NextSibling = $region
+    $root.FirstChild = $excluded
+    $script:uiaScope.path = @(1)
+  }
+}
 $expected = 'C:\trusted\fixture.exe'
 function Get-Process {
   param([int]$Id)
-  return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe'; MainWindowHandle = [System.IntPtr]::new(1234) }
+  return [pscustomobject]@{ Path = 'C:\trusted\fixture.exe'; MainWindowHandle = [System.IntPtr]::Zero }
 }
 "#;
         let mutate = r#"
 $firstControl.Failure = $failure
+if ($null -ne $region) {
+  if ($failure -ceq 'scopedDelayed') { $firstControl.Failure = 'delayedState' }
+  if ($failure -ceq 'scopeHidden') { $region.Failure = 'hidden' }
+  if ($failure -ceq 'scopeSensitive') { $region.Failure = 'sensitive' }
+  if ($failure -ceq 'scopeName') { $region.Identifier = 'Changed region' }
+  if ($failure -ceq 'scopeRuntime') { $region.RuntimeId = 11 }
+  if ($failure -ceq 'scopeOutside') { $firstControl.Parent = $root }
+  if ($failure -ceq 'scopePathChanged') { $laterControl.NextSibling = $region; $root.FirstChild = $laterControl }
+  if ($failure -ceq 'scopeBudget') { $script:uiaNodeCount = 255 }
+  if ($failure -ceq 'postScopeBudget') { $script:uiaNodeCount = 250 }
+}
 if ($failure -ceq 'noop') {
   $firstControl.Selected = $true
   $firstControl.ExpandState = $(if ($controlOperation -ceq 'expand') { 'Expanded' } else { 'Collapsed' })
+  $firstControl.ToggleState = $(if ($controlOperation -ceq 'check') { 'On' } else { 'Off' })
   $firstControl.ScrollPosition = $(if ($controlOperation -ceq 'scrollup') { 0 } else { 100 })
 }
 "#;
@@ -5306,6 +7460,8 @@ if ($failure -ceq 'noop') {
         let mut commands = Vec::new();
         for operation in [
             DesktopControlOperation::Select,
+            DesktopControlOperation::Check,
+            DesktopControlOperation::Uncheck,
             DesktopControlOperation::Expand,
             DesktopControlOperation::Collapse,
             DesktopControlOperation::ScrollUp,
@@ -5318,9 +7474,18 @@ if ($failure -ceq 'noop') {
                 "wrongState",
                 "mutationThrows",
                 "postStateUnavailable",
+                "postSelectedInvalid",
                 "postNameChanged",
+                "postRuntimeChanged",
                 "missingPattern",
                 "stateUnavailable",
+                "initialIndeterminate",
+                "initialStateNull",
+                "initialInvalidState",
+                "indeterminate",
+                "stateNull",
+                "invalidState",
+                "postIndeterminate",
                 "leaf",
                 "invalidPosition",
                 "nonScrollable",
@@ -5329,6 +7494,10 @@ if ($failure -ceq 'noop') {
                 let scrolling = matches!(
                     operation,
                     DesktopControlOperation::ScrollUp | DesktopControlOperation::ScrollDown
+                );
+                let checkbox = matches!(
+                    operation,
+                    DesktopControlOperation::Check | DesktopControlOperation::Uncheck
                 );
                 if (failure == "leaf"
                     && !matches!(
@@ -5339,13 +7508,29 @@ if ($failure -ceq 'noop') {
                         failure,
                         "invalidPosition" | "nonScrollable" | "wrongDirection"
                     ) && !scrolling)
+                    || (matches!(
+                        failure,
+                        "initialIndeterminate"
+                            | "initialStateNull"
+                            | "initialInvalidState"
+                            | "indeterminate"
+                            | "stateNull"
+                            | "invalidState"
+                            | "postIndeterminate"
+                    ) && !checkbox
+                        && !(operation == DesktopControlOperation::Select
+                            && matches!(
+                                failure,
+                                "initialInvalidState" | "stateNull" | "invalidState"
+                            )))
+                    || (failure == "postSelectedInvalid"
+                        && operation != DesktopControlOperation::Select)
                 {
                     continue;
                 }
                 let mut command =
                     desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
                 command
-                    .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
                     .env("ANGELBOT_TEST_FAILURE", failure)
                     .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
                     .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
@@ -5355,6 +7540,8 @@ if ($failure -ceq 'noop') {
                         "ANGELBOT_CONTROL_ROLE",
                         if operation == DesktopControlOperation::Select {
                             "radioButton"
+                        } else if checkbox {
+                            "checkBox"
                         } else if scrolling {
                             "pane"
                         } else {
@@ -5366,7 +7553,69 @@ if ($failure -ceq 'noop') {
                 commands.push(command);
             }
         }
-        for ((operation, failure), output) in cases.into_iter().zip(run_fixture_commands(commands))
+        for failure in [
+            "scopedNone",
+            "scopedDelayed",
+            "scopePrecedingHidden",
+            "scopePrecedingSensitive",
+            "scopeHidden",
+            "scopeSensitive",
+            "scopeName",
+            "scopeRuntime",
+            "scopeOutside",
+            "scopePathChanged",
+            "scopeBudget",
+            "postScopeName",
+            "postScopeMoved",
+            "postScopeBudget",
+        ] {
+            let mut command =
+                desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+            command
+                .env("ANGELBOT_TEST_FAILURE", failure)
+                .env("ANGELBOT_TEST_SCOPE", "true")
+                .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
+                .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
+                .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
+                .env("ANGELBOT_CONTROL_LABEL", "first")
+                .env("ANGELBOT_CONTROL_ROLE", "checkBox")
+                .env("ANGELBOT_CONTROL_OPERATION", "check");
+            cases.push((DesktopControlOperation::Check, failure));
+            commands.push(command);
+        }
+        // The same production helper must enforce state, identity and no-op
+        // semantics for newly admitted roles, not merely advertise a reference.
+        for (role, operation) in [
+            ("listItem", DesktopControlOperation::Select),
+            ("comboBox", DesktopControlOperation::Expand),
+            ("comboBox", DesktopControlOperation::Collapse),
+        ] {
+            for failure in ["none", "noop", "wrongState", "postNameChanged"] {
+                let mut command =
+                    desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+                command
+                    .env("ANGELBOT_TEST_FAILURE", failure)
+                    .env(
+                        "ANGELBOT_TEST_ROLE",
+                        if role == "listItem" {
+                            "ControlType.ListItem"
+                        } else {
+                            "ControlType.ComboBox"
+                        },
+                    )
+                    .env("ANGELBOT_DRAFT_EXPECTED_PID", "42")
+                    .env("ANGELBOT_DRAFT_EXPECTED_HWND", "1234")
+                    .env("ANGELBOT_DRAFT_EXPECTED_RUNTIME_ID", "1")
+                    .env("ANGELBOT_CONTROL_LABEL", "first")
+                    .env("ANGELBOT_CONTROL_ROLE", role)
+                    .env("ANGELBOT_CONTROL_OPERATION", operation.as_str());
+                cases.push((operation, failure));
+                commands.push(command);
+            }
+        }
+        for ((operation, failure), output) in cases
+            .into_iter()
+            .zip(run_fixture_commands(commands, Some(&script)))
         {
             assert!(
                 output.status.success(),
@@ -5380,7 +7629,16 @@ if ($failure -ceq 'noop') {
                         String::from_utf8_lossy(&output.stdout)
                     )
                 });
-            if matches!(failure, "none" | "delayedState" | "noop") {
+            if matches!(
+                failure,
+                "none"
+                    | "delayedState"
+                    | "noop"
+                    | "scopedNone"
+                    | "scopedDelayed"
+                    | "scopePrecedingHidden"
+                    | "scopePrecedingSensitive"
+            ) {
                 assert_eq!(result["status"], "verified", "{operation:?}/{failure}");
                 assert_eq!(result["action"], operation.as_str());
                 assert_eq!(
@@ -5392,6 +7650,19 @@ if ($failure -ceq 'noop') {
                 failure,
                 "missingPattern"
                     | "stateUnavailable"
+                    | "initialIndeterminate"
+                    | "initialStateNull"
+                    | "initialInvalidState"
+                    | "indeterminate"
+                    | "stateNull"
+                    | "invalidState"
+                    | "scopeHidden"
+                    | "scopeSensitive"
+                    | "scopeName"
+                    | "scopeRuntime"
+                    | "scopeOutside"
+                    | "scopePathChanged"
+                    | "scopeBudget"
                     | "leaf"
                     | "invalidPosition"
                     | "nonScrollable"
@@ -5399,11 +7670,34 @@ if ($failure -ceq 'noop') {
                 assert!(
                     matches!(
                         result["code"].as_str(),
-                        Some("UNSUPPORTED_CONTROL" | "TARGET_UNAVAILABLE")
+                        Some(
+                            "UNSUPPORTED_CONTROL"
+                                | "TARGET_UNAVAILABLE"
+                                | "TARGET_CHANGED"
+                                | "SCAN_LIMIT"
+                        )
                     ),
                     "{operation:?}/{failure}: {result}"
                 );
                 assert_eq!(result["applied"], false, "{operation:?}/{failure}");
+                if failure.starts_with("scope") {
+                    assert_eq!(
+                        result["code"],
+                        if failure == "scopeBudget" {
+                            "SCAN_LIMIT"
+                        } else {
+                            "TARGET_CHANGED"
+                        }
+                    );
+                }
+                if matches!(failure, "initialIndeterminate" | "indeterminate") {
+                    assert_eq!(result["code"], "UNSUPPORTED_CONTROL");
+                } else if matches!(
+                    failure,
+                    "initialStateNull" | "initialInvalidState" | "stateNull" | "invalidState"
+                ) {
+                    assert_eq!(result["code"], "TARGET_UNAVAILABLE");
+                }
             } else {
                 assert_eq!(
                     result["code"], "RESULT_UNKNOWN",
@@ -5418,6 +7712,19 @@ if ($failure -ceq 'noop') {
                     "noop"
                         | "missingPattern"
                         | "stateUnavailable"
+                        | "initialIndeterminate"
+                        | "initialStateNull"
+                        | "initialInvalidState"
+                        | "indeterminate"
+                        | "stateNull"
+                        | "invalidState"
+                        | "scopeHidden"
+                        | "scopeSensitive"
+                        | "scopeName"
+                        | "scopeRuntime"
+                        | "scopeOutside"
+                        | "scopePathChanged"
+                        | "scopeBudget"
                         | "leaf"
                         | "invalidPosition"
                         | "nonScrollable"
@@ -5615,8 +7922,12 @@ if ($failure -ceq 'noop') {
             "APPDATA",
             "LOCALAPPDATA",
             "USERPROFILE",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "PROGRAMW6432",
         ];
-        for (key, _) in command.get_envs() {
+        for (key, value) in command.get_envs() {
+            assert_eq!(value, std::env::var_os(key).as_deref());
             let key = key.to_string_lossy();
             assert!(
                 allowed.iter().any(|value| value.eq_ignore_ascii_case(&key)),
@@ -5689,39 +8000,45 @@ if ($failure -ceq 'noop') {
     #[test]
     fn cancelled_read_only_observation_reaps_its_helper() {
         use std::process::Stdio;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         let powershell = WindowsDesktopAdapter::system_powershell().unwrap();
-        let mut child = desktop_child_command(powershell)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 30",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let signal = Arc::clone(&stopped);
-        let cancel = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            signal.store(true, Ordering::Release);
-        });
-        let start = std::time::Instant::now();
-        let error = wait_for_read_only_child_with_control(
-            &mut child,
-            "Desktop observation",
-            &|| stopped.load(Ordering::Acquire),
-            DISCOVERY_TIMEOUT,
-        )
-        .unwrap_err();
-        cancel.join().unwrap();
-        assert_eq!(error.code, "SCAN_CANCELLED");
-        assert!(start.elapsed() < std::time::Duration::from_secs(3));
-        assert!(child.try_wait().unwrap().is_some(), "child was not reaped");
+        let script = format!(
+            "function Get-Process {{}}\n{}",
+            control_observation_script(false)
+        );
+        for cancelled in [true, false] {
+            let mut child = desktop_child_command(powershell.clone())
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .env("ANGELBOT_TARGET_EXE", "C:\\fixture\\not-launched.exe")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let start = std::time::Instant::now();
+            let timeout = if cancelled {
+                DISCOVERY_TIMEOUT
+            } else {
+                std::time::Duration::from_millis(150)
+            };
+            let error = wait_for_read_only_child_with_control(
+                &mut child,
+                "Desktop observation",
+                &|| cancelled && start.elapsed() >= std::time::Duration::from_millis(150),
+                timeout,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                if cancelled {
+                    "SCAN_CANCELLED"
+                } else {
+                    "SCAN_TIMEOUT"
+                }
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+            assert!(child.try_wait().unwrap().is_some(), "child was not reaped");
+        }
     }
 
     #[cfg(windows)]

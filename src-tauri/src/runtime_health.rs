@@ -8,6 +8,7 @@ pub enum RuntimeIssueCode {
     SettingsDefaults,
     DelegationDisabled,
     DelegationUnavailable,
+    StorageMigration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,6 +37,15 @@ pub struct RuntimeIssue {
 }
 
 impl RuntimeIssue {
+    pub fn storage_migration(recovery: bool) -> Self {
+        Self {
+            code: RuntimeIssueCode::StorageMigration,
+            severity: if recovery { RuntimeIssueSeverity::Warning } else { RuntimeIssueSeverity::Notice },
+            title: if recovery { "正在使用迁移前的资料目录" } else { "本地资料目录已统一" }.into(),
+            detail: if recovery { "迁移已回滚，旧资料保留。请先备份，再使用 --migrate-storage 明确重试；未自动合并两个目录。" } else { "迁移前资料已保留。浏览器工具需在设置中重新连接；检测到旧目录参数的自定义服务已停用。请另行核对自定义命令、环境变量及脚本中的路径。没有自动启动服务。" }.into(),
+            recovery_action: RuntimeRecoveryAction::None,
+        }
+    }
     pub fn ephemeral_storage() -> Self {
         Self {
             code: RuntimeIssueCode::EphemeralStorage,

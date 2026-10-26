@@ -815,6 +815,7 @@ mod tests {
 
     fn delivery(status: DeliveryStatus) -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery-1".into(),
             delivery_revision: 1,

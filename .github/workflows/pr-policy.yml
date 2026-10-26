@@ -2,7 +2,7 @@ name: PR policy
 
 on:
   pull_request:
-    branches: [dev, main]
+    branches: [main]
     types: [opened, synchronize, reopened, edited, ready_for_review]
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     steps:
       # Only read event metadata. Never check out or execute contributor code.
-      - name: Validate title and promotion route
+      - name: Validate title and target branch
         shell: python
         run: |
           import json
@@ -34,10 +34,7 @@ jobs:
           if not re.fullmatch(title_pattern, pr["title"].strip()):
               sys.exit("PR title must use type(scope): summary, for example: fix(desktop): reject stale window targets")
 
-          if pr["base"]["ref"] == "main":
-              source_repo = (pr["head"].get("repo") or {}).get("full_name")
-              target_repo = pr["base"]["repo"]["full_name"]
-              if pr["head"]["ref"] != "dev" or source_repo != target_repo:
-                  sys.exit("Stable promotions must come from this repository's dev branch.")
+          if pr["base"]["ref"] != "main":
+              sys.exit("Pull requests must target the main branch.")
 
           print("PR title and branch route passed.")

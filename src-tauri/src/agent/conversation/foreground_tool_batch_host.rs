@@ -96,11 +96,17 @@ impl<'a> ForegroundToolBatchHost<'a> {
                         .map(|tool| tool.execution_mode)
                         .unwrap_or_default(),
                 };
-                if let Err(error) = self.registry.validate_arguments(&call.name, &call.arguments) {
+                if let Err(error) = self
+                    .registry
+                    .validate_arguments(&call.name, &call.arguments)
+                {
                     ForegroundToolCallDisposition::Invalid {
-                        output: format!(
-                            "Tool call for '{}' was not executed: {}. Provide every required argument and retry the tool call.",
-                            call.name, error
+                        output: crate::agent::registry::argument_rejection_output(
+                            self.registry,
+                            call.id.as_deref().unwrap_or_default(),
+                            &call.name,
+                            &call.arguments,
+                            &error,
                         ),
                         call,
                     }

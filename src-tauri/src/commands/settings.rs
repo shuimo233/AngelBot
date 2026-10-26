@@ -3,7 +3,8 @@ use crate::AppState;
 use chrono::Utc;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use tauri::State;
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScheduledTask {
@@ -438,14 +439,6 @@ pub struct NotificationSettings {
     pub system: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct NotificationEventPayload {
-    pub channel: String,
-    pub title: String,
-    pub body: String,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -473,21 +466,22 @@ fn notification_channel_enabled(settings: &NotificationSettings, channel: &str) 
     }
 }
 
-fn notification_event_payload(
+fn send_notification_with(
     settings: &NotificationSettings,
-    channel: String,
-    title: String,
-    body: String,
-) -> Option<NotificationEventPayload> {
-    if !notification_channel_enabled(settings, &channel) {
-        return None;
+    channel: &str,
+    title: &str,
+    body: &str,
+    show: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<bool, String> {
+    if !notification_channel_enabled(settings, channel) {
+        return Ok(false);
     }
-
-    Some(NotificationEventPayload {
-        channel,
-        title,
-        body,
-    })
+    if title.trim().is_empty() || body.trim().is_empty() {
+        return Err("通知标题和内容不能为空".to_string());
+    }
+    show(title, body)?;
+    // Request acceptance is not proof that Windows displayed it or it was read.
+    Ok(true)
 }
 
 /// Get current notification channel settings
@@ -536,10 +530,10 @@ pub fn send_notification_channel(
     title: String,
     body: String,
 ) -> Result<bool, String> {
-    emit_notification_channel_impl(&state, &app_handle, channel, title, body)
+    send_notification_channel_impl(&state, &app_handle, channel, title, body)
 }
 
-pub(crate) fn emit_notification_channel_impl(
+pub(crate) fn send_notification_channel_impl(
     state: &AppState,
     app_handle: &tauri::AppHandle,
     channel: String,
@@ -547,14 +541,15 @@ pub(crate) fn emit_notification_channel_impl(
     body: String,
 ) -> Result<bool, String> {
     let settings = get_notification_settings_internal(state)?;
-    let Some(payload) = notification_event_payload(&settings, channel, title, body) else {
-        return Ok(false);
-    };
-
-    app_handle
-        .emit("notification-requested", payload)
-        .map_err(|e| format!("Failed to emit notification request: {}", e))?;
-    Ok(true)
+    send_notification_with(&settings, &channel, &title, &body, |title, body| {
+        app_handle
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|error| format!("无法请求系统通知: {error}"))
+    })
 }
 
 /// Internal helper: read notification settings without going through the command
@@ -640,6 +635,7 @@ pub fn save_api_config(app: tauri::AppHandle, config: ApiProviderConfig) -> Resu
 }
 
 // ─── Data export/import ───────────────────────────────────────────────────────
+mod conversations;
 
 use crate::commands::foreground_message_contracts::Message;
 use crate::commands::session::Session;
@@ -776,26 +772,32 @@ fn export_encrypted_data_with_store<S: McpCredentialStore>(
 ) -> Result<String, String> {
     state.mcp_manager.with_policy_gate(|| {
         let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-        let initial: serde_json::Value =
-            serde_json::from_str(&export_data_from_connection(&conn, opts.clone())?)
-                .map_err(|e| e.to_string())?;
+        // Resolving credentials needs server IDs, not a first full copy of
+        // conversations and result files. Snapshot that payload only once,
+        // after any legacy credential migration has finished.
+        let include_servers = matches!(
+            opts.as_ref()
+                .and_then(|opts| opts.scope.as_deref())
+                .unwrap_or("all"),
+            "all" | "settings"
+        );
+        let servers = if include_servers {
+            query_table(&conn, "SELECT id FROM mcp_servers")?
+        } else {
+            Vec::new()
+        };
         let mut credentials = Vec::new();
-        if let Some(servers) = initial
-            .get("mcp_servers")
-            .and_then(|value| value.as_array())
-        {
-            for server in servers {
-                let id = server
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| "Invalid MCP server ID in database".to_string())?;
-                let vars = read_effective_env(&mut conn, store, id)?;
-                if !vars.is_empty() {
-                    credentials.push(McpBackupCredential {
-                        server_id: id.to_string(),
-                        vars,
-                    });
-                }
+        for server in &servers {
+            let id = server
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "Invalid MCP server ID in database".to_string())?;
+            let vars = read_effective_env(&mut conn, store, id)?;
+            if !vars.is_empty() {
+                credentials.push(McpBackupCredential {
+                    server_id: id.to_string(),
+                    vars,
+                });
             }
         }
         // Legacy env migration can update env_keys, so build the public data
@@ -829,6 +831,9 @@ fn export_data_from_connection(
         .and_then(|o| o.scope.as_deref())
         .unwrap_or("all");
     let timestamp = chrono::Utc::now().timestamp();
+    if !matches!(scope, "all" | "memories" | "conversations" | "settings") {
+        return Err("不支持的备份范围。".to_owned());
+    }
     let include_all = scope == "all";
     let include_memories = include_all || scope == "memories";
     let include_conversations = include_all || scope == "conversations";
@@ -841,17 +846,16 @@ fn export_data_from_connection(
         exported_at: i64,
         scope: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        sessions: Option<Vec<serde_json::Value>>,
+        daily_files: Option<Vec<crate::backup::files::BackupFile>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        messages: Option<Vec<serde_json::Value>>,
+        #[serde(flatten)]
+        conversations: Option<conversations::Snapshot>,
         #[serde(skip_serializing_if = "Option::is_none")]
         memories: Option<Vec<serde_json::Value>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         profile: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         settings: Option<Vec<serde_json::Value>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context_summaries: Option<Vec<serde_json::Value>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         scheduled_tasks: Option<Vec<serde_json::Value>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -873,16 +877,15 @@ fn export_data_from_connection(
         .unwrap_or(0);
 
     let mut export = FullExport {
-        version: 1,
+        version: 2,
         schema_version,
         exported_at: timestamp,
         scope: scope.to_string(),
-        sessions: None,
-        messages: None,
+        daily_files: None,
+        conversations: None,
         memories: None,
         profile: None,
         settings: None,
-        context_summaries: None,
         scheduled_tasks: None,
         mcp_servers: None,
         agent_permission_grants: None,
@@ -891,12 +894,15 @@ fn export_data_from_connection(
     };
 
     if include_conversations {
-        export.sessions = Some(query_table(&conn, "SELECT id, title, created_at, updated_at, context_version, last_compressed_at, work_dir, metadata FROM sessions")?);
-        export.messages = Some(query_table(
-            &conn,
-            "SELECT id, session_id, role, content, created_at, metadata FROM messages",
-        )?);
-        export.context_summaries = Some(query_table(&conn, "SELECT id, session_id, summary, compressed_at, message_count_before, message_count_after, trigger FROM context_summaries")?);
+        // In-memory fixtures have no host files. Persistent exports use exactly
+        // the same host-owned root as the normal session file commands.
+        if conn.path().is_some_and(|path| !path.is_empty()) {
+            export.daily_files = Some(crate::backup::files::snapshot_excluding(
+                &super::file::personal_files_root(conn)?,
+                crate::browser_storage::owned_namespace(conn)?.as_deref(),
+            )?);
+        }
+        export.conversations = Some(conversations::snapshot(conn)?);
     }
 
     if include_memories {
@@ -952,6 +958,14 @@ fn export_data_from_connection(
 
 /// Helper: query a table into Vec<serde_json::Value> using column names.
 fn query_table(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<serde_json::Value>, String> {
+    query_table_with_params(conn, sql, &[])
+}
+
+fn query_table_with_params(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<serde_json::Value>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let col_count = stmt.column_count();
     let col_names: Vec<String> = (0..col_count)
@@ -959,7 +973,7 @@ fn query_table(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<serde_json:
         .collect();
 
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params, |r| {
             let mut map = serde_json::Map::new();
             for (i, name) in col_names.iter().enumerate() {
                 let val: rusqlite::types::Value = r.get_unwrap(i);
@@ -1033,16 +1047,18 @@ fn import_plain_data_with_store<S: McpCredentialStore>(
         .as_ref()
         .and_then(|option| option.mode.as_deref())
         .unwrap_or("merge");
-    state.mcp_manager.with_policy_gate(|| {
-        if mode == "replace" {
-            stop_running_mcp_servers(state)?;
-        }
-        let imported = import_data_under_gate(state, mode, &import)?;
-        if mode == "replace" {
-            let conn = state.db.lock().map_err(|error| error.to_string())?;
-            let _ = reap_old_references(&conn, store);
-        }
-        Ok(imported)
+    with_restore_guard(state, mode, || {
+        state.mcp_manager.with_policy_gate(|| {
+            if mode == "replace" {
+                stop_running_mcp_servers(state)?;
+            }
+            let imported = import_data_under_gate(state, mode, &import)?;
+            if mode == "replace" {
+                let conn = state.db.lock().map_err(|error| error.to_string())?;
+                let _ = reap_old_references(&conn, store);
+            }
+            Ok(imported)
+        })
     })
 }
 
@@ -1092,72 +1108,74 @@ fn import_encrypted_data_with_store<S: McpCredentialStore>(
         .and_then(|option| option.mode.as_deref())
         .unwrap_or("merge");
 
-    state.mcp_manager.with_policy_gate(|| {
-        // Imported credentials never become usable until all writes have
-        // succeeded. Keep the gate across stop, database restore, vault writes,
-        // and the final enabled-state switch.
-        stop_running_mcp_servers(state)?;
-        let existing = {
-            let conn = state.db.lock().map_err(|error| error.to_string())?;
-            current_mcp_server_ids(&conn)?
-        };
-        let restore_ids: HashSet<&str> = credentials
-            .iter()
-            .filter(|record| mode == "replace" || !existing.contains(&record.server_id))
-            .map(|record| record.server_id.as_str())
-            .collect();
-        let mut requested_enabled = HashMap::new();
-        if let Some(servers) = import
-            .get_mut("mcp_servers")
-            .and_then(|value| value.as_array_mut())
-        {
-            for server in servers {
-                let id = server["id"]
-                    .as_str()
-                    .ok_or_else(|| "Invalid MCP server ID in backup".to_string())?
-                    .to_string();
-                if restore_ids.contains(id.as_str()) {
-                    let enabled = server
-                        .get("enabled")
-                        .and_then(|value| {
-                            value
-                                .as_i64()
-                                .map(|number| number != 0)
-                                .or_else(|| value.as_bool())
-                        })
-                        .unwrap_or(true);
-                    requested_enabled.insert(id, enabled);
-                    server["enabled"] = serde_json::json!(0);
+    with_restore_guard(state, mode, || {
+        state.mcp_manager.with_policy_gate(|| {
+            // Imported credentials never become usable until all writes have
+            // succeeded. Keep the gate across stop, database restore, vault writes,
+            // and the final enabled-state switch.
+            stop_running_mcp_servers(state)?;
+            let existing = {
+                let conn = state.db.lock().map_err(|error| error.to_string())?;
+                current_mcp_server_ids(&conn)?
+            };
+            let restore_ids: HashSet<&str> = credentials
+                .iter()
+                .filter(|record| mode == "replace" || !existing.contains(&record.server_id))
+                .map(|record| record.server_id.as_str())
+                .collect();
+            let mut requested_enabled = HashMap::new();
+            if let Some(servers) = import
+                .get_mut("mcp_servers")
+                .and_then(|value| value.as_array_mut())
+            {
+                for server in servers {
+                    let id = server["id"]
+                        .as_str()
+                        .ok_or_else(|| "Invalid MCP server ID in backup".to_string())?
+                        .to_string();
+                    if restore_ids.contains(id.as_str()) {
+                        let enabled = server
+                            .get("enabled")
+                            .and_then(|value| {
+                                value
+                                    .as_i64()
+                                    .map(|number| number != 0)
+                                    .or_else(|| value.as_bool())
+                            })
+                            .unwrap_or(true);
+                        requested_enabled.insert(id, enabled);
+                        server["enabled"] = serde_json::json!(0);
+                    }
                 }
             }
-        }
 
-        let imported = import_data_under_gate(state, mode, &import)?;
-        if !restore_ids.is_empty() {
-            let mut conn = state.db.lock().map_err(|error| error.to_string())?;
-            for record in &credentials {
-                if restore_ids.contains(record.server_id.as_str()) {
-                    replace_env(&mut conn, store, &record.server_id, &record.vars)?;
+            let imported = import_data_under_gate(state, mode, &import)?;
+            if !restore_ids.is_empty() {
+                let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+                for record in &credentials {
+                    if restore_ids.contains(record.server_id.as_str()) {
+                        replace_env(&mut conn, store, &record.server_id, &record.vars)?;
+                    }
                 }
+                let tx = conn.transaction().map_err(|error| error.to_string())?;
+                for (id, enabled) in requested_enabled {
+                    tx.execute(
+                        "UPDATE mcp_servers SET enabled = ?2 WHERE id = ?1",
+                        rusqlite::params![id, enabled as i32],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                tx.commit().map_err(|error| error.to_string())?;
             }
-            let tx = conn.transaction().map_err(|error| error.to_string())?;
-            for (id, enabled) in requested_enabled {
-                tx.execute(
-                    "UPDATE mcp_servers SET enabled = ?2 WHERE id = ?1",
-                    rusqlite::params![id, enabled as i32],
-                )
-                .map_err(|error| error.to_string())?;
+            if mode == "replace" {
+                let conn = state.db.lock().map_err(|error| error.to_string())?;
+                // Retired references were durably queued in the same transaction
+                // that removed their server rows. Failed keyring cleanup is safe
+                // to retry and cannot make an old secret active again.
+                let _ = reap_old_references(&conn, store);
             }
-            tx.commit().map_err(|error| error.to_string())?;
-        }
-        if mode == "replace" {
-            let conn = state.db.lock().map_err(|error| error.to_string())?;
-            // Retired references were durably queued in the same transaction
-            // that removed their server rows. Failed keyring cleanup is safe
-            // to retry and cannot make an old secret active again.
-            let _ = reap_old_references(&conn, store);
-        }
-        Ok(imported)
+            Ok(imported)
+        })
     })
 }
 
@@ -1231,7 +1249,7 @@ fn clear_all_user_data_from_connection(conn: &mut rusqlite::Connection) -> Resul
          DELETE FROM profile;
          DELETE FROM sessions;
          DELETE FROM projects;
-         DELETE FROM settings WHERE key != 'schema_version';",
+         DELETE FROM settings WHERE key NOT IN ('schema_version','browser_runtime_namespace');",
     )
     .map_err(|e| format!("Failed to clear database: {}", e))?;
     tx.commit()
@@ -1267,18 +1285,97 @@ fn import_data_inner(
 
     check_import_version(&import)?;
 
-    state.mcp_manager.with_policy_gate(|| {
-        if mode == "replace" {
-            reject_state_only_mcp_credentials(state)?;
-        }
-        import_data_under_gate(state, mode, &import)
+    with_restore_guard(state, mode, || {
+        state.mcp_manager.with_policy_gate(|| {
+            if mode == "replace" {
+                reject_state_only_mcp_credentials(state)?;
+            }
+            import_data_under_gate(state, mode, &import)
+        })
     })
+}
+
+fn with_restore_guard<T>(
+    state: &AppState,
+    mode: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    state.steering.with_idle(|| {
+        let conn=state.db.lock().map_err(|e|e.to_string())?;
+        require_data_idle(&conn)?;
+        if mode=="replace" && conn.query_row("SELECT EXISTS(SELECT 1 FROM automations WHERE enabled=1) OR EXISTS(SELECT 1 FROM scheduled_tasks WHERE enabled=1)",[],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string())? {
+            return Err("替换恢复前请先暂停自动化，避免恢复过程中有新的任务到期。".to_owned());
+        }
+        drop(conn);
+        operation()
+    })
+}
+
+pub(crate) fn require_data_idle(conn: &rusqlite::Connection) -> Result<(), String> {
+    let busy:bool=conn.query_row("SELECT
+            EXISTS(SELECT 1 FROM task_runs WHERE status='running') OR
+            EXISTS(SELECT 1 FROM delegations WHERE status NOT IN ('completed','failed','cancelled')) OR
+            EXISTS(SELECT 1 FROM automation_runs WHERE status IN ('queued','claimed','running')) OR
+            EXISTS(SELECT 1 FROM workspace_supervisor_inputs WHERE status IN ('queued','claimed')) OR
+            EXISTS(SELECT 1 FROM workspace_supervisor_work WHERE status IN ('queued','claimed')) OR
+            EXISTS(SELECT 1 FROM delegated_delivery_follow_ups WHERE status IN ('queued','running'))",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if busy {
+        return Err("仍有待执行或运行中的任务，请结束或停止后再进行数据操作。".to_owned());
+    }
+    Ok(())
 }
 
 fn check_import_version(import: &serde_json::Value) -> Result<(), String> {
     let version = import.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
-    if version < 1 {
-        return Err("Unsupported export format version".to_string());
+    if !matches!(version, 1 | 2) {
+        return Err("备份版本不受支持，请使用兼容的 AngelBot 版本恢复。".to_owned());
+    }
+    let array_fields = [
+        "daily_files",
+        "sessions",
+        "messages",
+        "memories",
+        "settings",
+        "context_summaries",
+        "scheduled_tasks",
+        "mcp_servers",
+        "agent_permission_grants",
+        "adaptive_constraints",
+        "adaptive_constraint_evidence",
+        "projects",
+        "session_branches",
+        "task_runs",
+        "task_run_facts",
+        "agent_steps",
+        "agent_run_events",
+    ];
+    if !array_fields
+        .iter()
+        .copied()
+        .chain(std::iter::once("profile"))
+        .any(|field| import.get(field).is_some_and(|value| !value.is_null()))
+    {
+        return Err("备份没有可恢复的数据段，未开始恢复。".to_owned());
+    }
+    for field in array_fields {
+        if import
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_array())
+        {
+            return Err("备份数据格式无效，未开始恢复。".to_owned());
+        }
+    }
+    if version == 2
+        && import.get("sessions").is_some()
+        && !import.get("projects").is_some_and(|v| v.is_array())
+    {
+        return Err("备份缺少项目关联，未开始恢复。".to_owned());
+    }
+    if import
+        .get("profile")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err("备份用户资料格式无效，未开始恢复。".to_owned());
     }
     Ok(())
 }
@@ -1297,6 +1394,9 @@ fn import_data_under_gate(
     mode: &str,
     import: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    if !matches!(mode, "merge" | "replace") {
+        return Err("不支持的恢复方式，未开始恢复。".to_owned());
+    }
     if mode == "replace"
         || import
             .get("mcp_servers")
@@ -1311,6 +1411,16 @@ fn import_data_under_gate(
     }
 
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let restored_files = if let Some(files) = import.get("daily_files").filter(|v| !v.is_null()) {
+        let files: Vec<crate::backup::files::BackupFile> = serde_json::from_value(files.clone())
+            .map_err(|_| "备份日常结果文件格式无效。".to_owned())?;
+        Some(crate::backup::files::Restore::install(
+            &super::file::personal_files_root(&conn)?,
+            &files,
+        )?)
+    } else {
+        None // Older backups remain valid and never delete existing results.
+    };
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
     // Replace mode: drop all data first
@@ -1318,6 +1428,7 @@ fn import_data_under_gate(
         queue_active_mcp_references_for_cleanup(&tx)?;
         tx.execute_batch(
             "UPDATE projects SET active_session_id = NULL;
+             UPDATE sessions SET leaf_message_id = NULL;
              DELETE FROM messages;
              DELETE FROM context_summaries;
              DELETE FROM scheduled_tasks;
@@ -1328,9 +1439,15 @@ fn import_data_under_gate(
              DELETE FROM adaptive_constraints;
              DELETE FROM profile;
              DELETE FROM sessions;
-             DELETE FROM settings WHERE key != 'schema_version';",
+             DELETE FROM settings WHERE key NOT IN ('schema_version','browser_runtime_namespace');",
         )
         .map_err(|e| format!("Failed to clear database: {}", e))?;
+        if import.get("version").and_then(|v| v.as_i64()) == Some(2)
+            && import.get("projects").is_some()
+        {
+            tx.execute("DELETE FROM projects", [])
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     let mut imported = serde_json::json!({
@@ -1339,18 +1456,25 @@ fn import_data_under_gate(
         "scheduled_tasks": 0, "mcp_servers": 0,
     });
 
-    // Import each table in dependency order
-    if let Some(arr) = import.get("sessions").and_then(|v| v.as_array()) {
-        imported["sessions"] =
-            serde_json::Value::Number(batch_import(&tx, "sessions", arr)?.into());
-    }
-    if let Some(arr) = import.get("messages").and_then(|v| v.as_array()) {
-        imported["messages"] =
-            serde_json::Value::Number(batch_import(&tx, "messages", arr)?.into());
-    }
-    if let Some(arr) = import.get("context_summaries").and_then(|v| v.as_array()) {
-        imported["context_summaries"] =
-            serde_json::Value::Number(batch_import(&tx, "context_summaries", arr)?.into());
+    // Modern snapshots own circular workspace/tree pointers and inert receipts.
+    // Legacy partial backups keep their existing import path.
+    if import.get("version").and_then(|v| v.as_i64()) == Some(2) && import.get("projects").is_some()
+    {
+        let restored = conversations::restore(&tx, import)?;
+        for (key, count) in restored
+            .as_object()
+            .ok_or("Invalid conversation restore result")?
+        {
+            imported[key] = count.clone();
+        }
+    } else {
+        let restored = conversations::restore_legacy(&tx, import)?;
+        for (key, count) in restored
+            .as_object()
+            .ok_or("Invalid legacy restore result")?
+        {
+            imported[key] = count.clone();
+        }
     }
     if let Some(arr) = import.get("memories").and_then(|v| v.as_array()) {
         imported["memories"] =
@@ -1372,15 +1496,55 @@ fn import_data_under_gate(
         imported["profile"] = serde_json::Value::Bool(true);
     }
     if let Some(arr) = import.get("settings").and_then(|v| v.as_array()) {
+        // This obsolete global path also feeds session-less compatibility IPC.
+        // Restored paths must go through pending Project directory confirmation,
+        // not silently expand that fallback. Keep existing local grants intact.
+        let portable: Vec<_> = arr
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.get("key").and_then(|v| v.as_str()),
+                    Some("work_directory" | "browser_runtime_namespace")
+                )
+            })
+            .cloned()
+            .collect();
         imported["settings"] =
-            serde_json::Value::Number(batch_import(&tx, "settings", arr)?.into());
+            serde_json::Value::Number(batch_import(&tx, "settings", &portable)?.into());
     }
     if let Some(arr) = import.get("scheduled_tasks").and_then(|v| v.as_array()) {
         imported["scheduled_tasks"] =
             serde_json::Value::Number(batch_import(&tx, "scheduled_tasks", arr)?.into());
     }
     if let Some(arr) = import.get("mcp_servers").and_then(|v| v.as_array()) {
-        let sanitized = sanitize_mcp_server_rows(arr)?;
+        let mut sanitized = sanitize_mcp_server_rows(arr)?;
+        let source_namespace = import
+            .get("settings")
+            .and_then(|rows| rows.as_array())
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("key").and_then(|v| v.as_str()) == Some(crate::browser_storage::KEY)
+                })
+            })
+            .and_then(|row| row.get("value").and_then(|v| v.as_str()))
+            .map(|token| uuid::Uuid::parse_str(token).map(|id| format!("browser-runtime-{id}")))
+            .transpose()
+            .map_err(|_| "备份的浏览器临时区登记无效。")?;
+        for server in &mut sanitized {
+            crate::browser_storage::rebase_imported_server(
+                &tx,
+                server,
+                source_namespace.as_deref(),
+            )?;
+        }
+        // Catalogs are local observations, not backup authority. Even merge
+        // restores require fresh explicit discovery for restored services.
+        for server in &sanitized {
+            if let Some(id) = server.get("id").and_then(|value| value.as_str()) {
+                tx.execute("DELETE FROM mcp_tool_catalog WHERE server_id=?1", [id])
+                    .map_err(|_| "MCP 工具目录无法失效")?;
+            }
+        }
         imported["mcp_servers"] =
             serde_json::Value::Number(batch_import(&tx, "mcp_servers", &sanitized)?.into());
     }
@@ -1404,9 +1568,13 @@ fn import_data_under_gate(
     }
 
     // Rebuild FTS5 indexes after import
-    let _ = crate::fts::rebuild_fts_index(&tx);
+    crate::fts::rebuild_fts_index(&tx).map_err(|_| "无法恢复搜索索引，未提交恢复。".to_owned())?;
 
     tx.commit().map_err(|e| e.to_string())?;
+
+    if let Some(files) = restored_files {
+        files.commit();
+    }
 
     Ok(imported)
 }
@@ -1463,7 +1631,8 @@ fn sanitize_mcp_server_rows(rows: &[serde_json::Value]) -> Result<Vec<serde_json
         .collect()
 }
 
-/// Perform batch INSERT OR IGNORE for a table from an array of JSON objects.
+/// The caller owns the restore transaction. Only duplicate identities may be
+/// skipped; malformed rows and constraint failures must abort that transaction.
 fn batch_import(
     conn: &rusqlite::Connection,
     table: &str,
@@ -1473,20 +1642,60 @@ fn batch_import(
         return Ok(0);
     }
 
+    let (known_columns, primary_keys): (std::collections::HashSet<String>, Vec<String>) = {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|_| "无法核对备份表结构，未提交恢复。".to_owned())?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .map_err(|_| "无法核对备份表结构，未提交恢复。".to_owned())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "无法核对备份表结构，未提交恢复。".to_owned())?;
+        let keys = columns
+            .iter()
+            .filter(|(_, key)| *key > 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        (columns.into_iter().map(|(name, _)| name).collect(), keys)
+    };
+
     let mut count: i64 = 0;
     for row in rows {
         if let Some(obj) = row.as_object() {
             let columns: Vec<String> = obj.keys().cloned().collect();
+            if columns.is_empty() || columns.iter().any(|column| !known_columns.contains(column)) {
+                return Err("备份字段无效或版本不兼容，未提交恢复。".to_owned());
+            }
+            // SQLite permits NULL in some legacy single-column primary keys.
+            // A restore must retain identity, not mint an unreachable new row.
+            if primary_keys.len() == 1
+                && obj.get(&primary_keys[0]).map_or(true, |value| {
+                    value.is_null() || value.as_str().is_some_and(|id| id.trim().is_empty())
+                })
+            {
+                return Err("备份记录缺少有效标识，未提交恢复。".to_owned());
+            }
             let values: Vec<String> = columns
                 .iter()
                 .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
                 .collect();
             let sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) VALUES ({})",
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
                 table,
-                columns.join(", "),
-                values.join(", ")
+                columns
+                    .iter()
+                    .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                values.join(", "),
+                primary_keys
+                    .iter()
+                    .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
 
             let params: Vec<Box<dyn rusqlite::types::ToSql>> = columns
@@ -1530,10 +1739,11 @@ fn batch_import(
 
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|p| p.as_ref()).collect();
-            match conn.execute(&sql, param_refs.as_slice()) {
-                Ok(_) => count += 1,
-                Err(e) => eprintln!("[Import] Row skipped for {}: {}", table, e),
-            }
+            count += conn.execute(&sql, param_refs.as_slice()).map_err(|_| {
+                format!("无法恢复 {table} 记录：数据不完整或关联记录缺失，未提交恢复。")
+            })? as i64;
+        } else {
+            return Err("备份记录格式无效，未提交恢复。".to_owned());
         }
     }
     Ok(count)
@@ -1550,11 +1760,9 @@ mod tests {
     use rusqlite::params;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use tempfile::NamedTempFile;
 
     fn test_db() -> rusqlite::Connection {
-        let tmp = NamedTempFile::with_suffix(".db").unwrap();
-        let conn = init(tmp.path()).unwrap();
+        let conn = init(std::path::Path::new(":memory:")).unwrap();
         migrate(&conn).unwrap();
         conn
     }
@@ -1578,6 +1786,594 @@ mod tests {
             desktop_adapter: crate::desktop_control::create_mock_adapter(),
             desktop_action_previews: Default::default(),
         }
+    }
+
+    #[test]
+    fn daily_files_are_in_existing_encrypted_backup_and_restore_without_overwriting() {
+        let source = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        let conn = crate::db::init(&source.path().join("data.db")).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let root = super::super::file::personal_files_root(&conn).unwrap();
+        std::fs::write(root.join("清单.csv"), "事项,状态\n采购,待办\n").unwrap();
+        state.db = Arc::new(Mutex::new(conn));
+        let encrypted =
+            export_encrypted_data_impl(&state, "daily files password".into(), None).unwrap();
+        assert!(!encrypted.contains("采购"));
+        let plaintext = crate::backup::decrypt_export(&encrypted, "daily files password").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+        assert_eq!(payload["daily_files"][0]["path"], "清单.csv");
+        let target = tempfile::tempdir().unwrap();
+        let conn = crate::db::init(&target.path().join("data.db")).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        state.db = Arc::new(Mutex::new(conn));
+        import_data_impl(&state, plaintext.clone(), None).unwrap();
+        let restored_root =
+            super::super::file::personal_files_root(&state.db.lock().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(restored_root.join("清单.csv")).unwrap(),
+            "事项,状态\n采购,待办\n"
+        );
+        let mut invalid: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+        invalid["daily_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "path":"rollback.txt", "content_base64":"cm9sbGJhY2s="
+            }));
+        invalid["sessions"] = serde_json::json!([{
+            "id":"unresolved", "title":"bad", "project_id":"missing-project",
+            "created_at":1, "updated_at":1
+        }]);
+        assert!(import_data_impl(&state, invalid.to_string(), None).is_err());
+        assert!(!restored_root.join("rollback.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(restored_root.join("清单.csv")).unwrap(),
+            "事项,状态\n采购,待办\n"
+        );
+        std::fs::write(restored_root.join("清单.csv"), "newer").unwrap();
+        assert!(import_data_impl(
+            &state,
+            plaintext,
+            Some(ImportOptions {
+                mode: Some("replace".into())
+            })
+        )
+        .unwrap_err()
+        .contains("冲突"));
+        assert_eq!(
+            std::fs::read_to_string(restored_root.join("清单.csv")).unwrap(),
+            "newer"
+        );
+        assert!(crate::backup::decrypt_export(&encrypted, "incorrect password").is_err());
+    }
+
+    #[test]
+    fn encrypted_project_restore_preserves_main_branches_receipts_and_requires_one_directory_batch()
+    {
+        use super::super::workspace::{
+            confirm_restored_project_directories_impl, DirectoryConfirmation,
+        };
+        use rusqlite::OptionalExtension;
+        let source = test_state();
+        let roots = tempfile::tempdir().unwrap();
+        let a = roots.path().join("a");
+        let b = roots.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("source.txt"), "original project file").unwrap();
+        let a = super::super::file::display_work_dir(&a.canonicalize().unwrap());
+        let b = super::super::file::display_work_dir(&b.canonicalize().unwrap());
+        {
+            let conn = source.db.lock().unwrap();
+            for (id, path) in [("a", &a), ("b", &b)] {
+                conn.execute("INSERT INTO projects(id,name,path,created_at,kind,updated_at) VALUES(?1,?1,?2,1,'project',1)",params![id,path]).unwrap();
+                conn.execute("INSERT INTO sessions(id,title,created_at,updated_at,project_id,work_dir,additional_read_dirs) VALUES(?1,?1,1,1,?1,?2,'[\"C:/not-restored\"]')",params![id,path]).unwrap();
+                conn.execute("UPDATE projects SET active_session_id=?1 WHERE id=?1", [id])
+                    .unwrap();
+            }
+            conn.execute_batch("INSERT INTO messages(id,session_id,role,content,created_at,parent_id,metadata) VALUES
+                ('p1','personal-main','user','daily',1,NULL,NULL),('p2','personal-main','assistant','daily result',2,'p1',NULL),
+                ('a1','a','user','project request',1,NULL,NULL),('a2','a','assistant','receipt retained',2,'a1','{\"backup_marker\":\"original metadata\"}'),
+                ('a3','a','assistant','inactive message branch',3,'a1',NULL);
+                UPDATE sessions SET leaf_message_id='p2' WHERE id='personal-main';
+                UPDATE sessions SET leaf_message_id='a2' WHERE id='a';
+                INSERT INTO sessions(id,title,created_at,updated_at,parent_id,project_id,branch_name) VALUES('a-branch','older branch',1,1,'a','a','preserved');
+                INSERT INTO session_branches(id,session_id,name,created_at,updated_at) VALUES('branch-1','a-branch','older branch',1,1);
+                INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,confirmation_state,resumable,step_count,completed_step_count,created_at,updated_at)
+                VALUES('a2','a','a2','original task','awaiting_confirmation','[]','required',1,1,1,1,1);
+                INSERT INTO agent_steps(id,session_id,tool_name,tool_output,seq,created_at,call_id) VALUES('step-1','a','read_file','original receipt bytes',1,2,'call-1');
+                INSERT INTO agent_run_events(id,run_id,session_id,sequence,event_type,payload,created_at) VALUES('event-1','a2','a',1,'ExternalToolDispatchReserved','{\"type\":\"ExternalToolDispatchReserved\",\"data\":{\"call_id\":\"call-2\",\"tool_name\":\"mcp_owned\"}}',1);").unwrap();
+            let mut facts = crate::agent::task_facts::TaskFacts::new("original task");
+            facts.pending_confirmation = Some(crate::agent::task_facts::PendingConfirmationFact {
+                call_id: "call-2".into(),
+                tool_name: "mcp_owned".into(),
+                arguments: serde_json::json!({}),
+                requested_at: 1,
+            });
+            facts.terminal_reason =
+                Some(crate::agent::task_facts::TaskTerminalReason::AwaitingConfirmation);
+            crate::agent::task_facts::persist_task_facts(&conn, "a2", "a", "a2", &facts, 1)
+                .unwrap();
+            conn.execute("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,confirmation_state,resumable,created_at,updated_at) VALUES('p2','personal-main','p2','daily task','completed','[]','none',0,2,2)",[]).unwrap();
+            crate::agent::task_facts::persist_task_facts(
+                &conn,
+                "p2",
+                "personal-main",
+                "p2",
+                &crate::agent::task_facts::TaskFacts::new("daily task"),
+                2,
+            )
+            .unwrap();
+        }
+        let source_daily_history =
+            super::super::foreground_run_store::ForegroundRunStore::new(source.db.clone())
+                .project_session("personal-main")
+                .unwrap();
+        assert_eq!(
+            source_daily_history[1].task_run.as_ref().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            source_daily_history[1]
+                .task_facts
+                .as_ref()
+                .unwrap()
+                .terminal_reason,
+            None
+        );
+        let source_daily_history = serde_json::to_value(source_daily_history).unwrap();
+        let encrypted =
+            export_encrypted_data_impl(&source, "project backup password".into(), None).unwrap();
+        let plain = crate::backup::decrypt_export(&encrypted, "project backup password").unwrap();
+        let target = test_state();
+        let active = target.steering.try_start_run("personal-main").unwrap();
+        assert!(import_encrypted_data_impl(
+            &target,
+            encrypted.clone(),
+            "project backup password".into(),
+            None
+        )
+        .unwrap_err()
+        .contains("任务结束"));
+        drop(active);
+        let restored =
+            import_encrypted_data_impl(&target, encrypted, "project backup password".into(), None)
+                .unwrap();
+        assert_eq!(restored["messages"], 5);
+        let target_daily_history =
+            super::super::foreground_run_store::ForegroundRunStore::new(target.db.clone())
+                .project_session("personal-main")
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(target_daily_history).unwrap(),
+            source_daily_history,
+            "a completed task with no terminal-reason fact retains its full restored projection"
+        );
+        assert_eq!(
+            super::super::workspace::get_workspaces_impl(&target)
+                .unwrap()
+                .len(),
+            3
+        );
+        let opened = super::super::workspace::open_workspace_impl(&target, "a").unwrap();
+        assert_eq!(opened.workspace.active_session_id, "a");
+        assert!(!opened.workspace.directory_confirmed);
+        assert!(opened.session.work_dir.is_none());
+        assert!(super::super::file::resolve_work_dir(&target, Some("a"))
+            .unwrap_err()
+            .contains("尚未确认"));
+        {
+            let conn = target.db.lock().unwrap();
+            assert!(super::super::file::resolve_delegation_workspace_root(&conn, "a").is_err());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id='personal-main'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "p2"
+            );
+            assert_eq!(
+                conn.query_row("SELECT parent_id FROM messages WHERE id='a3'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+                "a1"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT parent_id FROM sessions WHERE id='a-branch'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "a"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT tool_output FROM agent_steps WHERE id='step-1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "original receipt bytes"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT status,resumable,confirmation_state FROM task_runs WHERE id='a2'",
+                    [],
+                    |r| Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?
+                    ))
+                )
+                .unwrap(),
+                ("needs_attention".into(), 0, "none".into())
+            );
+            let facts = crate::agent::task_facts::load_task_facts(&conn, "a2")
+                .unwrap()
+                .unwrap();
+            assert!(facts.facts.pending_confirmation.is_none());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM workspace_supervisor_work", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+        }
+        let history =
+            super::super::foreground_run_store::ForegroundRunStore::new(target.db.clone())
+                .project_session("a")
+                .unwrap();
+        assert_eq!(
+            history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "a2"]
+        );
+        assert!(!history[1].task_run.as_ref().unwrap().resumable);
+        let batch = |last_path: String| {
+            vec![
+                DirectoryConfirmation {
+                    id: "a".into(),
+                    expected_path: a.clone(),
+                    path: a.clone(),
+                },
+                DirectoryConfirmation {
+                    id: "b".into(),
+                    expected_path: b.clone(),
+                    path: last_path,
+                },
+            ]
+        };
+        assert!(
+            confirm_restored_project_directories_impl(&target, batch(format!("{b}/missing")))
+                .is_err()
+        );
+        assert!(
+            !super::super::workspace::open_workspace_impl(&target, "a")
+                .unwrap()
+                .workspace
+                .directory_confirmed,
+            "a later invalid entry must roll back the entire batch"
+        );
+        let relocated = roots.path().join("relocated-a");
+        std::fs::create_dir(&relocated).unwrap();
+        std::fs::write(relocated.join("source.txt"), "original project file").unwrap();
+        let relocated = super::super::file::display_work_dir(&relocated.canonicalize().unwrap());
+        confirm_restored_project_directories_impl(
+            &target,
+            vec![
+                DirectoryConfirmation {
+                    id: "a".into(),
+                    expected_path: a.clone(),
+                    path: relocated.clone(),
+                },
+                DirectoryConfirmation {
+                    id: "b".into(),
+                    expected_path: b.clone(),
+                    path: b.clone(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(super::super::workspace::get_workspaces_impl(&target)
+            .unwrap()
+            .iter()
+            .all(|w| w.directory_confirmed));
+        let root = super::super::file::resolve_work_dir(&target, Some("a")).unwrap();
+        assert_eq!(super::super::file::display_work_dir(&root), relocated);
+        assert!(
+            super::super::file::read_file_core(&root, &format!("{a}/source.txt")).is_err(),
+            "confirmation grants the newly selected local root, not the original path hint"
+        );
+        assert_eq!(
+            super::super::file::read_file_core(&root, "source.txt").unwrap(),
+            "original project file"
+        );
+        assert!(
+            confirm_restored_project_directories_impl(&target, batch(b.clone())).is_err(),
+            "a stale batch cannot re-authorize paths"
+        );
+        let merged = import_data_impl(&target, plain.clone(), None).unwrap();
+        assert_eq!(merged["messages"], 0);
+        assert!(
+            super::super::workspace::open_workspace_impl(&target, "a")
+                .unwrap()
+                .workspace
+                .directory_confirmed,
+            "merge preserves authority already confirmed on this machine"
+        );
+        assert_eq!(
+            super::super::file::display_work_dir(
+                &super::super::file::resolve_work_dir(&target, Some("a")).unwrap()
+            ),
+            relocated,
+            "merge does not redirect a local project back to its source-machine path"
+        );
+        import_data_impl(
+            &target,
+            plain.clone(),
+            Some(ImportOptions {
+                mode: Some("replace".into()),
+            }),
+        )
+        .unwrap();
+        assert!(
+            !super::super::workspace::open_workspace_impl(&target, "a")
+                .unwrap()
+                .workspace
+                .directory_confirmed,
+            "replace does not carry source directory grants"
+        );
+        assert_eq!(
+            std::fs::read_to_string(roots.path().join("a/source.txt")).unwrap(),
+            "original project file"
+        );
+        let mut invalid: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        for message in invalid["messages"].as_array_mut().unwrap() {
+            if message["id"] == "a1" {
+                message["parent_id"] = serde_json::json!("a2");
+            }
+        }
+        assert!(import_data_impl(&target, invalid.to_string(), None)
+            .unwrap_err()
+            .contains("循环"));
+        assert_eq!(
+            target
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+
+        let legacy = test_state();
+        let prior_global_root = legacy
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='work_directory'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap();
+        import_data_impl(&legacy,serde_json::json!({"version":1,"settings":[{"key":"work_directory","value":a,"updated_at":1}],"sessions":[{"id":"legacy","title":"old project","created_at":1,"updated_at":2}],"messages":[
+            {"id":"old-z","session_id":"legacy","role":"user","content":"old request","created_at":1},
+            {"id":"old-a","session_id":"legacy","role":"assistant","content":"old result","created_at":1}
+        ]}).to_string(),None).unwrap();
+        let old_project = super::super::workspace::get_workspaces_impl(&legacy)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.kind == "project")
+            .unwrap();
+        assert!(
+            !old_project.directory_confirmed,
+            "legacy work_dir is not a directory grant"
+        );
+        assert_eq!(old_project.root_path.as_deref(), Some(a.as_str()));
+        assert!(super::super::file::resolve_work_dir(&legacy, Some("legacy")).is_err());
+        let current_global_root = legacy
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='work_directory'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            current_global_root, prior_global_root,
+            "restore preserves a local fallback, not the archived path"
+        );
+        assert_ne!(
+            current_global_root.as_deref(),
+            Some(a.as_str()),
+            "legacy global paths do not bypass directory confirmation"
+        );
+        let old_history =
+            super::super::foreground_run_store::ForegroundRunStore::new(legacy.db.clone())
+                .project_session("legacy")
+                .unwrap();
+        assert_eq!(
+            old_history
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-z", "old-a"],
+            "same-second legacy messages retain backup array order, not UUID order"
+        );
+        assert_eq!(
+            legacy
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT leaf_message_id FROM sessions WHERE id='legacy'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+            "old-a",
+            "the recovered Main leaf remains the final assistant response"
+        );
+    }
+
+    #[test]
+    fn invalid_import_rolls_back_and_merge_counts_only_new_rows() {
+        let state = test_state();
+        state.db.lock().unwrap().execute(
+            "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('existing','keep',1,1)", [],
+        ).unwrap();
+        for bad in [
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!({"id":"bad","title":null,"created_at":1,"updated_at":1}),
+            serde_json::json!({"title":"missing identity","created_at":1,"updated_at":1}),
+            serde_json::json!({"id":null,"title":"null identity","created_at":1,"updated_at":1}),
+            serde_json::json!({"id":"","title":"empty identity","created_at":1,"updated_at":1}),
+            serde_json::json!({"id":"bad","title":"bad","created_at":1,"updated_at":1,"project_id":"missing-project"}),
+            serde_json::json!({"id":"bad","PRIVATE_UNSUPPORTED_COLUMN":"private row value"}),
+            serde_json::json!({"id":"bad","title) VALUES ('x'); --":"private row value"}),
+        ] {
+            let payload = serde_json::json!({"version":1,"sessions":[
+                {"id":"valid","title":"new","created_at":1,"updated_at":1}, bad
+            ]});
+            let error = import_data_impl(
+                &state,
+                payload.to_string(),
+                Some(ImportOptions {
+                    mode: Some("replace".into()),
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                !error.contains("private row value")
+                    && !error.contains("PRIVATE_UNSUPPORTED_COLUMN")
+            );
+            let conn = state.db.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT title FROM sessions WHERE id='existing'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "keep"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sessions WHERE id IN ('valid','bad')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+        for payload in [
+            serde_json::json!({"version":1}),
+            serde_json::json!({"version":99,"sessions":[]}),
+            serde_json::json!({"version":1,"sessions":{}}),
+            serde_json::json!({"version":1,"profile":[]}),
+        ] {
+            assert!(import_data_impl(
+                &state,
+                payload.to_string(),
+                Some(ImportOptions {
+                    mode: Some("replace".into())
+                })
+            )
+            .is_err());
+            assert_eq!(
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT title FROM sessions WHERE id='existing'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "keep"
+            );
+        }
+        let merged = import_data_impl(
+            &state,
+            serde_json::json!({"version":1,"daily_files":null,"sessions":[
+                {"id":"existing","title":"do not replace","created_at":1,"updated_at":1},
+                {"id":"new","title":"new","created_at":1,"updated_at":1}
+            ]})
+            .to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(merged["sessions"], 1);
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT title FROM sessions WHERE id='existing'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "keep"
+        );
+        let payload = serde_json::json!({"version":1,"sessions":[
+            {"id":"another","title":"keep","created_at":1,"updated_at":1}
+        ]})
+        .to_string();
+        assert!(import_data_impl(
+            &state,
+            payload.clone(),
+            Some(ImportOptions {
+                mode: Some("unsupported".into())
+            })
+        )
+        .unwrap_err()
+        .contains("不支持"));
+        // Conflicts on unrelated unique constraints are not duplicate identity.
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE UNIQUE INDEX test_session_title ON sessions(title);")
+            .unwrap();
+        assert!(import_data_impl(&state, payload.clone(), None).is_err());
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP INDEX test_session_title; DROP TABLE messages_fts;")
+            .unwrap();
+        assert!(import_data_impl(&state, payload, None)
+            .unwrap_err()
+            .contains("搜索索引"));
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sessions WHERE id='another'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "index failure must roll back the imported data too"
+        );
     }
 
     #[derive(Default)]
@@ -1646,6 +2442,9 @@ mod tests {
         )
         .unwrap();
 
+        super::super::mcp_catalog::store(&conn,"server","server-command","",&[
+            serde_json::from_value(serde_json::json!({"name":"inspect","description":"LOCAL_CATALOG_CANARY","inputSchema":{"type":"object"}})).unwrap()
+        ]).unwrap();
         let exported = export_data_from_connection(
             &conn,
             Some(ExportOptions {
@@ -1659,6 +2458,32 @@ mod tests {
         assert!(server.get("env").is_none());
         assert!(server.get("env_ref").is_none());
         assert!(!exported.contains("secret-canary"));
+        assert!(!exported.contains("LOCAL_CATALOG_CANARY"));
+        assert!(parsed.get("mcp_tool_catalog").is_none());
+    }
+
+    #[test]
+    fn merge_restore_invalidates_only_restored_mcp_catalogs_and_never_imports_discovery() {
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            for id in ["restored", "unrelated"] {
+                insert_mcp_server(&conn, id);
+                super::super::mcp_catalog::store(&conn, id, "server-command", "", &[]).unwrap();
+            }
+        }
+        import_data_under_gate(&state,"merge",&serde_json::json!({
+            "mcp_servers":[{"id":"restored","name":"Server","command":"server-command","args":"","enabled":1,"created_at":1}],
+            "mcp_tool_catalog":[{"server_id":"restored","tools_json":"[]"}]
+        })).unwrap();
+        let conn = state.db.lock().unwrap();
+        assert!(super::super::mcp_catalog::load(&conn, "restored")
+            .unwrap()
+            .is_none());
+        assert!(super::super::mcp_catalog::load(&conn, "unrelated")
+            .unwrap()
+            .is_some());
+        assert!(state.mcp_manager.running_servers().is_empty());
     }
 
     #[test]
@@ -2011,7 +2836,7 @@ mod tests {
     // ── Autostart ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn notification_event_payload_is_only_created_for_enabled_channels() {
+    fn notification_dispatch_observes_native_result_and_respects_channel() {
         let settings = NotificationSettings {
             chat_reply: false,
             reminder: true,
@@ -2020,25 +2845,69 @@ mod tests {
             system: true,
         };
 
-        assert!(notification_event_payload(
+        assert!(!send_notification_with(
             &settings,
-            "chat_reply".to_string(),
-            "Hidden".to_string(),
-            "Disabled channel".to_string(),
+            "chat_reply",
+            "Hidden",
+            "Disabled channel",
+            |_, _| panic!("disabled channels must not call the OS"),
         )
-        .is_none());
-
-        let payload = notification_event_payload(
+        .unwrap());
+        let mut calls = 0;
+        assert!(send_notification_with(
             &settings,
-            "reminder".to_string(),
-            "Stretch".to_string(),
-            "Stand up for a minute".to_string(),
+            "reminder",
+            "Stretch",
+            "Stand up for a minute",
+            |title, body| {
+                calls += 1;
+                assert_eq!(title, "Stretch");
+                assert_eq!(body, "Stand up for a minute");
+                Ok(())
+            }
         )
-        .expect("enabled channel should create a frontend notification payload");
+        .unwrap());
+        assert_eq!(calls, 1, "one channel request must call the OS once");
+        let error = send_notification_with(&settings, "reminder", "Stretch", "Stand up", |_, _| {
+            Err("fixture native request failed".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "fixture native request failed");
+        assert!(
+            send_notification_with(&settings, "reminder", " ", "Stand up", |_, _| {
+                panic!("invalid content must not call the OS")
+            })
+            .is_err()
+        );
+    }
 
-        assert_eq!(payload.channel, "reminder");
-        assert_eq!(payload.title, "Stretch");
-        assert_eq!(payload.body, "Stand up for a minute");
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit synthetic Windows notification request; requires ANGELBOT_NATIVE_NOTIFICATION_TEST=1"]
+    fn native_notification_request() {
+        assert_eq!(
+            std::env::var("ANGELBOT_NATIVE_NOTIFICATION_TEST").as_deref(),
+            Ok("1"),
+            "native notification acceptance must be explicitly enabled"
+        );
+        let state = crate::tests::test_app_state();
+        crate::db::migrate(&state.db.lock().unwrap()).unwrap();
+        let mut context = tauri::generate_context!();
+        context.config_mut().app.windows.clear();
+        let app = tauri::Builder::default()
+            .any_thread()
+            .plugin(tauri_plugin_notification::init())
+            .build(context)
+            .unwrap();
+        assert!(send_notification_channel_impl(
+            &state,
+            app.handle(),
+            "system".into(),
+            "AngelBot 验收提醒".into(),
+            "仅验证系统通知请求，无需操作，不包含个人数据。".into(),
+        )
+        .expect("native OS request failed; do not automatically replay"));
+        println!("NATIVE_NOTIFICATION_REQUEST accepted=true; one synthetic request, no model or user data, display/read not asserted");
     }
 
     #[test]

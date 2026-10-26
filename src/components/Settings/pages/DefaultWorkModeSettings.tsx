@@ -57,7 +57,7 @@ export function DefaultWorkModeSettings() {
         <p className="settings-muted">回复采用自然、克制的语言；不使用 Emoji、颜文字或拟人化装饰。</p>
         <ToggleField
           label="使用长期记忆"
-          description="关闭后，AngelBot 不会在后续回复中读取长期记忆；不会删除已有记忆。"
+          description="从下一次新对话请求起，关闭后不再读取长期记忆，确认或继续该任务时也保持关闭；不会删除已有记忆或撤回已发送的内容。"
           checked={preferences.habits.useLongTermMemory ?? true}
           onChange={(useLongTermMemory) => updateHabits({ useLongTermMemory })}
         />

@@ -15,6 +15,16 @@
 .automation-form select { width: 100%; min-width: 0; height: 38px; border: 1px solid var(--color-border); border-radius: 6px; padding: 0 10px; color: var(--color-text); background: var(--color-bg); font: inherit; font-size: 13px; outline: none; }
 .automation-form select:focus { border-color: var(--color-accent); box-shadow: 0 0 0 2px var(--color-accent-subtle); }
 .automation-form label small { color: var(--color-muted); font-size: 11px; font-weight: 400; }
+.automation-script-form .automation-args { grid-column: 1 / -1; }
+.automation-form textarea { width: 100%; min-width: 0; border: 1px solid var(--color-border); border-radius: var(--radius-control); padding: 8px 10px; color: var(--color-text); background: var(--color-surface); font: inherit; font-size: 13px; resize: vertical; outline: none; }
+.automation-form textarea:focus { border-color: var(--color-accent); box-shadow: 0 0 0 2px var(--color-accent-subtle); }
+.automation-script-guidance { margin: 0 0 16px; color: var(--color-muted); font-size: 12px; line-height: 1.55; }
+.automation-state-note { grid-column: 1 / -1; margin: 0; color: var(--color-muted); font-size: 12px; line-height: 1.55; }
+.automation-status.attention { color: var(--color-danger); }
+.automation-status.attention i { background: var(--color-danger); }
+.automation-form .automation-checkbox, .automation-review .automation-checkbox { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; font-size: 12px; line-height: 1.55; }
+.automation-checkbox input[type="checkbox"] { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0; }
+.automation-checkbox small { display: block; }
 .automation-nl-confirm { grid-template-columns: 2fr 110px 100px 220px; border-top: 1px dashed var(--color-border-muted); }
 .automation-nl-confirm .wide { grid-column: 1 / -1; }
 .automation-nl-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
@@ -50,6 +60,9 @@
 .automation-card:first-child { border-top: 0; }
 .automation-card:hover { background: color-mix(in srgb, var(--color-surface) 64%, transparent); }
 .automation-output pre { border-radius: var(--radius-control); }
+.automation-card-target { background: var(--color-surface); box-shadow: inset 2px 0 var(--color-accent); padding-inline: 12px; }
+.automation-card-target:focus { outline: 1px solid var(--color-border-muted); outline-offset: 2px; }
+.automation-history-entry { padding-block: 8px; border-top: 1px solid var(--color-border-muted); }
 .automation-empty { border: 0; border-top: 1px solid var(--color-border-muted); border-bottom: 1px solid var(--color-border-muted); border-radius: 0; }
 
 @media (max-width: 850px) { .automation-page { padding-inline: var(--feature-page-gutter); } }

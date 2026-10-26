@@ -4,13 +4,38 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn native_acceptance_borrows_saved_credentials_without_opening_automated_e2e() {
+    let isolated = PathBuf::from("isolated-runtime");
+    let saved = PathBuf::from("saved-owner-runtime");
+    for manual in [false, true] {
+        assert_eq!(
+            credential_root_for_mode(isolated.clone(), saved.clone(), false, manual),
+            Some(isolated.clone())
+        );
+    }
+    assert_eq!(
+        credential_root_for_mode(isolated.clone(), saved.clone(), true, false),
+        None
+    );
+    assert_eq!(
+        credential_root_for_mode(isolated, saved.clone(), true, true),
+        Some(saved)
+    );
+}
+
 fn auth_http_fixture(
     response: Option<&'static [u8]>,
-) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+) -> (
+    std::net::SocketAddr,
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Sender<()>,
+) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
+    let (release_body, headers_received) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let (mut stream, _) = loop {
@@ -25,26 +50,51 @@ fn auth_http_fixture(
                 Err(_) => return,
             }
         };
+        // Accepted sockets inherit the listener's nonblocking mode on Windows.
+        // Reads must honor the bounded blocking timeouts below, not race WouldBlock.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut request = [0; 4096];
-        let _ = stream.read(&mut request);
-        if let Some(response) = response {
-            let _ = stream.write_all(response);
-        } else {
+        let Some(response) = response else {
+            // The timeout fixture deliberately permits client cancellation
+            // before a complete request; only the response fixture needs it.
+            let _ = stream.read(&mut [0; 4096]);
             std::thread::sleep(Duration::from_millis(200));
+            return;
+        };
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0, "client must send complete request headers");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 8192, "fixture request headers are bounded");
         }
+        let body_at = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        stream.write_all(&response[..body_at]).unwrap();
+        stream.flush().unwrap();
+        // Ensure this test reaches read_response, rather than racing a
+        // reset/EOF while reqwest is still constructing the response.
+        headers_received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        stream.write_all(&response[body_at..]).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
     });
-    (address, server)
+    (address, server, release_body)
 }
 
 #[tokio::test]
 async fn authentication_timeout_is_distinct_and_keeps_request_url_private() {
-    let (address, server) = auth_http_fixture(None);
+    let (address, server, _release_body) = auth_http_fixture(None);
     let error = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_millis(50))
@@ -99,7 +149,7 @@ async fn authentication_connection_failure_keeps_request_url_private() {
 
 #[tokio::test]
 async fn truncated_authentication_response_reports_read_failure_without_private_body() {
-    let (address, server) = auth_http_fixture(Some(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\nfixture-private-response"));
+    let (address, server, release_body) = auth_http_fixture(Some(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\nfixture-private-response"));
     let response = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
@@ -109,6 +159,7 @@ async fn truncated_authentication_response_reports_read_failure_without_private_
         .send()
         .await
         .unwrap();
+    release_body.send(()).unwrap();
     let error = read_response::<TokenResponse>(response)
         .await
         .err()
@@ -217,6 +268,7 @@ fn identity_jwt(subject: &str, audience: &str, nonce: &str, expiry: u64) -> Stri
 struct MemoryStore {
     record: Mutex<Option<Record>>,
     fail_save: AtomicBool,
+    saved: Notify,
 }
 impl CredentialStore for MemoryStore {
     fn load(&self) -> Result<Option<Record>, String> {
@@ -228,6 +280,7 @@ impl CredentialStore for MemoryStore {
         }
         record.validate()?;
         *self.record.lock().unwrap() = Some(record.clone());
+        self.saved.notify_one();
         Ok(())
     }
 }
@@ -236,6 +289,9 @@ struct FakeTransport {
     responses: Mutex<VecDeque<Result<TokenResponse, AuthError>>>,
     requests: Mutex<Vec<Vec<(String, String)>>>,
     refresh_count: AtomicUsize,
+    pause_refresh: AtomicBool,
+    refresh_started: Notify,
+    refresh_release: Notify,
     revoke_count: AtomicUsize,
     fail_revoke: AtomicBool,
     revoke_requests: Mutex<Vec<(String, String)>>,
@@ -249,6 +305,9 @@ impl FakeTransport {
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
             refresh_count: AtomicUsize::new(0),
+            pause_refresh: AtomicBool::new(false),
+            refresh_started: Notify::new(),
+            refresh_release: Notify::new(),
             revoke_count: AtomicUsize::new(0),
             fail_revoke: AtomicBool::new(false),
             revoke_requests: Mutex::new(Vec::new()),
@@ -275,6 +334,10 @@ impl AuthTransport for FakeTransport {
     async fn token(&self, parameters: Vec<(String, String)>) -> Result<TokenResponse, AuthError> {
         self.refresh_count.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(parameters);
+        self.refresh_started.notify_one();
+        if self.pause_refresh.load(Ordering::SeqCst) {
+            self.refresh_release.notified().await;
+        }
         tokio::task::yield_now().await;
         self.responses
             .lock()
@@ -547,8 +610,235 @@ fn protected_blob_supports_large_tokens_and_detects_tampering() {
     assert!(!String::from_utf8_lossy(&blob).contains("fixture-token-canary"));
     assert_eq!(decrypt_record(&key, &blob).unwrap(), plaintext.as_bytes());
     assert!(decrypt_record(&[8; 32], &blob).is_err());
+    let old = Path::new("old-profile/chatgpt-plan.credentials");
+    let new = Path::new("new-profile/chatgpt-plan.credentials");
+    let moved = relocate_credential_blob(&blob, old).unwrap();
+    let (account, ciphertext) = credential_binding(&moved, &path_key_account(new)).unwrap();
+    assert_eq!(account, path_key_account(old));
+    assert_ne!(account, path_key_account(new));
+    assert_eq!(
+        decrypt_record(&key, ciphertext).unwrap(),
+        plaintext.as_bytes()
+    );
+    assert_eq!(relocate_credential_blob(&moved, new).unwrap(), moved);
+    for previous in [None, Some(blob.as_slice())] {
+        let legacy = credential_blob_for_write(&account, &blob, false, previous).unwrap();
+        assert_eq!(legacy, blob);
+        // An old, still-running adapter reads the refreshed v1 bytes directly.
+        assert_eq!(decrypt_record(&key, &legacy).unwrap(), plaintext.as_bytes());
+        assert_eq!(
+            credential_blob_for_write(&account, &blob, true, previous).unwrap(),
+            moved
+        );
+    }
+    assert_eq!(
+        credential_blob_for_write(&account, &blob, false, Some(&moved)).unwrap(),
+        moved
+    );
+    assert!(!String::from_utf8_lossy(&moved).contains("fixture-token-canary"));
+    let mut bad_header = moved;
+    bad_header[BLOB_MAGIC.len()] = b'/';
+    assert!(credential_binding(&bad_header, &path_key_account(new)).is_err());
+    assert!(relocate_credential_blob(&[], old).is_err());
     blob[20] ^= 1;
     assert!(decrypt_record(&key, &blob).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "native Windows credential-manager acceptance; synthetic namespace, never part of offline full"]
+fn native_profile_cutover_keeps_windows_vault_binding() {
+    use std::fs;
+    const CHILD_MARKER: &str = "native-storage-vault-child";
+    const SERVICE_PREFIX: &str = "com.angelbot.acceptance.storage.";
+    fn paths(root: &Path) -> crate::profile_storage::Paths {
+        crate::profile_storage::Paths {
+            legacy: root.join("angelbot"),
+            current: root.join(crate::profile_storage::DIRECTORY),
+            config: root.join("roaming/AngelBot/app_config.json"),
+        }
+    }
+    fn store(root: &Path, vault: &KeyringStore) -> ProtectedStore {
+        let path = root.join("chatgpt-plan.credentials");
+        ProtectedStore {
+            vault: Arc::new(vault.clone()),
+            key_account: path_key_account(&path),
+            path,
+            _profile_access: crate::profile_storage::borrow(root).unwrap(),
+        }
+    }
+    // The child reads only an explicitly supplied fixture namespace. It cannot
+    // fall back to the ordinary profile or the application vault namespace.
+    if let Some(config) = std::env::var_os("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR").map(PathBuf::from)
+    {
+        if let Ok(service) = fs::read_to_string(config.join(CHILD_MARKER)) {
+            Uuid::parse_str(service.strip_prefix(SERVICE_PREFIX).unwrap()).unwrap();
+            let vault = KeyringStore::new(service);
+            let paths = paths(config.parent().unwrap());
+            let current = store(&paths.current, &vault);
+            let mut record = current.load().unwrap().unwrap();
+            assert_eq!(record.authorization_epoch, 17);
+            let registration = record.registration.as_mut().unwrap();
+            assert_eq!(
+                registration.credential_ref,
+                self::registration().credential_ref
+            );
+            assert!(
+                registration
+                    .tokens
+                    .as_ref()
+                    .unwrap()
+                    .access_token
+                    .as_deref()
+                    == Some("fixture-access-old")
+            );
+            registration.tokens.as_mut().unwrap().access_token =
+                Some("fixture-access-native-updated".into());
+            current.save(&record).unwrap();
+            assert!(
+                vault.get_password(&current.key_account).unwrap().is_none(),
+                "cutover must reuse the original key, not create a replacement"
+            );
+            println!(
+                "native child: encrypted record read and updated through the production store"
+            );
+            return;
+        }
+    }
+    struct Cleanup(KeyringStore, Vec<String>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for account in &self.1 {
+                match self.0.get_password(account) {
+                    Ok(None) => {}
+                    Ok(Some(_)) if self.0.delete(account).is_ok() => {}
+                    _ => eprintln!(
+                        "Owned native fixture cleanup needs attention: {} / {account}",
+                        self.0.service()
+                    ),
+                }
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(temp.path());
+    let vault = KeyringStore::new(format!("{SERVICE_PREFIX}{}", Uuid::new_v4()));
+    let original_account = path_key_account(&paths.legacy.join("chatgpt-plan.credentials"));
+    let new_account = path_key_account(&paths.current.join("chatgpt-plan.credentials"));
+    // Never claim cleanup ownership over a pre-existing entry, even in the
+    // extremely unlikely event of a fixture namespace/path collision.
+    assert!(vault.get_password(&original_account).unwrap().is_none());
+    assert!(vault.get_password(&new_account).unwrap().is_none());
+    let _cleanup = Cleanup(
+        vault.clone(),
+        vec![original_account.clone(), new_account.clone()],
+    );
+    let mut record = Record::new();
+    record.registration = Some(registration());
+    record.authorization_epoch = 17;
+    let legacy = store(&paths.legacy, &vault);
+    legacy.save(&record).unwrap();
+    let original = fs::read(&legacy.path).unwrap();
+    assert!(!original.starts_with(BLOB_MAGIC));
+    assert!(legacy.load().unwrap().unwrap().host_id == record.host_id);
+    let key = vault.get_password(&original_account).unwrap().unwrap();
+    assert!(
+        crate::profile_storage::open(&paths, false, false).is_err(),
+        "a borrowed legacy store must block migration"
+    );
+    assert!(fs::read(&legacy.path).unwrap() == original);
+    drop(legacy);
+    let migrated = crate::profile_storage::open(&paths, false, false).unwrap();
+    assert!(migrated.migrated);
+    drop(migrated);
+    let current = store(&paths.current, &vault);
+    assert!(current.load().unwrap().unwrap().host_id == record.host_id);
+    let encoded = fs::read(&current.path).unwrap();
+    assert!(encoded.starts_with(BLOB_MAGIC));
+    assert_eq!(
+        credential_binding(&encoded, &new_account).unwrap().0,
+        original_account
+    );
+    drop(current);
+    // Unchanged rollback restores v1 for the old reader; explicit retry returns
+    // to v2 without changing the native vault identity or account registration.
+    let recovered = crate::profile_storage::open(&paths, false, true).unwrap();
+    assert!(recovered.legacy_recovery);
+    drop(recovered);
+    let legacy = store(&paths.legacy, &vault);
+    assert!(fs::read(&legacy.path).unwrap() == original);
+    assert!(legacy.load().unwrap().unwrap().host_id == record.host_id);
+    drop(legacy);
+    drop(crate::profile_storage::open(&paths, true, false).unwrap());
+    let config = temp.path().join("native-config");
+    fs::create_dir(&config).unwrap();
+    fs::write(config.join(CHILD_MARKER), vault.service()).unwrap();
+    let output = File::create(temp.path().join("native-child.log")).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "llm::chatgpt_auth::tests::native_profile_cutover_keeps_windows_vault_binding",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR", &config)
+        .stdin(std::process::Stdio::null())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("owned native credential child timed out");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        status.success(),
+        "{}",
+        fs::read_to_string(temp.path().join("native-child.log")).unwrap()
+    );
+    let current = store(&paths.current, &vault);
+    let updated = current.load().unwrap().unwrap();
+    assert!(updated.host_id == record.host_id);
+    assert_eq!(updated.authorization_epoch, record.authorization_epoch);
+    assert!(
+        updated
+            .registration
+            .unwrap()
+            .tokens
+            .unwrap()
+            .access_token
+            .as_deref()
+            == Some("fixture-access-native-updated")
+    );
+    assert!(vault.get_password(&original_account).unwrap().as_deref() == Some(key.as_str()));
+    assert!(vault.get_password(&new_account).unwrap().is_none());
+    drop(current);
+    assert!(
+        crate::profile_storage::open(&paths, false, true).is_err(),
+        "updated credentials must not be discarded by rollback"
+    );
+    vault.delete(&original_account).unwrap();
+    assert!(vault.get_password(&original_account).unwrap().is_none());
+    let current = store(&paths.current, &vault);
+    let before = fs::read(&current.path).unwrap();
+    assert!(current.load().is_err());
+    assert!(current.save(&record).is_err());
+    assert!(
+        fs::read(&current.path).unwrap() == before,
+        "a missing key must not recreate or overwrite the record"
+    );
+    assert!(vault.get_password(&original_account).unwrap().is_none());
+    assert!(vault.get_password(&new_account).unwrap().is_none());
+    println!("native vault cutover, unchanged rollback, cross-process update and missing-key refusal passed; fixture keys removed");
 }
 
 #[tokio::test]
@@ -579,6 +869,42 @@ async fn sixteen_concurrent_callers_refresh_once_and_use_durable_rotation() {
     assert!(requests[0].contains(&("client_id".into(), "oaiapp_fixture".into())));
     assert!(requests[0].contains(&("resource".into(), RESOURCE.into())));
     assert!(!requests[0].iter().any(|(key, _)| key == "scope"));
+}
+
+#[tokio::test]
+async fn cancelled_bearer_waiter_does_not_drop_an_inflight_rotation() {
+    let (session, store, transport, reference) = session_with(vec![Ok(response(
+        "fixture-access-new",
+        "fixture-refresh-new",
+    ))]);
+    transport.pause_refresh.store(true, Ordering::SeqCst);
+    let caller = {
+        let (session, reference) = (session.clone(), reference.clone());
+        tokio::spawn(async move { session.bearer(&reference).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), transport.refresh_started.notified())
+        .await
+        .expect("refresh must be in flight before cancelling its waiter");
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    transport.refresh_release.notify_one();
+    tokio::time::timeout(Duration::from_millis(200), store.saved.notified())
+        .await
+        .expect("an issued rotation must be persisted even if its waiter stopped");
+    let saved = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .registration
+        .unwrap()
+        .tokens
+        .unwrap();
+    assert_eq!(saved.refresh_token.as_deref(), Some("fixture-refresh-new"));
+    assert_eq!(
+        session.bearer(&reference).await.unwrap(),
+        "fixture-access-new"
+    );
+    assert_eq!(transport.refresh_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -399,12 +399,7 @@ impl SkillRegistry {
     /// then import common Codex, Claude, Cursor, and SKILL.md templates.
     pub fn import_github_repository(&mut self, repository_url: &str) -> Result<usize, String> {
         let (owner, repository) = parse_github_repository(repository_url)?;
-        let store = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("angelbot")
-            .join("skills")
-            .join(&owner)
-            .join(&repository);
+        let store = managed_skill_store().join(&owner).join(&repository);
         let parent = store.parent().ok_or("Invalid skill storage path")?;
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create skill storage: {e}"))?;
 
@@ -463,10 +458,7 @@ impl SkillRegistry {
 }
 
 fn managed_skill_store() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("angelbot")
-        .join("skills")
+    crate::app_data_dir().join("skills")
 }
 
 fn stable_path_key(path: &Path) -> String {

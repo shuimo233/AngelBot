@@ -202,7 +202,7 @@ pub enum TerminalBranchKind {
     #[allow(dead_code)]
     MaxToolCalls,
     LlmRepeatedlyFailed,
-    CodingCompletionBlocked,
+    CompletionBlocked,
     ProtocolViolation,
     TooManyToolFailures,
     /// Single turn exceeded the configured wall-clock budget (Issue #096).
