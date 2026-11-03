@@ -26,6 +26,8 @@ TEST_NAME = "commands::message::tests::native_uia_fixture_confirmation"
 CAPTURE_TEST_NAME = "commands::message::tests::native_uia_fixture_capture"
 VISUAL_CLICK_TEST_NAME = "commands::message::tests::native_visual_click_fixture_confirmation"
 CONFIRMED_TEXT = "Native UIA confirmed replacement — 中文"
+# Test-process cold start is not a desktop action or helper execution budget.
+FIXTURE_STARTUP_TIMEOUT = 60.0
 
 
 def build_cargo_binary(*, library_test: bool) -> Path:
@@ -100,6 +102,7 @@ def read_snapshot(path: Path) -> dict | None:
 
 def await_snapshot(path: Path, fixture: subprocess.Popen, expected_text: str, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
+    snapshot = None
     while time.monotonic() < deadline:
         if fixture.poll() is not None:
             raise RuntimeError(f"Owned fixture exited early (code {fixture.returncode}); interactive desktop required")
@@ -109,7 +112,8 @@ def await_snapshot(path: Path, fixture: subprocess.Popen, expected_text: str, ti
                 raise AssertionError("Fixture readiness belongs to an unexpected process")
             return snapshot
         time.sleep(0.05)
-    raise RuntimeError(f"Owned fixture did not report expected text within {timeout:g}s")
+    state = 'missing' if not path.exists() else 'unreadable' if snapshot is None else 'not-ready'
+    raise RuntimeError(f"Owned fixture did not report expected text within {timeout:g}s (snapshot={state})")
 
 
 class OwnedFixture(NamedTuple):
@@ -127,15 +131,17 @@ def owned_fixture(directory: Path, env: dict[str, str], *, dense: bool = False) 
     snapshot_path = directory / "fixture-state.json"
     title = f"AngelBot Native UIA Fixture {uuid.uuid4().hex}"
     print("Starting owned WPF fixture (a temporary non-activating window will be visible)...", flush=True)
+    started = time.monotonic()
     process = subprocess.Popen(
         [str(executable), str(snapshot_path), title], cwd=directory, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     try:
-        initial = await_snapshot(snapshot_path, process, "ordinary-seed", 15)
+        initial = await_snapshot(snapshot_path, process, "ordinary-seed", FIXTURE_STARTUP_TIMEOUT)
         if initial.get("windowTitle") != title:
             raise AssertionError("Unexpected owned fixture window title")
+        print(f"Owned WPF fixture ready in {time.monotonic() - started:.2f}s", flush=True)
         if dense:
             snapshot_path.with_suffix(".command").write_text("dense", encoding="utf-8")
             deadline = time.monotonic() + 5

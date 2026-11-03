@@ -1857,7 +1857,9 @@ const DRAFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 pub(crate) const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[cfg(windows)]
-const UIA_SAFETY_HELPERS_SCRIPT: &str = r#"
+const UIA_SAFETY_HELPERS_SCRIPT: &str = concat!(
+    include_str!("child_process_env/windows_powershell.ps1"),
+    r#"
 function Get-UiaSafetyState($element) {
   try {
     $current = $element.Current
@@ -1995,7 +1997,8 @@ function Find-UiaScopedRuntimeTarget([string]$expectedRuntimeId, $walker) {
   if ($null -eq $found) { throw 'TARGET_CHANGED|The selected control is no longer available' }
   return $found
 }
-"#;
+"#
+);
 
 #[cfg(windows)]
 const TRUSTED_WINDOW_SCRIPT: &str = concat!(
@@ -4696,6 +4699,11 @@ mod tests {
     ) -> Vec<crate::window_capture::BoundedChildOutput> {
         // Overlap slow PowerShell/CLR startup, keeping each fixture process-local.
         // The canonical runner serializes Rust tests, so batches do not overlap.
+        let wrapper = format!(
+            "{}\n[Console]::InputEncoding = New-Object Text.UTF8Encoding($false); . ([scriptblock]::Create([Console]::In.ReadToEnd()))",
+            include_str!("child_process_env/windows_powershell.ps1")
+        );
+        let wrapper = wrapper.as_str();
         let mut outputs = Vec::with_capacity(commands.len());
         for batch in commands.chunks_mut(4) {
             std::thread::scope(|scope| {
@@ -4707,11 +4715,20 @@ mod tests {
                             // command-line limit. Reuse the bounded child's
                             // stdin writer; no script file or user data is used.
                             if script.is_some() {
-                                command.args(["-Mta", "-NoProfile", "-NonInteractive", "-Command",
-                                    "[Console]::InputEncoding = New-Object Text.UTF8Encoding($false); $ErrorActionPreference = 'Stop'; . ([scriptblock]::Create([Console]::In.ReadToEnd()))"]);
+                                command.args([
+                                    "-Mta",
+                                    "-NoProfile",
+                                    "-NonInteractive",
+                                    "-Command",
+                                    wrapper,
+                                ]);
                             }
                             command
-                                .stdin(if script.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                                .stdin(if script.is_some() {
+                                    std::process::Stdio::piped()
+                                } else {
+                                    std::process::Stdio::null()
+                                })
                                 .stdout(std::process::Stdio::piped())
                                 .stderr(std::process::Stdio::piped());
                             crate::window_capture::run_bounded_child(
@@ -4792,6 +4809,49 @@ mod tests {
             }
             assembly = Some(path);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn internal_powershell_uses_builtin_cmdlets_even_with_a_foreign_module_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("Microsoft.PowerShell.Utility");
+        std::fs::create_dir(&module).unwrap();
+        let marker = directory.path().join("foreign-module-loaded");
+        std::fs::write(
+            module.join("Microsoft.PowerShell.Utility.psd1"),
+            "@{ RootModule='foreign.psm1'; ModuleVersion='99.0.0'; FunctionsToExport=@('New-Object') }",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("foreign.psm1"),
+            "[IO.File]::WriteAllText($env:ANGELBOT_TEST_MODULE_MARKER, 'loaded'); function New-Object { throw 'foreign-module-loaded' }; Export-ModuleMember -Function New-Object",
+        )
+        .unwrap();
+        let script = format!(
+            "{UIA_SAFETY_HELPERS_SCRIPT}\n[Console]::WriteLine((New-Object Text.StringBuilder).GetType().FullName); [Console]::WriteLine((Get-Process -Id $PID).Id)"
+        );
+        let mut command =
+            desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+        command
+            .args(["-Mta", "-NoProfile", "-NonInteractive", "-Command", &script])
+            .env("PSModulePath", directory.path())
+            .env("ANGELBOT_TEST_MODULE_MARKER", &marker);
+        let output = run_fixture_commands(vec![command], None).pop().unwrap();
+        assert!(
+            output.status.success(),
+            "internal cmdlets must not depend on installed module discovery: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "a foreign module implemented an internal helper"
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("System.Text.StringBuilder"));
+        assert!(lines.next().unwrap().trim().parse::<u32>().unwrap() > 0);
+        assert!(lines.next().is_none());
     }
 
     #[cfg(windows)]
@@ -6770,7 +6830,9 @@ public class ObservationTestWalker {
 "#;
 
     #[cfg(windows)]
-    const OBSERVATION_TEST_PROVIDER_FIXTURE: &str = r#"
+    const OBSERVATION_TEST_PROVIDER_FIXTURE: &str = concat!(
+        include_str!("child_process_env/windows_powershell.ps1"),
+        r#"
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -Path $env:ANGELBOT_TEST_PROVIDER_ASSEMBLY
@@ -6799,7 +6861,8 @@ function Get-UiaWindowProcessId([IntPtr]$handle) {
       ($failure -eq 'postWindowOwnerChanged' -and $firstControl.Written)) { return 99 }
   return 42
 }
-"#;
+"#
+    );
 
     #[cfg(windows)]
     #[test]

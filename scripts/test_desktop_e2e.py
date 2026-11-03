@@ -85,6 +85,50 @@ def memory_fixture_receipts(stages, paired=False):
 
 
 class DesktopE2eArtifactTests(unittest.TestCase):
+    def test_owned_fixture_cold_start_keeps_identity_and_failure_checks(self):
+        clock = [0.0]
+        snapshot = dict(processId=321, ordinaryValue='ordinary-seed',
+                        windowTitle='AngelBot Native UIA Fixture cold-start')
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(native, 'build_fixture', return_value=Path(directory)/'fixture.exe'), \
+                patch.object(native.subprocess, 'Popen') as spawn, \
+                patch.object(native.uuid, 'uuid4', return_value=SimpleNamespace(hex='cold-start')), \
+                patch.object(native.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(native.time, 'sleep', side_effect=sleep), \
+                patch.object(native, 'read_snapshot', side_effect=lambda _: snapshot if clock[0] >= 16 else None), \
+                patch.object(native.subprocess, 'CREATE_NO_WINDOW', 0, create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            process = spawn.return_value
+            process.pid = 321
+            process.returncode = 0
+            process.poll.return_value = None
+            with native.owned_fixture(Path(directory), {}) as fixture:
+                self.assertEqual(fixture.process.pid, 321)
+                self.assertGreaterEqual(clock[0], 16)
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once_with(timeout=5)
+
+            snapshot['processId'] = 999
+            with self.assertRaisesRegex(AssertionError, 'unexpected process'):
+                native.await_snapshot(Path(directory)/'state.json', process, 'ordinary-seed', 1)
+            snapshot['processId'] = 321
+            snapshot['windowTitle'] = 'unexpected window'
+            with self.assertRaisesRegex(AssertionError, 'window title'):
+                with native.owned_fixture(Path(directory), {}):
+                    self.fail('a wrong window title must never be accepted')
+            snapshot['ordinaryValue'] = 'not-ready'
+            with self.assertRaisesRegex(RuntimeError, 'expected text'):
+                native.await_snapshot(Path(directory)/'state.json', process, 'ordinary-seed', 1)
+            with self.assertRaisesRegex(RuntimeError, 'snapshot=missing'):
+                native.await_snapshot(Path(directory)/'state.json', process, 'ordinary-seed', 0)
+            process.poll.return_value = 0
+            with self.assertRaisesRegex(RuntimeError, 'exited early'):
+                native.await_snapshot(Path(directory)/'state.json', process, 'ordinary-seed', 1)
+
     def test_natural_acceptance_keeps_exact_source_snapshot(self):
         with tempfile.TemporaryDirectory(prefix='angelbot-natural-snapshot-') as temporary:
             root=Path(temporary); (root/'logs').mkdir()

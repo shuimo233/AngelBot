@@ -2,6 +2,8 @@
 //!
 //! This is credential isolation, not a filesystem or network sandbox. Callers
 //! may add only the variables their specific helper needs after applying it.
+//! The opt-in PowerShell prelude binds host-owned cmdlets to system modules;
+//! never prepend it to user-provided automation scripts or MCP services.
 
 use std::process::Command;
 
