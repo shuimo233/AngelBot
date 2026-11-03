@@ -27,6 +27,8 @@ use tauri::AppHandle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForegroundContextBudget {
     pub estimated_tool_count: usize,
+    pub context_window_tokens: usize,
+    pub max_output_tokens: usize,
 }
 
 /// Identifier-only provenance. Raw diagnostic evidence is deliberately absent.
@@ -45,7 +47,11 @@ pub struct ForegroundContextRequest<'a> {
     pub app: Option<&'a AppHandle>,
     pub request: &'a SendMessageRequest,
     pub history_before_created_at: i64,
+    pub agent_config: AgentConfig,
     pub budget: ForegroundContextBudget,
+    /// Borrow the turn's already-bound provider for best-effort compaction.
+    /// Preparation must not resolve a second model or credential binding.
+    pub provider: &'a dyn crate::llm::LlmProvider,
     /// Trusted queue binding, never parsed from model/user text.
     pub summary_delivery_id: Option<&'a str>,
 }
@@ -60,23 +66,48 @@ pub struct PreparedForegroundContext {
     pub sources: ForegroundContextSources,
 }
 
-/// Deep foreground context module with one preparation interface.
+/// Deep foreground context module: local config, then bound-model preparation.
 pub struct ForegroundContextAssembler;
 
 impl ForegroundContextAssembler {
-    /// Preserves ordering: config/profile/memory -> skills -> best-effort
-    /// compaction -> visible native history -> workspace expansion -> attention.
-    pub async fn prepare(
-        request: ForegroundContextRequest<'_>,
-    ) -> Result<PreparedForegroundContext, String> {
-        let mut agent_config = build_agent_config(request.state, request.request)?;
-        agent_config.skill_instructions = request
-            .state
+    /// Local configuration must fail before opening credentials/providers.
+    /// Return it once so preparation does not re-read profile/memory/settings.
+    pub fn load_config(
+        state: &AppState,
+        request: &SendMessageRequest,
+    ) -> Result<AgentConfig, String> {
+        let mut agent_config = build_agent_config(state, request)?;
+        agent_config.skill_instructions = state
             .skills
             .registry
             .lock()
             .map_err(|error| error.to_string())?
             .prompt_instructions();
+        Ok(agent_config)
+    }
+
+    /// Called with local config and one resolved model snapshot. Preserves
+    /// compaction -> archived history / completed view -> references -> attention.
+    pub async fn prepare(
+        request: ForegroundContextRequest<'_>,
+    ) -> Result<PreparedForegroundContext, String> {
+        Self::prepare_history(request, false).await
+    }
+
+    /// Explicit native-replay control for protocol acceptance, never a runtime
+    /// preference or a second production preparation path.
+    #[cfg(test)]
+    pub(crate) async fn prepare_native(
+        request: ForegroundContextRequest<'_>,
+    ) -> Result<PreparedForegroundContext, String> {
+        Self::prepare_history(request, true).await
+    }
+
+    async fn prepare_history(
+        request: ForegroundContextRequest<'_>,
+        native_control: bool,
+    ) -> Result<PreparedForegroundContext, String> {
+        let mut agent_config = request.agent_config;
 
         // Preserve the existing best-effort compaction failure mapping.
         let fresh_summary = best_effort_summary(
@@ -84,8 +115,11 @@ impl ForegroundContextAssembler {
                 request.state,
                 request.app,
                 &request.request.session_id,
+                request.history_before_created_at,
                 &agent_config,
-                request.budget.estimated_tool_count,
+                request.budget,
+                request.provider,
+                native_control,
             )
             .await,
         );
@@ -100,12 +134,33 @@ impl ForegroundContextAssembler {
             task_understanding_record_ids,
             attention_context,
         ) = {
-            let conn = request.state.db.lock().map_err(|error| error.to_string())?;
+            let db = request.state.db.lock().map_err(|error| error.to_string())?;
+            let conn = db
+                .unchecked_transaction()
+                .map_err(|error| error.to_string())?;
+            agent_config.context_summary = super::foreground_history::ConversationWindow::load(
+                &conn,
+                &request.request.session_id,
+                request.history_before_created_at,
+            )?
+            .summary;
             let history = hydrate_llm_history(
                 &conn,
                 &request.request.session_id,
                 request.history_before_created_at,
             )?;
+            let history = if native_control {
+                history
+            } else {
+                super::foreground_history::main_working_history(
+                    &conn,
+                    &request.request.session_id,
+                    request.history_before_created_at,
+                    history,
+                    agent_config.preferences.use_long_term_memory,
+                )?
+                .messages
+            };
             let cards = load_context_cards(&conn, &request.request.session_id)?;
             let (attention_card_ids, attention_context) = bounded_attention_context(&cards)?;
             let pending = DeliveryInbox::pending_for_session_from_connection(
@@ -471,7 +526,12 @@ mod tests {
                 is_provisional INTEGER NOT NULL DEFAULT 0
             );
             INSERT INTO messages VALUES ('visible', 's', 'user', 'keep', NULL, NULL, NULL, NULL, 1, 0);
-            INSERT INTO messages VALUES ('hidden', 's', 'assistant', 'never expose', NULL, NULL, NULL, NULL, 2, 1);"
+            INSERT INTO messages VALUES ('hidden', 's', 'assistant', 'never expose', NULL, NULL, NULL, NULL, 2, 1);
+            ALTER TABLE messages ADD COLUMN parent_id TEXT REFERENCES messages(id);
+            UPDATE messages SET parent_id='visible' WHERE id='hidden';
+            CREATE TABLE sessions(id TEXT PRIMARY KEY,leaf_message_id TEXT REFERENCES messages(id));
+            CREATE TABLE context_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),summary TEXT NOT NULL,anchor_message_id TEXT REFERENCES messages(id),compressed_at INTEGER NOT NULL);
+            INSERT INTO sessions VALUES('s','hidden');"
         ).unwrap();
         let history = hydrate_llm_history(&conn, "s", 3).unwrap();
         assert_eq!(history.len(), 1);

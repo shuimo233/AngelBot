@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
+#[path = "workspace_intent.rs"]
+pub(crate) mod intent;
+
 pub const PERSONAL_WORKSPACE_ID: &str = "personal";
 
 /// Empty or legacy restores must still leave the single Daily entry usable.

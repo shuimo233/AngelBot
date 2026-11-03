@@ -17,10 +17,11 @@ pub(crate) struct ForegroundToolSurface<'a> {
     state: &'a AppState,
     app: Option<&'a AppHandle>,
     memory_reading_enabled: bool,
+    current_run_id: Option<String>,
 }
 
 /// Conservative pre-build estimate used by context-budget admission.
-pub(crate) const ESTIMATED_TOOL_COUNT: usize = 22;
+pub(crate) const ESTIMATED_TOOL_COUNT: usize = 25;
 
 /// One Main-Agent registry and the opaque MCP definition revisions that were
 /// visible when it was built. The catalog exists only long enough to bind a
@@ -31,6 +32,8 @@ pub(crate) struct ForegroundToolSet {
     /// The same host-resolved root that admitted the file handlers. A caller
     /// must not pair those handlers with a runner's default Documents root.
     pub(crate) file_root: Option<PathBuf>,
+    pub(crate) context_projector:
+        Option<std::sync::Arc<dyn crate::agent::tool_context::ToolContextProjector>>,
 }
 
 impl<'a> ForegroundToolSurface<'a> {
@@ -39,6 +42,7 @@ impl<'a> ForegroundToolSurface<'a> {
             state,
             app,
             memory_reading_enabled: true,
+            current_run_id: None,
         }
     }
 
@@ -47,11 +51,23 @@ impl<'a> ForegroundToolSurface<'a> {
         self
     }
 
+    pub(crate) fn with_current_run(mut self, run_id: String) -> Self {
+        self.current_run_id = Some(run_id);
+        self
+    }
+
     /// Install every user-facing handler exactly once into an empty registry.
     /// Delegated workers must use a separate registry and capability policy.
     pub(crate) fn install(&self, registry: &mut ToolRegistry) {
         crate::agent::handlers::register_common_builtin_handlers(registry);
         crate::agent::handlers::register_extension_handlers(registry, self.state.db.clone());
+        // These handlers only echo model-supplied text. Main already reasons
+        // and extracts entities natively; neither is a host action or evidence.
+        // Keep the generic registry compatible, without paying for them on
+        // every foreground request (or encouraging an extra model round trip).
+        for name in ["think", "extract_entities"] {
+            registry.unregister(name);
+        }
         if !self.memory_reading_enabled {
             // This is capability admission, not a suggestion to the model.
             // Unknown/stale calls fail registry validation even in full access.
@@ -130,6 +146,7 @@ impl<'a> ForegroundToolSurface<'a> {
             registry,
             mcp_tool_revisions: Default::default(),
             file_root: None,
+            context_projector: None,
         }
     }
 
@@ -188,6 +205,13 @@ impl<'a> ForegroundToolSurface<'a> {
         session_id: String,
     ) -> Result<ForegroundToolSet, String> {
         let mut registry = self.build();
+        if self.memory_reading_enabled {
+            crate::commands::foreground_context_recall::register(
+                &mut registry,
+                self.state.db.clone(),
+                session_id.clone(),
+            );
+        }
         // Daily files reuse the same bounded file tools, never project commands
         // or delegated workspace authority.
         let file_root = crate::commands::file::resolve_work_dir(self.state, Some(&session_id)).ok();
@@ -222,23 +246,40 @@ impl<'a> ForegroundToolSurface<'a> {
             session_id.clone(),
             self.state.db.clone(),
         );
-        crate::commands::foreground_delegation_control::register(
-            &mut registry,
-            session_id.clone(),
-            self.state
-                .delegation_pump
-                .as_ref()
-                .map(|host| host.service().clone()),
-        );
+        // An absent service cannot accept any of these calls. Do not advertise
+        // dead capabilities; a running service still exposes the entire fixed
+        // contract, including controls for work created later in this turn.
+        if let Some(host) = self.state.delegation_pump.as_ref() {
+            crate::commands::foreground_delegation_control::register(
+                &mut registry,
+                session_id.clone(),
+                Some(host.service().clone()),
+            );
+        }
         crate::commands::foreground_task_understanding_control::register(
             &mut registry,
-            session_id,
+            session_id.clone(),
             self.state.db.clone(),
         );
+        let context_projector = if self.memory_reading_enabled || self.current_run_id.is_some() {
+            let sources = std::sync::Arc::new(
+                crate::commands::foreground_tool_sources::ForegroundToolSources::new(
+                    self.state.db.clone(),
+                    session_id,
+                    self.current_run_id.clone(),
+                    self.memory_reading_enabled,
+                ),
+            );
+            crate::commands::foreground_tool_sources::register(&mut registry, sources.clone());
+            Some(sources as std::sync::Arc<dyn crate::agent::tool_context::ToolContextProjector>)
+        } else {
+            None
+        };
         Ok(ForegroundToolSet {
             registry,
             mcp_tool_revisions,
             file_root,
+            context_projector,
         })
     }
 
@@ -632,6 +673,82 @@ mod tests {
     }
 
     #[test]
+    fn foreground_contract_omits_echo_tools_and_unavailable_delegation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = state_with_pending_network_confirmation(workspace.path());
+        let surface = ForegroundToolSurface::new(&state, None);
+        let tools = surface.build_for_session("network-session".into()).unwrap();
+        let omitted = [
+            "think",
+            "extract_entities",
+            "list_delegated_work",
+            "stop_delegated_work",
+            "review_delegated_delivery",
+            "materialize_delegated_change",
+        ];
+
+        // Reconstruct the old eager surface independently: cloning the registry
+        // would share its entries and hide accidental changes to real tools.
+        let mut eager = surface.build_for_session("network-session".into()).unwrap();
+        crate::agent::handlers::register_common_builtin_handlers(&mut eager);
+        crate::agent::extensions::knowledge::register(&mut eager, state.db.clone());
+        crate::commands::foreground_delegation_control::register(
+            &mut eager,
+            "network-session".into(),
+            None,
+        );
+        let expected: Vec<_> = eager
+            .get_schemas()
+            .into_iter()
+            .filter(|schema| !omitted.contains(&schema["function"]["name"].as_str().unwrap()))
+            .collect();
+        assert_eq!(tools.get_schemas(), expected);
+        for name in omitted {
+            assert!(!tools.contains(name));
+            assert!(!tools
+                .get_prompt_snippets()
+                .iter()
+                .any(|(tool, _)| tool == name));
+            assert!(
+                !tools
+                    .execute(
+                        &crate::agent::ToolCall::new(name.into(), json!({})),
+                        "unavailable-call",
+                        workspace.path(),
+                    )
+                    .result
+                    .success
+            );
+        }
+        for name in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "run_project_command",
+            "recall_memories",
+            "remember_fact",
+            "create_goal",
+            "verify_result",
+            "inspect_desktop_capabilities",
+            "create_automation",
+            "schedule_reminder",
+        ] {
+            assert!(tools.contains(name), "real capability lost: {name}");
+            assert_eq!(
+                tools.get(name).unwrap().requires_confirmation,
+                eager.get(name).unwrap().requires_confirmation,
+            );
+        }
+        eprintln!(
+            "foreground schema bytes: {} -> {}; tools: {} -> {} (unavailable service)",
+            serde_json::to_vec(&eager.get_schemas()).unwrap().len(),
+            serde_json::to_vec(&tools.get_schemas()).unwrap().len(),
+            eager.len(),
+            tools.len(),
+        );
+    }
+
+    #[test]
     fn delegated_sandbox_root_follows_the_database_instance() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = crate::tests::test_app_state();
@@ -735,6 +852,12 @@ mod tests {
             ),
             ("traverse_graph", json!({"entity":"private fact"})),
             ("check_constraint", json!({"action":"read a local file"})),
+            ("recall_conversation", json!({"query":"past agreement"})),
+            ("read_tool_result", json!({})),
+            (
+                "read_conversation",
+                json!({"message_id":"missing", "revision":"0".repeat(64)}),
+            ),
         ] {
             assert!(enabled.contains(name));
             assert!(!disabled.contains(name));
@@ -790,16 +913,21 @@ mod tests {
                 }
             }
         }
+        let current_only = ForegroundToolSurface::new(&state, None)
+            .with_memory_reading(false)
+            .with_current_run("host-owned-current-reply".into())
+            .build_for_session_with_mcp_revisions("network-session".into())
+            .unwrap();
+        assert!(current_only.registry.contains("read_tool_result"));
+        assert!(!current_only.registry.contains("recall_conversation"));
+        assert!(current_only.context_projector.is_some());
         for name in ["remember_fact", "update_memory", "forget_memory"] {
             assert!(
                 disabled.get(name).unwrap().requires_confirmation,
                 "explicit owner writes must retain their existing permission flow"
             );
         }
-        assert!(
-            disabled.contains("extract_entities"),
-            "stateless parsing is not long-term recall"
-        );
+        assert!(disabled.contains("verify_result"));
         assert!(disabled.contains("schedule_reminder"));
         assert!(
             ForegroundToolSurface::new(&state, None)

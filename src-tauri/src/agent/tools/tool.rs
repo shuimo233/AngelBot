@@ -843,7 +843,10 @@ pub mod schemas {
                     "type": "string",
                     "minLength": 1,
                     "description": "The path to a text file or a read-only DOCX/XLSX text snapshot, relative to the work directory"
-                }
+                },
+                "offset": {"type":"integer","minimum":0,"description":"Plain text only: zero-based Unicode character offset, not a line number. A window returns content and explicit partial/next_offset metadata."},
+                "limit": {"type":"integer","minimum":1,"maximum":2000,"description":"Plain text window length in Unicode characters, default 1200 when any window option is supplied. Encoded output is at most 5000 bytes; continue with next_offset."},
+                "tail": {"type":"boolean","description":"Plain text only: read the last limit characters directly; requires offset 0. Omit all window options for the unchanged full snapshot."}
             },
             "additionalProperties": false,
             "required": ["path"]

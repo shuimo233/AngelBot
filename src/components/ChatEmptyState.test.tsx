@@ -111,7 +111,7 @@ describe('ChatEmptyState', () => {
       activeWorkspaceId: 'personal',
     });
     useKnowledgeStore.setState({ entries: [{
-      id: 'k1', content: '偏好浓缩咖啡', category: 'knowledge', importance: 5, source: 'knowledge', createdAt: 1, updatedAt: 1,
+      id: 'k1', content: '偏好浓缩咖啡', category: 'knowledge', importance: 5, source: 'knowledge', createdAt: 1, updatedAt: 1, scope: 'global', isPermanent: false, forgetStage: 'active',
     }], isLoading: false, error: null });
     useNavigationStore.setState({ currentPage: 'chat' });
   });
@@ -119,7 +119,7 @@ describe('ChatEmptyState', () => {
   it('显示时间问候和发消息引导', () => {
     render(<ChatEmptyState />);
     expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/直接说出想处理的事/)).toBeInTheDocument();
+    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
   });
 
   it('个人空间任务起点只写入草稿，不直接发送', async () => {
@@ -144,7 +144,7 @@ describe('ChatEmptyState', () => {
     render(<ChatEmptyState />);
 
     expect(screen.getByText('项目 · AngelBot')).toBeInTheDocument();
-    expect(screen.getByText(/这个项目的文件、历史与受控委派范围/)).toBeInTheDocument();
+    expect(screen.getByText(/文件和任务进展都在右侧工作台/)).toBeInTheDocument();
   });
 
   it('项目任务起点优先读取和诊断，不默认修改', () => {
@@ -159,8 +159,7 @@ describe('ChatEmptyState', () => {
     expect(screen.queryByRole('button', { name: /整理今天的安排/ })).not.toBeInTheDocument();
   });
 
-  it('使用共享事项回看展示当前空间的待执行事项', async () => {
-    const user = userEvent.setup();
+  it('空白对话保留引导，不重复加载和展示自动化历史', () => {
     getAutomationsMock.mockResolvedValue({ items: [
       makeAutomation({ id: 'a1', title: '整理笔记', triggerValue: '每天 21:00', workspaceId: 'personal', nextRunAt: todayAt(21) }),
       makeAutomation({ id: 'a2', title: '已暂停任务', enabled: false, nextRunAt: todayAt(9) }),
@@ -168,23 +167,12 @@ describe('ChatEmptyState', () => {
     ], truncated: false });
     render(<ChatEmptyState />);
 
-    await user.click(await screen.findByText('事项回看'));
-    expect(screen.getByText('整理笔记')).toBeInTheDocument();
-    expect(screen.getByText(/自动任务 · 今天/)).toBeInTheDocument();
+    expect(getAutomationsMock).not.toHaveBeenCalled();
+    expect(screen.queryByText('事项回看')).not.toBeInTheDocument();
+    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
+    expect(screen.queryByText('整理笔记')).not.toBeInTheDocument();
     expect(screen.queryByText('已暂停任务')).not.toBeInTheDocument();
-    expect(screen.getByText('明天的任务')).toBeInTheDocument();
-  });
-
-  it('自动化加载失败仍保留问候和引导，并提供不阻断聊天的重试入口', async () => {
-    getAutomationsMock.mockRejectedValue(new Error('ipc down'));
-    render(<ChatEmptyState />);
-
-    await waitFor(() => expect(getAutomationsMock).toHaveBeenCalled());
-    expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/直接说出想处理的事/)).toBeInTheDocument();
-    expect(screen.getByText('事项回看')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '刷新' })).toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText('明天的任务')).not.toBeInTheDocument();
   });
 
   it('尚未解析到真实空间时不会加载或展示其他空间提醒', () => {
@@ -216,7 +204,7 @@ describe('ChatEmptyState', () => {
 
     unmount();
     render(<ChatEmptyState />);
-    await waitFor(() => expect(getAutomationsMock).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText('添加你的第一条资料，让 AngelBot 能引用它')).not.toBeInTheDocument());
     expect(screen.queryByText('添加你的第一条资料，让 AngelBot 能引用它')).not.toBeInTheDocument();
   });
 });

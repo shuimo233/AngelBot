@@ -121,6 +121,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         tools: Option<&[ToolSchema]>,
         thinking: Option<&ThinkingSettings>,
     ) -> Result<LlmResponse, String> {
+        *self.last_usage.lock().unwrap() = None;
         let mut body = serde_json::json!({
             "model": &*self.model.lock().unwrap(),
             "messages": self.build_messages(messages),
@@ -283,6 +284,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         thinking: Option<&ThinkingSettings>,
         delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<LlmResponse, String> {
+        *self.last_usage.lock().unwrap() = None;
         let mut body = serde_json::json!({
             "model": &*self.model.lock().unwrap(),
             "messages": self.build_messages(messages),
@@ -1233,14 +1235,17 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_response(&self, resp: Value) -> Result<LlmResponse, String> {
+        *self.last_usage.lock().unwrap() = None;
         if let (Some(input), Some(output)) = (
             resp["usage"]["prompt_tokens"].as_u64(),
             resp["usage"]["completion_tokens"].as_u64(),
         ) {
-            *self.last_usage.lock().unwrap() = Some(ProviderUsage {
-                input_tokens: input as u32,
-                output_tokens: output as u32,
-            });
+            *self.last_usage.lock().unwrap() = u32::try_from(input)
+                .ok()
+                .zip(u32::try_from(output).ok())
+                .map(|(input, output)| {
+                    ProviderUsage::from_response_usage(input, output, &resp["usage"], false)
+                });
         }
         let choice = resp["choices"]
             .as_array()

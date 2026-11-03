@@ -3,6 +3,8 @@ import { useSessionsStore } from '$stores/sessions';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { listWorkDir, readSessionFile, saveSessionFile, type WorkDirEntry } from '$lib/commands/file';
 import { WorkspaceActivityCapsule } from '../WorkspaceActivityCapsule';
+import { WorkspaceReminders } from '../WorkspaceReminders';
+import { openProjectFolder } from '$lib/project-folder';
 import './RightPanel.css';
 
 type PanelView = 'home' | 'activity' | 'browser' | 'files';
@@ -13,7 +15,7 @@ const FileIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7
 const ActivityIcon = () => <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h5M8 16h7"/></svg>;
 
 function FileTypeIcon({ entry }: { entry: WorkDirEntry }) {
-  if (entry.isDirectory) return <span className="file-type-icon folder" aria-label="文件夹">▣</span>;
+  if (entry.isDirectory) return <span className="file-type-icon folder" aria-label="文件夹"><FileIcon /></span>;
   const extension = entry.name.split('.').pop()?.toLowerCase() ?? '';
   const labels: Record<string, string> = { ts: 'TS', tsx: 'TS', js: 'JS', jsx: 'JS', py: 'PY', rs: 'RS', html: 'HT', css: 'CSS', json: '{}', md: 'MD', yml: 'Y', yaml: 'Y', bat: 'BAT', ps1: 'PS', vbs: 'VB', txt: 'TXT', sql: 'SQL' };
   return <span className={`file-type-icon ext-${extension || 'plain'}`} aria-label={`${extension || '文本'} 文件`}>{labels[extension] ?? '·'}</span>;
@@ -82,18 +84,26 @@ export function RightPanel({
   const workspaces = useWorkspacesStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
   const workspace = workspaces.find((item) => item.id === activeWorkspaceId);
+  const fileScope = JSON.stringify([session?.id, workspace?.rootPath, workspace?.directoryConfirmed]);
   const [view, setView] = useState<PanelView>('home');
-  const [rootEntries, setRootEntries] = useState<WorkDirEntry[]>([]);
+  const [rootSnapshot, setRootSnapshot] = useState<{ scope: string; entries: WorkDirEntry[] } | null>(null);
+  const rootEntries = rootSnapshot?.scope === fileScope ? rootSnapshot.entries : [];
+  const [rootExpanded, setRootExpanded] = useState(true);
+  const [openingFolder, setOpeningFolder] = useState(false);
+  const folderRequest = useRef(false);
+  const rootLabel = workspace?.kind === 'personal' ? '日常结果'
+    : workspace?.rootPath?.split(/[\\/]/).filter(Boolean).pop() || workspace?.name || '项目目录';
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [fileRevision, setFileRevision] = useState(0);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<{ path: string; content: string } | null>(null);
+  const [previewSnapshot, setPreview] = useState<{ scope: string; path: string; content: string } | null>(null);
+  const preview = previewSnapshot?.scope === fileScope ? previewSnapshot : null;
   const [savingFile, setSavingFile] = useState(false);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const previewRequest = useRef(0);
 
-  useEffect(() => { previewRequest.current += 1; setPreview(null); setLoadingPreview(false); setSaveNotice(null); }, [session?.id, workspace?.rootPath, workspace?.directoryConfirmed]);
+  useEffect(() => { previewRequest.current += 1; setPreview(null); setLoadingPreview(false); setSaveNotice(null); setRootExpanded(true); }, [fileScope]);
   const [browserUrl, setBrowserUrl] = useState('');
   const [browserPage, setBrowserPage] = useState<string | null>(null);
   const [browserMessage, setBrowserMessage] = useState<string | null>(null);
@@ -117,7 +127,7 @@ export function RightPanel({
       .then((result) => {
         if (cancelled || previewRequest.current !== revision) return;
         if (result.success) {
-          setPreview({ path: locateRequest.path, content: (result.content ?? '').slice(0, 500_000) });
+          setPreview({ scope: fileScope, path: locateRequest.path, content: (result.content ?? '').slice(0, 500_000) });
         } else {
           setFileError(result.error ?? '无法定位该项目文件');
         }
@@ -127,20 +137,35 @@ export function RightPanel({
       })
       .finally(() => { if (!cancelled && previewRequest.current === revision) setLoadingPreview(false); });
     return () => { cancelled = true; };
-  }, [locateRequest?.path, locateRequest?.revision, locateRequest?.sessionId, session?.id]);
+  }, [locateRequest?.path, locateRequest?.revision, locateRequest?.sessionId, fileScope]);
 
   useEffect(() => {
     if (view !== 'files' || !session) return;
     let cancelled = false;
     setLoadingFiles(true);
-    setRootEntries([]);
+    setRootSnapshot(null);
     setFileError(null);
     listWorkDir(session.id)
-      .then((items) => { if (!cancelled) setRootEntries(items); })
+      .then((items) => { if (!cancelled) setRootSnapshot({ scope: fileScope, entries: items }); })
       .catch((error) => { if (!cancelled) setFileError(error instanceof Error ? error.message : String(error)); })
       .finally(() => { if (!cancelled) setLoadingFiles(false); });
     return () => { cancelled = true; };
-  }, [session?.id, workspace?.rootPath, workspace?.directoryConfirmed, view, fileRevision]);
+  }, [fileScope, view, fileRevision]);
+
+  const openFolder = async () => {
+    if (folderRequest.current) return;
+    folderRequest.current = true;
+    setOpeningFolder(true);
+    setFileError(null);
+    try {
+      await openProjectFolder();
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : '无法打开文件夹，请重试。');
+    } finally {
+      folderRequest.current = false;
+      setOpeningFolder(false);
+    }
+  };
 
   const openView = (next: Exclude<PanelView, 'home'>) => {
     setView(next);
@@ -184,7 +209,7 @@ export function RightPanel({
       if (previewRequest.current !== revision || useSessionsStore.getState().activeSessionId !== session.id) return;
       if (result.success) {
         const content = (result.content ?? '').slice(0, 500_000);
-        setPreview({ path: entry.path, content });
+        setPreview({ scope: fileScope, path: entry.path, content });
       } else {
         setFileError(result.error ?? '无法读取该文件');
       }
@@ -228,10 +253,10 @@ export function RightPanel({
   // The panel itself is the workbench. It augments the active Main-Agent
   // session instead of switching into a second conversation surface.
   return (
-    <aside className="right-panel" aria-label="工作侧栏">
+    <aside id="conversation-workbench" className="right-panel" aria-label="工作侧栏">
       <div className="right-panel-header">
         {view === 'home' ? (
-          <span className="right-panel-title">工作侧栏</span>
+          <span className="right-panel-title">工作台</span>
         ) : (
           <button className="right-panel-back" onClick={() => setView('home')}>← 返回</button>
         )}
@@ -242,28 +267,38 @@ export function RightPanel({
         )}
       </div>
 
+      <nav className="workbench-tabs" aria-label="工作台视图">
+        <button type="button" aria-pressed={view === 'activity'} onClick={() => openView('activity')}><ActivityIcon /><span>任务</span></button>
+        <button type="button" aria-pressed={view === 'files'} onClick={() => openView('files')}><FileIcon /><span>{workspace?.kind === 'personal' ? '结果文件' : '文件'}</span></button>
+        <button type="button" aria-pressed={view === 'browser'} onClick={() => openView('browser')}><BrowserIcon /><span>浏览器</span></button>
+      </nav>
+
       <div className={`right-panel-content${view === 'files' ? ' right-panel-content--files' : view === 'browser' ? ' right-panel-content--browser' : ''}`}>
         {view === 'home' && (
-          <div className="workbench-menu">
-            <button className="workbench-menu-item" onClick={() => openView('activity')}>
-              <ActivityIcon /><span>任务与委派</span><kbd>Ctrl+J</kbd>
-            </button>
-            <button className="workbench-menu-item" onClick={() => openView('browser')}>
-              <BrowserIcon /><span>浏览器</span><kbd>Ctrl+T</kbd>
-            </button>
-            <button className="workbench-menu-item" onClick={() => openView('files')}>
-              <FileIcon /><span>文件</span><kbd>Ctrl+P</kbd>
-            </button>
+          <div className="workbench-overview">
+            <span className="ui-eyebrow">{workspace?.kind === 'personal' ? '个人空间' : '当前项目'}</span>
+            <h2>{workspace?.kind === 'personal' ? '日常事务，也有条理' : workspace?.name || '与你的对话一起工作'}</h2>
+            <p>查看正在处理的任务、打开文件，或浏览参考页面。对话始终留在左侧。</p>
+            <dl>
+              <div><dt>任务</dt><dd>查看进展与需要你决定的事项</dd></div>
+              <div><dt>{workspace?.kind === 'personal' ? '结果文件' : '文件'}</dt><dd>{workspace?.kind === 'personal' ? '预览和另存 AngelBot 交付的文件' : '预览项目文件，引用到当前对话'}</dd></div>
+              <div><dt>浏览器</dt><dd>打开参考页面；不会因此授予操作权限</dd></div>
+            </dl>
+            {workspace?.rootPath && <p className="workbench-scope" title={workspace.rootPath}>{workspace.rootPath}</p>}
           </div>
         )}
 
         {view === 'activity' && (
-          <WorkspaceActivityCapsule mode="panel" onReturnToConversation={returnToConversation} />
+          <>
+            <WorkspaceActivityCapsule mode="panel" onReturnToConversation={returnToConversation} />
+            <WorkspaceReminders workspaceId={workspace?.id} />
+          </>
         )}
 
         {view === 'browser' && (
-          <section className="workbench-browser">
+          <section className="workbench-browser" aria-labelledby="workbench-browser-title">
             <div className="workbench-toolbar">
+              <h2 id="workbench-browser-title" className="workbench-section-title">浏览器</h2>
               <button type="button" className="workbench-mode-button" disabled={!browserPage} onClick={popOutBrowser}>弹出窗口</button>
             </div>
             <form className="browser-address-form" onSubmit={(event) => {
@@ -287,12 +322,17 @@ export function RightPanel({
                 setBrowserMessage(error instanceof Error ? error.message : String(error));
               }
             }}>
+              <label htmlFor="browser-address">网址</label>
               <div className="browser-address-row">
-                <button type="button" className="browser-nav-button" aria-label="后退" disabled={browserIndex <= 0} onClick={() => { const index = browserIndex - 1; const page = browserHistory[index]; setBrowserIndex(index); setBrowserUrl(page); setBrowserPage(page); }}>←</button>
-                <button type="button" className="browser-nav-button" aria-label="前进" disabled={browserIndex >= browserHistory.length - 1} onClick={() => { const index = browserIndex + 1; const page = browserHistory[index]; setBrowserIndex(index); setBrowserUrl(page); setBrowserPage(page); }}>→</button>
-                <button type="button" className="browser-nav-button" aria-label="刷新" disabled={!browserPage} onClick={() => setBrowserRevision((value) => value + 1)}>↻</button>
-                <input id="browser-address" value={browserUrl} onChange={(event) => setBrowserUrl(event.target.value)} placeholder="输入网址" autoComplete="url" aria-label="网址" />
-                <button className="browser-go-button" type="submit" aria-label="打开网址">↗</button>
+                <div className="browser-navigation">
+                  <button type="button" className="browser-nav-button" aria-label="后退" disabled={browserIndex <= 0} onClick={() => { const index = browserIndex - 1; const page = browserHistory[index]; setBrowserIndex(index); setBrowserUrl(page); setBrowserPage(page); }}>←</button>
+                  <button type="button" className="browser-nav-button" aria-label="前进" disabled={browserIndex >= browserHistory.length - 1} onClick={() => { const index = browserIndex + 1; const page = browserHistory[index]; setBrowserIndex(index); setBrowserUrl(page); setBrowserPage(page); }}>→</button>
+                  <button type="button" className="browser-nav-button" aria-label="刷新" disabled={!browserPage} onClick={() => setBrowserRevision((value) => value + 1)}>↻</button>
+                </div>
+                <div className="browser-address-entry">
+                  <input id="browser-address" value={browserUrl} onChange={(event) => setBrowserUrl(event.target.value)} placeholder="输入网址" autoComplete="url" aria-label="网址" />
+                  <button className="browser-go-button" type="submit" aria-label="打开网址">↗</button>
+                </div>
               </div>
             </form>
             {browserMessage && <p className="workbench-hint browser-address-message">{browserMessage}</p>}
@@ -301,25 +341,33 @@ export function RightPanel({
         )}
 
         {view === 'files' && (
-          <section className={`workbench-files workbench-files--workspace${preview ? ' workbench-files--has-preview' : ''}`}>
-            <div className="workbench-section-title"><span>{workspace?.kind === 'personal' ? '日常结果' : '项目文件'}</span><button type="button" disabled={loadingFiles || !session} onClick={() => setFileRevision((value) => value + 1)}>刷新目录</button></div>
+          <section className={`workbench-files workbench-files--workspace${preview ? ' workbench-files--has-preview' : ''}`} aria-labelledby="workbench-files-title">
+            <div className="workbench-files-header"><h2 id="workbench-files-title" className="workbench-section-title">资源管理器</h2><div className="workbench-folder-actions">
+              <button type="button" disabled={openingFolder} onClick={() => void openFolder()} title="选择文件夹，打开或建立对应项目及其主对话">{openingFolder ? '正在打开…' : '打开文件夹'}</button>
+              <button type="button" disabled={loadingFiles || !session} onClick={() => setFileRevision((value) => value + 1)}>刷新目录</button>
+            </div></div>
+            {fileError && <div className="workbench-error" role="alert">{fileError}</div>}
             {!session ? (
-              <div className="workbench-empty"><FileIcon /><p>先选择一个项目工作区，再浏览其文件。</p></div>
+              <div className="workbench-empty"><FileIcon /><p>打开一个文件夹，在独立项目中浏览文件并与 AngelBot 继续工作。</p></div>
             ) : (
               <>
                 <p className="workbench-hint">{workspace?.kind === 'personal'
                   ? 'AngelBot 生成的文件默认保留在这里，不会访问其它目录。可预览、引用和另存；数据备份包含这些文件。'
-                  : `${workspace?.rootPath || session.workDir || '项目目录'} · 定位、预览或引用文件给主 Agent`}</p>
+                  : <><span className="workbench-directory-path">{workspace?.rootPath || session.workDir || '项目目录'}</span><span>定位、预览或引用文件给主 Agent</span></>}</p>
                 {loadingFiles && <div className="context-loading">加载中…</div>}
                 {loadingPreview && <div className="context-loading">正在读取文件…</div>}
-                {fileError && <div className="workbench-error">{fileError}</div>}
                 {saveNotice && <p className="workbench-hint" role="status">{saveNotice}</p>}
                 {!loadingFiles && (
-                  <ul className="file-tree">
+                  <div className="workbench-folder-tree">
+                  <button type="button" className="workbench-root-folder" aria-expanded={rootExpanded} aria-label={`${rootExpanded ? '收起' : '展开'} ${rootLabel}`} title={workspace?.rootPath || 'AngelBot 自有日常结果目录'} onClick={() => setRootExpanded(value => !value)}>
+                    <span aria-hidden="true">{rootExpanded ? '⌄' : '›'}</span><FileIcon /><span>{rootLabel}</span>
+                  </button>
+                  {rootExpanded && <ul className="file-tree" aria-label={`${rootLabel} 的文件`}>
                     {rootEntries.length === 0 ? !fileError && <li className="context-empty-hint">目录为空</li> : rootEntries.map((entry) => (
                       <FileTreeNode key={`${session.id}:${fileRevision}:${entry.path}`} entry={entry} sessionId={session.id} onOpenFile={(file) => void openEntry(file)} onSaveFile={(path) => void saveFile(path)} savingFile={savingFile} onError={setFileError} selectedPath={preview?.path} />
                     ))}
-                  </ul>
+                  </ul>}
+                  </div>
                 )}
                 {preview && (
                   <div className="file-preview">

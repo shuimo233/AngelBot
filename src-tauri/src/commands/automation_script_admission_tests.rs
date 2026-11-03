@@ -28,6 +28,63 @@ fn completed(_: &AppState, _: &Automation) -> ScriptRunResult {
     }
 }
 
+#[test]
+fn startup_uses_owned_execution_once_and_does_not_replay_on_manual_relaunch() {
+    let state = setup();
+    {
+        let mut conn = state.db.lock().unwrap();
+        conn.execute("UPDATE automations SET trigger_kind='startup',trigger_value='登录 Windows 后',next_run_at=NULL WHERE id='script'", []).unwrap();
+        assert!(
+            super::super::definition_next_run_at(&conn, "startup", "登录 Windows 后", 10).is_err()
+        );
+        conn.execute("INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES ('autostart_enabled','true',1),('autostart_launch_args',?1,1)", [crate::commands::settings::AUTOSTART_ARGUMENT]).unwrap();
+        assert_eq!(
+            super::super::definition_next_run_at(&conn, "startup", "登录 Windows 后", 10).unwrap(),
+            None
+        );
+        super::super::prepare_startup_automations(&mut conn, false, 10).unwrap();
+    }
+    assert!(!execute(&state, Origin::Scheduled, 10).unwrap());
+    {
+        let mut conn = state.db.lock().unwrap();
+        super::super::prepare_startup_automations(&mut conn, true, 15).unwrap();
+        assert_eq!(
+            super::super::claim_due_automations(&mut conn, 15)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert!(execute(&state, Origin::Scheduled, 15).unwrap());
+    assert_eq!(next(&state), None);
+    assert!(!execute(&state, Origin::Scheduled, 16).unwrap());
+    {
+        let mut conn = state.db.lock().unwrap();
+        super::super::prepare_startup_automations(&mut conn, false, 20).unwrap();
+    }
+    assert!(!execute(&state, Origin::Scheduled, 20).unwrap());
+    {
+        let mut conn = state.db.lock().unwrap();
+        // A distinct login is a new event. Pause still prevents it.
+        super::super::prepare_startup_automations(&mut conn, true, 30).unwrap();
+        assert_eq!(next_run_at("startup", "登录 Windows 后", 30), None);
+        conn.execute("UPDATE automations SET enabled=0 WHERE id='script'", [])
+            .unwrap();
+        super::super::prepare_startup_automations(&mut conn, true, 40).unwrap();
+    }
+    assert!(!execute(&state, Origin::Scheduled, 40).unwrap());
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM automation_runs", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
 fn execute(state: &AppState, origin: Origin, now: i64) -> Result<bool, String> {
     run(state, "script", origin, now, &|| {}, &completed)
 }

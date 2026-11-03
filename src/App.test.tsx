@@ -5,6 +5,7 @@ import { useSettingsStore } from './stores/settings';
 import type { Workspace } from './lib/commands/workspace';
 import { readSessionFile } from './lib/commands/file';
 import { useSessionsStore } from './stores/sessions';
+import { useThemeStore } from './stores/theme';
 
 const appMocks = vi.hoisted(() => ({
   settings: {
@@ -20,9 +21,9 @@ const appMocks = vi.hoisted(() => ({
 // Keep the real App lifecycle, with deterministic children/stores and no IPC,
 // model, HTTP, local storage or operating-system notification dependencies.
 vi.mock('./components/Sidebar', () => ({
-  Sidebar: () => <aside>{useSettingsStore((state) => state.profile.name)}</aside>,
+  Sidebar: () => <aside className="sidebar">{useSettingsStore((state) => state.profile.name)}<button>布局测试入口</button></aside>,
 }));
-vi.mock('./components/ChatArea', () => ({ ChatArea: () => <main /> }));
+vi.mock('./components/ChatArea', () => ({ ChatArea: () => <main><input aria-label="对话草稿" /></main> }));
 vi.mock('./components/WorkspaceActivityCapsule', () => ({ WorkspaceActivityCapsule: () => null }));
 vi.mock('./lib/commands/file', () => ({
   listWorkDir: vi.fn(async () => []),
@@ -45,19 +46,14 @@ vi.mock('./stores/workspaces', () => ({
     activeWorkspaceId: appMocks.activeWorkspaceId,
   }),
 }));
-vi.mock('./stores/theme', () => ({
-  initializeTheme: () => () => {},
-  useThemeStore: (selector: (state: unknown) => unknown) => selector({
-    resolvedTheme: 'light',
-    toggleTheme: vi.fn(),
-  }),
-}));
 vi.mock('./lib/commands/automation', () => ({ runDueAutomations: appMocks.runDue }));
 
 describe('App', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.clearAllMocks();
+    localStorage.clear();
+    useThemeStore.setState({ layout: 'A' });
     appMocks.runDue.mockReset().mockResolvedValue(0);
     appMocks.workspaces = [];
     appMocks.activeWorkspaceId = '';
@@ -90,6 +86,32 @@ describe('App', () => {
     expect(fireEvent.drop(outsideComposer, { dataTransfer: { types: ['text/plain'], files: [] } })).toBe(true);
     view.unmount();
     expect(appMocks.runDue).not.toHaveBeenCalled();
+  });
+
+  it('changes layout without remounting the active conversation or discarding its draft', () => {
+    const view = render(<App />);
+    const draft = screen.getByRole('textbox', { name: '对话草稿' });
+    fireEvent.change(draft, { target: { value: '尚未发送的请求' } });
+    const owner = appMocks.activeWorkspaceId;
+    act(() => useThemeStore.getState().setLayout('B'));
+    expect(view.container.querySelector('.app-shell')).toHaveAttribute('data-layout', 'B');
+    expect(screen.getByRole('textbox', { name: '对话草稿' })).toBe(draft);
+    expect(draft).toHaveValue('尚未发送的请求');
+    act(() => useThemeStore.getState().setLayout('A'));
+    expect(view.container.querySelector('.app-shell')).toHaveAttribute('data-layout', 'A');
+    expect(draft).toHaveValue('尚未发送的请求');
+    expect(appMocks.activeWorkspaceId).toBe(owner);
+    expect(appMocks.runDue).not.toHaveBeenCalled();
+  });
+
+  it('returns focus to the compact menu when the B rail becomes a closed A sidebar', () => {
+    render(<App />);
+    act(() => useThemeStore.getState().setLayout('B'));
+    const menu = screen.getByRole('button', { name: '打开菜单' });
+    vi.spyOn(menu, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 32, 34));
+    screen.getByRole('button', { name: '布局测试入口' }).focus();
+    act(() => useThemeStore.getState().setLayout('A'));
+    expect(menu).toHaveFocus();
   });
 
   it('never dispatches an old file locator into a new workspace or restored directory scope', async () => {

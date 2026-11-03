@@ -4,12 +4,12 @@
 //! - `Tool`: metadata/schema (name, description, JSON Schema)
 //! - `ToolHandler`: execution logic (via dynamic dispatch, shared via Arc)
 //!
-//! Issue #47: Registry is wrapped in `Arc<Mutex<HashMap>>` for thread-safe
-//! concurrent access during parallel tool execution.
+//! Issue #47: Registry is wrapped in `Arc<Mutex<BTreeMap>>` for thread-safe
+//! concurrent access and a stable tool-name order across registry views.
 
 use super::tool::{Tool, ToolCall, ToolCategory, ToolExecutionContext, ToolHandler, ToolResult};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 /// Host-produced rejection, before dispatch/approval. Handler errors use the
@@ -134,11 +134,11 @@ pub struct ToolExecResult {
 
 /// Global registry for all available tools.
 ///
-/// Wrapped in `Arc<Mutex<HashMap>>` for thread-safe concurrent access (Issue #47).
+/// Wrapped in `Arc<Mutex<BTreeMap>>` for thread-safe access and stable name order.
 /// Cloning the registry only clones the Arc pointer (cheap).
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    entries: Arc<Mutex<HashMap<String, ToolEntry>>>,
+    entries: Arc<Mutex<BTreeMap<String, ToolEntry>>>,
 }
 
 struct ToolEntry {
@@ -151,7 +151,7 @@ impl ToolRegistry {
     /// installation has one explicit, auditable entry point.
     pub fn empty() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -537,7 +537,8 @@ pub fn requires_immediate_confirmation(name: &str) -> bool {
 mod tests {
     use super::{requires_immediate_confirmation, ToolRegistry};
     use crate::agent::tool::{
-        Tool, ToolCall, ToolCancellation, ToolExecutionContext, ToolHandler, ToolResult,
+        Tool, ToolCall, ToolCancellation, ToolCategory, ToolExecutionContext, ToolHandler,
+        ToolResult,
     };
     use serde_json::json;
     use std::path::Path;
@@ -559,6 +560,84 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             ToolResult::success("recording_tool", "executed")
         }
+    }
+
+    #[test]
+    fn prompt_snippets_are_name_ordered_without_changing_tools_or_guidance() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn ToolHandler> = Arc::new(RecordingHandler {
+            calls: calls.clone(),
+        });
+        let expected = vec![
+            ("alpha".to_owned(), "原话 \"A\"\n第二行".to_owned()),
+            (
+                "middle".to_owned(),
+                "Keep this guidance unchanged.".to_owned(),
+            ),
+            ("zeta".to_owned(), "Z guidance".to_owned()),
+        ];
+        let mut previous_views = None;
+        for order in [[2, 0, 1], [1, 0, 2]] {
+            let mut registry = ToolRegistry::empty();
+            for index in order {
+                let (name, snippet) = &expected[index];
+                registry.register(
+                    Tool::new(name, "test guidance", json!({"type":"object"}))
+                        .with_prompt_snippet(snippet)
+                        .with_confirmation(index == 2)
+                        .with_category(if index == 1 {
+                            ToolCategory::Extension
+                        } else {
+                            ToolCategory::Core
+                        }),
+                    handler.clone(),
+                );
+            }
+            registry.register(
+                Tool::new("without_guidance", "no snippet", json!({"type":"object"}))
+                    .with_category(ToolCategory::Extension),
+                handler.clone(),
+            );
+            assert_eq!(registry.get_prompt_snippets(), expected);
+            let plain = registry.get_schemas();
+            let enhanced = registry.get_schemas_with_enhanced(true);
+            assert_eq!(plain, registry.get_schemas_with_enhanced(false));
+            for schemas in [&plain, &enhanced] {
+                assert_eq!(
+                    schemas
+                        .iter()
+                        .map(|schema| schema["function"]["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["alpha", "middle", "without_guidance", "zeta"]
+                );
+            }
+            let categories = [ToolCategory::Core, ToolCategory::Extension].map(|category| {
+                registry
+                    .get_by_category(category)
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(categories[0], ["alpha", "zeta"]);
+            assert_eq!(categories[1], ["middle", "without_guidance"]);
+            let views = (plain, enhanced, categories);
+            if let Some(previous) = &previous_views {
+                assert_eq!(&views, previous);
+            }
+            previous_views = Some(views);
+            assert_eq!(registry.len(), 4);
+            for (index, (name, snippet)) in expected.iter().enumerate() {
+                let tool = registry.get(name).unwrap();
+                assert_eq!(&tool.name, name);
+                assert_eq!(tool.prompt_snippet.as_ref(), Some(snippet));
+                assert_eq!(tool.requires_confirmation, index == 2);
+                assert!(Arc::ptr_eq(
+                    &registry.entries.lock().unwrap().get(name).unwrap().handler,
+                    &handler
+                ));
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

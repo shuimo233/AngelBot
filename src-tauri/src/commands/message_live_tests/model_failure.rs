@@ -136,18 +136,7 @@ pub(super) async fn send_after_known_effect(
             now,
         })
         .unwrap();
-    let prepared_context = ForegroundContextAssembler::prepare(ForegroundContextRequest {
-        state,
-        app: Some(app),
-        request: &request,
-        history_before_created_at: run.history_before_created_at,
-        budget: ForegroundContextBudget {
-            estimated_tool_count: ESTIMATED_TOOL_COUNT,
-        },
-        summary_delivery_id: None,
-    })
-    .await
-    .unwrap();
+    let agent_config = ForegroundContextAssembler::load_config(state, &request).unwrap();
     let mut resolved_model = ForegroundModelFactory::new(Some(app), state)
         .resolve(ForegroundModelRequest {
             session_id: &session_id,
@@ -155,6 +144,22 @@ pub(super) async fn send_after_known_effect(
             now,
         })
         .unwrap();
+    let prepared_context = ForegroundContextAssembler::prepare(ForegroundContextRequest {
+        state,
+        app: Some(app),
+        provider: resolved_model.provider.as_ref(),
+        agent_config,
+        request: &request,
+        history_before_created_at: run.history_before_created_at,
+        budget: ForegroundContextBudget {
+            estimated_tool_count: ESTIMATED_TOOL_COUNT,
+            context_window_tokens: resolved_model.context_window_tokens,
+            max_output_tokens: resolved_model.max_output_tokens,
+        },
+        summary_delivery_id: None,
+    })
+    .await
+    .unwrap();
     resolved_model.provider = Box::new(FailAfterReceipt {
         inner: resolved_model.provider,
         receipt: receipt.into(),

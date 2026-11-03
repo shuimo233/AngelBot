@@ -59,6 +59,25 @@ pub(crate) fn resolve_reply_memory_controls(
             return Err("会话不存在，无法保存记忆设置。".into());
         }
     }
+    // Do not retroactively learn the interval in which either switch was off.
+    // On re-enable, leave the newest user turn eligible; it may itself contain
+    // the new explicit request. Optional cursor damage must not block chat.
+    if !memory || !learning || saved_memory == Some(false) || saved_learning == Some(false) {
+        let advance = (|| -> Result<(), String> {
+            let (metadata, mut state) = automatic_review_state(conn, session_id)?;
+            let inputs = automatic_review_inputs(conn, session_id, &state)?;
+            let target = inputs.iter().rev().nth(usize::from(memory && learning));
+            if let Some(target) = target {
+                state.through_created_at = target.created_at;
+                state.through_message_id = Some(target.id.clone());
+                save_automatic_review_state(conn, session_id, metadata, &state)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = advance {
+            eprintln!("[Memory] Automatic learning boundary deferred: {error}");
+        }
+    }
     Ok((memory, learning))
 }
 
@@ -446,6 +465,8 @@ pub fn delete_memory(state: State<AppState>, id: String) -> Result<(), String> {
 }
 
 fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> Result<(), String> {
+    let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let conn = &transaction;
     let now = Utc::now().timestamp();
     let existing = conn
         .query_row(
@@ -463,12 +484,32 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
         )
         .map_err(|e| e.to_string())?;
 
+    if existing.2 != req.content {
+        let has_vector_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='memory_vectors' AND type='table')",
+            [], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if has_vector_table {
+            let rowid = conn
+                .query_row(
+                    "SELECT rowid FROM memory_vector_map WHERE memory_id=?1",
+                    [&req.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(rowid) = rowid {
+                crate::vector_store::delete_embedding(conn, rowid)?;
+            }
+        }
+    }
     let content_hash = compute_content_hash(&req.scope, &req.category, &req.content);
     let changed = conn
         .execute(
             "UPDATE memories
              SET scope = ?1, category = ?2, content = ?3, importance = ?4,
-                 is_permanent = ?5, content_hash = ?6, updated_at = ?7
+                 is_permanent = ?5, content_hash = ?6, updated_at = ?7,
+                 embedding = CASE WHEN content <> ?3 THEN NULL ELSE embedding END
              WHERE id = ?8",
             params![
                 &req.scope,
@@ -506,7 +547,7 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(())
+    transaction.commit().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1445,6 +1486,10 @@ struct AutomaticReviewState {
     through_created_at: i64,
     through_message_id: Option<String>,
     last_attempt_at: i64,
+    /// Last input already included in an attempted review (including failure).
+    /// A new urgent source may bypass cooling; the same failed source may not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority_through_message_id: Option<String>,
 }
 
 struct AutomaticReviewInput {
@@ -1544,10 +1589,33 @@ pub(crate) fn automatic_evolution_due(conn: &rusqlite::Connection, session_id: &
     let Ok((_, state)) = automatic_review_state(conn, session_id) else {
         return false;
     };
-    Utc::now().timestamp().saturating_sub(state.last_attempt_at)
-        >= AUTOMATIC_REVIEW_COOLDOWN_SECONDS
-        && automatic_review_inputs(conn, session_id, &state)
-            .is_ok_and(|inputs| inputs.len() >= AUTOMATIC_REVIEW_MIN_MESSAGES)
+    automatic_review_inputs(conn, session_id, &state).is_ok_and(|inputs| {
+        new_preference_revision_source(&inputs, &state)
+            || (Utc::now().timestamp().saturating_sub(state.last_attempt_at)
+                >= AUTOMATIC_REVIEW_COOLDOWN_SECONDS
+                && (inputs.len() >= AUTOMATIC_REVIEW_MIN_MESSAGES
+                    || inputs.iter().any(|input| {
+                        crate::agent::adaptive_constraints::has_explicit_preference_cue(
+                            &input.content,
+                        )
+                    })))
+    })
+}
+
+fn new_preference_revision_source(
+    inputs: &[AutomaticReviewInput],
+    state: &AutomaticReviewState,
+) -> bool {
+    // Do not require a saved global row: the first default may still be in
+    // flight. This only wakes the existing semantic reviewer, never writes.
+    let after = state
+        .priority_through_message_id
+        .as_ref()
+        .and_then(|id| inputs.iter().position(|i| &i.id == id))
+        .map_or(0, |i| i + 1);
+    inputs[after..]
+        .iter()
+        .any(|i| crate::agent::adaptive_constraints::has_preference_revision_cue(&i.content))
 }
 
 fn save_automatic_review_state(
@@ -1579,6 +1647,39 @@ fn empty_automatic_review() -> EvolutionReviewResult {
     }
 }
 
+/// Prepare the optional completion hook using the ordinary scheduling rules.
+/// Provider resolution stays with the caller so it can verify the foreground
+/// binding; no review is dispatched until the coordinator seals completion.
+pub(crate) fn automatic_evolution_after_completion(
+    db: Arc<Mutex<rusqlite::Connection>>,
+    session: &str,
+    enabled: bool,
+    resolve: impl FnOnce() -> Option<(
+        Box<dyn crate::llm::LlmProvider>,
+        Option<crate::llm::ThinkingSettings>,
+    )>,
+) -> Result<Option<Box<dyn FnOnce() + Send>>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let due = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        automatic_evolution_due(&conn, session)
+    };
+    if !due {
+        return Ok(None);
+    }
+    let Some((provider, thinking)) = resolve() else {
+        return Ok(None);
+    };
+    let session = session.to_string();
+    Ok(Some(Box::new(move || {
+        tokio::spawn(async move {
+            let _ = run_evolution_review_impl(db, &session, provider, thinking).await;
+        });
+    })))
+}
+
 /// Internal helper: run evolution on a specific session with a given provider.
 ///
 /// This function is `async` because `provider.chat` is async and must be
@@ -1601,26 +1702,60 @@ pub async fn run_evolution_review_impl(
     provider: Box<dyn crate::llm::LlmProvider>,
     thinking_settings: Option<crate::llm::ThinkingSettings>,
 ) -> Result<EvolutionReviewResult, String> {
-    // Optional reviews never queue behind one another or block a foreground
-    // reply. Process exit releases the permit; the session-owned checkpoint and
-    // cooldown survive restart without introducing another job scheduler.
+    // Ordinary reviews never queue. An urgent new source may wait boundedly
+    // for this existing slot, then recheck the cursor and controls; concurrent
+    // wake-ups coalesce instead of losing a correction or retrying old input.
     static REVIEW_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let Ok(_permit) = REVIEW_SLOT.try_acquire() else {
-        return Ok(empty_automatic_review());
+    let _permit = match REVIEW_SLOT.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let urgent = {
+                let conn = db.lock().map_err(|e| e.to_string())?;
+                let (_, state) = automatic_review_state(&conn, session_id)?;
+                new_preference_revision_source(
+                    &automatic_review_inputs(&conn, session_id, &state)?,
+                    &state,
+                )
+            };
+            if !urgent {
+                return Ok(empty_automatic_review());
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(65), REVIEW_SLOT.acquire())
+                .await
+                .map_err(|_| "Priority preference review was deferred")?
+                .map_err(|_| "Preference reviewer unavailable")?
+        }
     };
     let inputs = {
         let conn = db.lock().map_err(|e| e.to_string())?;
+        if resolve_reply_memory_controls(&conn, session_id, None, None)? != (true, true) {
+            return Ok(empty_automatic_review());
+        }
         let (metadata, mut state) = automatic_review_state(&conn, session_id)?;
+        let inputs = automatic_review_inputs(&conn, session_id, &state)?;
         if Utc::now().timestamp().saturating_sub(state.last_attempt_at)
             < AUTOMATIC_REVIEW_COOLDOWN_SECONDS
+            && !new_preference_revision_source(&inputs, &state)
         {
             return Ok(empty_automatic_review());
         }
-        let inputs = automatic_review_inputs(&conn, session_id, &state)?;
         if inputs.is_empty() {
             return Ok(empty_automatic_review());
         }
+        // Do not infer from a clipped statement whose unseen suffix could
+        // withdraw consent, or from a batch containing a no-save instruction.
+        if inputs.iter().any(|i| {
+            i.content.ends_with("[消息已截断]")
+                || crate::agent::adaptive_constraints::forbids_preference_learning(&i.content)
+        }) {
+            let latest = inputs.last().unwrap();
+            state.through_created_at = latest.created_at;
+            state.through_message_id = Some(latest.id.clone());
+            save_automatic_review_state(&conn, session_id, metadata, &state)?;
+            return Ok(empty_automatic_review());
+        }
         state.last_attempt_at = Utc::now().timestamp();
+        state.priority_through_message_id = inputs.last().map(|i| i.id.clone());
         save_automatic_review_state(&conn, session_id, metadata, &state)?;
         inputs
     };
@@ -1665,6 +1800,10 @@ pub async fn run_evolution_review_impl(
     let proposals_created = {
         let conn = db.lock().map_err(|e| e.to_string())?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        if resolve_reply_memory_controls(&tx, session_id, None, None)? != (true, true) {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(empty_automatic_review());
+        }
         let (metadata, mut state) = automatic_review_state(&tx, session_id)?;
         let current_inputs = automatic_review_inputs(&tx, session_id, &state)?;
         if !inputs.iter().all(|input| {
@@ -1674,10 +1813,54 @@ pub async fn run_evolution_review_impl(
         }) {
             return Err("Conversation changed during automatic review".into());
         }
+        if current_inputs.iter().any(|i| {
+            i.content.ends_with("[消息已截断]")
+                || crate::agent::adaptive_constraints::forbids_preference_learning(&i.content)
+        }) {
+            let latest = current_inputs.last().unwrap();
+            state.through_created_at = latest.created_at;
+            state.through_message_id = Some(latest.id.clone());
+            save_automatic_review_state(&tx, session_id, metadata, &state)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(empty_automatic_review());
+        }
         let latest = inputs.last().expect("a review always has user input");
         state.through_created_at = latest.created_at;
         state.through_message_id = Some(latest.id.clone());
-        let created = store_evolution_proposals(&tx, Some(session_id), &evo, "auto_evolution")?;
+        // A failed explicit-evidence claim must not quietly re-enter the
+        // inferred path and acquire confidence through repeated bad quotes.
+        let inferred = crate::agent::evolution::EvolutionResult {
+            new_memories: evo
+                .new_memories
+                .iter()
+                .filter(|m| {
+                    !evo.explicit_preferences
+                        .iter()
+                        .any(|p| p.content == m.content)
+                })
+                .cloned()
+                .collect(),
+            explicit_preferences: Vec::new(),
+            preferences_json: None,
+            summary: evo.summary.clone(),
+        };
+        let created =
+            store_evolution_proposals(&tx, Some(session_id), &inferred, "auto_evolution")?;
+        for preference in &evo.explicit_preferences {
+            if let Some(source) = inputs.get(preference.source_index).filter(|_| {
+                evo.new_memories
+                    .iter()
+                    .any(|m| m.category == "preference" && m.content == preference.content)
+            }) {
+                crate::agent::adaptive_constraints::record_explicit_preference(
+                    &tx,
+                    session_id,
+                    &source.id,
+                    &preference.content,
+                    &preference.quote,
+                )?;
+            }
+        }
         save_automatic_review_state(&tx, session_id, metadata, &state)?;
         tx.commit().map_err(|e| e.to_string())?;
         created
@@ -2499,6 +2682,235 @@ mod tests {
     }
 
     #[test]
+    fn bounded_preference_projection_reports_only_eligible_omissions() {
+        let (_tmp, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('projection-a','A',1,1),('projection-b','B',1,1)").unwrap();
+        for i in 0..14 {
+            conn.execute("INSERT INTO adaptive_constraints(id,scope,constraint_key,constraint_value,confidence,evidence_count,source,status,created_at,updated_at) VALUES(?1,'global',?1,?1,0.7,2,'fixture','active',1,1)",[format!("eligible-{i}")]).unwrap();
+        }
+        for (id, scope, session, status, evidence, confidence, expiry) in [
+            (
+                "own",
+                "session",
+                Some("projection-a"),
+                "active",
+                2,
+                0.7,
+                None,
+            ),
+            (
+                "foreign",
+                "session",
+                Some("projection-b"),
+                "active",
+                2,
+                0.7,
+                None,
+            ),
+            ("tentative", "global", None, "active", 1, 0.4, None),
+            ("expired", "global", None, "active", 2, 0.7, Some(1)),
+            ("disabled", "global", None, "disabled", 2, 0.7, None),
+        ] {
+            conn.execute("INSERT INTO adaptive_constraints(id,scope,session_id,constraint_key,constraint_value,confidence,evidence_count,source,status,created_at,updated_at,expires_at) VALUES(?1,?2,?3,?1,?1,?4,?5,'fixture',?6,1,2,?7)",params![id,scope,session,confidence,evidence,status,expiry]).unwrap();
+        }
+        let view =
+            crate::agent::adaptive_constraints::project_for_session(&conn, "projection-a").unwrap();
+        assert_eq!((view.records.len(), view.omitted), (12, 3));
+        assert!(view.records.iter().any(|r| r.key == "own"));
+        assert!(!view
+            .records
+            .iter()
+            .any(|r| ["foreign", "tentative", "expired", "disabled"].contains(&r.key.as_str())));
+        conn.execute("UPDATE adaptive_constraints SET status='disabled' WHERE id IN ('eligible-0','eligible-1','eligible-2')",[]).unwrap();
+        let exact =
+            crate::agent::adaptive_constraints::project_for_session(&conn, "projection-a").unwrap();
+        assert_eq!((exact.records.len(), exact.omitted), (12, 0));
+        conn.execute("UPDATE adaptive_constraints SET status='disabled'", [])
+            .unwrap();
+        let empty =
+            crate::agent::adaptive_constraints::project_for_session(&conn, "projection-a").unwrap();
+        assert_eq!((empty.records.len(), empty.omitted), (0, 0));
+        conn.execute_batch("DROP TABLE adaptive_constraints")
+            .unwrap();
+        assert!(
+            crate::agent::adaptive_constraints::project_for_session(&conn, "projection-a").is_err(),
+            "unavailable is not an empty archive"
+        );
+    }
+
+    #[test]
+    fn task_preference_projection_preserves_scope_sources_and_snapshot() {
+        use crate::agent::adaptive_constraints::{
+            project_for_session, project_for_task, record_explicit_preference,
+        };
+        let (_tmp, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('task-a','A',1,1),('task-b','B',1,1)").unwrap();
+        let quote = "以后工作日挑衬衫，颜色优先深蓝色。";
+        conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES('task-source','task-a','user',?1,10)",[quote]).unwrap();
+        assert!(record_explicit_preference(&conn, "task-a", "task-source", quote, quote).unwrap());
+        for i in 0..16 {
+            let text = format!("以后介绍其他话题{i}时，先给一个例子。");
+            let id = format!("task-noise-{i}");
+            conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES(?1,'task-a','user',?2,?3)",params![id,text,100+i]).unwrap();
+            assert!(record_explicit_preference(&conn, "task-a", &id, &text, &text).unwrap());
+        }
+        for (id, scope, session) in [
+            ("own-rule", "session", Some("task-a")),
+            ("global-rule", "global", None),
+            ("foreign-rule", "session", Some("task-b")),
+        ] {
+            conn.execute("INSERT INTO adaptive_constraints(id,scope,session_id,constraint_key,constraint_value,confidence,evidence_count,source,status,created_at,updated_at)
+                VALUES(?1,?2,?3,?1,'衬衫颜色的局部规则',1,1,'explicit_user_preference','active',1000,1000)",params![id,scope,session]).unwrap();
+        }
+        let base = project_for_session(&conn, "task-a").unwrap();
+        assert!(!base.records.iter().any(|r| r.value == quote));
+        let view = project_for_task(&conn, "task-a", "衬衫颜色").unwrap();
+        assert_eq!(view.task_matches, 1);
+        assert_eq!((view.records.len(), view.omitted), (12, 7));
+        assert!(view
+            .records
+            .iter()
+            .any(|r| r.value == quote && r.explicit && r.scope == "global"));
+        for (i, r) in base
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.key.starts_with("interaction_preference:"))
+        {
+            assert_eq!(
+                view.records[i].key, r.key,
+                "Non-preference and local slots cannot be displaced"
+            );
+        }
+        assert!(!view.records.iter().any(|r| r.key == "foreign-rule"));
+        assert!(conn.is_autocommit());
+        let outer = conn.unchecked_transaction().unwrap();
+        outer
+            .execute(
+                "UPDATE messages SET content='原句已经编辑' WHERE id='task-source'",
+                [],
+            )
+            .unwrap();
+        let changed = project_for_task(&outer, "task-a", "衬衫颜色").unwrap();
+        assert_eq!(
+            changed.task_matches, 0,
+            "Changed originals cannot be promoted"
+        );
+        assert!(
+            !conn.is_autocommit(),
+            "Do not commit the caller's transaction"
+        );
+        outer.rollback().unwrap();
+        for sql in [
+            "UPDATE messages SET role='assistant' WHERE id='task-source'",
+            "UPDATE messages SET is_provisional=1 WHERE id='task-source'",
+            "DELETE FROM messages WHERE id='task-source'",
+        ] {
+            let outer = conn.unchecked_transaction().unwrap();
+            outer.execute(sql, []).unwrap();
+            assert_eq!(
+                project_for_task(&outer, "task-a", "衬衫颜色")
+                    .unwrap()
+                    .task_matches,
+                0
+            );
+            outer.rollback().unwrap();
+        }
+        assert_eq!(
+            project_for_task(&conn, "task-a", "衬衫颜色")
+                .unwrap()
+                .task_matches,
+            1
+        );
+        for (column, value) in [("status", "'disabled'"), ("expires_at", "'1'")] {
+            let outer = conn.unchecked_transaction().unwrap();
+            outer.execute(&format!("UPDATE adaptive_constraints SET {column}={value} WHERE constraint_value=?1"),[quote]).unwrap();
+            let excluded = project_for_task(&outer, "task-a", "衬衫颜色").unwrap();
+            assert!(!excluded.records.iter().any(|r| r.value == quote));
+            assert_eq!(excluded.task_matches, 0);
+            outer.rollback().unwrap();
+        }
+        let inspected =
+            crate::agent::adaptive_constraints::find_preferences(&conn, "衬衣色泽", 50, false)
+                .unwrap();
+        assert!(inspected.partial, "Keep the explicit inspection fallback");
+        assert!(inspected.records.iter().any(|r| r.content == quote));
+        for query in ["", "xylophone-unmatched", "衬衣色泽"] {
+            let unchanged = project_for_task(&conn, "task-a", query).unwrap();
+            assert_eq!(unchanged.task_matches, 0);
+            assert_eq!(
+                unchanged.records.iter().map(|r| &r.key).collect::<Vec<_>>(),
+                base.records.iter().map(|r| &r.key).collect::<Vec<_>>()
+            );
+        }
+        let protected = conn.unchecked_transaction().unwrap();
+        for i in 0..12 {
+            protected.execute("INSERT INTO adaptive_constraints(id,scope,session_id,constraint_key,constraint_value,confidence,evidence_count,source,status,created_at,updated_at)
+                VALUES(?1,'session','task-a',?1,'本会话规则',1,1,'explicit_user_preference','active',20000,20000)",[format!("protected-{i}")]).unwrap();
+        }
+        let full = project_for_task(&protected, "task-a", "衬衫颜色").unwrap();
+        assert_eq!(
+            full.task_matches, 0,
+            "No room for task candidates when all slots are scoped rules"
+        );
+        assert!(full.records.iter().all(|r| r.key.starts_with("protected-")));
+        protected.rollback().unwrap();
+    }
+
+    #[test]
+    fn task_preference_projection_scales_on_owned_synthetic_records() {
+        let (_tmp, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('scale','Synthetic',1,1);
+            WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+            INSERT INTO messages(id,session_id,role,content,created_at) SELECT 'bench-source-'||i,'scale','user','以后谈论其它主题'||i||'时先给一个例子。',2000+i FROM n;
+            INSERT INTO adaptive_constraints(id,scope,constraint_key,constraint_value,confidence,evidence_count,source,status,created_at,updated_at)
+            SELECT 'bench-pref-'||substr(id,14),'global','interaction_preference:'||id,content,1,1,'explicit_user_preference','active',created_at,created_at FROM messages WHERE id LIKE 'bench-source-%';
+            INSERT INTO adaptive_constraint_evidence(id,constraint_key,session_id,source,observed_at)
+            SELECT 'bench-evidence-'||id,'interaction_preference:'||id,session_id,'explicit_user:'||id,created_at FROM messages WHERE id LIKE 'bench-source-%';").unwrap();
+        let quote = "以后工作日挑衬衫，颜色优先深蓝色。";
+        conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES('old-source','scale','user',?1,1)",[quote]).unwrap();
+        assert!(
+            crate::agent::adaptive_constraints::record_explicit_preference(
+                &conn,
+                "scale",
+                "old-source",
+                quote,
+                quote
+            )
+            .unwrap()
+        );
+        let started = std::time::Instant::now();
+        let matched =
+            crate::agent::adaptive_constraints::project_for_task(&conn, "scale", "衬衫颜色")
+                .unwrap();
+        let match_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let miss = crate::agent::adaptive_constraints::project_for_task(
+            &conn,
+            "scale",
+            "xylophone-unmatched",
+        )
+        .unwrap();
+        let miss_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let partial =
+            crate::agent::adaptive_constraints::project_for_task(&conn, "scale", "衬衣色泽")
+                .unwrap();
+        println!("TASK_PREFERENCE_SCALE rows=10001 match_ms={match_ms} miss_ms={miss_ms} char_only_ms={}",started.elapsed().as_millis());
+        assert_eq!(
+            (matched.records.len(), matched.omitted, matched.task_matches),
+            (12, 9989, 1)
+        );
+        assert_eq!(miss.task_matches, 0);
+        assert_eq!(partial.task_matches, 0);
+        assert_eq!(
+            partial.records.iter().map(|r| &r.key).collect::<Vec<_>>(),
+            miss.records.iter().map(|r| &r.key).collect::<Vec<_>>()
+        );
+        assert!(matched.records.iter().any(|r| r.value == quote));
+    }
+
+    #[test]
     fn repeated_preference_evidence_is_stored_without_visible_proposals() {
         for importance in [1, 3, 6, 8] {
             let (_tmp, conn) = setup_db();
@@ -2521,6 +2933,7 @@ mod tests {
             );
             assert!(
                 crate::agent::adaptive_constraints::active_for_session(&conn, "any-session")
+                    .unwrap()
                     .is_empty()
             );
             crate::agent::adaptive_constraints::record_preferences(&conn, None, &memories, "test")
@@ -2536,7 +2949,9 @@ mod tests {
             assert_eq!(evidence, 2);
             assert!((confidence - 0.7).abs() < f64::EPSILON);
             assert_eq!(
-                crate::agent::adaptive_constraints::active_for_session(&conn, "any-session").len(),
+                crate::agent::adaptive_constraints::active_for_session(&conn, "any-session")
+                    .unwrap()
+                    .len(),
                 1
             );
             assert_eq!(
@@ -2582,7 +2997,9 @@ mod tests {
             .unwrap();
         assert_eq!(evidence, 1);
         assert!(
-            crate::agent::adaptive_constraints::active_for_session(&conn, "session-a").is_empty()
+            crate::agent::adaptive_constraints::active_for_session(&conn, "session-a")
+                .unwrap()
+                .is_empty()
         );
 
         // A later independent conversation can supply the second evidence.
@@ -2602,7 +3019,9 @@ mod tests {
             .unwrap();
         assert_eq!(evidence, 2);
         assert_eq!(
-            crate::agent::adaptive_constraints::active_for_session(&conn, "session-a").len(),
+            crate::agent::adaptive_constraints::active_for_session(&conn, "session-a")
+                .unwrap()
+                .len(),
             1
         );
 
@@ -2619,7 +3038,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::agent::adaptive_constraints::active_for_session(&conn, "session-c").is_empty()
+            crate::agent::adaptive_constraints::active_for_session(&conn, "session-c")
+                .unwrap()
+                .is_empty()
         );
         let counts: (i32, i32) = conn.query_row(
             "SELECT evidence_count, (SELECT COUNT(*) FROM adaptive_constraint_evidence) FROM adaptive_constraints", [],
@@ -2668,7 +3089,8 @@ mod tests {
         assert!(records[0].ready);
         let id = records[0].id.clone();
         let serialized = serde_json::to_value(&records[0]).unwrap();
-        assert_eq!(serialized.as_object().unwrap().len(), 4);
+        assert_eq!(serialized.as_object().unwrap().len(), 5);
+        assert_eq!(serialized["explicit"], false);
         assert!(serialized.get("updatedAt").is_some());
         conn.execute_batch(
             "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','owner',1,1);
@@ -2681,7 +3103,11 @@ mod tests {
         dismiss_learned_preference(&conn, &id).unwrap();
         dismiss_learned_preference(&conn, &id).unwrap(); // Safe uncertain IPC retry.
         assert!(learned_preferences(&conn).unwrap().is_empty());
-        assert!(crate::agent::adaptive_constraints::active_for_session(&conn, "s").is_empty());
+        assert!(
+            crate::agent::adaptive_constraints::active_for_session(&conn, "s")
+                .unwrap()
+                .is_empty()
+        );
         let retained: (String, String, i64) = conn.query_row(
             "SELECT status, constraint_value, (SELECT COUNT(*) FROM adaptive_constraint_evidence)
              FROM adaptive_constraints WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -2716,13 +3142,18 @@ mod tests {
             0
         );
         assert!(learned_preferences(&conn).unwrap().is_empty());
-        assert!(crate::agent::adaptive_constraints::active_for_session(&conn, "s").is_empty());
+        assert!(
+            crate::agent::adaptive_constraints::active_for_session(&conn, "s")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn automatic_evolution_does_not_create_frontend_proposals() {
         let (_tmp, conn) = setup_db();
         let result = crate::agent::evolution::EvolutionResult {
+            explicit_preferences: Vec::new(),
             new_memories: vec![crate::agent::evolution::NewMemory {
                 category: "preference".to_string(),
                 content: "用户偏好简洁结论。".to_string(),
@@ -2752,6 +3183,9 @@ mod tests {
 
     #[test]
     fn update_memory_edits_fields_and_writes_history() {
+        unsafe {
+            crate::vector_store::load_extension_globally();
+        }
         let (_tmp, conn) = setup_db();
         conn.execute(
             "INSERT INTO memories (id, scope, category, content, importance, source, frequency, is_permanent, decay_factor, forget_stage, content_hash, created_at, updated_at)
@@ -2759,6 +3193,14 @@ mod tests {
             [],
         )
         .unwrap();
+
+        // Content edits must invalidate both copies of the old search vector;
+        // otherwise a newly edited library item is still retrieved by old meaning.
+        crate::vector_store::init_vector_table(&conn).unwrap();
+        let rowid = crate::vector_store::get_or_create_rowid(&conn, "m1").unwrap();
+        crate::vector_store::upsert_embedding(&conn, rowid, &vec![0.5; 1536]).unwrap();
+        conn.execute("UPDATE memories SET embedding=x'0102' WHERE id='m1'", [])
+            .unwrap();
 
         update_memory_impl(
             &conn,
@@ -2781,11 +3223,628 @@ mod tests {
             )
             .unwrap();
         assert_eq!(updated, ("new content".to_string(), 8, 1));
+        assert!(conn
+            .query_row(
+                "SELECT embedding IS NULL FROM memories WHERE id='m1'",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE rowid=?1",
+                [rowid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
 
         let history_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_history WHERE memory_id = 'm1' AND operation = 'update'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(history_count, 1);
+
+        // Metadata-only changes retain vectors; a failed audit rolls back the
+        // content and both vector stores together instead of partly saving.
+        crate::vector_store::upsert_embedding(&conn, rowid, &vec![0.25; 1536]).unwrap();
+        conn.execute("UPDATE memories SET embedding=x'0304' WHERE id='m1'", [])
+            .unwrap();
+        update_memory_impl(
+            &conn,
+            UpdateMemoryRequest {
+                id: "m1".into(),
+                scope: "global".into(),
+                category: "preference".into(),
+                content: "new content".into(),
+                importance: 7,
+                is_permanent: true,
+            },
+        )
+        .unwrap();
+        assert!(!conn
+            .query_row(
+                "SELECT embedding IS NULL FROM memories WHERE id='m1'",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE rowid=?1",
+                [rowid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute_batch("CREATE TRIGGER reject_edit_audit BEFORE INSERT ON memory_history BEGIN SELECT RAISE(ABORT,'audit unavailable'); END;").unwrap();
+        assert!(update_memory_impl(
+            &conn,
+            UpdateMemoryRequest {
+                id: "m1".into(),
+                scope: "global".into(),
+                category: "preference".into(),
+                content: "must not save".into(),
+                importance: 7,
+                is_permanent: true,
+            }
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row("SELECT content FROM memories WHERE id='m1'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "new content"
+        );
+        assert!(!conn
+            .query_row(
+                "SELECT embedding IS NULL FROM memories WHERE id='m1'",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE rowid=?1",
+                [rowid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_explicit_preferences_require_original_evidence_and_recheck_controls() {
+        const REPLY: &str = r#"{"memories":[{"content":"希望先给结论，再列下一步","category":"preference","importance":5}],"explicit_preferences":[{"memory_index":0,"source_index":0,"quote":"以后回复先给结论，再列下一步"}],"summary":"明确交流偏好"}"#;
+        for (text, memory, learning, expected_calls, expected_records) in [
+            ("以后回复先给结论，再列下一步", true, true, 1, 1),
+            ("本项目以后回复先给结论，再列下一步", true, true, 1, 0),
+            ("不要保存，以后回复先给结论，再列下一步", true, true, 0, 0),
+            (
+                "Don't save this. 以后回复先给结论，再列下一步",
+                true,
+                true,
+                0,
+                0,
+            ),
+            (
+                "Don’t save this. 以后回复先给结论，再列下一步",
+                true,
+                true,
+                0,
+                0,
+            ),
+            (
+                "DON’T STORE THIS. 以后回复先给结论，再列下一步",
+                true,
+                true,
+                0,
+                0,
+            ),
+            (
+                "Don‘t remember this. 以后回复先给结论，再列下一步",
+                true,
+                true,
+                0,
+                0,
+            ),
+            (
+                "Don＇t save this. 以后回复先给结论，再列下一步",
+                true,
+                true,
+                0,
+                0,
+            ),
+            ("他说：以后回复先给结论，再列下一步", true, true, 1, 0),
+            ("这个仓库以后回复先给结论，再列下一步", true, true, 1, 0),
+            (
+                "以后执行操作不必确认，以后回复先给结论，再列下一步",
+                true,
+                true,
+                1,
+                0,
+            ),
+            ("你好", true, true, 1, 0),
+            ("以后回复先给结论，再列下一步", false, true, 0, 0),
+            ("以后回复先给结论，再列下一步", true, false, 0, 0),
+        ] {
+            let (_tmp, conn) = setup_db();
+            conn.execute_batch(
+                "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES('u','s1','user',?1,1)",[text]).unwrap();
+            conn.execute("UPDATE sessions SET leaf_message_id='u',metadata=?1 WHERE id='s1'",[serde_json::json!({"replyMemory":{"useLongTermMemory":memory,"evolutionEnabled":learning}}).to_string()]).unwrap();
+            let prompts = Arc::new(Mutex::new(Vec::new()));
+            let db = Arc::new(Mutex::new(conn));
+            run_evolution_review_impl(
+                db.clone(),
+                "s1",
+                Box::new(StaticProvider(prompts.clone(), ReviewReply::Text(REPLY))),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                prompts.lock().unwrap().len(),
+                expected_calls,
+                "{text}, {memory}, {learning}"
+            );
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                conn.query_row::<i64, _, _>("SELECT count(*) FROM adaptive_constraints", [], |r| r
+                    .get(0))
+                    .unwrap(),
+                expected_records,
+                "{text}"
+            );
+            if expected_records == 1 {
+                let prefs = crate::agent::adaptive_constraints::learned_preferences(&conn).unwrap();
+                assert!(prefs[0].explicit && prefs[0].ready);
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT evidence_count FROM adaptive_constraints",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    1,
+                    "one statement is not two observations"
+                );
+                assert!(
+                    !automatic_evolution_due(&conn, "s1"),
+                    "do not repeatedly bill the same statement"
+                );
+            }
+        }
+        struct RevokeDuringReview(Arc<Mutex<Connection>>, Option<&'static str>);
+        #[async_trait::async_trait]
+        impl crate::llm::LlmProvider for RevokeDuringReview {
+            fn name(&self) -> &str {
+                "revoke-during-review"
+            }
+            async fn chat(
+                &self,
+                _: &[crate::llm::Message],
+                _: Option<&[crate::llm::ToolSchema]>,
+                _: Option<&crate::llm::ThinkingSettings>,
+            ) -> Result<crate::llm::LlmResponse, String> {
+                let conn = self.0.lock().unwrap();
+                if let Some(text) = self.1 {
+                    conn.execute("INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('no-save','s1','user',?1,'u',2)",[text]).map_err(|e|e.to_string())?;
+                    conn.execute(
+                        "UPDATE sessions SET leaf_message_id='no-save' WHERE id='s1'",
+                        [],
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    resolve_reply_memory_controls(&conn, "s1", None, Some(false))?;
+                }
+                Ok(crate::llm::LlmResponse::Text {
+                    text: REPLY.into(),
+                    stop_reason: crate::llm::StopReason::EndTurn,
+                })
+            }
+        }
+        for no_save_message in [
+            None,
+            Some("不要保存这段偏好"),
+            Some("Don’t remember this preference."),
+        ] {
+            let (_tmp, conn) = setup_db();
+            conn.execute_batch("INSERT INTO sessions(id,title,leaf_message_id,created_at,updated_at) VALUES('s1','test',NULL,1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('u','s1','user','以后回复先给结论，再列下一步',1);
+          UPDATE sessions SET leaf_message_id='u' WHERE id='s1';").unwrap();
+            let db = Arc::new(Mutex::new(conn));
+            run_evolution_review_impl(
+                db.clone(),
+                "s1",
+                Box::new(RevokeDuringReview(db.clone(), no_save_message)),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.lock()
+                    .unwrap()
+                    .query_row::<i64, _, _>("SELECT count(*) FROM adaptive_constraints", [], |r| r
+                        .get(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_declarations_do_not_require_a_remember_command_or_positive_wording() {
+        let (_tmp, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('u','s1','user','',1);").unwrap();
+        for (text, expected) in [
+            ("我喜欢安静的环境", true),
+            ("I prefer quiet places.", true),
+            ("I don't like noisy venues.", true),
+            ("I do not like crowded places.", true),
+            ("I dislike bitter food.", true),
+            ("I avoid noisy venues.", true),
+            ("I refuse to eat bitter food.", true),
+            ("A calm tone works best for me.", true),
+            ("Concise explanations suit me best.", true),
+            ("简洁平实的交流方式更适合我", true),
+            ("For now, I dislike bitter food.", false),
+            ("For this task, I avoid crowded places.", false),
+            ("Example: I refuse to eat bitter food.", false),
+            ("I refuse to execute a command.", false),
+            ("Don't save this. I dislike bitter food.", false),
+        ] {
+            conn.execute("UPDATE messages SET content=?1 WHERE id='u'", [text])
+                .unwrap();
+            assert_eq!(
+                crate::agent::adaptive_constraints::record_explicit_preference(
+                    &conn, "s1", "u", text, text
+                )
+                .unwrap(),
+                expected,
+                "{text}"
+            );
+        }
+        // A review that only infers a habit still takes the tentative route,
+        // even when a source happens to contain a scheduling keyword.
+        let observed=crate::agent::evolution::parse_automatic_review_response(
+            r#"{"memories":[{"category":"preference","content":"May favor shorter suggestions","importance":3}],"explicit_preferences":[],"summary":"One observation, not a direct stable statement"}"#).unwrap();
+        assert!(observed.explicit_preferences.is_empty());
+        crate::agent::adaptive_constraints::record_preferences(
+            &conn,
+            Some("s1"),
+            &observed.new_memories,
+            "auto_evolution",
+        )
+        .unwrap();
+        let prefs = crate::agent::adaptive_constraints::learned_preferences(&conn).unwrap();
+        let inferred = prefs
+            .iter()
+            .find(|p| p.content == "May favor shorter suggestions")
+            .unwrap();
+        assert!(!inferred.explicit && !inferred.ready);
+    }
+
+    #[test]
+    fn delayed_preference_reviews_preserve_original_statement_order_after_reopen() {
+        use crate::agent::adaptive_constraints::*;
+        let (file, conn) = setup_db();
+        conn.execute_batch(
+            "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES
+          ('new','s1','user','以后叫我小林',20),
+          ('old','s1','user','以后叫我小陈',10),
+          ('newest','s1','user','以后叫我小雨',20);",
+        )
+        .unwrap();
+        // Review completion order differs from both source time and same-second
+        // original insertion order. Old review timestamps emulate legacy rows.
+        for (id, text, at) in [
+            ("newest", "以后叫我小雨", 100),
+            ("new", "以后叫我小林", 200),
+            ("old", "以后叫我小陈", 300),
+        ] {
+            assert!(record_explicit_preference(&conn, "s1", id, text, text).unwrap());
+            conn.execute(
+                "UPDATE adaptive_constraints SET updated_at=?1 WHERE constraint_value=?2",
+                params![at, text],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let conn = crate::db::init(file.path()).unwrap();
+        let prefs = learned_preferences(&conn).unwrap();
+        assert_eq!(
+            prefs.iter().map(|p| p.content.as_str()).collect::<Vec<_>>(),
+            ["以后叫我小雨", "以后叫我小林", "以后叫我小陈"]
+        );
+        assert_eq!(
+            prefs.iter().map(|p| p.updated_at).collect::<Vec<_>>(),
+            [20, 20, 10]
+        );
+        assert_eq!(
+            active_for_session(&conn, "s1")
+                .unwrap()
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>(),
+            ["以后叫我小雨", "以后叫我小林", "以后叫我小陈"]
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>("SELECT count(*) FROM messages", [], |r| r.get(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn explicit_preference_survives_reopen_and_dismissal_never_reteaches_it() {
+        use crate::agent::adaptive_constraints::*;
+        let (file, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('u','s1','user','以后回复先给结论，再列下一步',1);").unwrap();
+        for (role, provisional, session) in [
+            ("assistant", 0, "s1"),
+            ("user", 1, "s1"),
+            ("user", 0, "other"),
+        ] {
+            conn.execute(
+                "UPDATE messages SET role=?1,is_provisional=?2 WHERE id='u'",
+                params![role, provisional],
+            )
+            .unwrap();
+            assert!(!record_explicit_preference(
+                &conn,
+                session,
+                "u",
+                "先给结论，再列下一步",
+                "以后回复先给结论，再列下一步"
+            )
+            .unwrap());
+        }
+        conn.execute(
+            "UPDATE messages SET role='user',is_provisional=0 WHERE id='u'",
+            [],
+        )
+        .unwrap();
+        assert!(record_explicit_preference(
+            &conn,
+            "s1",
+            "u",
+            "先给结论，再列下一步",
+            "以后回复先给结论，再列下一步"
+        )
+        .unwrap());
+        drop(conn);
+        let conn = crate::db::init(file.path()).unwrap();
+        let prefs = learned_preferences(&conn).unwrap();
+        assert!(prefs[0].explicit && prefs[0].ready);
+        assert_eq!(active_for_session(&conn, "s1").unwrap().len(), 1);
+        conn.execute(
+            "UPDATE adaptive_constraint_evidence SET observed_at=?1",
+            [Utc::now().timestamp() - 100 * 24 * 60 * 60],
+        )
+        .unwrap();
+        conn.execute("UPDATE adaptive_constraints SET updated_at=1", [])
+            .unwrap();
+        record_preferences(
+            &conn,
+            Some("s1"),
+            &[crate::agent::evolution::NewMemory {
+                content: prefs[0].content.clone(),
+                category: "preference".into(),
+                importance: 5,
+            }],
+            "auto_evolution",
+        )
+        .unwrap();
+        assert!(
+            learned_preferences(&conn).unwrap()[0].explicit,
+            "inferred evidence must not downgrade or expire explicit preferences"
+        );
+        assert_eq!(
+            learned_preferences(&conn).unwrap()[0].updated_at,
+            1,
+            "an inferred observation must not make an old explicit statement look newer"
+        );
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM adaptive_constraint_evidence WHERE source LIKE 'explicit_user:%'",[],|r|r.get(0)).unwrap(),1);
+        assert!(conn
+            .query_row::<Option<i64>, _, _>(
+                "SELECT expires_at FROM adaptive_constraints",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap()
+            .is_none());
+        dismiss_learned_preference(&conn, &prefs[0].id).unwrap();
+        assert!(!record_explicit_preference(
+            &conn,
+            "s1",
+            "u",
+            "先给结论，再列下一步",
+            "以后回复先给结论，再列下一步"
+        )
+        .unwrap());
+        assert!(active_for_session(&conn, "s1").unwrap().is_empty());
+        assert!(learned_preferences(&conn).unwrap().is_empty());
+        assert_eq!(
+            conn.query_row::<String, _, _>("SELECT content FROM messages WHERE id='u'", [], |r| r
+                .get(0))
+                .unwrap(),
+            "以后回复先给结论，再列下一步"
+        );
+    }
+
+    #[test]
+    fn disabled_learning_interval_is_not_learned_retroactively() {
+        let (_file, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('off','s1','user','我喜欢黑咖啡',1);
+          UPDATE sessions SET leaf_message_id='off' WHERE id='s1';").unwrap();
+        resolve_reply_memory_controls(&conn, "s1", Some(false), Some(false)).unwrap();
+        conn.execute_batch("INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('new','s1','user','以后叫我小林','off',2);
+          UPDATE sessions SET leaf_message_id='new' WHERE id='s1';").unwrap();
+        resolve_reply_memory_controls(&conn, "s1", Some(true), Some(true)).unwrap();
+        let (_, state) = automatic_review_state(&conn, "s1").unwrap();
+        let inputs = automatic_review_inputs(&conn, "s1", &state).unwrap();
+        assert_eq!(
+            inputs.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["new"]
+        );
+        assert!(
+            automatic_evolution_due(&conn, "s1"),
+            "one explicit request can use the existing review slot"
+        );
+        let db = Arc::new(Mutex::new(conn));
+        assert!(
+            automatic_evolution_after_completion(db.clone(), "s1", false, || panic!(
+                "disabled learning must not resolve a provider"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        let resolved = std::cell::Cell::new(false);
+        assert!(
+            automatic_evolution_after_completion(db.clone(), "s1", true, || {
+                resolved.set(true);
+                None
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(resolved.get());
+        db.lock().unwrap().execute("UPDATE sessions SET metadata=json_set(metadata,'$.automaticEvolution.last_attempt_at',?1) WHERE id='s1'",[Utc::now().timestamp()]).unwrap();
+        assert!(
+            automatic_evolution_after_completion(db, "s1", true, || panic!(
+                "cooldown must not resolve a provider"
+            ))
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn urgent_preference_revision_does_not_retry_a_failed_source() {
+        let (_file, conn) = setup_db();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('old','s1','user','我喜欢绿茶',1);
+          UPDATE sessions SET leaf_message_id='old' WHERE id='s1';").unwrap();
+        crate::agent::adaptive_constraints::record_explicit_preference(
+            &conn,
+            "s1",
+            "old",
+            "我喜欢绿茶",
+            "我喜欢绿茶",
+        )
+        .unwrap();
+        let now = Utc::now().timestamp();
+        conn.execute("UPDATE sessions SET metadata=json_object('automaticEvolution',json_object('through_created_at',1,'through_message_id','old','last_attempt_at',?1)) WHERE id='s1'",[now]).unwrap();
+        conn.execute_batch("INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('change','s1','user','我的饮品偏好改为乌龙茶','old',2);
+          UPDATE sessions SET leaf_message_id='change' WHERE id='s1';").unwrap();
+        assert!(automatic_evolution_due(&conn, "s1"));
+        let db = Arc::new(Mutex::new(conn));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        assert!(run_evolution_review_impl(
+            db.clone(),
+            "s1",
+            Box::new(StaticProvider(prompts.clone(), ReviewReply::Unavailable)),
+            None
+        )
+        .await
+        .is_err());
+        let conn = db.lock().unwrap();
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+        assert!(!automatic_evolution_due(&conn, "s1"));
+        conn.execute_batch("INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('chat','s1','user','继续随便聊聊','change',3);
+          UPDATE sessions SET leaf_message_id='chat' WHERE id='s1';").unwrap();
+        assert!(!automatic_evolution_due(&conn, "s1"));
+        conn.execute_batch("INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('cancel','s1','user','撤回先前的饮品偏好，不再沿用','chat',4);
+          UPDATE sessions SET leaf_message_id='cancel' WHERE id='s1';").unwrap();
+        assert!(automatic_evolution_due(&conn, "s1"));
+    }
+
+    #[tokio::test]
+    async fn urgent_preference_revision_waits_for_the_existing_slot_then_rechecks() {
+        const OLD: &str = r#"{"memories":[{"category":"preference","content":"绿茶","importance":5}],"explicit_preferences":[{"memory_index":0,"source_index":0,"quote":"我喜欢绿茶"}],"summary":"原偏好"}"#;
+        const NEW: &str = r#"{"memories":[{"category":"preference","content":"乌龙茶","importance":5}],"explicit_preferences":[{"memory_index":0,"source_index":0,"quote":"我的饮品偏好改为乌龙茶"}],"summary":"更正"}"#;
+        for (other_session, already_saved) in [(false, true), (false, false), (true, false)] {
+            let (_file, conn) = setup_db();
+            conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s1','test',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('old','s1','user','我喜欢绿茶',1);
+          INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('chat','s1','user','随便聊聊','old',2);
+          UPDATE sessions SET leaf_message_id='chat' WHERE id='s1';").unwrap();
+            if already_saved {
+                crate::agent::adaptive_constraints::record_explicit_preference(
+                    &conn,
+                    "s1",
+                    "old",
+                    "我喜欢绿茶",
+                    "我喜欢绿茶",
+                )
+                .unwrap();
+            }
+            let db = Arc::new(Mutex::new(conn));
+            let prompts = Arc::new(Mutex::new(Vec::new()));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let proceed = Arc::new(tokio::sync::Notify::new());
+            let background = tokio::spawn({
+                let db = db.clone();
+                let provider = PausedProvider {
+                    inner: StaticProvider(prompts.clone(), ReviewReply::Text(OLD)),
+                    entered: entered.clone(),
+                    proceed: proceed.clone(),
+                };
+                async move { run_evolution_review_impl(db, "s1", Box::new(provider), None).await }
+            });
+            entered.notified().await;
+            let session = if other_session { "s2" } else { "s1" };
+            {
+                let conn = db.lock().unwrap();
+                if other_session {
+                    // The original default has not been saved yet. A new session
+                    // must still wait for it before rechecking the correction.
+                    conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s2','correction',1,1);
+                  INSERT INTO messages(id,session_id,role,content,created_at) VALUES('change','s2','user','我的饮品偏好改为乌龙茶',3);
+                  UPDATE sessions SET leaf_message_id='change' WHERE id='s2';").unwrap();
+                } else {
+                    conn.execute_batch("INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('change','s1','user','我的饮品偏好改为乌龙茶','chat',3); UPDATE sessions SET leaf_message_id='change' WHERE id='s1';").unwrap();
+                }
+                assert!(automatic_evolution_due(&conn, session));
+            }
+            let urgent = tokio::spawn({
+                let db = db.clone();
+                let prompts = prompts.clone();
+                async move {
+                    run_evolution_review_impl(
+                        db,
+                        session,
+                        Box::new(StaticProvider(prompts, ReviewReply::Text(NEW))),
+                        None,
+                    )
+                    .await
+                }
+            });
+            tokio::task::yield_now().await;
+            assert!(!urgent.is_finished());
+            proceed.notify_one();
+            background.await.unwrap().unwrap();
+            urgent.await.unwrap().unwrap();
+            let conn = db.lock().unwrap();
+            assert!(
+                crate::agent::adaptive_constraints::learned_preferences(&conn)
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.content == "我的饮品偏好改为乌龙茶")
+            );
+            assert_eq!(prompts.lock().unwrap().len(), 2);
+            assert!(!automatic_evolution_due(&conn, session));
+        }
     }
 
     #[tokio::test]
@@ -3076,6 +4135,7 @@ mod tests {
     fn accepting_evolution_proposal_writes_memory_and_audit_history() {
         let (_tmp, conn) = setup_db();
         let evo = crate::agent::evolution::EvolutionResult {
+            explicit_preferences: Vec::new(),
             new_memories: vec![crate::agent::evolution::NewMemory {
                 category: "preference".to_string(),
                 content: "用户偏好简短回答".to_string(),
@@ -3138,6 +4198,7 @@ mod tests {
     fn rejecting_evolution_proposal_does_not_write_memory() {
         let (_tmp, conn) = setup_db();
         let evo = crate::agent::evolution::EvolutionResult {
+            explicit_preferences: Vec::new(),
             new_memories: vec![crate::agent::evolution::NewMemory {
                 category: "fact".to_string(),
                 content: "用户临时提到一个不应保存的事实".to_string(),

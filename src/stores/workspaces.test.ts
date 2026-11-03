@@ -7,7 +7,7 @@ import {
   type Workspace,
 } from '$lib/commands/workspace';
 import { useSessionsStore } from './sessions';
-import { projectWorkspaceForMessage, useWorkspacesStore } from './workspaces';
+import { projectCandidatesForMessage, useWorkspacesStore } from './workspaces';
 
 vi.mock('$lib/commands/workspace', () => ({
   createProjectWorkspace: vi.fn(),
@@ -171,14 +171,13 @@ describe('workspace store', () => {
     expect(createProjectWorkspaceMock).toHaveBeenCalledTimes(1);
   });
 
-  it('routes only an explicit Personal-space project mention to one known project', () => {
+  it('finds named candidates without mistaking a mention or longest name for routing intent', () => {
     const nested = { ...project, id: 'project-angelbot', name: 'AngelBot' };
 
-    expect(projectWorkspaceForMessage('继续推进 AngelBot 的工作', [personal, project, nested], personal.id))
-      .toEqual(nested);
-    expect(projectWorkspaceForMessage('继续推进日常事项', [personal, project, nested], personal.id))
-      .toBeNull();
-    expect(projectWorkspaceForMessage('继续推进 AngelBot', [personal, project, nested], nested.id))
-      .toBeNull();
+    expect(projectCandidatesForMessage('继续推进 AngelBot 的工作', [personal, project, nested], personal.id)).toEqual([nested]);
+    expect(projectCandidatesForMessage('昨天 AngelBot 让我很累', [personal, project, nested], personal.id)).toEqual([nested]);
+    expect(projectCandidatesForMessage('比较 Project A 和 AngelBot', [personal, project, nested], personal.id)).toEqual([project, nested]);
+    expect(projectCandidatesForMessage('继续推进日常事项', [personal, project, nested], personal.id)).toEqual([]);
+    expect(projectCandidatesForMessage('继续推进 AngelBot', [personal, project, nested], nested.id)).toEqual([]);
   });
 });

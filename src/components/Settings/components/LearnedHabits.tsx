@@ -55,8 +55,8 @@ export function LearnedHabits({ enabled }: { enabled: boolean }) {
     <div className="evolution-proposals">
       <div className="evolution-proposals-header">
         <div>
-          <h4>逐渐了解的习惯</h4>
-          <p>这里是近期了解到的日常习惯和相处偏好。不再沿用会移除这条自动记录，不会删除原对话或你主动保存的记忆。</p>
+          <h4>交流偏好与习惯</h4>
+          <p>你明确表达的稳定偏好可直接沿用；观察到的习惯仍需重复证据。不再沿用会停止使用这条记录，不会删除原对话或其他记忆。</p>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={() => void load()} disabled={loading || busyId !== null}>
           {loading ? '读取中...' : '刷新习惯'}
@@ -76,6 +76,7 @@ export function LearnedHabits({ enabled }: { enabled: boolean }) {
           <div className="proposal-item" role="listitem" key={habit.id}>
             <div className="proposal-meta">
               <span>{!enabled ? '已暂停沿用' : habit.ready ? '可作为回应参考' : '还在了解'}</span>
+              <span>{habit.explicit ? '你明确表达的偏好' : '观察到的习惯'}</span>
             </div>
             <p>{habit.content}</p>
             <div className="proposal-actions">

@@ -31,6 +31,7 @@ export interface WorkspaceAutomationOverview { items: WorkspaceAutomationStatus[
 export const getWorkspaceAutomationOverview = (workspaceId: string) =>
   invoke<WorkspaceAutomationOverview>('get_workspace_automation_overview', { workspaceId });
 export type CreateAutomationInput = Pick<Automation,'title'|'prompt'|'triggerKind'|'triggerValue'|'permissionSummary'|'executorKind'|'workspaceId'|'scriptPath'|'scriptArgs'|'workingDir'|'timeoutSeconds'>;
+/** For script tasks scriptPath is the source; the saved result points to its managed copy. */
 export const createAutomation = (input: CreateAutomationInput) => invoke<Automation>('create_automation', input);
 export interface CreateMaaAutomationInput { title:string; triggerValue:string; workspaceId:string; appId:string; launchEmulator:boolean; timeoutSeconds?:number; }
 export const createMaaAutomation = (input: CreateMaaAutomationInput) => invoke<Automation>('create_maa_automation', { ...input });

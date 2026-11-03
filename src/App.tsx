@@ -1,9 +1,11 @@
 import { useEffect, useState, type DragEvent } from 'react';
 import { Sidebar } from './components/Sidebar';
+import { SidebarToggleIcon } from './components/SidebarToggleIcon';
 import { ChatArea } from './components/ChatArea';
 import { RightPanel } from './components/RightPanel';
 import { AutomationPage } from './components/Automation/AutomationPage';
 import { LibraryPage } from './components/Library/LibraryPage';
+import { ProjectsPage } from './components/ProjectsPage';
 import { SettingsModal } from './components/Settings';
 import { CommandPalette } from './components/CommandPalette';
 import type { SettingsPage } from './components/Settings/types';
@@ -12,6 +14,7 @@ import { useSettingsStore } from './stores/settings';
 import { useWorkspacesStore } from './stores/workspaces';
 import { initializeTheme, useThemeStore } from './stores/theme';
 import './styles/settings.css';
+import './styles/layouts.css';
 
 interface OpenSettingsEvent extends Event {
   detail?: SettingsPage;
@@ -35,6 +38,7 @@ export default function App() {
   const activeWorkspaceId = useWorkspacesStore((s) => s.activeWorkspaceId);
   const dark = useThemeStore((s) => s.resolvedTheme === 'dark');
   const toggleTheme = useThemeStore((s) => s.toggleTheme);
+  const layout = useThemeStore((s) => s.layout);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsPage, setSettingsPage] = useState<SettingsPage>('personality');
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -73,6 +77,14 @@ export default function App() {
 
   useEffect(() => initializeTheme(), []);
 
+  // B's rail is always visible. Returning to compact A must not strand
+  // keyboard focus in its now off-screen sidebar.
+  useEffect(() => {
+    if (layout !== 'A' || sidebarOpen || !document.activeElement?.closest('.sidebar')) return;
+    const menu = document.querySelector<HTMLButtonElement>('.mobile-menu-btn');
+    if (menu && menu.getBoundingClientRect().width > 0) menu.focus();
+  }, [layout, sidebarOpen]);
+
   useEffect(() => {
     const handleLocateFile = (event: Event) => {
       if (!workbenchAvailable || !activeWorkspace) return;
@@ -93,6 +105,13 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented && workbenchOpen && currentPage === 'chat'
+        && !document.querySelector('[aria-modal="true"]')) {
+        e.preventDefault();
+        setWorkbenchOpen(false);
+        document.querySelector<HTMLButtonElement>('[aria-controls="conversation-workbench"]')?.focus();
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLocaleLowerCase() === 'k') {
         e.preventDefault();
         setCommandPaletteOpen((open) => !open);
@@ -114,7 +133,7 @@ export default function App() {
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [workbenchAvailable]);
+  }, [workbenchAvailable, workbenchOpen, currentPage]);
 
   useEffect(() => {
     const handleOpenSettings = (event: Event) => {
@@ -130,19 +149,22 @@ export default function App() {
   }, []);
 
   return (
-    <div className={`app app-shell${workbenchOpen ? ' app-shell--workbench' : ''}`}
-      onDragOver={preventFileNavigation} onDrop={preventFileNavigation}>
+    <div className={`app app-shell${currentPage === 'chat' ? ' app-shell--chat' : ''}${workbenchOpen && workbenchAvailable && currentPage === 'chat' ? ' app-shell--workbench' : ''}`}
+      data-layout={layout} onDragOver={preventFileNavigation} onDrop={preventFileNavigation}>
+      <header className="layout-context-header" aria-label="当前工作区">
+        <span>{currentPage === 'tasks' ? '自动化' : currentPage === 'knowledge' ? '资料库' : currentPage === 'projects' ? '项目' : '日常对话'}</span>
+        <span>{activeWorkspace?.name || 'AngelBot'}</span>
+      </header>
       {/* 窄窗口（<960px）显示的移动端顶栏，内含侧栏菜单按钮 */}
       <div className="mobile-topbar">
         <button
           type="button"
           className="mobile-menu-btn"
           aria-label="打开菜单"
+          title="展开侧栏"
           onClick={() => setSidebarOpen(true)}
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
-          </svg>
+          <SidebarToggleIcon />
         </button>
       </div>
       <Sidebar
@@ -160,16 +182,17 @@ export default function App() {
         <button type="button" className="sidebar-scrim" aria-label="关闭菜单" onClick={() => setSidebarOpen(false)} />
       )}
       {currentPage === 'chat' ? (
-        <ChatArea onToggleWorkbench={workbenchAvailable
+        <ChatArea workbenchOpen={workbenchOpen} onToggleWorkbench={workbenchAvailable
           ? () => setWorkbenchOpen((open) => !open)
           : undefined} />
       ) : (
-        <main className="main-with-nav">
+        <div className="main-with-nav">
           {currentPage === 'tasks' && <AutomationPage />}
           {currentPage === 'knowledge' && <LibraryPage />}
-        </main>
+          {currentPage === 'projects' && <ProjectsPage />}
+        </div>
       )}
-      {workbenchOpen && workbenchAvailable && (
+      {workbenchOpen && workbenchAvailable && currentPage === 'chat' && (
         <RightPanel
           onClose={() => setWorkbenchOpen(false)}
           locateRequest={scopedFileLocator}

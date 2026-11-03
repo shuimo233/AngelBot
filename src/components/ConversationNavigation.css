@@ -1,0 +1,18 @@
+.chat-transcript { position: relative; display: flex; flex: 1 1 auto; min-height: 0; min-width: 0; }
+.chat-transcript--indexed .messages { padding-inline-start: max(44px, var(--conversation-gutter), calc((100% - var(--conversation-content-width)) / 2)); }
+.conversation-index { position: absolute; top: 12px; bottom: 12px; left: 6px; z-index: 5; width: 28px; display: flex; align-items: center; }
+.conversation-index ol { display: flex; flex-direction: column; width: 100%; height: 100%; margin: 0; padding: 0; list-style: none; }
+.conversation-index li { flex: 1; min-height: 0; }
+.conversation-index button { display: flex; align-items: center; width: 28px; height: 100%; min-height: 0; padding: 0 6px; border: 0; border-radius: 0; background: transparent; cursor: pointer; }
+.conversation-index button > span { display: block; width: 7px; height: 2px; flex-shrink: 0; background: var(--color-border); }
+.conversation-index button:hover > span, .conversation-index button:focus-visible > span { width: 14px; background: var(--color-text-secondary); }
+.conversation-index button[aria-current] > span { width: 18px; background: var(--color-accent); }
+.conversation-index button:focus-visible { outline: 2px solid var(--ui-focus); outline-offset: -2px; }
+.conversation-index-preview { position: absolute; z-index: 6; left: 42px; box-sizing: border-box; width: 320px; max-width: calc(100% - 64px); max-height: calc(100% - 16px); overflow: hidden; padding: 12px 14px; border: 1px solid var(--color-border); border-radius: var(--radius-control); color: var(--color-text); background: var(--color-bg); box-shadow: 0 4px 16px var(--shadow); pointer-events: none; }
+.conversation-index-preview strong, .conversation-index-preview p { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.conversation-index-preview strong { -webkit-line-clamp: 2; font-size: 13px; font-weight: 500; line-height: 1.6; }
+.conversation-index-preview p { -webkit-line-clamp: 3; margin: 7px 0 10px; color: var(--color-text-secondary); font-size: 12px; line-height: 1.7; }
+.conversation-index-preview small { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; color: var(--color-muted); font-size: 11px; }
+.conversation-latest { position: absolute; z-index: 4; left: 50%; bottom: 12px; transform: translateX(-50%); display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid var(--color-border); border-radius: 50%; color: var(--color-text-secondary); background: var(--color-bg); box-shadow: 0 2px 8px var(--shadow); cursor: pointer; }
+.conversation-latest:hover { color: var(--color-text); border-color: var(--color-text-secondary); }
+.conversation-latest:focus-visible { outline: 2px solid var(--ui-focus); outline-offset: 2px; }

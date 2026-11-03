@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { SettingsSection } from '../components/SettingsSection';
 import { TextField } from '../components/TextField';
+import { TextField as NativeTextField } from '../../../ui';
 import { ToggleField } from '../components/ToggleField';
 import {
   clearMcpEnv,
@@ -480,14 +481,8 @@ export function McpServersSettings() {
                           ))}
                         </div>
                       ) : <div className="field-hint">尚未配置环境变量。</div>}
-                      <label className="field input-field">
-                        <span className="field-label">变量名</span>
-                        <input value={envKeyDraft} placeholder="例如 GITHUB_PERSONAL_ACCESS_TOKEN" autoComplete="off" spellCheck={false} disabled={saving} onChange={(event) => setEnvKeyDraft(event.target.value)} />
-                      </label>
-                      <label className="field input-field">
-                        <span className="field-label">新变量值</span>
-                        <input type="password" value={envValueDraft} placeholder="输入后保存；现有值不会显示" autoComplete="new-password" spellCheck={false} disabled={saving} onChange={(event) => setEnvValueDraft(event.target.value)} />
-                      </label>
+                      <NativeTextField label="变量名" value={envKeyDraft} placeholder="例如 GITHUB_PERSONAL_ACCESS_TOKEN" autoComplete="off" spellCheck={false} disabled={saving} onChange={(event) => setEnvKeyDraft(event.target.value)} />
+                      <NativeTextField label="新变量值" type="password" value={envValueDraft} placeholder="输入后保存；现有值不会显示" autoComplete="new-password" spellCheck={false} disabled={saving} onChange={(event) => setEnvValueDraft(event.target.value)} />
                       <div className="field-hint">变量名只能使用英文字母、数字和下划线，且不能以数字开头。保存同名变量会替换原值；留空不会更改。</div>
                       <div className="form-actions">
                         <button className="btn btn-secondary" type="button" disabled={saving} onClick={closeEnvEditor}>完成</button>

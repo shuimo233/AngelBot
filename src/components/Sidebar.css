@@ -1,330 +1,44 @@
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  overflow: hidden;
-}
-
-/* Identity bar */
-.sidebar-identity {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 0;
-  flex-shrink: 0;
-  height: 44px;
-}
-
-.sidebar-primary-nav {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 4px;
-  padding: 8px 10px;
-  border-bottom: 0;
-}
-
-.sidebar-primary-nav-item {
-  min-height: 32px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--color-muted);
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-  transition: background-color 160ms ease, color 160ms ease;
-}
-
-.sidebar-primary-nav-item:hover {
-  background: var(--color-surface-hover);
-  color: var(--color-text);
-}
-
-.sidebar-primary-nav-item.active {
-  background: var(--color-accent-subtle);
-  color: var(--color-accent);
-  font-weight: 600;
-}
-
-/* Session bar */
-.sidebar-session-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-bottom: 0;
-  flex-shrink: 0;
-  min-height: 38px;
-}
-
-/* Work dir bar */
-.work-dir-bar {
-  flex-shrink: 0;
-  padding: 4px 10px;
-  border-bottom: 0;
-}
-
-/* Session list */
-.sidebar-section {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 6px 8px;
-}
-
-/* Session list item wrapper */
-.session-item-wrapper {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
-  align-items: center;
-  min-width: 0;
-  margin-bottom: 2px;
-  border-radius: 7px;
-}
-
-.session-item-wrapper.active {
-  background: var(--color-accent-subtle);
-}
-
-.session-item-select {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  min-width: 0;
-  width: 100%;
-  padding: 6px 4px 6px 8px;
-  border: 0;
-  color: var(--color-text);
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-}
-
-.session-item-wrapper.active .session-item-select {
-  color: var(--color-accent);
-  font-weight: 600;
-}
-
-.session-item-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-item-branch-mark {
-  display: inline-block;
-  margin-right: 5px;
-  color: var(--color-muted);
-  font-size: 11px;
-}
-
-.session-item-time {
-  margin-left: 6px;
-  color: var(--color-muted);
-  font-size: 10px;
-  font-weight: 400;
-  white-space: nowrap;
-}
-
-.session-item-delete {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 0;
-  border-radius: 5px;
-  color: var(--color-muted);
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-  font-size: 14px;
-  line-height: 1;
-}
-
-.session-item-delete:hover {
-  color: var(--color-danger);
-  background: var(--color-surface-hover);
-}
-
-/* Project navigator. A project is the session-owned workspace root; tasks
-   remain one Main-Agent conversation index within that project. */
-.project-group {
-  margin: 2px 0 10px;
-}
-
-.project-group-header {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 6px;
-  min-height: 30px;
-  padding: 3px 8px;
-  color: var(--color-text);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.project-group-header svg {
-  width: 15px;
-  height: 15px;
-  color: var(--color-muted);
-}
-
-.project-group-name,
-.project-group-path {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sidebar-project-error {
-  margin: 0 8px 8px;
-  color: var(--color-danger, #b42318);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-.project-group-count {
-  color: var(--color-muted);
-  font-size: 10px;
-  font-weight: 500;
-}
-
-.project-group-path {
-  margin: -3px 8px 3px 30px;
-  color: var(--color-muted);
-  font-size: 10px;
-}
-
-/* Per-row menu button replaces the always-visible delete × */
-.session-item-wrapper {
-  position: relative;
-}
-
-.session-item-menu-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0 0 4px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--color-muted);
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-  font-size: 14px;
-  line-height: 1;
-  opacity: 0;
-}
-
-.session-item-wrapper:hover .session-item-menu-btn,
-.session-item-wrapper.active .session-item-menu-btn,
-.session-item-menu-btn[aria-expanded='true'] {
-  opacity: 1;
-}
-
-.session-item-menu-btn:hover {
-  color: var(--color-text);
-  background: var(--color-surface-hover);
-}
-
-.session-item-pin {
-  margin-right: 4px;
-  color: var(--color-muted);
-  vertical-align: -1px;
-}
-
-.session-item-rename {
-  width: 100%;
-  min-width: 0;
-  padding: 6px 8px;
-  border: 1px solid var(--color-accent);
-  border-radius: 6px;
-  background: var(--color-bg);
-  color: var(--color-text);
-  font: inherit;
-  font-size: 12px;
-  outline: none;
-}
-
-.session-menu {
-  position: absolute;
-  right: 4px;
-  top: 100%;
-  z-index: 500;
-  min-width: 120px;
-  padding: 4px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  box-shadow: 0 18px 32px var(--shadow);
-}
-
-.session-menu button {
-  display: block;
-  width: 100%;
-  padding: 6px 10px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--color-text);
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-}
-
-.session-menu button:hover {
-  background: var(--color-surface-hover);
-}
-
-.sidebar-restore-directories {
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
-  color: var(--color-text);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.session-menu .session-menu-danger {
-  color: var(--color-danger);
-}
-
-/* Narrow-window overlay mode (driven from App via .open) */
+/* Workspace navigation owns its layout here; no legacy session-menu skin. */
+.sidebar { display: flex; flex-direction: column; height: 100%; overflow: hidden; background: var(--ui-subtle); border-right: 1px solid var(--color-border-muted); }
+.sidebar-identity { display: flex; align-items: center; gap: 10px; height: 64px; min-height: 64px; padding: 14px 20px; flex-shrink: 0; }
+.sidebar-profile-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 600; }
+.sidebar-quick-switch { display: flex; align-items: center; gap: 9px; min-height: 36px; margin: 12px 14px; padding: 0 10px; border: 1px solid var(--color-border-muted); border-radius: var(--radius-control); background: var(--ui-surface); color: var(--color-muted); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.sidebar kbd { margin-left: auto; font: inherit; font-size: 12px; color: var(--color-muted); }
+.sidebar-primary-nav { display: grid; gap: 4px; padding: 4px 12px 20px; border-bottom: 0; }
+.sidebar-primary-nav-item { display: flex; align-items: center; gap: 12px; min-height: 40px; padding: 0 12px; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--color-text-secondary); font: inherit; font-size: 14px; font-weight: 400; text-align: left; cursor: pointer; }
+.sidebar-primary-nav-item.active { background: var(--ui-surface); color: var(--color-text); box-shadow: inset 2px 0 var(--color-accent); }
+.sidebar-primary-nav-item.active svg { color: var(--color-accent); }
+.sidebar-primary-nav-item:hover, .sidebar-quick-switch:hover, .sidebar-settings:hover, .sidebar-add-project:hover { background: var(--ui-hover); color: var(--color-text); }
+.sidebar-feedback { min-width: 0; max-height: min(35vh, 260px); flex-shrink: 0; overflow-y: auto; padding-inline: 12px; }
+.sidebar-section { flex: 1; min-height: 0; overflow-y: auto; padding: 0 12px 16px; }
+.session-item-select { display: flex; align-items: center; gap: 10px; min-height: 38px; width: 100%; margin: 2px 0; padding: 9px 11px; border: 1px solid transparent; border-radius: var(--radius-control); background: transparent; color: var(--color-text-secondary); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.session-item-select svg { flex-shrink: 0; color: var(--color-muted); }
+.session-item-select:hover { background: var(--ui-hover); color: var(--color-text); }
+.session-item-select.active { color: var(--color-text); background: var(--ui-surface); border-color: var(--color-border-muted); }
+.session-item-select.active svg { color: var(--color-accent); }
+.session-item-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-project-heading { display: flex; align-items: center; justify-content: space-between; margin: 22px 8px 7px; }
+.sidebar-section-label { color: var(--color-muted); font-size: 12px; font-weight: 500; }
+.sidebar-add-project { display: flex; align-items: center; gap: 4px; min-height: 28px; padding: 2px 6px; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--color-muted); font: inherit; font-size: 11px; cursor: pointer; }
+.sidebar-add-project > span:first-child { font-size: 16px; }
+.session-empty { padding: 8px 11px; }
+.session-empty-hint { color: var(--color-muted); font-size: 12px; line-height: 1.75; text-align: left; }
+.sidebar-project-error { margin: 0 8px 10px; color: var(--color-danger); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.sidebar-project-error button { display: block; margin-top: 6px; padding: 4px 8px; border: 1px solid currentColor; border-radius: var(--radius-control); background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.sidebar-loading { padding: 8px 11px; color: var(--color-muted); font-size: 12px; }
+.sidebar-restore-directories { width: 100%; min-height: 32px; margin: 4px 0 8px; padding: 6px 10px; border: 1px solid var(--ui-warning); background: var(--ui-warning-soft); color: var(--ui-warning); border-radius: var(--radius-control); text-align: left; font: inherit; cursor: pointer; }
+.sidebar-footer { display: flex; align-items: center; gap: 6px; padding: 12px; }
+.sidebar-layout-toggle,
+.mobile-menu-btn { display: grid; place-items: center; flex: 0 0 36px; width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--color-text-secondary); cursor: pointer; }
+.sidebar-layout-toggle:hover,
+.mobile-menu-btn:hover { background: var(--ui-hover); }
+.sidebar-layout-toggle:focus-visible,
+.mobile-menu-btn:focus-visible { outline: 2px solid var(--ui-focus); outline-offset: 2px; }
+.sidebar-settings { display: flex; align-items: center; gap: 10px; min-height: 36px; flex: 1; padding: 0 10px; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--color-text-secondary); font: inherit; cursor: pointer; }
+.sidebar :is(button) { transition: background-color var(--ui-duration-fast) var(--ui-ease), color var(--ui-duration-fast) var(--ui-ease); }
+.sidebar button:disabled { cursor: wait; opacity: .6; }
 @media (max-width: 959px) {
-  .sidebar {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    z-index: 420;
-    width: min(280px, 84vw);
-    background: var(--color-bg);
-    box-shadow: 0 0 40px rgba(0, 0, 0, 0.18);
-    transform: translateX(-105%);
-    transition: transform 0.18s ease;
-  }
-
-  .sidebar.open {
-    transform: none;
-  }
+  .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 420; width: min(280px, 84vw); box-shadow: var(--ui-shadow-dialog); transform: translateX(-105%); transition: transform var(--ui-duration-enter) var(--ui-ease); }
+  .sidebar.open { transform: none; }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .sidebar {
-    transition: none;
-  }
-}
+@media (prefers-reduced-motion: reduce) { .sidebar { transition: none; } }

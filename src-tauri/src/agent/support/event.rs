@@ -367,18 +367,29 @@ impl AgentRunJournal {
         let mut conn = self.db.lock().map_err(|error| error.to_string())?;
         let transaction = conn.transaction().map_err(|error| error.to_string())?;
         for (offset, (event_type, payload)) in serialized.iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let created_at = chrono::Utc::now().timestamp();
+            let payload = super::tool_source::seal(&super::tool_source::SourceRecord {
+                id: &id,
+                run_id: &self.run_id,
+                session_id,
+                sequence: *next + offset as i64,
+                event_type,
+                payload,
+                created_at,
+            })?;
             transaction
                 .execute(
                     "INSERT INTO agent_run_events (id, run_id, session_id, sequence, event_type, payload, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
-                        uuid::Uuid::new_v4().to_string(),
+                        id,
                         &self.run_id,
                         session_id,
                         *next + offset as i64,
                         event_type,
                         payload,
-                        chrono::Utc::now().timestamp(),
+                        created_at,
                     ],
                 )
                 .map_err(|error| error.to_string())?;

@@ -99,6 +99,7 @@ pub fn get_usage_last_n_days(state: State<'_, AppState>, days: i64) -> Result<Co
                     completion_tokens: 0,
                     total_tokens: 0,
                     cost_usd: 0.0,
+                    cost_basis: "legacy_static_estimate_not_bill".into(),
                 });
         entry.prompt_tokens += stat.prompt_tokens as u64;
         entry.completion_tokens += stat.completion_tokens as u64;
@@ -113,5 +114,6 @@ pub fn get_usage_last_n_days(state: State<'_, AppState>, days: i64) -> Result<Co
         total_cost_usd: total_cost,
         by_provider,
         by_model,
+        cost_basis: "legacy_static_estimate_not_bill".into(),
     })
 }

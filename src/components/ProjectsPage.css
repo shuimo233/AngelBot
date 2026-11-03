@@ -1,0 +1,21 @@
+.projects-page { width: 100%; max-width: var(--feature-content-width); margin: 0 auto; padding: 40px var(--feature-page-gutter) 64px; color: var(--color-text); }
+.projects-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding-bottom: 20px; border-bottom: 1px solid var(--color-border-muted); }
+.projects-header .ui-eyebrow { display: block; margin-bottom: 10px; }
+.projects-header h1 { margin: 0; font-size: 24px; font-weight: 600; }
+.projects-header p { margin: 10px 0 0; color: var(--color-text-secondary); font-size: 14px; line-height: 1.65; }
+.projects-page button { min-height: 36px; padding: 8px 13px; border: 1px solid var(--color-border); border-radius: var(--radius-control); background: var(--ui-surface); color: var(--color-text); font: inherit; cursor: pointer; }
+.projects-page .projects-add { flex-shrink: 0; border-color: var(--color-accent-border); background: var(--ui-accent); color: var(--ui-accent-ink); }
+.projects-list { margin-top: 24px; }
+.projects-list .project-entry { display: flex; align-items: center; gap: 16px; width: 100%; padding: 22px 0; border: 0; border-bottom: 1px solid var(--color-border-muted); border-radius: 0; background: transparent; text-align: left; transition: background-color var(--ui-duration-fast) var(--ui-ease); }
+.projects-list .project-entry:hover { background: var(--ui-subtle); }
+.project-entry > svg { flex-shrink: 0; color: var(--color-muted); }
+.project-entry-copy { display: grid; gap: 6px; flex: 1; min-width: 0; }
+.project-entry-copy strong { overflow-wrap: anywhere; font-size: 16px; font-weight: 500; line-height: 1.5; }
+.project-entry-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-muted); font: 13px/1.6 var(--ui-font-sans); }
+.project-entry-action { flex-shrink: 0; color: var(--color-muted); font-size: 12px; }
+.projects-empty { padding: 48px 0; color: var(--color-muted); line-height: 1.8; }
+.projects-empty h2 { color: var(--color-text); font-size: 18px; font-weight: 500; }
+.projects-empty p { margin: 12px 0 24px; }
+.projects-error { margin: 20px 0; padding: 12px; border-left: 2px solid var(--ui-danger); background: var(--ui-danger-soft); color: var(--ui-danger); }
+.projects-page button:disabled { opacity: .6; cursor: wait; }
+@media (max-width: 600px) { .projects-header { align-items: flex-start; flex-direction: column; }.project-entry-action { max-width: 80px; white-space: normal; } }

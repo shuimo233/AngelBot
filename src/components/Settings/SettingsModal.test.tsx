@@ -63,7 +63,8 @@ describe('SettingsModal', () => {
     render(<SettingsNav activePage="api" onNavigate={vi.fn()} />);
 
     expect(screen.getByRole('navigation', { name: '设置分类' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '模型 API' })).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByRole('button', { name: '性格' })).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('button', { name: '模型与连接' })).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('button', { name: '常规' })).not.toHaveAttribute('aria-current');
+    expect(screen.queryByRole('button', { name: '性格' })).not.toBeInTheDocument();
   });
 });

@@ -1272,7 +1272,7 @@ fn record_private_message(
         saved.tool_images.clear();
         saved
             .content
-            .push_str("\n[图像瞬时载荷未保留；需要新状态时请重新观察。]");
+            .push_str(&format!("\n{}", crate::llm::TRANSIENT_IMAGE_NOTICE));
     }
     transcript.push(saved);
     messages.push(message);
@@ -1804,6 +1804,31 @@ mod private_protocol_tests {
 }
 
 #[cfg(test)]
+mod tool_context_projection_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_output_never_recommends_repeating_the_operation() {
+        let short = "Result: 已完成";
+        assert_eq!(
+            AgentRunner::truncate_tool_result_for_context(short.into()),
+            short
+        );
+        let full = "中🪶".repeat(MAX_TOOL_RESULT_CONTEXT_CHARS);
+        let result = AgentRunner::truncate_tool_result_for_context(full.clone());
+        assert!(result.starts_with(
+            &full
+                .chars()
+                .take(MAX_TOOL_RESULT_CONTEXT_CHARS)
+                .collect::<String>()
+        ));
+        assert!(result.contains("partial view"));
+        assert!(result.contains("do not repeat the operation"));
+        assert!(!result.contains("rerun"));
+    }
+}
+
+#[cfg(test)]
 mod tool_image_runtime_tests {
     use super::*;
     use crate::agent::{AfterToolCallResult, Tool, ToolHandler, ToolResult, ToolResultCache};
@@ -1918,6 +1943,19 @@ mod tool_image_runtime_tests {
 
     struct CompactionProbe(Arc<AtomicUsize>);
 
+    struct ProjectionProbe(Arc<AtomicUsize>);
+
+    impl crate::agent::tool_context::ToolContextProjector for ProjectionProbe {
+        fn project(&self, _: &str, _: &str, result: &ToolResult) -> Result<Option<String>, String> {
+            assert_eq!(
+                result.content, "text observation",
+                "even unsupported/canceled image receipts must bypass text projection"
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
     #[async_trait::async_trait]
     impl CompactionHook for CompactionProbe {
         async fn maybe_compact(
@@ -1989,6 +2027,7 @@ mod tool_image_runtime_tests {
                 let requests = Arc::new(Mutex::new(Vec::new()));
                 let executions = Arc::new(AtomicUsize::new(0));
                 let compactions = Arc::new(AtomicUsize::new(0));
+                let projections = Arc::new(AtomicUsize::new(0));
                 let events = Arc::new(Mutex::new(Vec::new()));
                 let mut runner = AgentRunner::new(
                     Box::new(ImageRoundsProvider {
@@ -1998,6 +2037,8 @@ mod tool_image_runtime_tests {
                     AgentConfig::default(),
                 );
                 runner.compaction_hook = Arc::new(CompactionProbe(compactions.clone()));
+                runner.tool_context_projector =
+                    Some(Arc::new(ProjectionProbe(projections.clone())));
                 runner.emitter = Some(Arc::new(Events(events.clone())));
                 runner.tool_registry_mut().register(
                     Tool::new(
@@ -2018,6 +2059,7 @@ mod tool_image_runtime_tests {
                 let requests = requests.lock().unwrap();
                 assert_eq!(requests.len(), 3);
                 assert_eq!(executions.load(Ordering::SeqCst), 2);
+                assert_eq!(projections.load(Ordering::SeqCst), 1);
                 assert!(requests[0]
                     .iter()
                     .all(|message| message.tool_images.is_empty()));
@@ -2240,6 +2282,7 @@ pub struct AgentRunner {
     lifecycle_hook: Arc<dyn AgentLifecycleHook>,
     compaction_hook: Arc<dyn CompactionHook>,
     tool_lifecycle_hook: Arc<dyn ToolLifecycleHook>,
+    tool_context_projector: Option<Arc<dyn crate::agent::tool_context::ToolContextProjector>>,
     api_key_provider: Arc<dyn DynamicApiKeyProvider>,
     /// Soft termination guards evaluated at every main iteration boundary.
     /// Guards observe runner state and emit `Continue` / `PauseForUser` /
@@ -2261,12 +2304,6 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
-    pub fn latest_usage(&self) -> Option<crate::llm::ProviderUsage> {
-        self.provider.latest_usage()
-    }
-    pub fn provider_name(&self) -> &str {
-        self.provider.name()
-    }
     fn truncate_tool_result_for_context(result: String) -> String {
         let char_count = result.chars().count();
         if char_count <= MAX_TOOL_RESULT_CONTEXT_CHARS {
@@ -2277,7 +2314,7 @@ impl AgentRunner {
             .take(MAX_TOOL_RESULT_CONTEXT_CHARS)
             .collect::<String>();
         format!(
-            "{head}\n\n[tool output truncated: {char_count} chars total; inspect the relevant file or rerun a narrower command if more detail is needed]"
+            "{head}\n\n[tool output truncated: {char_count} chars total; partial view, not complete evidence. Inspect an authorized source read-only; do not repeat the operation to recover output.]"
         )
     }
     /// Preserve a terminal runner condition alongside completed tool facts.
@@ -2601,6 +2638,7 @@ impl AgentRunner {
     ) -> LlmMessage {
         // Model capability is part of the visible receipt, not only a hidden
         // prompt suffix. Never persist or emit a misleading image-read success.
+        let had_images = !exec_result.result.images.is_empty();
         let mut safe_result = exec_result.clone();
         if !safe_result.result.images.is_empty()
             && (self.cancellation.is_cancelled() || !self.provider.supports_tool_images())
@@ -2643,10 +2681,21 @@ impl AgentRunner {
             exec_result,
         );
 
+        // Project only after the raw step and event have been recorded. A
+        // failed optional source lookup preserves the original model view.
+        let mut visible_result = exec_result.result.clone();
+        if let Some(projector) = self.tool_context_projector.as_ref().filter(|_| !had_images) {
+            match projector.project(call_id, tool_name, &exec_result.result) {
+                Ok(Some(content)) => visible_result.content = content,
+                Ok(None) => {}
+                Err(error) => eprintln!("[ToolContext] original result retained: {error}"),
+            }
+        }
+
         let mut message = LlmMessage {
             role: "tool".to_string(),
             content: Self::truncate_tool_result_for_context(
-                exec_result.result.format_for_llm(include_hint),
+                visible_result.format_for_llm(include_hint),
             ),
             tool_calls: None,
             tool_call_id: Some(exec_result.call_id.clone()),
@@ -2837,6 +2886,7 @@ impl AgentRunner {
             lifecycle_hook: Arc::new(DefaultLifecycleHook),
             compaction_hook: Arc::new(DefaultCompactionHook::new(provider.clone())),
             tool_lifecycle_hook: Arc::new(DefaultToolLifecycleHook),
+            tool_context_projector: None,
             api_key_provider: Arc::new(DefaultApiKeyProvider),
             guards: default_guard_set(),
             cancellation: ToolCancellation::new(),
@@ -2871,6 +2921,7 @@ impl AgentRunner {
             lifecycle_hook: Arc::new(DefaultLifecycleHook),
             compaction_hook: Arc::new(DefaultCompactionHook::new(provider.clone())),
             tool_lifecycle_hook: Arc::new(DefaultToolLifecycleHook),
+            tool_context_projector: None,
             api_key_provider: Arc::new(DefaultApiKeyProvider),
             guards: default_guard_set(),
             cancellation: ToolCancellation::new(),
@@ -2979,6 +3030,14 @@ impl AgentRunner {
     /// blocking or overriding tool execution.
     pub fn with_tool_lifecycle_hook(mut self, hook: Arc<dyn ToolLifecycleHook>) -> Self {
         self.tool_lifecycle_hook = hook;
+        self
+    }
+
+    pub(crate) fn with_tool_context_projector(
+        mut self,
+        projector: Arc<dyn crate::agent::tool_context::ToolContextProjector>,
+    ) -> Self {
+        self.tool_context_projector = Some(projector);
         self
     }
 

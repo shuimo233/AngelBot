@@ -6,9 +6,17 @@ export interface SkillManifest {
   description: string;
   version: string;
   author?: string | null;
-  actions: unknown[];
+  actions: SkillAction[];
   dependencies: string[];
   permissions: string[];
+  prompts?: Array<{ name: string; content: string }>;
+}
+
+export interface SkillAction {
+  name: string;
+  description: string;
+  handler: string;
+  parameters: Array<{ name: string; param_type: string; required: boolean; description: string }>;
 }
 
 export function getSkills(): Promise<SkillManifest[]> {

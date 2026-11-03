@@ -34,6 +34,14 @@ use super::{MAX_TOOL_IMAGES, MAX_TOOL_IMAGE_TOTAL_BYTES as MAX_TOOL_IMAGE_BYTES}
 const INVALID_RESPONSE: &str = "Responses 返回的协议数据无效；未提交工具调用。";
 const INVALID_HISTORY: &str = "Responses 对话历史中的工具调用顺序或私有续接数据无效。";
 
+#[cfg(test)]
+#[derive(Default)]
+struct CacheComparisonState {
+    enabled: bool,
+    previous_response_id: Option<String>,
+    latest: Option<super::ProviderCacheDiagnostics>,
+}
+
 fn invalid_response_at(stage: &'static str) -> String {
     // Stages are static allowlisted labels, never remote field values.
     format!("{INVALID_RESPONSE} 校验阶段：{stage}。")
@@ -61,6 +69,12 @@ pub struct OpenAiResponsesProvider {
     temperature: f64,
     native_context_threshold: usize,
     last_usage: Mutex<Option<ProviderUsage>>,
+    #[cfg(test)]
+    last_request_fingerprint: Mutex<Option<super::ProviderRequestFingerprint>>,
+    #[cfg(test)]
+    last_response_metadata: Mutex<Option<super::ProviderResponseMetadata>>,
+    #[cfg(test)]
+    cache_comparison: Mutex<CacheComparisonState>,
 }
 
 impl OpenAiResponsesProvider {
@@ -107,6 +121,12 @@ impl OpenAiResponsesProvider {
                 / 100)
                 .max(1),
             last_usage: Mutex::new(None),
+            #[cfg(test)]
+            last_request_fingerprint: Mutex::new(None),
+            #[cfg(test)]
+            last_response_metadata: Mutex::new(None),
+            #[cfg(test)]
+            cache_comparison: Mutex::new(CacheComparisonState::default()),
         })
     }
 
@@ -130,6 +150,18 @@ impl OpenAiResponsesProvider {
         });
         if !instructions.is_empty() {
             body["instructions"] = Value::String(instructions.join("\n\n"));
+        }
+        #[cfg(test)]
+        {
+            let state = self
+                .cache_comparison
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.enabled {
+                if let Some(id) = &state.previous_response_id {
+                    body["prompt_cache_options"] = json!({"comparison_response_id":id});
+                }
+            }
         }
         if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
             let mut names = HashSet::new();
@@ -218,7 +250,32 @@ impl OpenAiResponsesProvider {
         delta_sender: Option<UnboundedSender<String>>,
     ) -> Result<LlmResponse, LlmFailure> {
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        #[cfg(test)]
+        let previous_organization = self
+            .last_response_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .and_then(|metadata| metadata.organization_fingerprint);
+        #[cfg(test)]
+        {
+            self.cache_comparison
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .latest = None;
+            *self
+                .last_request_fingerprint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         let body = self.request_body(messages, tools, thinking)?;
+        #[cfg(test)]
+        {
+            *self
+                .last_request_fingerprint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(request_fingerprint(&body)?);
+        }
         let mut request = self
             .client
             .post(self.endpoint.clone())
@@ -264,6 +321,8 @@ impl OpenAiResponsesProvider {
         if !response.status().is_success() {
             return Err(read_http_error(response).await);
         }
+        #[cfg(test)]
+        let response_headers = response_metadata_headers(response.headers());
         let content_type_header = response.headers().get(reqwest::header::CONTENT_TYPE);
         let content_type = content_type_header
             .and_then(|value| value.to_str().ok())
@@ -324,6 +383,19 @@ impl OpenAiResponsesProvider {
                 .feed_classified(&chunk, delta_sender.as_ref())
                 .map_err(&transport_error)?;
             if let Some(completed) = parser.completed.take() {
+                #[cfg(test)]
+                let completed = {
+                    let mut completed = completed;
+                    let metadata = &mut completed.metadata;
+                    metadata.request_id = response_headers.0.clone();
+                    metadata.organization_fingerprint = response_headers.1.clone();
+                    metadata.organization_matches_previous = previous_organization
+                        .as_ref()
+                        .zip(metadata.organization_fingerprint.as_ref())
+                        .map(|(a, b)| a == b);
+                    metadata.details_invalid |= response_headers.2;
+                    completed
+                };
                 return self.accept_completed(completed).map_err(Into::into);
             }
         }
@@ -343,6 +415,24 @@ impl OpenAiResponsesProvider {
             "模型会话已失效，请重新连接账号；未提交工具调用，也不会自动重试外部操作。".to_string()
         })?;
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = completed.usage;
+        #[cfg(test)]
+        {
+            *self
+                .last_response_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(completed.metadata);
+        }
+        #[cfg(test)]
+        {
+            let mut state = self
+                .cache_comparison
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.enabled {
+                state.previous_response_id = Some(completed.response_id);
+                state.latest = completed.cache_diagnostics;
+            }
+        }
         Ok(completed.response)
     }
 }
@@ -351,6 +441,47 @@ impl OpenAiResponsesProvider {
 impl LlmProvider for OpenAiResponsesProvider {
     fn name(&self) -> &str {
         &self.provider_name
+    }
+
+    #[cfg(test)]
+    fn enable_cache_comparison(&self) -> bool {
+        if self.endpoint.as_str() != PLAN_ENDPOINT || self.auth_mode != ModelAuthMode::ChatgptPlan {
+            return false;
+        }
+        let mut state = self
+            .cache_comparison
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *state = CacheComparisonState {
+            enabled: true,
+            ..Default::default()
+        };
+        true
+    }
+
+    #[cfg(test)]
+    fn latest_cache_diagnostics(&self) -> Option<super::ProviderCacheDiagnostics> {
+        self.cache_comparison
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .latest
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn latest_request_fingerprint(&self) -> Option<super::ProviderRequestFingerprint> {
+        self.last_request_fingerprint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn latest_response_metadata(&self) -> Option<super::ProviderResponseMetadata> {
+        self.last_response_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn supports_tool_images(&self) -> bool {
@@ -688,6 +819,43 @@ fn same_calls(left: &[ToolCall], right: &[ToolCall]) -> bool {
         })
 }
 
+#[cfg(test)]
+fn request_fingerprint(body: &Value) -> Result<super::ProviderRequestFingerprint, String> {
+    use sha2::{Digest, Sha256};
+    let digest = |value: &Value| -> Result<String, String> {
+        let encoded = serde_json::to_vec(value).map_err(|_| INVALID_HISTORY)?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    };
+    let mut settings = body.clone();
+    let fields = settings.as_object_mut().ok_or(INVALID_HISTORY)?;
+    fields.remove("input");
+    fields.remove("instructions");
+    fields.remove("tools");
+    let input = body["input"]
+        .as_array()
+        .ok_or(INVALID_HISTORY)?
+        .iter()
+        .map(|item| {
+            Ok(super::ProviderInputFingerprint {
+                kind: item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+                    .into(),
+                role: item.get("role").and_then(Value::as_str).map(String::from),
+                sha256: digest(item)?,
+                bytes: serde_json::to_vec(item).map_err(|_| INVALID_HISTORY)?.len(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(super::ProviderRequestFingerprint {
+        settings: digest(&settings)?,
+        instructions: digest(&body["instructions"])?,
+        tools: digest(&body["tools"])?,
+        input,
+    })
+}
+
 /// Explicit live acceptance inspects only the shape of the production codec's
 /// initial replay, never returning encrypted continuation data to test logs.
 #[cfg(test)]
@@ -740,7 +908,7 @@ fn encode_messages(
         })
         .unwrap_or(0);
     for (index, message) in messages.iter().enumerate() {
-        if index < active_start && message.role != "system" {
+        if index < active_start && !matches!(message.role.as_str(), "system" | "developer") {
             continue;
         }
         if message.role != "assistant"
@@ -853,6 +1021,126 @@ fn encode_messages(
 struct CompletedResponse {
     response: LlmResponse,
     usage: Option<ProviderUsage>,
+    #[cfg(test)]
+    response_id: String,
+    #[cfg(test)]
+    cache_diagnostics: Option<super::ProviderCacheDiagnostics>,
+    #[cfg(test)]
+    metadata: super::ProviderResponseMetadata,
+}
+
+#[cfg(test)]
+fn response_metadata_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> (Option<String>, Option<String>, bool) {
+    use sha2::{Digest, Sha256};
+    let mut invalid = false;
+    let mut read = |name| match headers.get(name) {
+        None => None,
+        Some(value) => match value.to_str().ok().filter(|s| {
+            !s.is_empty()
+                && s.len() <= 200
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+        }) {
+            Some(value) => Some(value.to_owned()),
+            None => {
+                invalid = true;
+                None
+            }
+        },
+    };
+    let request_id = read("x-request-id");
+    let organization =
+        read("openai-organization").map(|v| format!("{:x}", Sha256::digest(v.as_bytes())));
+    (request_id, organization, invalid)
+}
+
+#[cfg(test)]
+fn response_metadata(response: &Value, requested_model: &str) -> super::ProviderResponseMetadata {
+    let mut metadata = super::ProviderResponseMetadata::default();
+    metadata.model_matches_requested = response
+        .get("model")
+        .and_then(Value::as_str)
+        .map(|m| m == requested_model);
+    metadata.service_tier = match response.get("service_tier") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(tier))
+            if matches!(
+                tier.as_str(),
+                "auto" | "default" | "flex" | "priority" | "fast" | "scale" | "ultrafast"
+            ) =>
+        {
+            Some(tier.clone())
+        }
+        _ => {
+            metadata.details_invalid = true;
+            None
+        }
+    };
+    if response
+        .get("model")
+        .is_some_and(|m| !m.is_null() && !m.is_string())
+    {
+        metadata.details_invalid = true;
+    }
+    metadata
+}
+
+#[cfg(test)]
+fn cache_diagnostics(value: Option<&Value>) -> Option<super::ProviderCacheDiagnostics> {
+    let value = value.filter(|v| !v.is_null())?;
+    let mut invalid = false;
+    let kind = match value.get("type").and_then(Value::as_str) {
+        Some(
+            kind @ ("cache_hit" | "cache_miss" | "comparison_response_not_found" | "unavailable"),
+        ) => kind,
+        _ => {
+            invalid = true;
+            "invalid"
+        }
+    };
+    let reason = match value.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(reason))
+            if matches!(
+                reason.as_str(),
+                "model_changed"
+                    | "service_tier_changed"
+                    | "tools_changed"
+                    | "text_format_changed"
+                    | "reasoning_effort_changed"
+                    | "verbosity_changed"
+                    | "context_compacted"
+                    | "input_changed"
+            ) =>
+        {
+            Some(reason.clone())
+        }
+        _ => {
+            invalid = true;
+            Some("unclassified".into())
+        }
+    };
+    let mut count = |name: &str| match value.get(name) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => Some(n),
+            None => {
+                invalid = true;
+                None
+            }
+        },
+    };
+    let comparison_reusable_tokens = count("comparison_reusable_tokens");
+    let cache_missed_tokens = count("cache_missed_tokens");
+    Some(super::ProviderCacheDiagnostics {
+        kind: kind.into(),
+        reason,
+        comparison_reusable_tokens,
+        cache_missed_tokens,
+        details_invalid: invalid,
+    })
 }
 
 fn parse_completed(
@@ -910,12 +1198,12 @@ fn parse_completed(
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid_response_at("usage 字段"))?;
-            Some(ProviderUsage {
-                input_tokens: u32::try_from(input)
-                    .map_err(|_| invalid_response_at("usage 范围"))?,
-                output_tokens: u32::try_from(output)
-                    .map_err(|_| invalid_response_at("usage 范围"))?,
-            })
+            Some(ProviderUsage::from_response_usage(
+                u32::try_from(input).map_err(|_| invalid_response_at("usage 范围"))?,
+                u32::try_from(output).map_err(|_| invalid_response_at("usage 范围"))?,
+                usage,
+                true,
+            ))
         }
     };
     let result = if parsed.calls.is_empty() {
@@ -944,6 +1232,12 @@ fn parse_completed(
             protocol,
         },
         usage,
+        #[cfg(test)]
+        response_id: response["id"].as_str().unwrap().into(), // validated above
+        #[cfg(test)]
+        cache_diagnostics: cache_diagnostics(response.get("prompt_cache_diagnostics")),
+        #[cfg(test)]
+        metadata: response_metadata(response, model),
     })
 }
 
@@ -1308,7 +1602,19 @@ async fn read_http_error(mut response: reqwest::Response) -> LlmFailure {
     let mut failure = match read_error_body(&mut response).await {
         Ok(bytes) => {
             let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            structured_failure(value.get("error").unwrap_or(&value), Some(status))
+            let mut failure =
+                structured_failure(value.get("error").unwrap_or(&value), Some(status));
+            let shape = if value.get("error").is_some_and(Value::is_object) {
+                "结构化API错误"
+            } else if value.get("detail").is_some() {
+                "准入detail"
+            } else {
+                "未识别"
+            };
+            failure
+                .diagnostic
+                .push_str(&format!(" 错误形态：{shape}。"));
+            failure
         }
         Err(_) => structured_failure(&Value::Null, Some(status)),
     };
@@ -1431,10 +1737,37 @@ fn structured_failure(error: &Value, status: Option<u16>) -> LlmFailure {
         }
         _ => LlmFailureKind::Unclassified,
     };
-    LlmFailure {
-        kind,
-        diagnostic: structured_error(error, status),
+    let mut diagnostic = structured_error(error, status);
+    // The plan route recommends preserving code/param for rejected requests.
+    // Only fixed protocol identifiers leave the adapter, never remote text or
+    // arbitrary values that a gateway could use to echo private input.
+    if let Some(
+        code @ ("invalid_request_error"
+        | "unknown_parameter"
+        | "unsupported_parameter"
+        | "invalid_value"
+        | "unsupported_value"
+        | "subscription_sharing_unsupported_capability"),
+    ) = error.get("code").and_then(Value::as_str)
+    {
+        diagnostic.push_str(&format!(" code={code}。"));
     }
+    if let Some(
+        param @ ("model"
+        | "input"
+        | "instructions"
+        | "tools"
+        | "service_tier"
+        | "prompt_cache_options"
+        | "prompt_cache_options.mode"
+        | "prompt_cache_options.comparison_response_id"
+        | "input[0].content[0].prompt_cache_breakpoint"
+        | "input[0].content[0].prompt_cache_breakpoint.mode"),
+    ) = error.get("param").and_then(Value::as_str)
+    {
+        diagnostic.push_str(&format!(" param={param}。"));
+    }
+    LlmFailure { kind, diagnostic }
 }
 
 #[cfg(test)]

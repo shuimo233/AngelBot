@@ -1,14 +1,15 @@
 import { Component, Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, type ErrorInfo, type ReactNode } from 'react';
 import { useMessagesStore, type LiveBlock } from '$stores/messages';
 import { useSessionsStore } from '$stores/sessions';
-import { projectWorkspaceForMessage, useWorkspacesStore } from '$stores/workspaces';
+import { projectCandidatesForMessage, useWorkspacesStore } from '$stores/workspaces';
+import { resolveWorkspaceIntent, type Workspace } from '$lib/commands/workspace';
 import { usePreferencesStore } from '$stores/preferences';
 import { useSettingsStore } from '$stores/settings';
 import { ComposerInput, type ComposerInputHandle } from './Composer/ComposerInput';
 import { ChatEmptyState } from './ChatEmptyState';
-import { WorkspaceReminders } from './WorkspaceReminders';
 import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { ChatHeader } from './ChatHeader';
+import { ConversationNavigation } from './ConversationNavigation';
 import { useThinkingEffortStore } from '$stores/thinkingEffort';
 import { sendMessage, getMessages, resolveAgentConfirmation, interruptAgent, pauseAgent, resumeAgent, submitInProgressCommand } from '$lib/commands';
 import { deleteMessage, editAndResendMessage } from '$lib/commands/message';
@@ -29,7 +30,6 @@ import { TextAttachmentDetails } from './TextAttachmentDetails';
 import { cardDescription } from '$lib/tavern-card';
 import { extractSecureWebSearchSetup } from '$lib/web-search-setup';
 import { WorkspaceActivityCapsule } from './WorkspaceActivityCapsule';
-import { ChatToolbar } from './ChatToolbar';
 import { TaskDecisionCard } from './TaskDecisionCard';
 import { RuntimeHealthNotice } from './RuntimeHealthNotice';
 import { UpdateNotice } from './UpdateNotice';
@@ -751,7 +751,7 @@ function titleFromFirstUserMessage(content: string) {
   return characters.length > 40 ? `${characters.slice(0, 40).join('')}…` : normalized;
 }
 
-export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void }) {
+export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggleWorkbench?: () => void; workbenchOpen?: boolean }) {
   const session = useSessionsStore((state) => state.activeSession);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
   const activeWorkspaceKind = useWorkspacesStore((state) => (
@@ -797,9 +797,20 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
     resolve: (accepted: boolean) => void;
   } | null>(null);
   const [routeVersion, setRouteVersion] = useState(0);
+  const routingRequest = useRef<object | null>(null);
+  const routeChoice = useRef<{ sessionId: string; inputToken: object; workspaceId: string | null } | null>(null);
+  const [routingBusy, setRoutingBusy] = useState(false);
+  const [routingDecision, setRoutingDecision] = useState<{ sessionId: string; inputToken: object; candidates: Workspace[]; error?: string } | null>(null);
+  const [routingSelection, setRoutingSelection] = useState<{ sessionId: string; inputToken: object; label: string } | null>(null);
+  const [routeNotice, setRouteNotice] = useState<{ workspaceId: string; name: string; sourceWorkspaceId: string; error?: string } | null>(null);
+  useEffect(() => {
+    routingRequest.current = null; routeChoice.current = null;
+    setRoutingBusy(false); setRoutingDecision(null); setRoutingSelection(null);
+  }, [session?.id]);
   useEffect(() => () => {
     const pending = pendingProjectMessageRef.current;
     pendingProjectMessageRef.current = null;
+    routingRequest.current = null;
     pending?.resolve(false);
   }, []);
   // Keep following only while the reader is already at the newest content.
@@ -933,6 +944,8 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   useLayoutEffect(() => {
     const sessionId = session?.id;
     const generation = ++sessionGenerationRef.current;
+    // Reading older messages belongs to this conversation, not the next Main.
+    shouldFollowLatestRef.current = true;
     clearMessages();
     setIsStreaming(false);
     setIsPaused(false);
@@ -977,6 +990,13 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
     shouldFollowLatestRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 96;
   }, []);
 
+  const leaveLatest = useCallback(() => { shouldFollowLatestRef.current = false; }, []);
+  const returnToLatest = useCallback(() => {
+    shouldFollowLatestRef.current = true;
+    const node = containerRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, []);
+
   // Auto-scroll on new messages only when the reader has not intentionally
   // navigated away from the bottom of the conversation.
   useEffect(() => {
@@ -994,13 +1014,44 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   } : undefined;
 
   const onSend = async (text: string, files: TextAttachment[] = [], clearSubmittedDraft = true): Promise<boolean> => {
-    if ((!text.trim() && !files.length) || isStreamingRef.current || historyAttempt.current || historyBlocked) return false;
+    if ((!text.trim() && !files.length) || isStreamingRef.current || historyAttempt.current || historyBlocked || routingRequest.current) return false;
     const workspaceState = useWorkspacesStore.getState();
-    const route = projectWorkspaceForMessage(
-      text,
-      workspaceState.workspaces,
-      workspaceState.activeWorkspaceId,
-    );
+    const secureWebSearch = extractSecureWebSearchSetup(text);
+    const inputToken = useMessagesStore.getState().inputToken;
+    const selected = routeChoice.current;
+    routeChoice.current = null;
+    let destination: Workspace | undefined;
+    if (selected?.sessionId === session?.id && selected?.inputToken === inputToken) {
+      destination = selected.workspaceId ? workspaceState.workspaces.find(item => item.id === selected.workspaceId && item.kind === 'project') : undefined;
+      if (selected.workspaceId && !destination) return false;
+    } else {
+      const candidates = projectCandidatesForMessage(secureWebSearch.displayContent, workspaceState.workspaces, workspaceState.activeWorkspaceId);
+      if (candidates.length && session?.id) {
+        const request = {};
+        const sourceSession = session.id;
+        const sourceGeneration = sessionGenerationRef.current;
+        const ownsRequest = () => routingRequest.current === request
+          && useSessionsStore.getState().activeSessionId === sourceSession
+          && useWorkspacesStore.getState().activeWorkspaceId === workspaceState.activeWorkspaceId
+          && sessionGenerationRef.current === sourceGeneration && useMessagesStore.getState().inputToken === inputToken;
+        routingRequest.current = request; setRoutingBusy(true); setRoutingDecision(null); setRoutingSelection(null);
+        try {
+          const intent = await resolveWorkspaceIntent(sourceSession, secureWebSearch.displayContent);
+          if (!ownsRequest()) return false;
+          if (intent.kind === 'clarify') { setRoutingDecision({ sessionId: sourceSession, inputToken, candidates }); return false; }
+          if (intent.kind === 'project') {
+            destination = useWorkspacesStore.getState().workspaces.find(item => item.id === intent.projectId && item.kind === 'project');
+            if (!destination || !candidates.some(item => item.id === destination?.id)) throw new Error('项目目录已变化，请重新选择归属空间。');
+          }
+        } catch (cause) {
+          if (ownsRequest()) setRoutingDecision({ sessionId: sourceSession, inputToken, candidates,
+            error: cause instanceof Error ? cause.message : '暂时无法确认项目归属。' });
+          return false;
+        } finally { if (routingRequest.current === request) { routingRequest.current = null; setRoutingBusy(false); } }
+      }
+    }
+    setRoutingSelection(null);
+    const route = destination;
     if (route) {
       // Routing occurs before a turn begins, so the original text and every
       // later tool/file operation belong to the project's single Main session.
@@ -1029,6 +1080,7 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
             return;
           }
           pending.sessionId = targetSessionId;
+          setRouteNotice({ workspaceId: route.id, name: route.name, sourceWorkspaceId: workspaceState.activeWorkspaceId! });
           setRouteVersion((version) => version + 1);
         }).catch(() => {
           if (pendingProjectMessageRef.current === pending) pendingProjectMessageRef.current = null;
@@ -1041,7 +1093,6 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
       });
     }
     if (!session?.id) return false;
-    const secureWebSearch = extractSecureWebSearchSetup(text);
     const messageContent = secureWebSearch.displayContent;
     const sessionId = session.id;
     const generation = ++sessionGenerationRef.current;
@@ -1526,15 +1577,20 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
   return (
     <main className="main-with-nav">
       <div className="chat-area">
-        <ChatHeader onToggleWorkbench={onToggleWorkbench} />
+        <ChatHeader onToggleWorkbench={onToggleWorkbench} workbenchOpen={workbenchOpen} />
+        {routeNotice && routeNotice.workspaceId === activeWorkspaceId && <aside className="workspace-route-notice" role="status"><span>{routeNotice.error || <>当前位于 <strong>{routeNotice.name}</strong> 项目，使用它独立的上下文。</>}</span><button type="button" onClick={() => { void useWorkspacesStore.getState().openWorkspace(routeNotice.sourceWorkspaceId).catch(() => setRouteNotice(current => current ? { ...current, error: '暂时无法返回日常，请重试；项目任务未取消。' } : null)); }}>返回日常，项目任务继续</button><button type="button" aria-label="关闭切换提示" onClick={() => setRouteNotice(null)}>×</button></aside>}
+        {routingBusy && <aside className="workspace-route-notice" role="status"><span>正在确认这条请求的项目归属，尚未开始执行。</span><button type="button" onClick={() => { routingRequest.current = null; setRoutingBusy(false); }}>取消判断</button></aside>}
+        {routingDecision && routingDecision.sessionId === session?.id && routingDecision.inputToken === useMessagesStore.getState().inputToken && <aside className="workspace-route-notice workspace-route-choice" role="status">
+          <span>{routingDecision.error || '这条请求的归属还不明确。'} 尚未发送，请选择后再次发送；草稿和附件仍保留。</span>
+          <div><button type="button" onClick={() => { routeChoice.current = { sessionId: routingDecision.sessionId, inputToken: routingDecision.inputToken, workspaceId: null }; setRoutingSelection({ ...routingDecision, label: '日常' }); setRoutingDecision(null); }}>留在日常</button>
+            {routingDecision.candidates.map(project => <button type="button" key={project.id} onClick={() => { routeChoice.current = { sessionId: routingDecision.sessionId, inputToken: routingDecision.inputToken, workspaceId: project.id }; setRoutingSelection({ ...routingDecision, label: project.name }); setRoutingDecision(null); }}>按 {project.name} 项目处理</button>)}</div>
+        </aside>}
+        {routingSelection && routingSelection.sessionId === session?.id && routingSelection.inputToken === useMessagesStore.getState().inputToken && <p className="workspace-route-notice" role="status">已选择 {routingSelection.label}，点击发送后继续。</p>}
         <UpdateNotice />
         <RuntimeHealthNotice />
         <ModelConfigurationNotice />
-        <ChatToolbar branchOnly />
         <TaskDecisionCard decision={taskDecision} />
-        {messages.length > 0 && (
-          <WorkspaceReminders workspaceId={activeWorkspaceKind ? activeWorkspaceId : null} />
-        )}
+      <div className={`chat-transcript${messages.some(message => message.role === 'user' && message.sessionId === session?.id) ? ' chat-transcript--indexed' : ''}`}>
       <div className="messages" ref={containerRef} onScroll={updateFollowLatest}>
         {messages.length === 0 && !historyBlocked && (
           <ChatEmptyState
@@ -1545,7 +1601,7 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
         {messages.filter((message) => (isStreaming && message.id === streamingMsgId)
           || !isEmptySuccessfulToolTurn(message)).map((message) => (
           <Fragment key={message.id}>
-          <div className={`message-row ${message.role}`}>
+          <div className={`message-row ${message.role}`} data-conversation-message-id={message.id}>
             {message.role === 'user' && (
               <div className="message-avatar">
                 <div className="avatar user-avatar">U</div>
@@ -1646,6 +1702,8 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
           </Fragment>
         ))}
       </div>
+      <ConversationNavigation key={session?.id ?? 'none'} messages={messages} sessionId={session?.id} containerRef={containerRef} onNavigateAway={leaveLatest} onReturnToLatest={returnToLatest} />
+      </div>
       <WorkspaceActivityCapsule />
       <div className="composer">
         {currentHistoryAction && <div className="chat-history-feedback" role={currentHistoryAction.pending ? 'status' : 'alert'}>
@@ -1679,7 +1737,7 @@ export function ChatArea({ onToggleWorkbench }: { onToggleWorkbench?: () => void
           soundEnabled={soundEnabled}
           onSoundToggle={() => setSoundEnabled((v) => !v)}
           disabled={!session || (historyBlocked && currentHistoryAction?.kind !== 'load')}
-          sendDisabled={historyBlocked}
+          sendDisabled={historyBlocked || routingBusy}
         />
       </div>
       </div>

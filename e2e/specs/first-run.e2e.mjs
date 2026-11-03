@@ -24,6 +24,36 @@ async function navigatePrimary(label) {
   await browser.$('.sidebar-primary-nav').$(`button=${label}`).click();
 }
 
+async function returnToProjectConversation() {
+  await navigatePrimary('项目');
+  const projectEntry = await browser.$('.project-entry');
+  await projectEntry.waitForDisplayed({ timeout: 5_000 });
+  assert.match(await projectEntry.getText(), /Desktop E2E Project/);
+  await projectEntry.click();
+  await browser.$('.chat-area').waitForDisplayed({ timeout: 10_000 });
+  assert.equal(await browser.$('.session-item-select.active .session-item-title').getText(), 'Desktop E2E Project');
+}
+
+async function returnToDailyConversation() {
+  await navigatePrimary('日常');
+  await browser.waitUntil(async () => (await browser.$('.chat-header-workspace-kind').getText()) === '个人空间', {
+    timeout: 10_000, timeoutMsg: 'Personal did not become active through daily navigation',
+  });
+}
+
+async function openAutomationRecall() {
+  if (!(await browser.$('.right-panel').isDisplayed())) {
+    await browser.$('[aria-label="打开工作台"]').click();
+  }
+  await browser.$('.workbench-tabs').$('button=任务').click();
+  const recall = await browser.$('.right-panel .workspace-reminders');
+  await recall.waitForDisplayed({ timeout: 5_000 });
+  if (await recall.getAttribute('open') === null) await recall.$('summary').click();
+  assert.equal(await browser.$$('.chat-area > .workspace-reminders').length, 0,
+    'historical automation recall must not reserve a conversation strip');
+  return recall;
+}
+
 // Cross-confirmation evidence belongs to the durable ledger, not a compacted
 // model prompt. Parent links order slices; call ordinals order this sequential
 // script within a slice. Result-array order carries no chronology.
@@ -341,9 +371,7 @@ describe('first-run desktop experience', () => {
     assert.match(await sheetAttachment.$('pre').getText(), /数字未按日期、百分比或货币格式换算/);
     await browser.saveScreenshot(join(screenshotDir, 'xlsx-sent.png'));
     await sheetAttachment.$('summary').click();
-    const reminderRecall = await browser.$('.workspace-reminders');
-    await reminderRecall.waitForDisplayed({ timeout: 5_000 });
-    await reminderRecall.$('summary').click();
+    const reminderRecall = await openAutomationRecall();
     assert.match(await reminderRecall.getText(), /核对今天的安排/);
     assert.match(await reminderRecall.getText(), /待执行 1 · 今日已触发 0/);
     const reminder = (await browser.tauri.execute(({ core }) => core.invoke('get_automations')))
@@ -409,6 +437,7 @@ describe('first-run desktop experience', () => {
     });
     await browser.execute(() => window.dispatchEvent(new Event('focus')));
 
+    await browser.$('[aria-label="关闭工作侧栏"]').click();
     await composer.setValue('每天上午九点检查待处理邮件，整理成行动清单。只整理和起草，不要发送邮件。');
     // Streaming replaces Send with Stop; the first turn's Send handle no
     // longer represents the enabled control after the completed reply.
@@ -560,7 +589,8 @@ describe('first-run desktop experience', () => {
     }
     assert.equal('output' in recalledAutomation.latestRun, false, 'recall must not expose raw process output');
     await browser.tauri.execute(() => window.dispatchEvent(new Event('focus')));
-    await browser.waitUntil(async () => /主 Agent 已结束/.test(await reminderRecall.getText()), {
+    const automationResultRecall = await openAutomationRecall();
+    await browser.waitUntil(async () => /主 Agent 已结束/.test(await automationResultRecall.getText()), {
       timeout: 5_000, timeoutMsg: 'automation result did not reach the existing Main conversation recall',
     });
     await browser.saveScreenshot(join(screenshotDir, 'daily-automation-result.png'));
@@ -578,6 +608,7 @@ describe('first-run desktop experience', () => {
 
     // A daily definition remains scheduled after one completed occurrence.
     // Viewing that result returns to its existing Main conversation, not a rerun.
+    await browser.$('[aria-label="关闭工作侧栏"]').click();
     await navigatePrimary('自动化');
     const dailyAutomationCard = await browser.$('//article[contains(@class,"automation-card")][.//h3[text()="每日邮件行动清单"]]');
     await dailyAutomationCard.waitForDisplayed({ timeout: 10_000 });
@@ -693,7 +724,7 @@ describe('first-run desktop experience', () => {
       groupFontSize: '12px',
     });
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), '模型与 API');
-    assert.equal(await settingsDialog.$('button=模型 API').getAttribute('aria-current'), 'page');
+    assert.equal(await settingsDialog.$('button=模型与 API').getAttribute('aria-current'), 'page');
     assert.match(await settingsDialog.getText(), /服务商与模型/);
     assert.match(await settingsDialog.getText(), /连接信息/);
     await settingsDialog.$('.model-field select').waitForDisplayed({ timeout: 5_000 });
@@ -709,7 +740,7 @@ describe('first-run desktop experience', () => {
     // and fresh tool discovery without a network service or model credential.
     assert.ok(existsSync(mcpFixturePath), `MCP E2E fixture is missing: ${mcpFixturePath}`);
     const mcpFixtureArgs = `"${mcpFixturePath}"`;
-    await settingsDialog.$('button=MCP').click();
+    await settingsDialog.$('button=工具服务 MCP').click();
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), 'MCP 服务');
     await settingsDialog.$('button=添加服务').click();
     const mcpForm = await settingsDialog.$('.add-server-form');
@@ -1177,7 +1208,7 @@ describe('first-run desktop experience', () => {
     const filePreviewBack = await browser.$('.right-panel-back');
     await filePreviewBack.waitForDisplayed({ timeout: 5_000 });
     await filePreviewBack.click();
-    await browser.$('.workbench-menu-item').waitForDisplayed({ timeout: 5_000 });
+    await browser.$('.workbench-tabs button').waitForDisplayed({ timeout: 5_000 });
 
     // Exercise the visible permission-management path against the real IPC and
     // SQLite manager. The fixture is feature-gated inside the desktop E2E build;
@@ -1325,7 +1356,7 @@ describe('first-run desktop experience', () => {
     const ownedStopPid = Number(readFileSync(ownedStopStarted, 'utf8'));
     assert.ok(Number.isInteger(ownedStopPid) && ownedStopPid > 0);
     process.kill(ownedStopPid, 0);
-    await navigatePrimary('对话');
+    await returnToProjectConversation();
     await browser.$('.chat-area').waitForDisplayed({ timeout: 10_000 });
     for (const decision of ['rejected', 'approved']) {
       const callId = `main-stop-${decision}`;
@@ -1398,10 +1429,7 @@ describe('first-run desktop experience', () => {
       return settled && runs.length === 1 && runs[0].status === 'cancelled' && runs[0].stopControl === undefined;
     }, { timeout: 10_000, timeoutMsg: 'owned stop did not finalize after process cleanup' });
     assert.throws(() => process.kill(ownedStopPid, 0), 'owned process must have exited before final receipt');
-    const recall = await browser.$('.workspace-reminders');
-    await recall.waitForExist({ timeout: 5_000 });
-    const recallWasOpen = await recall.getAttribute('open') !== null;
-    if (!recallWasOpen) await recall.$('summary').click();
+    const recall = await openAutomationRecall();
     await browser.waitUntil(async () => (await recall.getText()).includes('本次已停止'), {
       timeout: 5_000, timeoutMsg: 'Main conversation did not recall the final stop result',
     });
@@ -1431,7 +1459,7 @@ describe('first-run desktop experience', () => {
     assert.ok(!Object.hasOwn(stopOutput, 'status'));
     assert.equal((await browser.$$('vite-error-overlay')).length, 0);
     await browser.saveScreenshot(join(mainStopEvidenceDir, 'main-automation-stop-result.png'));
-    if (!recallWasOpen) await recall.$('summary').click();
+    await browser.$('[aria-label="关闭工作侧栏"]').click();
     await navigatePrimary('自动化');
     await browser.$('.automation-page').waitForDisplayed({ timeout: 10_000 });
     await browser.waitUntil(async () => (await browser.$('//article[contains(@class,"automation-card")][.//h3[text()="停止本次执行检查"]]').getText()).includes('已停止'), { timeout: 5_000 });
@@ -1449,12 +1477,12 @@ describe('first-run desktop experience', () => {
     await libraryPage.$('.memory-page').waitForDisplayed({ timeout: 10_000 });
     await browser.saveScreenshot(join(screenshotDir, 'library-memory.png'));
 
-    await navigatePrimary('对话');
+    await returnToProjectConversation();
     await browser.$('.chat-area').waitForDisplayed({ timeout: 10_000 });
-    const workbenchButton = await browser.$('[aria-label="打开工作台"]');
-    await workbenchButton.waitForDisplayed({ timeout: 20_000 });
     const workbenchAlreadyOpen = await browser.$('.right-panel').isDisplayed();
     if (!workbenchAlreadyOpen) {
+      const workbenchButton = await browser.$('[aria-label="打开工作台"]');
+      await workbenchButton.waitForDisplayed({ timeout: 20_000 });
       await workbenchButton.click();
     }
     await browser.$('.right-panel').waitForDisplayed({ timeout: 10_000 });
@@ -1465,12 +1493,14 @@ describe('first-run desktop experience', () => {
       panelCount: document.querySelectorAll('.right-panel').length,
       toggleCount: document.querySelectorAll('[aria-label="打开工作台"]').length,
       projectLabels: Array.from(document.querySelectorAll('.session-item-title')).map((node) => node.textContent),
-      workbenchEntries: Array.from(document.querySelectorAll('.workbench-menu-item span')).map((node) => node.textContent),
+      workbenchEntries: Array.from(document.querySelectorAll('.workbench-tabs button span')).map((node) => node.textContent),
     }));
     assert.equal(workbenchState.panelCount, 1, JSON.stringify(workbenchState));
-    assert.deepEqual(workbenchState.workbenchEntries, ['任务与委派', '浏览器', '文件']);
+    assert.deepEqual(workbenchState.workbenchEntries, ['任务', '文件', '浏览器']);
     await browser.$('.right-panel').waitForDisplayed({ timeout: 20_000 });
-    await browser.$('.workbench-menu-item').click();
+    const activityTab = await browser.$('.workbench-tabs').$('button=任务');
+    await activityTab.click();
+    assert.equal(await activityTab.getAttribute('aria-pressed'), 'true');
     await browser.$('.workspace-activity-panel').waitForDisplayed({ timeout: 20_000 });
     const completedDelegation = await browser.$('.workspace-activity-panel__list');
     await completedDelegation.waitForDisplayed({ timeout: 10_000 });
@@ -1479,9 +1509,10 @@ describe('first-run desktop experience', () => {
     await browser.saveScreenshot(join(screenshotDir, 'project-workbench.png'));
 
     await browser.$('.right-panel-back').click();
-    const filesEntry = await browser.$('//button[contains(@class,"workbench-menu-item")][.//span[text()="文件"]]');
+    const filesEntry = await browser.$('.workbench-tabs').$('button=文件');
     await filesEntry.waitForDisplayed({ timeout: 5_000 });
     await filesEntry.click();
+    assert.equal(await filesEntry.getAttribute('aria-pressed'), 'true');
     const readmeEntry = await browser.$('//button[contains(@class,"file-item")][contains(.,"README.md")]');
     await readmeEntry.waitForDisplayed({ timeout: 10_000 });
     await readmeEntry.click();
@@ -1528,10 +1559,7 @@ describe('first-run desktop experience', () => {
     // survive replay/edit without granting Personal a project root. Its owned
     // results tools remain available, but this snapshot turn must not use them. A real
     // File/change event exercises the production reader; no IPC-only shortcut.
-    await browser.$('//button[contains(@class,"session-item-select")][.//span[text()="AngelBot 日常"]]').click();
-    await browser.waitUntil(async () => (await browser.$('.session-item-select.active .session-item-title').getText()) === 'AngelBot 日常', {
-      timeout: 10_000, timeoutMsg: 'Personal did not become active for the explicit file journey',
-    });
+    await returnToDailyConversation();
     const invalidAttachment = await browser.tauri.execute(async ({ core }) => {
       // The earlier reload clears window globals. Resolve the live identity
       // through the same workspace contract instead of a stale test variable.
@@ -1618,10 +1646,8 @@ describe('first-run desktop experience', () => {
     await waitForVisible(browser, '//*[contains(text(), "上一轮的文件快照仍在当前日常会话中")]', { timeout: 20_000 });
     // Switching away/back must render the persisted attachment, not a local
     // preview left behind in Composer state.
-    await browser.$('//button[contains(@class,"session-item-select")][.//span[text()="Desktop E2E Project"]]').click();
-    await browser.waitUntil(async () => (await browser.$('.session-item-select.active .session-item-title').getText()) === 'Desktop E2E Project', { timeout: 10_000 });
-    await browser.$('//button[contains(@class,"session-item-select")][.//span[text()="AngelBot 日常"]]').click();
-    await browser.waitUntil(async () => (await browser.$('.session-item-select.active .session-item-title').getText()) === 'AngelBot 日常', { timeout: 10_000 });
+    await returnToProjectConversation();
+    await returnToDailyConversation();
     const attachedRow = await browser.$('//div[contains(@class,"message-row") and contains(@class,"user")][contains(.,"daily-actions.csv")]');
     await attachedRow.waitForDisplayed({ timeout: 10_000 });
     await attachedRow.$('button[title="编辑消息"]').click();

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type AppPage = 'chat' | 'memory' | 'tasks' | 'knowledge' | 'persona';
+export type AppPage = 'chat' | 'projects' | 'memory' | 'tasks' | 'knowledge' | 'persona';
 export interface AutomationTarget { automationId: string; workspaceId: string; }
 
 interface NavigationState {

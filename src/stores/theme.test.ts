@@ -28,7 +28,7 @@ describe('theme', () => {
   beforeEach(() => {
     localStorage.clear();
     document.documentElement.classList.remove('dark');
-    useThemeStore.setState({ theme: 'light', resolvedTheme: 'light' });
+    useThemeStore.setState({ theme: 'light', resolvedTheme: 'light', layout: 'A' });
   });
 
   afterEach(() => {
@@ -36,6 +36,25 @@ describe('theme', () => {
     dispose = undefined;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it.each(['A', 'B'] as const)('persists and restores layout %s independently of theme', (layout) => {
+    mockSystemTheme(false);
+    useThemeStore.getState().setTheme('dark');
+    useThemeStore.getState().setLayout(layout);
+    expect(localStorage.getItem('ui-layout')).toBe(layout);
+    useThemeStore.setState({ layout: layout === 'A' ? 'B' : 'A' });
+    dispose = initializeTheme();
+    expect(useThemeStore.getState()).toMatchObject({ layout, theme: 'dark' });
+  });
+
+  it('defaults invalid layouts to A and still switches when storage is unavailable', () => {
+    localStorage.setItem('ui-layout', 'C');
+    dispose = initializeTheme();
+    expect(useThemeStore.getState().layout).toBe('A');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('disabled'); });
+    expect(() => useThemeStore.getState().setLayout('B')).not.toThrow();
+    expect(useThemeStore.getState().layout).toBe('B');
   });
 
   it.each(['light', 'dark'] as const)('restores a persisted %s theme', (theme) => {

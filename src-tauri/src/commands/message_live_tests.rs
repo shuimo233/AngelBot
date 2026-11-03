@@ -5,18 +5,36 @@
 
 use super::*;
 
+#[path = "message_live_tests/agent_benchmarks.rs"]
+mod agent_benchmarks;
 #[path = "message_live_tests/browser_daily.rs"]
 mod browser_daily;
+#[path = "message_live_tests/companion.rs"]
+mod companion;
+#[path = "message_live_tests/context_management.rs"]
+mod context_management;
+#[path = "message_live_tests/context_variants.rs"]
+mod context_variants;
+#[path = "message_live_tests/continuous_main.rs"]
+mod continuous_main;
 #[path = "message_live_tests/delegation.rs"]
 mod delegation;
+#[path = "message_live_tests/durable_sources.rs"]
+mod durable_sources;
 #[path = "message_live_tests/inference_probe.rs"]
 mod inference_probe;
 #[path = "message_live_tests/mcp_interrupt.rs"]
 mod mcp_interrupt;
+#[path = "message_live_tests/minimal_architecture.rs"]
+mod minimal_architecture;
 #[path = "message_live_tests/model_failure.rs"]
 mod model_failure;
 #[path = "message_live_tests/native_context.rs"]
 mod native_context;
+#[path = "message_live_tests/preference_benchmark.rs"]
+mod preference_benchmark;
+#[path = "message_live_tests/query_expansion_prototype.rs"]
+mod query_expansion_prototype;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -215,6 +233,13 @@ fn configured_model_completes_bounded_file_task() {
     }
     if std::env::var("ANGELBOT_LIVE_MODEL_JOURNEY").as_deref() == Ok("recorded-inference") {
         println!("\nRECORDED_INFERENCE_REPORT {}", inference_probe::run());
+        return;
+    }
+    if std::env::var("ANGELBOT_LIVE_MODEL_JOURNEY").as_deref() == Ok("cache-comparison") {
+        println!(
+            "\nCACHE_COMPARISON_REPORT {}",
+            agent_benchmarks::configured_cache_comparison()
+        );
         return;
     }
     // The parent owns the only writable root. Separate test processes prove
@@ -878,6 +903,7 @@ async fn verify_live_learning(
         assert_eq!(evidence, 0);
         assert!(
             crate::agent::adaptive_constraints::active_for_session(&conn, "live-session")
+                .unwrap()
                 .is_empty()
         );
         println!("LIVE_LEARNING_RESTART verified: dismissal, evidence cleanup and paused controls survived a fresh process");
@@ -977,6 +1003,7 @@ async fn verify_live_learning(
         assert_eq!(max_evidence, 1);
         assert!(
             crate::agent::adaptive_constraints::active_for_session(&conn, "live-session")
+                .unwrap()
                 .is_empty()
         );
     }

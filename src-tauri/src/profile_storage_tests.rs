@@ -86,6 +86,13 @@ fn fixture() -> (tempfile::TempDir, Paths) {
 #[test]
 fn cutover_preserves_data_config_key_binding_and_only_rebases_owned_browser_output() {
     let (_temp, paths) = fixture();
+    let relative = Path::new("automation-scripts/script-fixture/task.py");
+    fs::create_dir_all(paths.legacy.join(relative).parent().unwrap()).unwrap();
+    fs::write(paths.legacy.join(relative), "# retained script copy").unwrap();
+    {
+        let conn = crate::db::init(&paths.legacy.join("data.db")).unwrap();
+        conn.execute("INSERT INTO automations(id,title,prompt,trigger_kind,trigger_value,executor_kind,script_path,created_at,updated_at) VALUES('script-copy','Copy','','schedule','每天 09:00','script',?1,1,1)", [paths.legacy.join(relative).to_string_lossy().as_ref()]).unwrap();
+    }
     let source_hash = fingerprint(&paths.legacy.join("data.db")).unwrap();
     let config = fs::read(&paths.config).unwrap();
     let lease = open(&paths, false, false).unwrap();
@@ -134,6 +141,18 @@ fn cutover_preserves_data_config_key_binding_and_only_rebases_owned_browser_outp
     renew.try_lock_exclusive().unwrap();
     FileExt::unlock(&renew).unwrap();
     let conn = crate::db::init(&paths.current.join("data.db")).unwrap();
+    assert_eq!(
+        fs::read_to_string(paths.current.join(relative)).unwrap(),
+        "# retained script copy"
+    );
+    let copied_path: String = conn
+        .query_row(
+            "SELECT script_path FROM automations WHERE id='script-copy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(Path::new(&copied_path), paths.current.join(relative));
     assert_eq!(
         crate::commands::file::personal_files_root(&conn).unwrap(),
         paths.current.canonicalize().unwrap().join("results")

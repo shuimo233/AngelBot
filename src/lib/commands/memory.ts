@@ -381,6 +381,7 @@ export interface LearnedPreference {
   id: string;
   content: string;
   ready: boolean;
+  explicit?: boolean;
   updatedAt: number;
 }
 

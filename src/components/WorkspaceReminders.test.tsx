@@ -102,6 +102,37 @@ describe('workspace reminder selection', () => {
 });
 
 describe('WorkspaceReminders', () => {
+  it('compact conversation state hides schedules and finished history without discarding workbench records', async () => {
+    getOverviewMock.mockResolvedValue(overview([
+      automation(),
+      automation({id:'ended',title:'旧运行结果',enabled:false,nextRunAt:null,latestRun:run('completed')}),
+    ]));
+    const view = render(<WorkspaceReminders workspaceId="personal" compact />);
+    await act(async () => {});
+    expect(view.container).toBeEmptyDOMElement();
+    view.rerender(<WorkspaceReminders workspaceId="personal" defaultOpen />);
+    expect(await screen.findByText('事项回看')).toBeVisible();
+    expect(screen.getByText('旧运行结果')).toBeVisible();
+    expect(screen.getByText('记得喝水')).toBeVisible();
+  });
+
+  it('compact state retains running and failed signals, scope filtering and stale-read errors', async () => {
+    getOverviewMock.mockResolvedValue(overview([
+      automation({latestRun:run('running')}),
+      automation({id:'queued',latestRun:run('queued')}),
+      automation({id:'failed',title:'需检查',latestRun:run('failed')}),
+      automation({id:'other',workspaceId:'project',latestRun:run('running')}),
+    ]));
+    render(<WorkspaceReminders workspaceId="personal" compact />);
+    const link = await screen.findByRole('button',{name:'自动化 · 1 项需处理 · 1 项进行中 · 1 项排队中'});
+    fireEvent.click(link);
+    expect(useNavigationStore.getState().currentPage).toBe('tasks');
+    expect(screen.queryByText('运行结果')).not.toBeInTheDocument();
+    getOverviewMock.mockRejectedValue(new Error('ipc unavailable'));
+    act(() => { fireEvent(window,new Event(AUTOMATIONS_UPDATED_EVENT)); });
+    expect(await screen.findByRole('button',{name:'自动化 · 暂未更新'})).toBeVisible();
+  });
+
   it('通知关闭时保留未发送回执，不称为完成或需要重试', async () => {
     getOverviewMock.mockResolvedValue(overview([
       automation({ enabled: false, nextRunAt: null, lastRunAt: todayAt(14),

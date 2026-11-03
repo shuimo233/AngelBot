@@ -16,10 +16,106 @@ use crate::commands::foreground_text_attachments;
 use crate::llm::{Message as LlmMessage, ToolCall as LlmToolCall};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 const PRIVATE_TRANSCRIPT_KEY: &str = "privateProtocolTranscript";
+
+mod working_view;
+pub(crate) use working_view::main_working_history;
+pub(crate) use working_view::working_history;
+
+pub(crate) struct ConversationAnchor {
+    pub id: String,
+    parent: Option<String>,
+    pub role: String,
+    pub visible: bool,
+}
+pub(crate) struct ConversationBranch {
+    pub anchors: Vec<ConversationAnchor>,
+    pub incomplete: bool,
+    pub leaf: Option<String>,
+}
+
+/// One selected ancestry for replay and source recall. A bounded reader may
+/// request a window; full protocol replay must never silently truncate a turn.
+/// UNION makes a corrupt cycle finite before host-side validation rejects it.
+/// Callers own the connection/read snapshot; no model supplies a leaf pointer.
+pub(crate) fn conversation_branch(
+    conn: &Connection,
+    session: &str,
+    limit: Option<usize>,
+) -> Result<ConversationBranch, String> {
+    let leaf: Option<Option<String>> = conn
+        .query_row(
+            "SELECT leaf_message_id FROM sessions WHERE id=?1",
+            [session],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let leaf = leaf.ok_or("Conversation is unavailable")?;
+    let sql_limit = match limit {
+        Some(0) => return Err("Conversation branch window must be positive".into()),
+        Some(n) => i64::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("Invalid branch window")?,
+        None => -1,
+    };
+    let mut statement = conn.prepare(
+        "WITH RECURSIVE active(id,parent_id,role,is_provisional) AS (
+          SELECT id,parent_id,role,is_provisional FROM messages WHERE id=?2 AND session_id=?1
+          UNION
+          SELECT m.id,m.parent_id,m.role,m.is_provisional FROM messages m JOIN active a ON m.id=a.parent_id
+          WHERE m.session_id=?1 LIMIT ?3
+        ) SELECT id,parent_id,role,is_provisional FROM active"
+    ).map_err(|e|e.to_string())?;
+    let rows = statement
+        .query_map(params![session, leaf, sql_limit], |r| {
+            Ok(ConversationAnchor {
+                id: r.get(0)?,
+                parent: r.get(1)?,
+                role: r.get(2)?,
+                visible: r.get::<_, i64>(3)? == 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut nodes = HashMap::new();
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        if row.id.len() > 128 || row.id.chars().any(char::is_control) {
+            return Err("Invalid conversation ancestry identity".into());
+        }
+        nodes.insert(row.id.clone(), row);
+    }
+    let mut cursor = leaf.clone();
+    let mut anchors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut incomplete = false;
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            return Err("Invalid or cyclic conversation ancestry".into());
+        }
+        let node = nodes
+            .remove(&id)
+            .ok_or("Conversation ancestry is incomplete or unavailable")?;
+        cursor = node.parent.clone();
+        anchors.push(node);
+        if limit.is_some_and(|limit| anchors.len() > limit) {
+            anchors.pop();
+            incomplete = true;
+            break;
+        }
+    }
+    anchors.retain(|a| a.visible);
+    anchors.reverse();
+    Ok(ConversationBranch {
+        anchors,
+        incomplete,
+        leaf,
+    })
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +184,153 @@ fn private_transcript_from_metadata(
     }
     validate_private_transcript(&ledger.messages)?;
     Ok(Some(ledger.messages))
+}
+
+/// Legacy text is checkpointable only when its visible original is sufficient
+/// to recover it. Private/unindexed protocol stays on the native fallback.
+pub(crate) fn checkpoint_row_text(
+    role: &str,
+    content: &str,
+    metadata: Option<&str>,
+) -> Result<Option<String>, String> {
+    if content.contains(crate::llm::TRANSIENT_IMAGE_NOTICE) {
+        return Ok(None);
+    }
+    if role == "assistant" {
+        if let Some(messages) = private_transcript_from_metadata(metadata)? {
+            if messages.len() != 1
+                || messages[0].role != "assistant"
+                || messages[0].content != content
+                || messages[0].protocol_state.is_some()
+                || messages[0].tool_calls.is_some()
+                || messages[0]
+                    .content
+                    .contains(crate::llm::TRANSIENT_IMAGE_NOTICE)
+            {
+                return Ok(None);
+            }
+        }
+    }
+    foreground_text_attachments::render_stored(content, role, metadata).map(Some)
+}
+
+/// One source snapshot for persisted checkpoints. Reuse Main's completed view
+/// rather than asking a text summarizer to interpret opaque provider items.
+/// Legacy transparent history keeps its old representation; unsafe runs defer.
+pub(crate) struct CheckpointHistory {
+    pub window: ConversationWindow,
+    pub messages: Vec<(String, String, String)>,
+}
+impl CheckpointHistory {
+    pub(crate) fn load(
+        conn: &Connection,
+        session: &str,
+        before: i64,
+        allow_working: bool,
+    ) -> Result<Option<Self>, String> {
+        let window = ConversationWindow::load(conn, session, before)?;
+        let ids = serde_json::to_string(&window.ids).map_err(|e| e.to_string())?;
+        let (managed,unsettled): (bool,bool) = conn.query_row(
+            "SELECT count(*)>0,COALESCE(max(t.status!='completed' OR t.confirmation_state='pending'),0) FROM task_runs t JOIN json_each(?2) s ON s.value=t.message_id
+             JOIN messages m ON m.id=t.message_id AND m.session_id=t.session_id
+             WHERE t.session_id=?1 AND m.created_at<?3",
+            params![session,ids,before],|r|Ok((r.get(0)?,r.get(1)?)),
+        ).map_err(|e|e.to_string())?;
+        if unsettled && !allow_working {
+            return Ok(None);
+        }
+        if allow_working {
+            let raw = hydrate_llm_history(conn, session, before)?;
+            let view = working_history(conn, session, before, raw, true)?;
+            if view.applied {
+                let mut messages: Vec<_> = view
+                    .message_ids
+                    .into_iter()
+                    .zip(view.messages)
+                    .map(|(id, m)| (id, m.role, m.content))
+                    .collect();
+                if !checkpoint_references(conn, session, &mut messages)? {
+                    return Ok(None);
+                }
+                return Ok(Some(Self { window, messages }));
+            }
+            if managed {
+                return Ok(None);
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT m.id,m.role,m.content,m.metadata FROM messages m JOIN json_each(?2) s ON s.value=m.id
+             WHERE m.session_id=?1 AND m.created_at<?3 ORDER BY CAST(s.key AS INTEGER)",
+        ).map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map(params![session, ids, before], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (id, role, content, metadata) = row.map_err(|e| e.to_string())?;
+            let Some(text) = checkpoint_row_text(&role, &content, metadata.as_deref())? else {
+                return Ok(None);
+            };
+            messages.push((id, role, text));
+        }
+        if !checkpoint_references(conn, session, &mut messages)? {
+            return Ok(None);
+        }
+        Ok(Some(Self { window, messages }))
+    }
+}
+
+fn checkpoint_references(
+    conn: &Connection,
+    session: &str,
+    messages: &mut [(String, String, String)],
+) -> Result<bool, String> {
+    for (id, _, text) in messages {
+        let Some(reference) =
+            super::foreground_context_recall::checkpoint_reference(conn, session, id)?
+        else {
+            return Ok(false);
+        };
+        text.push_str("\n<conversation-source>");
+        text.push_str(&reference.to_string());
+        text.push_str("</conversation-source>");
+    }
+    Ok(true)
+}
+
+/// The existing summary table is a working-context projection, not a second
+/// memory store. Its anchor must still belong to the selected visible branch.
+pub(crate) struct ConversationWindow {
+    pub ids: Vec<String>,
+    pub summary: Option<String>,
+}
+impl ConversationWindow {
+    pub(crate) fn load(conn: &Connection, session: &str, before: i64) -> Result<Self, String> {
+        let branch = conversation_branch(conn, session, None)?;
+        let ids: Vec<String> = branch.anchors.into_iter().map(|a| a.id).collect();
+        let encoded = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+        let selected:Option<(usize,String)>=conn.query_row(
+            "SELECT CAST(s.key AS INTEGER),c.summary FROM context_summaries c
+             JOIN json_each(?2) s ON s.value=c.anchor_message_id
+             JOIN messages m ON m.id=c.anchor_message_id AND m.session_id=c.session_id
+             WHERE c.session_id=?1 AND m.created_at<?3 ORDER BY CAST(s.key AS INTEGER) DESC,c.compressed_at DESC,c.rowid DESC LIMIT 1",
+            params![session,encoded,before],|r|Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let (start, summary) = selected
+            .map(|(position, text)| (position + 1, Some(text)))
+            .unwrap_or((0, None));
+        Ok(Self {
+            ids: ids.into_iter().skip(start).collect(),
+            summary,
+        })
+    }
 }
 
 /// Keep the native tool receipt in sync when a durable confirmation settles.
@@ -287,6 +530,8 @@ pub(crate) fn hydrate_llm_history(
     session_id: &str,
     before_created_at: i64,
 ) -> Result<Vec<LlmMessage>, String> {
+    let window = ConversationWindow::load(conn, session_id, before_created_at)?;
+    let ids = serde_json::to_string(&window.ids).map_err(|e| e.to_string())?;
     let has_provisional = conn
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messages') WHERE name = 'is_provisional')",
@@ -304,25 +549,27 @@ pub(crate) fn hydrate_llm_history(
     // order; role priority or random IDs can put replies before user input.
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT role, content, tool_calls, tool_call_id, metadata, created_at FROM (
-               SELECT role, content, tool_calls, tool_call_id, metadata, created_at, rowid AS insertion_order
-               FROM messages
+            "WITH selected AS (SELECT value AS id FROM json_each(?3)), eligible AS (
+               SELECT m.*,m.rowid AS insertion_order FROM messages m WHERE m.session_id=?1 AND (
+                 m.id IN (SELECT id FROM selected)
+                 OR (m.role='tool' AND EXISTS (
+                   SELECT 1 FROM messages a JOIN selected s ON s.id=a.id
+                   JOIN json_each(CASE WHEN json_valid(a.tool_calls) THEN a.tool_calls ELSE '[]' END) c
+                   WHERE a.session_id=?1 AND a.role='assistant' AND a.created_at=m.created_at
+                     AND CASE WHEN c.type='object' THEN json_extract(c.value,'$.id') END=m.tool_call_id
+                 ))
+               )
+             ) SELECT role, content, tool_calls, tool_call_id, metadata, created_at FROM (
+               SELECT role, content, tool_calls, tool_call_id, metadata, created_at, insertion_order
+               FROM eligible
                WHERE session_id = ?1 AND created_at < ?2{visible}
-                 AND (COALESCE(metadata, '') NOT LIKE '%\"compressed\": true%'
-                      OR metadata LIKE '%\"privateProtocolTranscript\"%')
                ORDER BY created_at DESC, insertion_order DESC
-               LIMIT CASE WHEN EXISTS (
-                 SELECT 1 FROM messages
-                 WHERE session_id = ?1 AND created_at < ?2{visible}
-                   AND role = 'assistant'
-                   AND metadata LIKE '%\"privateProtocolTranscript\"%'
-               ) THEN -1 ELSE 100 END
              )
              ORDER BY created_at ASC, insertion_order ASC"
         ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![session_id, before_created_at], |row| {
+        .query_map(params![session_id, before_created_at, ids], |row| {
             let role: String = row.get(0)?;
             let content: String = row.get(1)?;
             let metadata: Option<String> = row.get(4)?;
@@ -957,6 +1204,7 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute_batch("UPDATE messages SET parent_id='u' WHERE id='a'; UPDATE sessions SET leaf_message_id='a' WHERE id='s';").unwrap();
         let history = hydrate_llm_history(&conn, "s", 10).unwrap();
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].role, "assistant");

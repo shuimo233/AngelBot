@@ -16,6 +16,8 @@ const langOptions = [
 ];
 
 export function AppearanceSettings() {
+  const layout = useThemeStore((state) => state.layout);
+  const setLayout = useThemeStore((state) => state.setLayout);
   const theme = useThemeStore((state) => state.theme);
   const setTheme = useThemeStore((state) => state.setTheme);
   const [language, setLanguage] = useState('zh-CN');
@@ -66,6 +68,9 @@ export function AppearanceSettings() {
 
   return (
     <div className="settings-page-content">
+      <SettingsSection title="界面布局" description="两种布局使用同一份对话、任务和设置。切换立即生效，并在此设备上记住选择。" defaultOpen>
+        <SelectField label="布局" value={layout} options={[{ value: 'A', label: 'A · 安静工作区（文字侧栏）' }, { value: 'B', label: 'B · 生活视图（图标侧栏）' }]} onChange={value => { if (value === 'A' || value === 'B') setLayout(value); }} />
+      </SettingsSection>
       <SettingsSection title="主题" description="选择应用的外观主题">
         <SelectField
           label="颜色主题"
@@ -93,9 +98,10 @@ export function AppearanceSettings() {
         )}
         {bgImage && (
           <div className="slider-field" style={{ marginTop: 12 }}>
-            <label>背景透明度</label>
+            <label htmlFor="appearance-background-opacity">背景透明度</label>
             <div className="slider-row">
               <input
+                id="appearance-background-opacity"
                 type="range"
                 min="0"
                 max="100"
@@ -119,9 +125,10 @@ export function AppearanceSettings() {
 
       <SettingsSection title="显示" description="调整界面显示效果">
         <div className="slider-field">
-          <label>字体大小</label>
+          <label htmlFor="appearance-font-size">字体大小</label>
           <div className="slider-row">
             <input
+              id="appearance-font-size"
               type="range"
               min="12"
               max="20"

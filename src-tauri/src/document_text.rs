@@ -7,6 +7,9 @@ mod docx;
 mod package;
 mod xlsx;
 
+#[cfg(test)]
+pub(crate) use package::fixture as package_fixture;
+
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_TEXT_BYTES: usize = 16 * 1024;
 pub(crate) const DOCX_NOTICE: &str = "【DOCX 正文文字快照】仅含正文段落与表格文字；不含图片、文本框、页眉页脚、批注、脚注/尾注、自动编号或版式。复杂域与修订不解析。\n\n";

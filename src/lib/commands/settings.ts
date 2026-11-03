@@ -3,6 +3,9 @@
  */
 import { invoke } from '../invoke';
 
+export const getAutostart = () => invoke<boolean>('get_autostart');
+export const setAutostart = (enabled: boolean) => invoke<void>('set_autostart', { enabled });
+
 export interface ScheduledTask {
   id: string;
   type: string;

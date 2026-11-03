@@ -1,6 +1,18 @@
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
 
+const CHECKPOINT_DEPENDENCY_GUARDS_DROP: &str = "
+ DROP TRIGGER IF EXISTS checkpoint_message_time_update;
+ DROP TRIGGER IF EXISTS checkpoint_task_insert;
+ DROP TRIGGER IF EXISTS checkpoint_task_update;
+ DROP TRIGGER IF EXISTS checkpoint_task_delete;
+ DROP TRIGGER IF EXISTS checkpoint_facts_insert;
+ DROP TRIGGER IF EXISTS checkpoint_facts_update;
+ DROP TRIGGER IF EXISTS checkpoint_facts_delete;
+ DROP TRIGGER IF EXISTS checkpoint_receipt_insert;
+ DROP TRIGGER IF EXISTS checkpoint_receipt_update;
+ DROP TRIGGER IF EXISTS checkpoint_receipt_delete;";
+
 /// Open a SQLite connection and apply performance PRAGMAs.
 /// Enables WAL mode, foreign keys, and tunes memory/IO settings.
 pub fn init(path: &Path) -> Result<Connection, String> {
@@ -232,6 +244,18 @@ const MIGRATIONS: &[(i32, &str)] = &[
         82,
         include_str!("migrations/082_automation_result_notifications.sql"),
     ),
+    (
+        83,
+        include_str!("migrations/083_anchored_context_checkpoints.sql"),
+    ),
+    (
+        84,
+        include_str!("migrations/084_checkpoint_fact_sources.sql"),
+    ),
+    (
+        85,
+        include_str!("migrations/085_provider_usage_details.sql"),
+    ),
 ];
 
 /// Short human-readable description for each migration version, used in
@@ -320,6 +344,9 @@ const MIGRATION_DESCRIPTIONS: &[&str] = &[
     "credential-free MCP discovery catalog",
     "restored project directories require local confirmation",
     "owned automation result notification receipts",
+    "branch-anchored conversation checkpoints",
+    "checkpoint task facts and source invalidation",
+    "optional provider-reported cache and reasoning usage",
 ];
 
 /// Read an integer setting, returning `default` if the key is missing or unparseable.
@@ -632,6 +659,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             )",
         );
 
+        // A surviving v84 guard must not prevent replaying an older schema
+        // before parent_id exists. Quarantine only our derived-data guards in
+        // this transaction; v36/v84 reinstall them once the tree is available.
+        if *version == 32 && !messages_has_column(conn, "parent_id") {
+            conn.execute_batch(CHECKPOINT_DEPENDENCY_GUARDS_DROP)
+                .map_err(|e| format!("Migration v32 checkpoint guard repair failed: {e}"))?;
+        }
+
         // Migration 034 ships ALTER TABLE ADD COLUMN statements. SQLite has no
         // `ADD COLUMN IF NOT EXISTS`, so we run the schema portion in code
         // (probing one column first) before executing the data-backfill
@@ -656,7 +691,33 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         // v43 is also replayed by historical recovery fixtures where the
         // schema survived but the migration journal did not. Apply its ALTERs
         // only when needed; the index remains idempotent in either case.
-        let migration_sql = if *version == 43 {
+        let checkpoint_schema_present: bool = if *version == 36 {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('context_summaries') WHERE name='anchor_message_id')",[],|r|r.get(0))
+                .map_err(|e|format!("Migration v36 checkpoint inspection failed: {e}"))?
+        } else {
+            false
+        };
+        let migration_sql = if checkpoint_schema_present {
+            // Journal recovery may rebuild an older messages table while the
+            // newer checkpoint table survived. Keep its data and reinstall
+            // only our own guards inside the SAME migration transaction.
+            format!(
+                "CREATE TEMP TABLE angelbot_checkpoint_rebuild AS SELECT * FROM context_summaries;
+              DROP TRIGGER IF EXISTS context_summary_anchor_insert;
+              DROP TRIGGER IF EXISTS context_summary_anchor_update;
+              DROP TRIGGER IF EXISTS context_checkpoint_source_update;
+              DROP TRIGGER IF EXISTS context_checkpoint_source_delete;
+              {}
+              {sql}
+              {}
+              {}
+              INSERT OR IGNORE INTO context_summaries SELECT * FROM angelbot_checkpoint_rebuild;
+              DROP TABLE angelbot_checkpoint_rebuild;",
+                CHECKPOINT_DEPENDENCY_GUARDS_DROP,
+                include_str!("migrations/083_anchored_context_checkpoints.sql"),
+                include_str!("migrations/084_checkpoint_fact_sources.sql")
+            )
+        } else if *version == 43 {
             if !attention_states_has_column(conn, "scope_owner_profile_id") {
                 conn.execute_batch(MIGRATION_043_SCHEMA)
                     .map_err(|e| format!("Migration v{} schema failed: {}", *version, e))?;
@@ -799,11 +860,31 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             // A surviving schema is not an instruction to re-grant imported
             // paths. Journal repair must preserve pending zero values too.
             String::new()
+        } else if *version == 83 {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('context_summaries') WHERE name='anchor_message_id')",
+                [], |row|row.get(0),
+            ).map_err(|e|format!("Migration v83 schema inspection failed: {e}"))?;
+            if !present {
+                conn.execute_batch("ALTER TABLE context_summaries ADD COLUMN anchor_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE;")
+                    .map_err(|e|format!("Migration v83 schema failed: {e}"))?;
+            }
+            (*sql).to_owned()
         } else if *version == 82 && automation_runs_has_column(conn, "notification_status") {
             // A recovered database may retain the column but lose the journal.
             // Preserve every notification claim, especially unconfirmed: adding
             // the column again or clearing claims must not trigger a resend.
             String::new()
+        } else if *version == 85 {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_stats') WHERE name='provider_usage_json')",
+                [], |row| row.get(0),
+            ).map_err(|e| format!("Migration v85 schema inspection failed: {e}"))?;
+            if present {
+                String::new()
+            } else {
+                (*sql).to_owned()
+            }
         } else {
             (*sql).to_owned()
         };
@@ -842,8 +923,20 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|e| format!("Migration v{} failed to record version: {}", *version, e))?;
 
-        conn.execute_batch("COMMIT")
-            .map_err(|e| format!("Migration v{} COMMIT failed: {}", *version, e))?;
+        conn.execute_batch("COMMIT").map_err(|e| {
+            let relation = conn
+                .query_row(
+                    r#"SELECT "table",parent FROM pragma_foreign_key_check LIMIT 1"#,
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .ok();
+            let detail = relation
+                .map(|(child, parent)| format!("; foreign key {child} -> {parent}"))
+                .unwrap_or_default();
+            let _ = conn.execute_batch("ROLLBACK");
+            format!("Migration v{} COMMIT failed: {e}{detail}", *version)
+        })?;
     }
 
     // Insert default settings if not present (idempotent)

@@ -223,7 +223,7 @@ fn output_message(text: &str, phase: &str) -> Value {
 fn completed(items: Vec<Value>) -> Value {
     json!({"type":"response.completed","response":{
         "id":"resp_test","object":"response","status":"completed","error":null,"incomplete_details":null,"model":"gpt-5.4","output":items,
-        "usage":{"input_tokens":31,"output_tokens":17}
+        "usage":{"input_tokens":31,"output_tokens":17,"input_tokens_details":{"cached_tokens":12},"output_tokens_details":{"reasoning_tokens":5}}
     }})
 }
 
@@ -383,6 +383,17 @@ fn native_compaction_replays_only_the_bound_window_without_new_tool_authority() 
         assert_eq!(body["input"][2]["content"], "follow-up");
         assert_eq!(body["instructions"], "persistent owner policy");
         assert!(!body.to_string().contains("old-source-marker"));
+        let mut with_runtime = history.clone();
+        with_runtime.insert(1, message("developer", "current host clock and policy"));
+        let replay = p.request_body(&with_runtime, None, None).unwrap();
+        assert_eq!(replay["input"][0]["role"], "developer");
+        assert_eq!(
+            replay["input"][0]["content"],
+            "current host clock and policy"
+        );
+        assert_eq!(replay["input"][1], checkpoint);
+        assert_eq!(replay["instructions"], "persistent owner policy");
+        assert!(!replay.to_string().contains("old-source-marker"));
         let luna = provider(mode, "gpt-6-luna");
         let short_task = luna
             .request_body(
@@ -633,6 +644,26 @@ fn sampling_is_omitted_for_reasoning_or_unknown_models() {
         .unwrap();
     assert_eq!(body["reasoning"]["effort"], "high");
     assert!(body.get("max_output_tokens").is_none());
+    let mut paired_bodies = Vec::new();
+    for (effort, label) in [
+        (ThinkingEffort::Low, "low"),
+        (ThinkingEffort::Medium, "medium"),
+    ] {
+        let settings = ThinkingSettings {
+            protocol: ThinkingProtocol::OpenAiResponses,
+            effort,
+            budget_tokens: None,
+        };
+        let mut body = provider(ModelAuthMode::ChatgptPlan, "gpt-6-luna")
+            .request_body(&[message("user", "hello")], None, Some(&settings))
+            .unwrap();
+        assert_eq!(body["reasoning"], json!({"effort":label}));
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        body.as_object_mut().unwrap().remove("reasoning");
+        paired_bodies.push(body);
+    }
+    assert_eq!(paired_bodies[0], paired_bodies[1]);
 }
 
 #[test]
@@ -690,6 +721,95 @@ fn endpoint_never_routes_plan_credentials_to_custom_hosts_or_backend_api() {
 }
 
 #[test]
+fn cache_comparison_is_opt_in_and_diagnostic_values_cannot_publish_private_content() {
+    let p = provider(ModelAuthMode::ChatgptPlan, "gpt-6-luna");
+    let messages = [
+        message("system", "stable synthetic instructions"),
+        message("user", "OK"),
+    ];
+    assert!(p
+        .request_body(&messages, None, None)
+        .unwrap()
+        .get("prompt_cache_options")
+        .is_none());
+    assert!(p.enable_cache_comparison());
+    assert!(p
+        .request_body(&messages, None, None)
+        .unwrap()
+        .get("prompt_cache_options")
+        .is_none());
+    let mut wire = completed(vec![output_message("OK", "final_answer")]);
+    wire["response"]["id"] = json!("resp_private_comparison_id");
+    wire["response"]["prompt_cache_diagnostics"] = json!({"type":"cache_miss","reason":"tools_changed",
+        "comparison_reusable_tokens":1024,"cache_missed_tokens":0});
+    let parsed = parse_completed(
+        &wire["response"],
+        "gpt-6-luna",
+        "account-test",
+        ModelAuthMode::ChatgptPlan,
+        &HashSet::new(),
+    )
+    .unwrap();
+    p.accept_completed(parsed).unwrap();
+    let body = p.request_body(&messages, None, None).unwrap();
+    assert_eq!(
+        body["prompt_cache_options"]["comparison_response_id"],
+        "resp_private_comparison_id"
+    );
+    assert!(
+        body.get("previous_response_id").is_none() && body.get("prompt_cache_retention").is_none()
+    );
+    let d = p.latest_cache_diagnostics().unwrap();
+    assert_eq!(d.kind, "cache_miss");
+    assert_eq!(d.cache_missed_tokens, Some(0));
+    assert!(!d.details_invalid);
+    let public = serde_json::to_string(&(d, request_fingerprint(&body).unwrap())).unwrap();
+    assert!(!public.contains("resp_private_comparison_id"));
+    let invalid = cache_diagnostics(Some(
+        &json!({"type":"cache_miss","reason":"PRIVATE-REMOTE-PAYLOAD",
+        "cache_missed_tokens":"0"}),
+    ))
+    .unwrap();
+    assert!(invalid.details_invalid && invalid.cache_missed_tokens.is_none());
+    assert!(!serde_json::to_string(&invalid).unwrap().contains("PRIVATE"));
+    assert!(cache_diagnostics(None).is_none());
+    assert!(!provider(ModelAuthMode::ApiKey, "gpt-6-luna").enable_cache_comparison());
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-request-id", "req_private_support".parse().unwrap());
+    headers.insert("openai-organization", "org_private_scope".parse().unwrap());
+    headers.insert("authorization", "PRIVATE-UNREAD-SECRET".parse().unwrap());
+    let (request_id, organization, invalid) = response_metadata_headers(&headers);
+    assert_eq!(request_id.as_deref(), Some("req_private_support"));
+    assert_eq!(organization.as_ref().unwrap().len(), 64);
+    assert!(!invalid);
+    wire["response"]["model"] = json!("gpt-6-luna");
+    wire["response"]["service_tier"] = json!("default");
+    let mut metadata = response_metadata(&wire["response"], "gpt-6-luna");
+    metadata.request_id = request_id;
+    metadata.organization_fingerprint = organization;
+    assert_eq!(metadata.model_matches_requested, Some(true));
+    assert_eq!(metadata.service_tier.as_deref(), Some("default"));
+    let public = serde_json::to_string(&metadata).unwrap();
+    assert!(!public.contains("private") && !public.contains("SECRET"));
+    wire["response"]["service_tier"] = json!("PRIVATE-UNKNOWN-TIER");
+    assert!(response_metadata(&wire["response"], "gpt-6-luna").details_invalid);
+    headers.insert("openai-organization", "invalid scope".parse().unwrap());
+    assert!(response_metadata_headers(&headers).2);
+    for model in ["gpt-6-sol", "gpt-6.1-sol"] {
+        let p = provider(ModelAuthMode::ChatgptPlan, model);
+        let reference = [
+            message("system", &"synthetic reference ".repeat(1000)),
+            message("user", "OK"),
+        ];
+        let body = p.request_body(&reference, None, None).unwrap();
+        assert!(
+            body.get("context_management").is_none(),
+            "cache sample must not accidentally compact against an unknown-model fallback"
+        );
+    }
+}
+
+#[test]
 fn completed_stream_returns_all_calls_only_after_terminal_event() {
     let mut parser = parser(ModelAuthMode::ChatgptPlan);
     let incremental = json!({"type":"response.function_call_arguments.done","item_id":"fc_call1","arguments":"{\"value\":1}"});
@@ -711,6 +831,9 @@ fn completed_stream_returns_all_calls_only_after_terminal_event() {
     parser.finish().unwrap();
     let result = parser.completed.take().unwrap();
     assert_eq!(result.usage.unwrap().input_tokens, 31);
+    assert_eq!(result.usage.unwrap().cached_input_tokens, Some(12));
+    assert_eq!(result.usage.unwrap().reasoning_tokens, Some(5));
+    assert!(result.usage.unwrap().cache_write_tokens.is_none());
     let (response, continuation) = result.response.into_parts();
     assert_eq!(continuation.unwrap().output_items.len(), 3);
     match response {
@@ -772,7 +895,7 @@ fn encrypted_reasoning_and_phase_replay_without_duplicate_visible_content_or_cal
     let mut result = message("tool", "result");
     result.tool_call_id = Some("call1".into());
     let (input, _) = encode_messages(
-        &[message("user", "do it"), assistant, result],
+        &[message("user", "do it"), assistant.clone(), result.clone()],
         "gpt-5.4",
         "account-test",
         ModelAuthMode::ChatgptPlan,
@@ -802,6 +925,44 @@ fn encrypted_reasoning_and_phase_replay_without_duplicate_visible_content_or_cal
     assert!(!serde_json::to_string(&input)
         .unwrap()
         .contains("normalized working"));
+
+    let provider = provider(ModelAuthMode::ChatgptPlan, "gpt-5.4");
+    let mut messages = vec![
+        message("developer", "stable owner instructions"),
+        message("user", "do it"),
+        assistant,
+        result,
+        message("developer", "host clock A"),
+        message("user", "continue"),
+    ];
+    let tools = [tool("read")];
+    let first = provider
+        .request_body(&messages, Some(&tools), None)
+        .unwrap();
+    messages[4].content = "host clock B".into();
+    let second = provider
+        .request_body(&messages, Some(&tools), None)
+        .unwrap();
+    let a = request_fingerprint(&first).unwrap();
+    let b = request_fingerprint(&second).unwrap();
+    assert_eq!(a.settings, b.settings);
+    assert_eq!(a.tools, b.tools);
+    assert_eq!(a.instructions, b.instructions);
+    assert_eq!(&a.input[..6], &b.input[..6]);
+    assert_ne!(a.input[6], b.input[6]);
+    assert_eq!(a.input[0].role.as_deref(), Some("developer"));
+    assert_eq!(a.input[3].kind, "message");
+    assert_eq!(a.input[4].kind, "function_call");
+    let public = serde_json::to_string(&a).unwrap();
+    for private in [
+        "opaque-account-secret",
+        "account-test",
+        "deterministic-not-a-key",
+        "stable owner instructions",
+        "host clock A",
+    ] {
+        assert!(!public.contains(private));
+    }
 }
 
 #[test]
@@ -1118,6 +1279,30 @@ fn known_structured_errors_are_clear_and_do_not_echo_remote_secrets() {
     )
     .contains("不会自动切换"));
     assert!(structured_error(&Value::Null, Some(302)).contains("重定向"));
+    let failure = structured_failure(
+        &json!({"code":"unsupported_parameter",
+        "param":"prompt_cache_options.mode","message":"PRIVATE-REMOTE-CACHE-ERROR"}),
+        Some(400),
+    );
+    assert!(failure.diagnostic.contains("code=unsupported_parameter"));
+    assert!(failure
+        .diagnostic
+        .contains("param=prompt_cache_options.mode"));
+    assert!(!failure.diagnostic.contains("PRIVATE"));
+    let unknown = structured_failure(
+        &json!({"code":"PRIVATE-CODE","param":"PRIVATE-PARAM",
+        "message":"PRIVATE-MESSAGE"}),
+        Some(400),
+    );
+    assert!(!unknown.diagnostic.contains("PRIVATE"));
+    assert_eq!(
+        structured_failure(
+            &json!({"code":"subscription_sharing_usage_limit_exceeded"}),
+            Some(429)
+        )
+        .kind,
+        LlmFailureKind::QuotaExceeded
+    );
 }
 
 #[test]
@@ -1271,6 +1456,7 @@ async fn refresh_is_resolved_every_request_and_failures_stop_before_network_with
     *provider.last_usage.lock().unwrap() = Some(ProviderUsage {
         input_tokens: 999,
         output_tokens: 999,
+        ..ProviderUsage::default()
     });
     let messages = [message("user", "offline test")];
     for error in [

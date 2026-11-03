@@ -340,7 +340,10 @@ pub(super) fn admit(
         }
         if origin == Origin::Scheduled
             && (!automation.enabled
-                || !matches!(automation.trigger_kind.as_str(), "schedule" | "once")
+                || !matches!(
+                    automation.trigger_kind.as_str(),
+                    "schedule" | "once" | "startup"
+                )
                 || !automation.next_run_at.is_some_and(|due| due <= now))
         {
             return Ok(Admission::NotDue);

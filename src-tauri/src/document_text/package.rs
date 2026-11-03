@@ -9,7 +9,7 @@ pub(super) struct Package<'a> {
 }
 
 #[cfg(test)]
-pub(super) fn fixture(parts: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn fixture(parts: &[(&str, &str)]) -> Vec<u8> {
     use std::io::Write;
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));

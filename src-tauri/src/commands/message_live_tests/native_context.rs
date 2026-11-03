@@ -164,13 +164,19 @@ pub(super) async fn verify(
     };
     let mut input = request(&session, content);
     input.content.push_str("只用项目文件读取／写入工具；仅限这两个文件。禁止运行代码、脚本、终端、联网、应用、自动化或派发子代理。");
-    let prepared = ForegroundContextAssembler::prepare(ForegroundContextRequest {
+    let agent_config = ForegroundContextAssembler::load_config(&state, &input).unwrap();
+    let provider = crate::llm::create_provider_for_app(config, Some(app)).unwrap();
+    let prepared = ForegroundContextAssembler::prepare_native(ForegroundContextRequest {
         state: &state,
         app: Some(app),
+        provider: provider.as_ref(),
+        agent_config,
         request: &input,
         history_before_created_at: i64::MAX,
         budget: ForegroundContextBudget {
             estimated_tool_count: crate::commands::foreground_tool_surface::ESTIMATED_TOOL_COUNT,
+            context_window_tokens: crate::llm::context_window_tokens(config),
+            max_output_tokens: config.max_tokens as usize,
         },
         summary_delivery_id: None,
     })

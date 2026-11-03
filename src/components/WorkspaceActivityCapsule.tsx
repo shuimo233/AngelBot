@@ -37,19 +37,19 @@ export function WorkspaceActivityCapsule({
   );
   const pendingDecisions = visibleProjection?.pendingDecisions ?? [];
 
-  if (mode === 'capsule' && !visibleProjection && (visibleError || isLoading)) {
+  if (mode === 'capsule' && !visibleProjection && visibleError) {
     return (
       <section
-        className={`workspace-activity-capsule${visibleError ? ' workspace-activity-capsule--error' : ''}`}
-        role={visibleError ? 'alert' : 'status'}
+        className="workspace-activity-capsule workspace-activity-capsule--error"
+        role="alert"
         aria-live="polite"
       >
         <span className="workspace-activity-capsule__dot" aria-hidden="true" />
         <div className="workspace-activity-capsule__body">
-          <strong>{visibleError ? '无法读取任务状态' : '正在同步任务状态'}</strong>
-          {visibleError && <span>{visibleError}</span>}
+          <strong>无法读取任务状态</strong>
+          <span>{visibleError}</span>
         </div>
-        {visibleError && workspaceId && (
+        {workspaceId && (
           <button
             className="workspace-activity-capsule__retry"
             type="button"
@@ -61,13 +61,14 @@ export function WorkspaceActivityCapsule({
       </section>
     );
   }
-  if (mode === 'capsule' && active === 0 && pending === 0 && attentionCount === 0 && !visibleError) return null;
+  // Historical Main work remains in the workbench and its header count. Do not
+  // keep an old recovery card above the composer or flash loading on each visit.
+  if (mode === 'capsule' && active === 0 && pending === 0 && !visibleError) return null;
 
   const label = pending > 0
     ? `AngelBot 有 ${pending} 项需要和你确认`
-    : attentionCount > 0
-      ? `AngelBot 有 ${attentionCount} 项工作需要继续处理`
-    : `AngelBot 正在处理 ${active} 项工作`;
+    : active > 0 ? `AngelBot 正在处理 ${active} 项工作`
+      : `AngelBot 有 ${attentionCount} 项工作需要继续处理`;
 
   if (mode === 'panel') {
     const shownDetails = new Map(work.slice(0, 8).map((item) => [
@@ -180,13 +181,6 @@ export function WorkspaceActivityCapsule({
             ))}
           </div>
         ))}
-        {attention && (
-          <div className="workspace-activity-capsule__attention">
-            <span className="workspace-activity-capsule__attention-detail">
-              进度已安全保留，可直接在对话中继续。
-            </span>
-          </div>
-        )}
       </div>
     </section>
   );

@@ -441,7 +441,7 @@ pub(crate) fn register(
             serde_json::json!({"type":"object","additionalProperties":false,
                 "properties":{"query":{"type":"string","maxLength":120,"description":"可选：自动化标题的字面包含查询，不是通配符"}}}),
         ).with_category(ToolCategory::Extension)
-            .with_prompt_snippet("查询提醒是否已触发、通知结果或日常自动化进度／结果时，用 list_automations 读取当前工作区的持久回执，可按标题 query；不要只查待提醒列表。暂停、停止前也先查询准确状态和 ID。latestRun.stopControl 仅在本应用持有本次运行时出现；缺少它不能停止历史运行。触发不证明通知送达，completed 不承诺游戏目标全部完成。"),
+            .with_prompt_snippet("提醒是否触发、通知或运行结果查 list_automations，不只查待提醒列表。"),
         Arc::new(ListAutomationsHandler { session_id: session_id.clone(), db: db.clone() }),
     );
     registry.register(
@@ -450,8 +450,7 @@ pub(crate) fn register(
             serde_json::json!({"type":"object","additionalProperties":false,
                 "properties":{"automation_id":{"type":"string","minLength":1,"description":"list_automations 返回的当前工作区自动化 ID"}},
                 "required":["automation_id"]}),
-        ).with_category(ToolCategory::Extension).with_confirmation(true)
-            .with_prompt_snippet("暂停自动化先准确查询 ID 并遵守确认策略。暂停只影响未来调度，不意味着停止脚本、MAA 队列或已经开始的主 Agent；结果未知时先指导核对实际状态，绝不自动重放。"),
+        ).with_category(ToolCategory::Extension).with_confirmation(true),
         Arc::new(PauseAutomationHandler { session_id: session_id.clone(), db: db.clone() }),
     );
     registry.register(
@@ -463,7 +462,7 @@ pub(crate) fn register(
                     "run_id":{"type":"string","minLength":1,"description":"list_automations 返回的 latestRun.id"}},
                 "required":["automation_id","run_id"]}),
         ).with_category(ToolCategory::Extension).with_confirmation(true)
-            .with_prompt_snippet("用户要停止当前自动化而非暂停未来计划时，先准确查询，再遵守统一确认策略调用 stop_automation_run。requested 只代表请求已接受，须查询结束回执；MAA 停止后可能需要人工核对，不自动重试。"),
+            .with_prompt_snippet("requested 仅是停止请求已接受，须再查结束回执；MAA 停止后可能需人工核对，不自动重试。"),
         Arc::new(StopAutomationRunHandler { session_id: session_id.clone(), db: db.clone() }),
     );
     registry.register(
@@ -476,8 +475,7 @@ pub(crate) fn register(
                 "properties": {}
             }),
         )
-        .with_category(ToolCategory::Extension)
-        .with_prompt_snippet("查看待提醒或取消前用 list_reminders 获取准确 ID；查询提醒是否触发、通知是否成功或历史结果用 list_automations，不从待提醒空列表推断结果。"),
+        .with_category(ToolCategory::Extension),
         Arc::new(ListRemindersHandler {
             session_id: session_id.clone(),
             db: db.clone(),
@@ -497,8 +495,7 @@ pub(crate) fn register(
             }),
         )
         .with_category(ToolCategory::Extension)
-        .with_confirmation(true)
-        .with_prompt_snippet("取消提醒是副作用：先准确定位提醒，再用 cancel_reminder 并遵守确认策略。"),
+        .with_confirmation(true),
         Arc::new(CancelReminderHandler {
             session_id: session_id.clone(),
             db: db.clone(),
@@ -1008,13 +1005,12 @@ mod tests {
         .unwrap();
         let mut registry = ToolRegistry::empty();
         register(&mut registry, session_id.clone(), db.clone());
-        assert!(registry
-            .get("list_reminders")
-            .unwrap()
-            .prompt_snippet
-            .as_ref()
-            .unwrap()
-            .contains("list_automations"));
+        let tool = registry.get("list_reminders").unwrap();
+        assert!(tool.description.contains("list_automations"));
+        assert!(
+            tool.prompt_snippet.is_none(),
+            "do not repeat the native schema"
+        );
         let handler = ListRemindersHandler {
             session_id: session_id.clone(),
             db: db.clone(),

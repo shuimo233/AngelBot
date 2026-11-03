@@ -19,6 +19,7 @@ const NAMES: &[&str] = &[
     "data.db-wal",
     "data.db-shm",
     "results",
+    "automation-scripts",
     "skills",
     "delegated",
     "chatgpt-plan.credentials",
@@ -547,6 +548,46 @@ fn validate_database(paths: &Paths) -> io::Result<()> {
         } else if mentions_old {
             conn.execute("UPDATE mcp_servers SET enabled=0 WHERE id=?1", [&id])
                 .map_err(io::Error::other)?;
+        }
+    }
+    // Only imported copies move with the profile. Never rebase user scripts or
+    // arbitrary command/argument text, which may intentionally reference files.
+    let scripts = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id,script_path,working_dir FROM automations WHERE executor_kind='script'",
+            )
+            .map_err(io::Error::other)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(io::Error::other)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?
+    };
+    let legacy_root = paths.legacy.join("automation-scripts");
+    let legacy_root = legacy_root.canonicalize().unwrap_or(legacy_root);
+    let rebase = |value: &str| -> Option<String> {
+        let original = PathBuf::from(value);
+        let original = original.canonicalize().unwrap_or(original);
+        let relative = original.strip_prefix(&legacy_root).ok()?;
+        Some(crate::commands::file::display_work_dir(
+            &paths.current.join("automation-scripts").join(relative),
+        ))
+    };
+    for (id, script, working_dir) in scripts {
+        if let Some(script) = script.as_deref().and_then(&rebase) {
+            let working_dir = working_dir.map(|value| rebase(&value).unwrap_or(value));
+            conn.execute(
+                "UPDATE automations SET script_path=?1,working_dir=?2 WHERE id=?3",
+                rusqlite::params![script, working_dir, id],
+            )
+            .map_err(io::Error::other)?;
         }
     }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")

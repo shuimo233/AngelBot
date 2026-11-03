@@ -212,7 +212,7 @@ describe('WorkspaceActivityCapsule', () => {
     expect(screen.getByText(/上次记录：AngelBot/)).toBeInTheDocument();
   });
 
-  it('surfaces recoverable Main-Agent work without exposing a retry control', () => {
+  it('keeps historical Main work in the workbench rather than a permanent composer card', () => {
     const onReturnToConversation = vi.fn();
     useWorkspaceActivityStore.setState({
       projection: {
@@ -227,10 +227,9 @@ describe('WorkspaceActivityCapsule', () => {
       },
     });
 
-    const { rerender } = render(<WorkspaceActivityCapsule />);
+    const { container, rerender } = render(<WorkspaceActivityCapsule />);
 
-    expect(screen.getByText('AngelBot 有 2 项工作需要继续处理')).toBeInTheDocument();
-    expect(screen.getByText('进度已安全保留，可直接在对话中继续。')).toBeInTheDocument();
+    expect(container).toBeEmptyDOMElement();
     expect(screen.queryByRole('button', { name: /继续|重试/i })).not.toBeInTheDocument();
 
     rerender(<WorkspaceActivityCapsule mode="panel" onReturnToConversation={onReturnToConversation} />);

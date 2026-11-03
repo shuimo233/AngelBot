@@ -13,6 +13,7 @@ target/
 *.log
 # Local diagnostics and their recovery manifests are never published.
 /logs/
+/.playwright-mcp/
 .env
 .env.*
 !.env.example

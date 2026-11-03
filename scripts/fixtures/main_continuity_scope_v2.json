@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "base_fixture_sha256": "947a5a76e2c40a4897074077d3c410b619ab05c65423826ee24f9bc0176ba6f7",
+  "read_only_context": {
+    "agreement": false,
+    "draft": true,
+    "correction": true,
+    "checkpoint": true,
+    "resume": true,
+    "next_task": true
+  }
+}

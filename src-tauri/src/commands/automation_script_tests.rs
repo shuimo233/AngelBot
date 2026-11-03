@@ -88,7 +88,8 @@ fn script_timeout_stops_before_joining_output_readers() {
         process.argv[2]], {stdio:'inherit',windowsHide:true}); setInterval(()=>{},1000);").unwrap();
         let state = Arc::new(crate::tests::test_app_state());
         {
-            let conn = state.db.lock().unwrap();
+            let mut conn = state.db.lock().unwrap();
+            *conn = rusqlite::Connection::open(directory.path().join("data.db")).unwrap();
             crate::db::migrate(&conn).unwrap();
             conn.execute(
             "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('work_directory',?1,1)",
@@ -231,7 +232,8 @@ fn invalid_script_definition_is_rejected_before_persistence() {
     let directory = tempfile::tempdir().unwrap();
     let state = crate::tests::test_app_state();
     {
-        let connection = state.db.lock().unwrap();
+        let mut connection = state.db.lock().unwrap();
+        *connection = rusqlite::Connection::open(directory.path().join("data.db")).unwrap();
         crate::db::migrate(&connection).unwrap();
         connection
             .execute(
@@ -269,6 +271,157 @@ fn invalid_script_definition_is_rejected_before_persistence() {
         .query_row("SELECT COUNT(*) FROM automations", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
+    let oversized = directory.path().join("oversized.py");
+    fs::File::create(&oversized)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(create_automation_impl(
+        &state,
+        "Too large".into(),
+        String::new(),
+        "schedule".into(),
+        "每天 09:00".into(),
+        String::new(),
+        Some("script".into()),
+        None,
+        Some(oversized.to_string_lossy().into_owned()),
+        None,
+        None,
+        None
+    )
+    .unwrap_err()
+    .contains("16 MiB"));
+    assert_eq!(
+        fs::read_dir(directory.path().join("automation-scripts"))
+            .unwrap()
+            .count(),
+        0,
+        "invalid argv must not leave imported copies"
+    );
+}
+
+#[test]
+fn arbitrary_source_is_copied_transactionally_executed_and_cleaned_without_touching_source() {
+    let profile = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let source = external.path().join("独立 routine.cjs");
+    fs::write(&source, "console.log('imported-copy-canary')").unwrap();
+    let state = crate::tests::test_app_state();
+    {
+        let mut conn = state.db.lock().unwrap();
+        *conn = rusqlite::Connection::open(profile.path().join("data.db")).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('work_directory',?1,1)",
+            [profile.path().to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_import BEFORE INSERT ON automations BEGIN SELECT RAISE(FAIL,'fixture rejected insert'); END;").unwrap();
+    }
+    let create = || {
+        create_automation_impl(
+            &state,
+            "Imported script".into(),
+            String::new(),
+            "schedule".into(),
+            "每天 09:00".into(),
+            "explicit copy".into(),
+            Some("script".into()),
+            None,
+            Some(source.to_string_lossy().into_owned()),
+            Some(vec![]),
+            None,
+            Some(30),
+        )
+    };
+    assert!(create().is_err());
+    let owned_root = profile.path().join("automation-scripts");
+    assert_eq!(
+        fs::read_dir(&owned_root).unwrap().count(),
+        0,
+        "DB failure must roll back the copy"
+    );
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_import")
+        .unwrap();
+    let automation = create().unwrap();
+    let copy = Path::new(automation.script_path.as_deref().unwrap());
+    assert!(copy.starts_with(&owned_root));
+    assert_ne!(copy, source);
+    assert_eq!(fs::read(copy).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(
+        get_automation_runs_impl(&state, &automation.id)
+            .unwrap()
+            .len(),
+        0,
+        "creating a copy must not run it"
+    );
+    assert!(
+        super::validate_script_path(&state, &source.to_string_lossy(), None).is_err(),
+        "runtime never gains arbitrary path execution"
+    );
+    fs::write(&source, "throw new Error('source-must-not-run')").unwrap();
+    super::run_automation_now_impl(&state, &automation.id).unwrap();
+    let runs = get_automation_runs_impl(&state, &automation.id).unwrap();
+    assert_eq!(runs.len(), 1);
+    let result = &runs[0];
+    assert_eq!(result.status, "completed");
+    assert_eq!(result.output, "imported-copy-canary");
+    // A managed path cannot fall back to legacy scope after directory replacement.
+    let original_directory = copy.parent().unwrap();
+    let retained = profile.path().join("retained-copy");
+    let redirected = profile.path().join("legacy-directory");
+    fs::create_dir(&redirected).unwrap();
+    fs::write(redirected.join(copy.file_name().unwrap()), "must not run").unwrap();
+    fs::rename(original_directory, &retained).unwrap();
+    crate::tests::create_test_directory_link(original_directory, &redirected);
+    let redirected_result = super::validate_script_path(&state, &copy.to_string_lossy(), None);
+    #[cfg(windows)]
+    fs::remove_dir(original_directory).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(original_directory).unwrap();
+    fs::rename(&retained, original_directory).unwrap();
+    assert!(
+        redirected_result.is_err(),
+        "an imported copy must never resolve back into the legacy work directory"
+    );
+    super::delete_automation_impl(&state, &automation.id).unwrap();
+    assert!(!copy.exists());
+    assert_eq!(
+        fs::read_to_string(&source).unwrap(),
+        "throw new Error('source-must-not-run')"
+    );
+    assert_eq!(fs::read_dir(&owned_root).unwrap().count(), 0);
+    let second = create().unwrap();
+    let second_copy = Path::new(second.script_path.as_deref().unwrap());
+    let second_directory = second_copy.parent().unwrap();
+    let retained_second = profile.path().join("retained-second-copy");
+    let other_directory = owned_root.join("script-other");
+    fs::create_dir(&other_directory).unwrap();
+    let other_file = other_directory.join(second_copy.file_name().unwrap());
+    fs::write(&other_file, "another-task-canary").unwrap();
+    fs::rename(second_directory, &retained_second).unwrap();
+    crate::tests::create_test_directory_link(second_directory, &other_directory);
+    let deletion = super::delete_automation_impl(&state, &second.id);
+    #[cfg(windows)]
+    fs::remove_dir(second_directory).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(second_directory).unwrap();
+    fs::rename(&retained_second, second_directory).unwrap();
+    assert!(deletion.unwrap_err().contains("重定向"));
+    assert_eq!(
+        fs::read_to_string(&other_file).unwrap(),
+        "another-task-canary"
+    );
+    super::script_store::remove_unreferenced(
+        &state.db.lock().unwrap(),
+        second.script_path.as_deref().unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(windows)]

@@ -8,7 +8,7 @@
 //! 5. Runs the agent with personality-aware system prompt
 //! 6. Persists the AI reply and updates memory frequencies
 
-use crate::agent::compaction::checkpoint_prompt;
+use crate::agent::compaction::{checkpoint_prompt, checkpoint_text};
 use crate::agent::config::{
     AgentConfig, MemoryContext, PersonalityTraits, UserPreferences, UserProfile,
 };
@@ -23,6 +23,7 @@ use crate::agent::AgentRunner;
 use crate::agent::{
     derive_run_state, RunStateInput, ToolCall, ToolCancellation, ToolExecutionContext,
 };
+use crate::commands::foreground_context_assembler::ForegroundContextBudget;
 use crate::commands::foreground_history::{
     hydrate_agent_steps, hydrate_llm_history, hydrate_task_facts_from_db, hydrate_task_runs,
     hydrate_task_runs_from_db, parse_inline_tool_calls, persist_task_run, persist_tool_results,
@@ -1785,58 +1786,53 @@ pub async fn call_deepseek(
 fn task_facts_compression_context(
     state: &AppState,
     session_id: &str,
+    summarized_ids: &[String],
 ) -> Result<Option<String>, String> {
     let conn = state.db.lock().map_err(|error| error.to_string())?;
+    task_facts_compression_context_from_connection(&conn, session_id, summarized_ids)
+}
+
+fn task_facts_compression_context_from_connection(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    summarized_ids: &[String],
+) -> Result<Option<String>, String> {
     if !table_exists(&conn, "task_run_facts")? {
         return Ok(None);
     }
-    let facts_json: Option<String> = conn
+    let stored: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT facts_json FROM task_run_facts
-             WHERE session_id = ?1 ORDER BY updated_at DESC LIMIT 1",
-            params![session_id],
-            |row| row.get(0),
+            "SELECT task_run_id,message_id,facts_json FROM task_run_facts
+             WHERE session_id = ?1 AND message_id IN (SELECT value FROM json_each(?2))
+             ORDER BY updated_at DESC, task_run_id LIMIT 1",
+            params![
+                session_id,
+                serde_json::to_string(summarized_ids).map_err(|e| e.to_string())?
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let Some(facts_json) = facts_json else {
+    let Some((task_run_id, message_id, facts_json)) = stored else {
         return Ok(None);
     };
     let facts: TaskFacts = serde_json::from_str(&facts_json)
         .map_err(|error| format!("Stored task facts are invalid: {error}"))?;
 
-    let verification = facts
-        .verification_evidence
-        .iter()
-        .map(|evidence| format!("{} (exit {})", evidence.command, evidence.exit_code))
-        .collect::<Vec<_>>()
-        .join("; ");
     let pending = facts
         .pending_confirmation
         .as_ref()
-        .map(|confirmation| confirmation.tool_name.as_str())
-        .unwrap_or("none");
-    Ok(Some(format!(
-        "任务事实（必须保留）：目标={}; 改动={}; 验证={}; 待确认={}; 失败步骤={}; 无进展次数={}",
-        facts.goal,
-        if facts.modified_files.is_empty() {
-            "none".to_string()
-        } else {
-            facts.modified_files.join(", ")
-        },
-        if verification.is_empty() {
-            "none".to_string()
-        } else {
-            verification
-        },
-        pending,
-        if facts.failed_steps.is_empty() {
-            "none".to_string()
-        } else {
-            facts.failed_steps.join(", ")
-        },
-        facts.no_progress_count,
-    )))
+        .map(|confirmation| confirmation.tool_name.as_str());
+    // This is one covered run, not the conversation's complete task ledger.
+    // Empty verification/approval records do not negate older observations or
+    // the user's unfinished work. Never export private provider state here.
+    Ok(Some(serde_json::json!({
+        "scope":"one_covered_task_run_only","task_run_id":task_run_id,"message_id":message_id,
+        "goal":facts.goal,"terminal_reason":facts.terminal_reason,
+        "modified_files":facts.modified_files,"verification_evidence":facts.verification_evidence,
+        "pending_confirmation_tool":pending,"failed_steps":facts.failed_steps,
+        "no_progress_count":facts.no_progress_count,
+    }).to_string()))
 }
 
 fn persisted_checkpoint_prompt(
@@ -1863,62 +1859,38 @@ pub(crate) async fn auto_compress_if_needed(
     state: &AppState,
     app: Option<&AppHandle>,
     session_id: &str,
+    history_before_created_at: i64,
     agent_config: &crate::agent::AgentConfig,
-    tool_count: usize,
+    budget: ForegroundContextBudget,
+    provider: &dyn crate::llm::LlmProvider,
+    native_control: bool,
 ) -> Result<Option<String>, String> {
-    {
+    let snapshot = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let has_private_ledger: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id=?1 AND metadata LIKE '%\"privateProtocolTranscript\"%')",
-            params![session_id], |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if has_private_ledger {
-            // A text summary cannot replace the private protocol ledger.
-            return Ok(None);
-        }
-    }
-    // Use the selected model's advertised context window. The configured
-    // completion budget and system prompt occupy part of that total window.
-    let provider_config =
-        crate::commands::api_config::load_api_config_internal().unwrap_or_default();
-    let system_tokens = estimate_system_prompt_tokens(agent_config, tool_count);
-    let usable_context = usable_context_tokens(agent_config, tool_count, &provider_config)?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        crate::commands::foreground_history::CheckpointHistory::load(
+            &tx,
+            session_id,
+            history_before_created_at,
+            !native_control && agent_config.preferences.use_long_term_memory,
+        )?
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let window = snapshot.window;
+    let messages = snapshot.messages;
+    // Limits and provider belong to the same resolved turn. Settings may change
+    // concurrently, but must not switch a summary's model or context budget.
+    let mut checkpoint_config = agent_config.clone();
+    checkpoint_config.context_summary = window.summary.clone();
+    let system_tokens =
+        estimate_system_prompt_tokens(&checkpoint_config, budget.estimated_tool_count);
+    let usable_context = usable_context_tokens(agent_config, budget)?;
     // Reserve headroom for a tool-result turn and the final answer. Waiting
     // until the provider's hard context limit is reached makes recovery depend
     // on a failed request; compact while the foreground loop can still proceed.
-    let threshold = usable_context.saturating_mul(70) / 100;
-
-    // Get all messages for this session and count tokens
-    let messages: Vec<(String, String, String)> = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare("SELECT id, role, content, metadata FROM messages WHERE session_id = ?1 AND COALESCE(metadata, '') NOT LIKE '%\"compressed\": true%' ORDER BY created_at ASC, id ASC LIMIT 200")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![session_id], |r| {
-                let role: String = r.get(1)?;
-                let content: String = r.get(2)?;
-                let metadata: Option<String> = r.get(3)?;
-                let content = foreground_text_attachments::render_stored(
-                    &content,
-                    &role,
-                    metadata.as_deref(),
-                )
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        error.into(),
-                    )
-                })?;
-                Ok((r.get::<_, String>(0)?, role, content))
-            })
-            .map_err(|e| e.to_string())?;
-        let result: Vec<_> = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        result
-    };
+    let threshold = (usable_context.saturating_mul(70) / 100).max(1);
 
     let msg_tokens: usize = messages
         .iter()
@@ -1933,7 +1905,10 @@ pub(crate) async fn auto_compress_if_needed(
     // Need compression: take older messages (keep last ~10 for recency),
     // generate a summary using the LLM provider
     let keep_count = 10usize.min(messages.len() / 4);
-    let split_point = messages.len().saturating_sub(keep_count);
+    let mut split_point = messages.len().saturating_sub(keep_count);
+    while split_point > 0 && messages.get(split_point).is_some_and(|m| m.1 != "user") {
+        split_point -= 1;
+    }
     let old_messages = &messages[..split_point];
 
     if old_messages.is_empty() {
@@ -1947,20 +1922,18 @@ pub(crate) async fn auto_compress_if_needed(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let facts_context = task_facts_compression_context(state, session_id)?;
+    let summarized_ids = old_messages.iter().map(|m| m.0.clone()).collect::<Vec<_>>();
+    let facts_context = task_facts_compression_context(state, session_id, &summarized_ids)?;
     let includes_task_facts = facts_context.is_some();
     // Both foreground turns and delegated runs resume from the same compact,
     // structured checkpoint contract. Keeping one prompt prevents automatic
     // foreground compression from discarding decisions or marking pending work
     // as completed in a free-form summary.
-    let compression_prompt =
-        persisted_checkpoint_prompt(agent_config, &conversation_text, facts_context.as_deref());
-
-    // Call the LLM for compression
-    let model_config = crate::commands::foreground_model_factory::resolve_model_config(app)
-        .map_err(|error| format!("Failed to resolve LLM provider for compression: {error}"))?;
-    let provider = crate::llm::create_provider_for_app(&model_config, app)
-        .map_err(|e| format!("Failed to create LLM provider for compression: {}", e))?;
+    let compression_prompt = persisted_checkpoint_prompt(
+        &checkpoint_config,
+        &conversation_text,
+        facts_context.as_deref(),
+    );
 
     let llm_messages = vec![crate::llm::Message {
         role: "user".to_string(),
@@ -1974,34 +1947,46 @@ pub(crate) async fn auto_compress_if_needed(
     let summary = match provider
         .chat(&llm_messages, None, None)
         .await
-        .map(|response| response.into_parts().0)
+        .and_then(checkpoint_text)
     {
-        Ok(crate::llm::LlmResponse::Text { text, .. }) => text,
-        Ok(crate::llm::LlmResponse::ProtocolViolation { reason, .. }) => {
-            return Err(format!(
-                "Invalid tool-call protocol during compression: {reason}"
-            ));
-        }
-        Ok(crate::llm::LlmResponse::ToolCalls { .. }) => {
-            return Err("Unexpected tool call during compression".to_string());
-        }
-        Ok(crate::llm::LlmResponse::WithProtocol { .. }) => {
-            unreachable!("protocol wrappers are flattened by into_parts")
-        }
+        Ok(text) => text,
         Err(e) => {
             eprintln!("[AutoCompress] Compression failed: {}", e);
             return Ok(None); // Graceful degradation: skip compression
         }
     };
 
+    let replaced_bytes =
+        conversation_text.len() + window.summary.as_deref().unwrap_or_default().len();
+    if summary.len() >= replaced_bytes {
+        return Err(
+            "Checkpoint did not reduce the persisted context; original history retained".into(),
+        );
+    }
+
     // Store the compression result
     let now = Utc::now().timestamp();
     let summary_id = uuid::Uuid::new_v4().to_string();
     {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO context_summaries (id, session_id, summary, compressed_at, message_count_before, message_count_after, trigger)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let current = crate::commands::foreground_history::CheckpointHistory::load(
+            &tx,
+            session_id,
+            history_before_created_at,
+            !native_control && agent_config.preferences.use_long_term_memory,
+        )?
+        .ok_or("Conversation checkpoint source changed; original history retained")?;
+        if current.window.summary != window.summary
+            || !current.messages.starts_with(old_messages)
+            || task_facts_compression_context_from_connection(&tx, session_id, &summarized_ids)?
+                != facts_context
+        {
+            return Err("Conversation checkpoint source changed; original history retained".into());
+        }
+        tx.execute(
+            "INSERT INTO context_summaries (id, session_id, summary, compressed_at, message_count_before, message_count_after, trigger,anchor_message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,?8)",
             params![
                 summary_id,
                 session_id,
@@ -2010,32 +1995,20 @@ pub(crate) async fn auto_compress_if_needed(
                 old_messages.len() as i32,
                 messages.len() as i32,
                 "auto_token_threshold",
+                old_messages.last().unwrap().0,
             ],
         )
         .map_err(|e| e.to_string())?;
 
-        conn.execute(
+        tx.execute(
             "UPDATE sessions SET context_version = context_version + 1, last_compressed_at = ?1 WHERE id = ?2",
             params![now, session_id],
         )
         .map_err(|e| e.to_string())?;
 
-        // Mark exactly the summarized snapshot IDs. Merge the flag instead of
-        // replacing metadata: explicit user files must survive history recall,
-        // edit/resend and backup even after their context has been compacted.
-        for (id, _, _) in old_messages {
-            if let Ok(metadata) = conn.query_row(
-                "SELECT metadata FROM messages WHERE id = ?1 AND session_id = ?2",
-                params![id, session_id],
-                |row| row.get::<_, Option<String>>(0),
-            ) {
-                let merged = foreground_text_attachments::compressed_metadata(metadata.as_deref());
-                let _ = conn.execute(
-                    "UPDATE messages SET metadata = ?1 WHERE id = ?2 AND session_id = ?3",
-                    params![merged, id, session_id],
-                );
-            }
-        }
+        // The branch anchor owns the live cutoff. Do not rewrite original
+        // message/attachment/protocol metadata with global compression flags.
+        tx.commit().map_err(|e| e.to_string())?;
     }
 
     eprintln!(
@@ -2060,30 +2033,28 @@ pub(crate) async fn auto_compress_if_needed(
     Ok(Some(summary))
 }
 
-pub(crate) fn live_context_compaction_threshold(
+pub(crate) fn live_context_compaction_budget(
     agent_config: &crate::agent::AgentConfig,
-    tool_count: usize,
-) -> Result<usize, String> {
-    let system_tokens = estimate_system_prompt_tokens(agent_config, tool_count);
-    let provider_config =
-        crate::commands::api_config::load_api_config_internal().unwrap_or_default();
-    Ok(usable_context_tokens(agent_config, tool_count, &provider_config)?.saturating_mul(70) / 100)
+    budget: ForegroundContextBudget,
+) -> Result<(usize, usize), String> {
+    let threshold = (usable_context_tokens(agent_config, budget)?.saturating_mul(70) / 100).max(1);
+    // A fixed 2048-token floor can exceed a small model's entire available
+    // window. Keep the recent-turn allowance proportional to this binding.
+    Ok((threshold, (threshold / 2).max(1)))
 }
 
 fn usable_context_tokens(
     agent_config: &crate::agent::AgentConfig,
-    tool_count: usize,
-    provider_config: &crate::llm::ProviderConfig,
+    budget: ForegroundContextBudget,
 ) -> Result<usize, String> {
-    let system_tokens = estimate_system_prompt_tokens(agent_config, tool_count);
-    let context_window = crate::llm::context_window_tokens(provider_config);
-    let reserved_tokens = system_tokens.saturating_add(provider_config.max_tokens as usize);
-    context_window.checked_sub(reserved_tokens).ok_or_else(|| {
-        format!(
-            "Configured output budget ({}) and system prompt exceed the {} token context window for {}",
-            provider_config.max_tokens, context_window, provider_config.model
-        )
-    })
+    let system_tokens = estimate_system_prompt_tokens(agent_config, budget.estimated_tool_count);
+    let reserved_tokens = system_tokens.saturating_add(budget.max_output_tokens);
+    budget.context_window_tokens.checked_sub(reserved_tokens)
+        .filter(|available| *available > 0)
+        .ok_or_else(|| format!(
+            "Configured output budget ({}) and system prompt leave no room in the {} token context window",
+            budget.max_output_tokens, budget.context_window_tokens
+        ))
 }
 
 #[tauri::command]
@@ -2498,6 +2469,30 @@ async fn send_message_after_run_admission(
     let recovery_run = foreground_run.clone();
     let result = async {
 
+    let agent_config =
+        crate::commands::foreground_context_assembler::ForegroundContextAssembler::load_config(state, &req)?;
+    // Bind once before preparation: summary inference, budget and execution
+    // must use the same model even if settings change during this turn.
+    let resolved_model = match
+        crate::commands::foreground_model_factory::ForegroundModelFactory::new(app, state)
+            .resolve(
+                crate::commands::foreground_model_factory::ForegroundModelRequest {
+                    session_id: &session_id,
+                    requested_thinking_effort: req.thinking_effort.as_deref(),
+                    now,
+                },
+            ) {
+        Ok(model) => model,
+        Err(error) => {
+            let Some(content) = error.provider_unavailable_message() else {
+                return Err(error.to_string());
+            };
+            // One durable reply owns both the explanation and task state.
+            let reply = run_store.complete_model_unavailable(&foreground_run, &goal, content)?;
+            lifecycle_control.commit_terminal()?;
+            return Ok(reply);
+        }
+    };
     // Workspace creation owns the stable Main-conversation title. Never send
     // user content to an unrelated provider for background title generation.
     // 1.6. Prepare the complete foreground context through one deep seam.
@@ -2508,6 +2503,8 @@ async fn send_message_after_run_admission(
             crate::commands::foreground_context_assembler::ForegroundContextRequest {
                 state: &state,
                 app,
+                provider: resolved_model.provider.as_ref(),
+                agent_config,
                 request: &req,
                 summary_delivery_id: match &tool_mode {
                     crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard => None,
@@ -2515,6 +2512,8 @@ async fn send_message_after_run_admission(
                 },
                 history_before_created_at: history_before_created_at.unwrap_or(foreground_run.history_before_created_at),
                 budget: crate::commands::foreground_context_assembler::ForegroundContextBudget {
+                    context_window_tokens: resolved_model.context_window_tokens,
+                    max_output_tokens: resolved_model.max_output_tokens,
                     estimated_tool_count: match &tool_mode {
                         crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard => ESTIMATED_TOOL_COUNT,
                         crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::ReviewedDeliverySummary { .. } => 1,
@@ -2523,31 +2522,6 @@ async fn send_message_after_run_admission(
             },
         )
         .await?;
-    let effective_thinking_effort = req.thinking_effort.as_deref();
-    // 4. Run the agent with personalized system prompt. Provider/keychain
-    // fallback and session binding live behind one reusable factory seam.
-    let resolved_model = match
-        crate::commands::foreground_model_factory::ForegroundModelFactory::new(app, state)
-            .resolve(
-                crate::commands::foreground_model_factory::ForegroundModelRequest {
-                    session_id: &session_id,
-                    requested_thinking_effort: effective_thinking_effort,
-                    now,
-                },
-            ) {
-        Ok(model) => model,
-        Err(error) => {
-            let Some(content) = error.provider_unavailable_message() else {
-                return Err(error.to_string());
-            };
-            // This is a settled failure, not an interrupted agent or a failed
-            // IPC request. One durable reply owns both the explanation and
-            // task state, so the UI does not append a second local error.
-            let reply = run_store.complete_model_unavailable(&foreground_run, &goal, content)?;
-            lifecycle_control.commit_terminal()?;
-            return Ok(reply);
-        }
-    };
     // Only an interactive user turn receives an issuance identity and
     // app-managed sandbox capability. A reviewed delivery summary gets its
     // own one-tool surface later and must never prepare these credentials or
@@ -2592,44 +2566,18 @@ async fn send_message_after_run_admission(
             (None, None, None)
         }
     };
-    let trigger_evolution = {
-        let conn = state.db.lock().map_err(|error| error.to_string())?;
-        matches!(
+    let evolution_enabled = matches!(
             &tool_mode,
             crate::commands::foreground_turn_coordinator::ForegroundTurnToolMode::Standard
         ) && prepared_context.agent_config.preferences.evolution_enabled
-            && prepared_context.agent_config.preferences.use_long_term_memory
-            && crate::commands::memory::automatic_evolution_due(&conn, &req.session_id)
-    };
-    let after_completion: Option<Box<dyn FnOnce() + Send + 'static>> = trigger_evolution.then(|| {
+            && prepared_context.agent_config.preferences.use_long_term_memory;
+    let after_completion = crate::commands::memory::automatic_evolution_after_completion(
+        state.db.clone(), &req.session_id, evolution_enabled, || {
         let config = crate::commands::foreground_model_factory::resolve_model_config(app).ok()?;
-        // Optional evolution must use the same configured identity as this turn.
-        // If settings changed during context preparation, defer it to a later turn.
-        if config.profile_identity() != resolved_model.identity.provider_profile_ref
-            || config.credential_identity() != resolved_model.identity.credential_handle_ref
-            || config.model != resolved_model.identity.model
-        {
-            return None;
-        }
-        let provider = crate::llm::create_provider_for_app(&config, app).ok()?;
-        // Optional short preference extraction must not inherit an expensive
-        // service-default reasoning budget. Reuse the provider/model resolver;
-        // unsupported models still receive no private reasoning fields.
-        let review_thinking = crate::llm::resolve_thinking_settings(&config, Some("low")).ok()?;
-        let db = state.db.clone();
-        let session_id = req.session_id.clone();
-        Some(Box::new(move || {
-            tokio::spawn(async move {
-                let _ = crate::commands::memory::run_evolution_review_impl(
-                    db,
-                    &session_id,
-                    provider,
-                    review_thinking,
-                )
-                .await;
-            });
-        }) as Box<dyn FnOnce() + Send + 'static>)
-    }).flatten();
+        resolved_model.completion_review_provider(&config, |current| {
+            crate::llm::create_provider_for_app(current, app)
+        })
+    })?;
 
     crate::commands::foreground_turn_coordinator::ForegroundTurnCoordinator::new(
         state,
@@ -3113,7 +3061,7 @@ pub(crate) fn build_agent_config(
         None
     };
     let relevant_memories = if memory_enabled {
-        fetch_relevant_memories(&conn, &req.content)
+        fetch_relevant_memories(&conn, &req.content)?
     } else {
         Vec::new()
     };
@@ -3126,7 +3074,7 @@ pub(crate) fn build_agent_config(
     };
 
     // ── Fetch latest context summary for this session (Issue #35) ─────────
-    let context_summary = fetch_latest_summary(&conn, &req.session_id);
+    let context_summary = fetch_latest_summary(&conn, &req.session_id)?;
     let workspace_context = workspace_context_for_session(&conn, &req.session_id)?;
 
     // ── Fetch knowledge graph context (Issue #37 Phase 4) ──────────────────
@@ -3141,10 +3089,10 @@ pub(crate) fn build_agent_config(
         Some(graph_ctx)
     };
 
-    let adaptive_constraints = if memory_enabled && preferences.evolution_enabled {
-        crate::agent::adaptive_constraints::active_for_session(&conn, &req.session_id)
+    let adaptive_projection = if memory_enabled && preferences.evolution_enabled {
+        crate::agent::adaptive_constraints::project_for_task(&conn, &req.session_id, &req.content)?
     } else {
-        Vec::new()
+        Default::default()
     };
 
     Ok(AgentConfig {
@@ -3156,7 +3104,9 @@ pub(crate) fn build_agent_config(
         preferences,
         relevant_memories,
         saved_constraint_context,
-        adaptive_constraints,
+        adaptive_constraints: adaptive_projection.records,
+        adaptive_constraints_omitted: adaptive_projection.omitted,
+        adaptive_constraints_task_matches: adaptive_projection.task_matches,
         skill_instructions: Vec::new(),
         core_memories,
         knowledge_graph_context,
@@ -3218,12 +3168,12 @@ fn fetch_profile(conn: &std::sync::MutexGuard<rusqlite::Connection>) -> Option<U
 }
 
 /// Fetch the latest context summary for a session (Issue #35).
-fn fetch_latest_summary(conn: &rusqlite::Connection, session_id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT summary FROM context_summaries WHERE session_id = ?1 ORDER BY compressed_at DESC LIMIT 1",
-        params![session_id],
-        |r| r.get(0),
-    ).ok()
+fn fetch_latest_summary(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    crate::commands::foreground_history::ConversationWindow::load(conn, session_id, i64::MAX)
+        .map(|window| window.summary)
 }
 
 /// Fetch core memory blocks for persistent identity/context.
@@ -3247,141 +3197,145 @@ fn fetch_core_memories(conn: &rusqlite::Connection) -> Vec<crate::agent::config:
     .collect()
 }
 
-/// Fetch relevant memories for the given query text.
-/// Uses time-based scoring when vectors are disabled (default),
-/// or vector similarity when enabled.
+/// Main and explicit recall use the same bounded, source-filtered retrieval.
 fn fetch_relevant_memories(
-    conn: &std::sync::MutexGuard<rusqlite::Connection>,
+    conn: &rusqlite::Connection,
     query_text: &str,
-) -> Vec<MemoryContext> {
-    // Avoid initializing or querying the vector virtual table until there is
-    // actually something to recall. Besides saving work for a new profile,
-    // this keeps an empty memory store out of the chat request critical path.
-    let has_memories = conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)", [], |row| {
-            row.get::<_, i64>(0)
+) -> Result<Vec<MemoryContext>, String> {
+    crate::fts::recall_active_memories(conn, query_text, 5, crate::fts::MemoryRecallMode::Context)
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|memory| MemoryContext {
+                    category: memory.category,
+                    content: memory.content,
+                    importance: memory.importance,
+                })
+                .collect()
         })
-        .unwrap_or(0)
-        != 0;
-    if !has_memories {
-        return Vec::new();
-    }
-
-    // Try semantic search first using TF embedding
-    let query_emb = crate::vector::text_to_embedding(query_text, 128);
-
-    // Try vector similarity search
-    let query_f32: Vec<f32> = {
-        let mut v: Vec<f32> = query_emb.iter().map(|&x| x as f32).collect();
-        v.resize(1536, 0.0);
-        v
-    };
-
-    if let Ok(knn) = crate::vector_store::find_nearest(conn, &query_f32, 5) {
-        if !knn.is_empty() {
-            let rowids: Vec<i64> = knn.iter().map(|r| r.rowid).collect();
-            if let Ok(mapping) = crate::vector_store::rowids_to_memory_ids(conn, &rowids) {
-                let id_list: Vec<String> = mapping.iter().map(|(_, id)| id.clone()).collect();
-                if !id_list.is_empty() {
-                    let placeholders: Vec<String> = id_list
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| format!("?{}", i + 1))
-                        .collect();
-                    let sql = format!(
-                        "SELECT category, content, importance FROM memories WHERE id IN ({})
-                         AND forget_stage = 'active' AND superseded_by IS NULL AND category != 'constraint'",
-                        placeholders.join(",")
-                    );
-                    if let Ok(mut stmt) = conn.prepare(&sql) {
-                        let param_refs: Vec<Box<dyn rusqlite::types::ToSql>> = id_list
-                            .iter()
-                            .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
-                            .collect();
-                        let results: Vec<MemoryContext> = stmt
-                            .query_map(
-                                rusqlite::params_from_iter(param_refs.iter().map(|p| p.as_ref())),
-                                |r| {
-                                    Ok(MemoryContext {
-                                        category: r.get::<_, String>(0)?,
-                                        content: r.get::<_, String>(1)?,
-                                        importance: r.get::<_, Option<i32>>(2)?.unwrap_or(5),
-                                    })
-                                },
-                            )
-                            .unwrap()
-                            .filter_map(|r| r.ok())
-                            .collect();
-                        if !results.is_empty() {
-                            return results;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback to keyword search using query text
-    let now = Utc::now().timestamp();
-    let mut stmt = match conn.prepare(
-        "SELECT id, scope, category, content, importance,
-                frequency, last_mentioned
-         FROM memories
-         WHERE forget_stage = 'active'
-         AND superseded_by IS NULL AND category != 'constraint'
-         AND (content LIKE '%' || ?1 || '%' OR category LIKE '%' || ?1 || '%')
-         ORDER BY is_permanent DESC, importance DESC, frequency DESC
-         LIMIT 5",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows: Vec<(String, String, String, String, i32, i32, Option<i64>)> =
-        match stmt.query_map(params![query_text, query_text], |r| {
-            Ok((
-                r.get::<_, String>(0)?,                   // id
-                r.get::<_, String>(1)?,                   // scope
-                r.get::<_, String>(2)?,                   // category
-                r.get::<_, String>(3)?,                   // content
-                r.get::<_, Option<i32>>(4)?.unwrap_or(0), // importance
-                r.get::<_, Option<i32>>(5)?.unwrap_or(0), // frequency
-                r.get::<_, Option<i64>>(6)?,              // last_mentioned
-            ))
-        }) {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            Err(_) => return Vec::new(),
-        };
-
-    // Score and sort by recency + importance + frequency
-    let mut scored: Vec<(f64, MemoryContext)> = rows
-        .into_iter()
-        .map(
-            |(_id, _scope, category, content, importance, frequency, last_mentioned)| {
-                let score =
-                    crate::vector::time_based_score(frequency, last_mentioned, importance, now);
-                (
-                    score,
-                    MemoryContext {
-                        category,
-                        content,
-                        importance,
-                    },
-                )
-            },
-        )
-        .collect();
-
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(5);
-
-    scored.into_iter().map(|(_, ctx)| ctx).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::migrate;
+
+    #[test]
+    fn checkpoint_facts_only_belong_to_the_summarized_message_prefix() {
+        let conn = private_protocol_edit_fixture();
+        for (run, message, updated) in [("old", "a1", 10), ("future", "a2", 20)] {
+            conn.execute("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES(?1,'s',?2,'owned','completed','[]',1,?3)",params![run,message,updated]).unwrap();
+            let facts = if run == "old" {
+                serde_json::to_string(&TaskFacts::new("covered task")).unwrap()
+            } else {
+                "malformed future task facts".into()
+            };
+            conn.execute("INSERT INTO task_run_facts(task_run_id,session_id,message_id,facts_json,created_at,updated_at) VALUES(?1,'s',?2,?3,1,?4)",params![run,message,facts,updated]).unwrap();
+        }
+        let state = app_state_from_connection(conn);
+        let context = task_facts_compression_context(&state, "s", &["u1".into(), "a1".into()])
+            .unwrap()
+            .unwrap();
+        let facts: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(facts["scope"], "one_covered_task_run_only");
+        assert_eq!(facts["task_run_id"], "old");
+        assert_eq!(facts["message_id"], "a1");
+        assert_eq!(facts["goal"], "covered task");
+        assert_eq!(facts["verification_evidence"], serde_json::json!([]));
+        assert!(facts["pending_confirmation_tool"].is_null());
+        assert!(task_facts_compression_context(&state, "s", &["u1".into()])
+            .unwrap()
+            .is_none());
+        assert!(task_facts_compression_context(&state, "s", &["a2".into()]).is_err());
+    }
+
+    struct CheckpointProvider {
+        text: String,
+        stop_reason: crate::llm::StopReason,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for CheckpointProvider {
+        fn name(&self) -> &str {
+            "owned-checkpoint"
+        }
+        async fn chat(
+            &self,
+            _: &[LlmMessage],
+            _: Option<&[crate::llm::ToolSchema]>,
+            _: Option<&crate::llm::ThinkingSettings>,
+        ) -> Result<crate::llm::LlmResponse, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::llm::LlmResponse::Text {
+                text: self.text.clone(),
+                stop_reason: self.stop_reason.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn main_task_projection_is_current_request_scoped_and_respects_memory_controls() {
+        let conn = private_protocol_edit_fixture();
+        let quote = "以后工作日挑衬衫，颜色优先深蓝色。";
+        conn.execute("UPDATE messages SET content=?1 WHERE id='u1'", [quote])
+            .unwrap();
+        assert!(
+            crate::agent::adaptive_constraints::record_explicit_preference(
+                &conn, "s", "u1", quote, quote
+            )
+            .unwrap()
+        );
+        for i in 0..16 {
+            let text = format!("以后介绍其他话题{i}时，先给一个例子。");
+            let id = format!("main-task-noise-{i}");
+            conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES(?1,'s','user',?2,?3)",params![id,text,chrono::Utc::now().timestamp()+100+i]).unwrap();
+            assert!(
+                crate::agent::adaptive_constraints::record_explicit_preference(
+                    &conn, "s", &id, &text, &text
+                )
+                .unwrap()
+            );
+        }
+        let state = app_state_from_connection(conn);
+        for (memory, evolution) in [(false, true), (true, false), (true, true)] {
+            let request: SendMessageRequest = serde_json::from_value(
+                serde_json::json!({"sessionId":"s","role":"user","content":"衬衫颜色",
+                "preferences":{"useLongTermMemory":memory,"evolutionEnabled":evolution}}),
+            )
+            .unwrap();
+            let config = build_agent_config(&state, &request).unwrap();
+            assert_eq!(
+                config.adaptive_constraints_task_matches,
+                usize::from(memory && evolution)
+            );
+            assert_eq!(
+                config.adaptive_constraints.iter().any(|r| r.value == quote),
+                memory && evolution
+            );
+            let prompt = crate::agent::prompt::build_agent_system_prompt(&config, &[], &[]);
+            assert_eq!(
+                prompt.contains("Task preference lookup:"),
+                memory && evolution
+            );
+            if memory && evolution {
+                assert!(prompt.contains("\"facts_searched\":false"));
+                assert!(
+                    prompt.contains("When current or historical preferences matter"),
+                    "Do not silently promote the experimental lookup directive"
+                );
+                let mut next = request;
+                next.content = "xylophone-unmatched".into();
+                assert_eq!(
+                    build_agent_config(&state, &next)
+                        .unwrap()
+                        .adaptive_constraints_task_matches,
+                    0,
+                    "No stale lookup note on the next task"
+                );
+            }
+        }
+    }
 
     #[test]
     fn disabling_memory_or_evolution_omits_learned_defaults_from_main_context() {
@@ -3411,6 +3365,21 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "UPDATE messages SET content='以后回复先给结论，再列下一步' WHERE id='u1'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            crate::agent::adaptive_constraints::record_explicit_preference(
+                &conn,
+                "s",
+                "u1",
+                "明确交流偏好标记",
+                "以后回复先给结论，再列下一步"
+            )
+            .unwrap()
+        );
         let state = app_state_from_connection(conn);
         for (memory, evolution) in [(false, true), (true, false), (true, true)] {
             let request = serde_json::from_value::<SendMessageRequest>(serde_json::json!({
@@ -3427,7 +3396,16 @@ mod tests {
             );
             assert_eq!(
                 config.adaptive_constraints.len(),
-                usize::from(memory && evolution)
+                2 * usize::from(memory && evolution)
+            );
+            assert_eq!(
+                prompt.contains("以后回复先给结论，再列下一步"),
+                memory && evolution,
+                "explicit preferences must survive unrelated queries, independently of summaries"
+            );
+            assert_eq!(
+                prompt.contains("user-stated preference"),
+                memory && evolution
             );
             if !memory {
                 assert!(config.relevant_memories.is_empty());
@@ -3464,7 +3442,11 @@ mod tests {
             assert_eq!(continued.preferences.evolution_enabled, evolution);
             assert_eq!(
                 continued.adaptive_constraints.len(),
-                usize::from(memory && evolution)
+                2 * usize::from(memory && evolution)
+            );
+            assert_eq!(
+                continued_prompt.contains("以后回复先给结论，再列下一步"),
+                memory && evolution
             );
         }
         state
@@ -3527,7 +3509,12 @@ mod tests {
         let conn = state.db.lock().unwrap();
         conn.execute_batch(
             "ALTER TABLE messages ADD COLUMN metadata TEXT;
-             ALTER TABLE messages ADD COLUMN tool_calls TEXT;",
+             ALTER TABLE messages ADD COLUMN tool_calls TEXT;
+             ALTER TABLE messages ADD COLUMN parent_id TEXT REFERENCES messages(id);
+             ALTER TABLE messages ADD COLUMN is_provisional INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE sessions ADD COLUMN leaf_message_id TEXT REFERENCES messages(id);
+             CREATE TABLE context_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),summary TEXT NOT NULL,anchor_message_id TEXT REFERENCES messages(id),compressed_at INTEGER NOT NULL);
+             UPDATE sessions SET leaf_message_id='msg-1' WHERE id='s1';",
         )
         .unwrap();
         let transcript = vec![
@@ -3591,6 +3578,156 @@ mod tests {
         assert_eq!(
             history[1].protocol_state.as_ref().unwrap().output_items[0]["encrypted_content"],
             "retained-marker"
+        );
+    }
+
+    #[test]
+    fn main_history_restores_only_selected_ancestry_before_decoding_private_ledgers() {
+        let conn = private_protocol_edit_fixture();
+        conn.execute_batch(
+            "INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES
+          ('discarded-user','s','user','ABANDONED instructions','a1',20),
+          ('discarded-answer','s','assistant','ABANDONED answer','discarded-user',21);",
+        )
+        .unwrap();
+        let history = hydrate_llm_history(&conn, "s", i64::MAX).unwrap();
+        assert!(
+            !serde_json::to_string(&history)
+                .unwrap()
+                .contains("ABANDONED"),
+            "Main preparation must obey the same selected branch as source recall"
+        );
+        conn.execute(
+            "UPDATE messages SET metadata='not json' WHERE id='discarded-answer'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            hydrate_llm_history(&conn, "s", i64::MAX).is_ok(),
+            "do not decode private data from a discarded branch and only filter it afterward"
+        );
+        conn.execute(
+            "UPDATE sessions SET leaf_message_id='discarded-user' WHERE id='s'",
+            [],
+        )
+        .unwrap();
+        let switched = hydrate_llm_history(&conn, "s", i64::MAX).unwrap();
+        let body = serde_json::to_string(&switched).unwrap();
+        assert!(body.contains("ABANDONED instructions"));
+        assert!(!body.contains("pruned-marker"));
+        assert!(body.contains("retained-marker"));
+    }
+
+    #[test]
+    fn working_checkpoint_keeps_its_branch_cutoff_and_legacy_originals() {
+        use crate::commands::foreground_history::ConversationWindow;
+        let conn = private_protocol_edit_fixture();
+        conn.execute_batch("INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger)
+          VALUES('legacy','s','UNSCOPED assumption',100,2,2,'auto_token_threshold');
+          UPDATE messages SET metadata='{\"compressed\":true}' WHERE id='u1';").unwrap();
+        assert!(ConversationWindow::load(&conn, "s", i64::MAX)
+            .unwrap()
+            .summary
+            .is_none());
+        assert_eq!(
+            hydrate_llm_history(&conn, "s", i64::MAX).unwrap()[0].content,
+            "first",
+            "unusable legacy summaries must not hide their original input"
+        );
+        conn.execute_batch("INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger,anchor_message_id)
+          VALUES('owned','s','User prefers short replies; task pending',1,1,3,'auto_token_threshold','u1');
+          INSERT INTO messages(id,session_id,role,content,parent_id,created_at) VALUES('side','s','user','Side branch','u1',20);").unwrap();
+        assert_eq!(
+            ConversationWindow::load(&conn, "s", 10).unwrap().summary,
+            None,
+            "a history cutoff must not import a later checkpoint"
+        );
+        conn.execute_batch("UPDATE sessions SET leaf_message_id='side' WHERE id='s';
+          INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger,anchor_message_id)
+          VALUES('discarded','s','WRONG future complete',200,4,0,'auto_token_threshold','a2');").unwrap();
+        let window = ConversationWindow::load(&conn, "s", i64::MAX).unwrap();
+        assert_eq!(
+            window.summary.as_deref(),
+            Some("User prefers short replies; task pending")
+        );
+        assert_eq!(window.ids, vec!["side"]);
+        assert_eq!(
+            hydrate_llm_history(&conn, "s", i64::MAX).unwrap()[0].content,
+            "Side branch"
+        );
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('other','Other',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at) VALUES('foreign','other','user','Private',1);").unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE context_summaries SET anchor_message_id='foreign' WHERE id='owned'",
+                []
+            )
+            .is_err());
+        conn.execute("DELETE FROM migration_log WHERE version=83", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE settings SET value='82' WHERE key='schema_version'",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            ConversationWindow::load(&conn, "s", i64::MAX)
+                .unwrap()
+                .summary,
+            window.summary,
+            "journal repair must preserve anchored and legacy rows"
+        );
+        // A forced rollback of a modern database into v35 is not a supported
+        // upgrade. Keep the counterexample: never disable FKs to force that
+        // destructive historical table swap through a surviving live graph.
+        conn.execute("DELETE FROM migration_log WHERE version>=36", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE settings SET value='35' WHERE key='schema_version'",
+            [],
+        )
+        .unwrap();
+        let error = migrate(&conn).unwrap_err();
+        assert!(
+            error.contains("v36") && error.contains("FOREIGN KEY"),
+            "{error}"
+        );
+        assert!(conn.is_autocommit());
+        assert!(conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(
+            ConversationWindow::load(&conn, "s", i64::MAX)
+                .unwrap()
+                .summary,
+            window.summary,
+            "a failed historical swap must roll back checkpoint data and guards"
+        );
+        conn.execute(
+            "UPDATE messages SET content='User corrected the original instruction' WHERE id='u1'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            ConversationWindow::load(&conn, "s", i64::MAX)
+                .unwrap()
+                .summary
+                .is_none(),
+            "a retained anchor ID cannot preserve a summary of edited input"
+        );
+        assert_eq!(
+            hydrate_llm_history(&conn, "s", i64::MAX).unwrap()[0].content,
+            "User corrected the original instruction"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM context_summaries WHERE id='legacy'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
     }
 
@@ -3727,11 +3864,11 @@ mod tests {
     fn persisted_checkpoint_keeps_previous_summary_inside_untrusted_transcript() {
         let conn = private_protocol_edit_fixture();
         conn.execute(
-            "INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger) VALUES('previous','s',?1,1,12,2,'auto_token_threshold')",
+            "INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger,anchor_message_id) VALUES('previous','s',?1,1,12,2,'auto_token_threshold','a1')",
             ["earlier-checkpoint: user requires drafts only; report still pending"],
         ).unwrap();
         let config = AgentConfig {
-            context_summary: fetch_latest_summary(&conn, "s"),
+            context_summary: fetch_latest_summary(&conn, "s").unwrap(),
             ..AgentConfig::default()
         };
         let transcript = "user: report has now been verified; next check is read-only";
@@ -3761,12 +3898,29 @@ mod tests {
             })
             .unwrap();
         let state = app_state_from_connection(conn);
-        assert!(
-            auto_compress_if_needed(&state, None, "s", &AgentConfig::default(), 0)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let provider = CheckpointProvider {
+            text: "must not be used".into(),
+            stop_reason: crate::llm::StopReason::EndTurn,
+            calls: Default::default(),
+        };
+        assert!(auto_compress_if_needed(
+            &state,
+            None,
+            "s",
+            i64::MAX,
+            &AgentConfig::default(),
+            ForegroundContextBudget {
+                estimated_tool_count: 0,
+                context_window_tokens: 8192,
+                max_output_tokens: 1024
+            },
+            &provider,
+            false,
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let conn = state.db.lock().unwrap();
         let after: String = conn
             .query_row("SELECT metadata FROM messages WHERE id='a1'", [], |row| {
@@ -3781,6 +3935,277 @@ mod tests {
             0,
             "protocol-aware compaction is deferred; a text summary must not replace opaque state"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_working_checkpoint_survives_reopen_without_rewriting_native_archive() {
+        struct ViewProvider;
+        #[async_trait::async_trait]
+        impl crate::llm::LlmProvider for ViewProvider {
+            fn name(&self) -> &str {
+                "working-checkpoint-fixture"
+            }
+            async fn chat(
+                &self,
+                messages: &[LlmMessage],
+                tools: Option<&[crate::llm::ToolSchema]>,
+                _: Option<&crate::llm::ThinkingSettings>,
+            ) -> Result<crate::llm::LlmResponse, String> {
+                assert!(tools.is_none());
+                assert!(messages[0].content.contains("以中文回答"));
+                assert!(!messages[0].content.contains("retained-marker"));
+                assert!(!messages[0].content.contains("pruned-marker"));
+                Ok(crate::llm::LlmResponse::Text {
+                    text: "以中文回答；周末计划仍待用户确认，尚未执行。".into(),
+                    stop_reason: crate::llm::StopReason::EndTurn,
+                })
+            }
+        }
+        let conn = private_protocol_edit_fixture();
+        conn.execute_batch("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES
+            ('a1','s','a1','chat','completed','[]',11,11),('a2','s','a2','chat','completed','[]',31,31);").unwrap();
+        conn.execute(
+            "UPDATE messages SET content=?1 WHERE id='u1'",
+            [format!(
+                "以中文回答，周末计划先暂定。{}",
+                "background ".repeat(3000)
+            )],
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("working.db");
+        conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+            .unwrap();
+        drop(conn);
+        let state = app_state_from_connection(Connection::open(&path).unwrap());
+        let original: Vec<(String, String, Option<String>)> = {
+            let conn = state.db.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id,content,metadata FROM messages ORDER BY rowid")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let mut config = AgentConfig::default();
+        config.preferences.use_long_term_memory = true;
+        let summary = auto_compress_if_needed(
+            &state,
+            None,
+            "s",
+            i64::MAX,
+            &config,
+            ForegroundContextBudget {
+                estimated_tool_count: 0,
+                context_window_tokens: 8192,
+                max_output_tokens: 1024,
+            },
+            &ViewProvider,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(state);
+        let conn = Connection::open(&path).unwrap();
+        let window =
+            crate::commands::foreground_history::ConversationWindow::load(&conn, "s", i64::MAX)
+                .unwrap();
+        assert_eq!(window.summary.as_deref(), Some(summary.as_str()));
+        assert_eq!(window.ids, vec!["u2", "a2"]);
+        let mut stmt = conn
+            .prepare("SELECT id,content,metadata FROM messages ORDER BY rowid")
+            .unwrap();
+        let after: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            original, after,
+            "checkpoint must not replace originals or opaque archive"
+        );
+        assert!(hydrate_llm_history(&conn, "s", i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|m| m.protocol_state.is_some()));
+        drop(stmt);
+        drop(conn);
+        // Deterministic growth mechanics, not a model-quality or multi-day
+        // score: many closed native turns must leave a smaller working window
+        // while an archived attachment remains independently readable.
+        let state = app_state_from_connection(Connection::open(&path).unwrap());
+        let mut old_reference = serde_json::Value::Null;
+        for i in 0..24 {
+            {
+                let conn = state.db.lock().unwrap();
+                let parent: String = conn
+                    .query_row(
+                        "SELECT leaf_message_id FROM sessions WHERE id='s'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let user = format!("grow-{i}-u");
+                let reply = format!("grow-{i}-a");
+                let metadata = crate::commands::foreground_text_attachments::metadata(&[
+                    crate::commands::foreground_text_attachments::TextAttachment {
+                        name: format!("note-{i}.txt"),
+                        text: format!("DOC-{i}-ORIGINAL {}", "background ".repeat(400)),
+                    },
+                ]);
+                conn.execute("INSERT INTO messages(id,session_id,role,content,metadata,parent_id,created_at) VALUES(?1,'s','user','聊聊这个话题',?2,?3,?4)",params![user,metadata,parent,100+i*2]).unwrap();
+                conn.execute("INSERT INTO messages(id,session_id,role,content,metadata,parent_id,created_at) SELECT ?1,'s','assistant','好的，先聊当前话题。',metadata,?2,?3 FROM messages WHERE id='a2'",params![reply,user,101+i*2]).unwrap();
+                conn.execute("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES(?1,'s',?1,'chat','completed','[]',?2,?2)",params![reply,101+i*2]).unwrap();
+                if i == 1 {
+                    conn.execute(
+                        "UPDATE task_runs SET status='needs_attention' WHERE id=?1",
+                        [&reply],
+                    )
+                    .unwrap();
+                    conn.execute("INSERT INTO agent_run_events(id,run_id,session_id,sequence,event_type,payload,created_at) VALUES('growth-provider-failure',?1,'s',1,'Error',?2,?3)",params![reply,serde_json::json!({"type":"Error","data":{"code":"LlmError","message":"request ended before dispatch","recoverable":true,"turn_id":null}}).to_string(),101+i*2]).unwrap();
+                }
+                conn.execute(
+                    "UPDATE sessions SET leaf_message_id=?1 WHERE id='s'",
+                    [reply],
+                )
+                .unwrap();
+                if i == 0 {
+                    old_reference =
+                        crate::commands::foreground_context_recall::checkpoint_reference(
+                            &conn, "s", &user,
+                        )
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            auto_compress_if_needed(
+                &state,
+                None,
+                "s",
+                i64::MAX,
+                &config,
+                ForegroundContextBudget {
+                    estimated_tool_count: 0,
+                    context_window_tokens: 8192,
+                    max_output_tokens: 1024,
+                },
+                &ViewProvider,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let conn = state.db.lock().unwrap();
+            let history = crate::commands::foreground_history::CheckpointHistory::load(
+                &conn,
+                "s",
+                i64::MAX,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            let active: usize = history.messages.iter().map(|m| m.2.len()).sum();
+            let archived:i64=conn.query_row("SELECT sum(length(CAST(content AS BLOB))+length(CAST(COALESCE(metadata,'') AS BLOB))) FROM messages WHERE session_id='s'",[],|r|r.get(0)).unwrap();
+            assert!(
+                active * 2 < archived as usize,
+                "active={active}, archive={archived}"
+            );
+            assert!(
+                conn.query_row::<i64, _, _>("SELECT count(*) FROM context_summaries", [], |r| r
+                    .get(0))
+                    .unwrap()
+                    >= 3
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>("SELECT count(*) FROM messages", [], |r| r.get(0))
+                    .unwrap(),
+                52
+            );
+        }
+        let mut registry = crate::agent::ToolRegistry::empty();
+        crate::commands::foreground_context_recall::register(
+            &mut registry,
+            state.db.clone(),
+            "s".into(),
+        );
+        let restored=registry.execute(&crate::agent::ToolCall::new("read_conversation".into(),serde_json::json!({"message_id":old_reference["message_id"],"revision":old_reference["revision"],"attachment_index":0})),"growth-read",std::path::Path::new(".")).result;
+        assert!(
+            restored.success && restored.content.contains("DOC-0-ORIGINAL"),
+            "{}",
+            restored.content
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_source_mutations_during_summary_inference() {
+        struct EditingProvider(Arc<Mutex<rusqlite::Connection>>, &'static str);
+        #[async_trait::async_trait]
+        impl crate::llm::LlmProvider for EditingProvider {
+            fn name(&self) -> &str {
+                "editing-checkpoint-fixture"
+            }
+            async fn chat(
+                &self,
+                _: &[crate::llm::Message],
+                _: Option<&[crate::llm::ToolSchema]>,
+                _: Option<&crate::llm::ThinkingSettings>,
+            ) -> Result<crate::llm::LlmResponse, String> {
+                self.0.lock().unwrap().execute(self.1, []).unwrap();
+                Ok(crate::llm::LlmResponse::Text {
+                    text: "A stale but concise checkpoint".into(),
+                    stop_reason: crate::llm::StopReason::EndTurn,
+                })
+            }
+        }
+        for mutation in [
+            "UPDATE messages SET content='A newer user correction' WHERE id='u1'",
+            "UPDATE task_run_facts SET facts_json=json_set(facts_json,'$.goal','A newer fact') WHERE task_run_id='a1'",
+            "UPDATE task_runs SET status='awaiting_confirmation' WHERE id='a1'",
+            "INSERT INTO agent_run_events(id,run_id,session_id,sequence,event_type,payload,created_at) VALUES('late','a1','s',1,'ToolExecutionEnd','{}',11)",
+        ] {
+        let conn = private_protocol_edit_fixture();
+        conn.execute(
+            "UPDATE messages SET metadata=NULL,content=?1",
+            ["source ".repeat(1000)],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES
+            ('a1','s','a1','chat','completed','[]',11,11),('a2','s','a2','chat','completed','[]',31,31);").unwrap();
+        persist_task_facts(&conn,"a1","s","a1",&TaskFacts::new("original fact"),11).unwrap();
+        let state = app_state_from_connection(conn);
+        let provider = EditingProvider(state.db.clone(),mutation);
+        let error = auto_compress_if_needed(
+            &state,
+            None,
+            "s",
+            i64::MAX,
+            &AgentConfig::default(),
+            ForegroundContextBudget {
+                estimated_tool_count: 0,
+                context_window_tokens: 4096,
+                max_output_tokens: 1024,
+            },
+            &provider,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("source changed"), "{error}");
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM context_summaries", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        if mutation.starts_with("UPDATE messages") { assert_eq!(
+            hydrate_llm_history(&conn, "s", i64::MAX).unwrap()[0].content,
+            "A newer user correction"
+        ); }
+        }
     }
 
     #[test]
@@ -4169,11 +4594,139 @@ mod tests {
             ..Default::default()
         };
 
-        let deepseek_budget = usable_context_tokens(&agent_config, 15, &deepseek).unwrap();
-        let custom_budget = usable_context_tokens(&agent_config, 15, &custom).unwrap();
+        let budget = |config: &crate::llm::ProviderConfig| ForegroundContextBudget {
+            estimated_tool_count: 15,
+            context_window_tokens: crate::llm::context_window_tokens(config),
+            max_output_tokens: config.max_tokens as usize,
+        };
+        let deepseek_budget = usable_context_tokens(&agent_config, budget(&deepseek)).unwrap();
+        let custom_budget = usable_context_tokens(&agent_config, budget(&custom)).unwrap();
 
         assert!(deepseek_budget > custom_budget);
         assert_eq!(deepseek_budget - custom_budget, 1_000_000 - 8_192);
+    }
+
+    #[test]
+    fn live_compaction_uses_bound_limits_without_small_window_floor_or_fallback() {
+        let config = AgentConfig::default();
+        let system = estimate_system_prompt_tokens(&config, 15);
+        for window in [system + 1025, 8192, 1_000_000] {
+            let budget = ForegroundContextBudget {
+                estimated_tool_count: 15,
+                context_window_tokens: window,
+                max_output_tokens: 1024,
+            };
+            let (threshold, tail) = live_context_compaction_budget(&config, budget).unwrap();
+            assert!(0 < tail && tail <= threshold);
+            assert!(threshold <= window - system - 1024);
+        }
+        for output in [8192 - system, 8192] {
+            assert!(
+                live_context_compaction_budget(
+                    &config,
+                    ForegroundContextBudget {
+                        estimated_tool_count: 15,
+                        context_window_tokens: 8192,
+                        max_output_tokens: output,
+                    }
+                )
+                .is_err(),
+                "invalid limits must not become a default 8192-token budget"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_checkpoint_uses_bound_provider_and_retains_history_on_invalid_output() {
+        use crate::llm::StopReason;
+        for (text, stop_reason, accepted) in [
+            ("partial".into(), StopReason::MaxTokens, false),
+            (" ".into(), StopReason::EndTurn, false),
+            ("x".repeat(30_000), StopReason::EndTurn, false),
+            (
+                "Concise supported checkpoint".into(),
+                StopReason::EndTurn,
+                true,
+            ),
+        ] {
+            for transparent_ledger in [false, true] {
+                let conn = private_protocol_edit_fixture();
+                conn.execute(
+                    "UPDATE messages SET metadata=NULL, content=?1",
+                    ["source ".repeat(1000)],
+                )
+                .unwrap();
+                if transparent_ledger {
+                    let metadata =
+                        crate::commands::foreground_history::private_transcript_metadata(&[
+                            crate::llm::Message {
+                                role: "assistant".into(),
+                                content: "source ".repeat(1000),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                tool_images: vec![],
+                                protocol_state: None,
+                            },
+                        ])
+                        .unwrap()
+                        .unwrap();
+                    conn.execute(
+                        "UPDATE messages SET metadata=?1 WHERE role='assistant'",
+                        [metadata],
+                    )
+                    .unwrap();
+                }
+                let state = app_state_from_connection(conn);
+                let provider = CheckpointProvider {
+                    text: text.clone(),
+                    stop_reason: stop_reason.clone(),
+                    calls: Default::default(),
+                };
+                let result = auto_compress_if_needed(
+                    &state,
+                    None,
+                    "s",
+                    i64::MAX,
+                    &AgentConfig::default(),
+                    ForegroundContextBudget {
+                        estimated_tool_count: 0,
+                        context_window_tokens: 4096,
+                        max_output_tokens: 1024,
+                    },
+                    &provider,
+                    false,
+                )
+                .await;
+                assert_eq!(result.ok().flatten().is_some(), accepted);
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let conn = state.db.lock().unwrap();
+                let summaries: i64 = conn
+                    .query_row("SELECT count(*) FROM context_summaries", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                let marked: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM messages WHERE metadata LIKE '%\"compressed\": true%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+                assert_eq!(summaries, i64::from(accepted));
+                assert_eq!(
+                    marked, 0,
+                    "the checkpoint does not mutate its original sources"
+                );
+                if accepted {
+                    assert!(fetch_latest_summary(&conn, "s").unwrap().is_some());
+                    assert_eq!(
+                        hydrate_llm_history(&conn, "s", i64::MAX).unwrap().len(),
+                        2,
+                        "completed turns before the anchor stay archived, not replayed"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4436,6 +4989,24 @@ mod tests {
         assert_eq!(unique_step_ids, 2);
     }
 
+    // These compact fixtures exercise legacy inline protocol payloads, not a
+    // legacy database reader. Supply the current selected-ancestry contract.
+    fn select_legacy_history_fixture(conn: &rusqlite::Connection, leaf: &str) {
+        conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,leaf_message_id TEXT REFERENCES messages(id));
+          CREATE TABLE context_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),summary TEXT NOT NULL,anchor_message_id TEXT REFERENCES messages(id),compressed_at INTEGER NOT NULL);
+          ALTER TABLE messages ADD COLUMN parent_id TEXT REFERENCES messages(id);
+          ALTER TABLE messages ADD COLUMN is_provisional INTEGER NOT NULL DEFAULT 0;
+          UPDATE messages SET parent_id=(SELECT older.id FROM messages older
+            WHERE older.session_id=messages.session_id AND older.role!='tool'
+              AND (older.created_at<messages.created_at OR (older.created_at=messages.created_at AND older.rowid<messages.rowid))
+            ORDER BY older.created_at DESC,older.rowid DESC LIMIT 1) WHERE role!='tool';").unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,leaf_message_id) VALUES('s1',?1)",
+            [leaf],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn hydrate_llm_history_restores_native_tool_result_pairs() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -4469,6 +5040,7 @@ mod tests {
         )
         .unwrap();
 
+        select_legacy_history_fixture(&conn, "call-1");
         let history = hydrate_llm_history(&conn, "s1", 3).unwrap();
 
         assert_eq!(history.len(), 3);
@@ -4540,6 +5112,7 @@ mod tests {
         )
         .unwrap();
 
+        select_legacy_history_fixture(&conn, "u1-dup");
         let history = hydrate_llm_history(&conn, "s1", 3).unwrap();
 
         // The hydrated history must contain the original assistant tool call
@@ -4590,6 +5163,7 @@ mod tests {
         )
         .unwrap();
 
+        select_legacy_history_fixture(&conn, "u2");
         let history = hydrate_llm_history(&conn, "s1", 4).unwrap();
 
         assert_eq!(history.len(), 3);
@@ -4643,6 +5217,7 @@ mod tests {
         )
         .unwrap();
 
+        select_legacy_history_fixture(&conn, "c1");
         let history = hydrate_llm_history(&conn, "s1", 4).unwrap();
 
         // Must have 3 messages: user + assistant with tool_calls + tool result for c1
@@ -5835,7 +6410,9 @@ mod tests {
                 DesktopControlOperation::ScrollUp => {
                     ("fixtureScroll", "Fixture scroll area", "scrollAtTop", true)
                 }
-                DesktopControlOperation::Invoke | DesktopControlOperation::Choose => unreachable!(),
+                DesktopControlOperation::Invoke | DesktopControlOperation::Choose => {
+                    unreachable!()
+                }
             };
             let before_preview = read_owned_fixture();
             assert!(before_preview["scrollableHeight"].as_f64().unwrap() > 0.0);
@@ -8182,7 +8759,12 @@ rl.on('line', (line) => {{
     #[test]
     fn delegated_change_materialization_uses_the_standard_confirmation_flow() {
         let dir = tempfile::tempdir().unwrap();
-        let state = setup_confirmation_state(dir.path());
+        let mut state = setup_confirmation_state(dir.path());
+        let (service, calls) = crate::agent::delegation_service::test_support::recording_service(
+            crate::agent::delegation_contract::ContractLimits::default(),
+        );
+        state.delegation_pump =
+            Some(crate::agent::delegation_pump::DelegationPumpHostHandle::new(service));
         let registry =
             crate::commands::foreground_tool_surface::ForegroundToolSurface::new(&state, None)
                 .build_for_session("s1".to_string())
@@ -8193,6 +8775,26 @@ rl.on('line', (line) => {{
                 .expect("materialization tool should be registered")
                 .requires_confirmation
         );
+        for name in [
+            "list_delegated_work",
+            "stop_delegated_work",
+            "review_delegated_delivery",
+        ] {
+            assert!(
+                registry.contains(name),
+                "live service control missing: {name}"
+            );
+        }
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "assembly must not start work"
+        );
+        state.delegation_pump = None;
+        let unavailable =
+            crate::commands::foreground_tool_surface::ForegroundToolSurface::new(&state, None)
+                .build_for_session("s1".to_string())
+                .unwrap();
+        assert!(!unavailable.contains("materialize_delegated_change"));
     }
 
     #[test]

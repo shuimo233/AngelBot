@@ -52,6 +52,132 @@ mod tests {
     }
 
     #[test]
+    fn read_file_windows_preserve_unicode_provenance_and_legacy_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let text = format!("{}尾部标记", "中🪶\n\"\\\u{0000}".repeat(1800));
+        std::fs::write(&path, &text).unwrap();
+        let h = ReadFileHandler::new();
+        let legacy = h.execute(&serde_json::json!({"path":"notes.txt"}), dir.path());
+        assert!(legacy.success, "{}", legacy.content);
+        let full: serde_json::Value = serde_json::from_str(&legacy.content).unwrap();
+        assert_eq!(full["content"], text);
+        assert_eq!(full.as_object().unwrap().len(), 2);
+        let tail = h.execute(
+            &serde_json::json!({"path":"notes.txt","tail":true,"limit":2000}),
+            dir.path(),
+        );
+        assert!(tail.success, "{}", tail.content);
+        assert!(tail.content.starts_with("{\"resolvedPath\":"));
+        assert!(tail.content.len() <= crate::agent::tool_context::MAX_VIEW_BYTES);
+        let end: serde_json::Value = serde_json::from_str(&tail.content).unwrap();
+        assert_eq!(end["resolvedPath"], full["resolvedPath"]);
+        assert!(end["content"].as_str().unwrap().ends_with("尾部标记"));
+        assert_eq!(end["complete"], false);
+        assert_eq!(end["omitted_before"], true);
+        assert_eq!(end["has_more"], false);
+        assert!(end["next_offset"].is_null());
+        assert_eq!(
+            end["offset"].as_u64().unwrap() as usize
+                + end["content"].as_str().unwrap().chars().count(),
+            text.chars().count()
+        );
+        let page = h.execute(
+            &serde_json::json!({"path":"notes.txt","offset":1,"limit":2}),
+            dir.path(),
+        );
+        let page: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+        assert_eq!(page["content"], "🪶\n");
+        assert_eq!(page["next_offset"], 3);
+        let mut restored = String::new();
+        let mut offset = 0;
+        loop {
+            let page = h.execute(
+                &serde_json::json!({"path":"notes.txt","offset":offset,"limit":2000}),
+                dir.path(),
+            );
+            assert!(page.success, "{}", page.content);
+            assert!(page.content.len() <= crate::agent::tool_context::MAX_VIEW_BYTES);
+            let page: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            let Some(next) = page["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(restored, text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let schema = crate::agent::tool::schemas::read_file();
+        assert_eq!(schema["properties"]["offset"]["minimum"], 0);
+        assert_eq!(schema["properties"]["limit"]["maximum"], 2000);
+        assert_eq!(schema["required"], serde_json::json!(["path"]));
+        println!(
+            "FILE_WINDOW_BYTES full={} tail={}",
+            legacy.content.len(),
+            tail.content.len()
+        );
+    }
+
+    #[test]
+    fn read_file_windows_reject_invalid_options_and_keep_office_limitations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "short").unwrap();
+        let h = ReadFileHandler::new();
+        for args in [
+            serde_json::json!({"path":"notes.txt","limit":0}),
+            serde_json::json!({"path":"notes.txt","limit":2001}),
+            serde_json::json!({"path":"notes.txt","offset":-1}),
+            serde_json::json!({"path":"notes.txt","offset":6}),
+            serde_json::json!({"path":"notes.txt","tail":true,"offset":1}),
+            serde_json::json!({"path":"notes.txt","tail":"true"}),
+            serde_json::json!({"path":"notes.txt","line":1}),
+        ] {
+            assert!(!h.execute(&args, dir.path()).success, "{args}");
+        }
+        let complete = h.execute(
+            &serde_json::json!({"path":"notes.txt","limit":2000}),
+            dir.path(),
+        );
+        let complete: serde_json::Value = serde_json::from_str(&complete.content).unwrap();
+        assert_eq!(complete["complete"], true);
+        assert_eq!(complete["content"], "short");
+        let package = crate::document_text::package_fixture(&[
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            (
+                "word/document.xml",
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Office body</w:t></w:r></w:p></w:body></w:document>"#,
+            ),
+        ]);
+        std::fs::write(dir.path().join("notes.DOCX"), &package).unwrap();
+        let legacy = h.execute(&serde_json::json!({"path":"notes.DOCX"}), dir.path());
+        assert!(legacy.success, "{}", legacy.content);
+        let full: serde_json::Value = serde_json::from_str(&legacy.content).unwrap();
+        assert!(full["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::document_text::DOCX_NOTICE));
+        let window = h.execute(
+            &serde_json::json!({"path":"notes.DOCX","tail":true}),
+            dir.path(),
+        );
+        assert!(!window.success);
+        assert!(window.content.contains("Office 文本快照暂不支持局部参数"));
+        assert!(!window.content.contains("Office body"));
+        assert_eq!(
+            std::fs::read(dir.path().join("notes.DOCX")).unwrap(),
+            package
+        );
+    }
+
+    #[test]
     fn test_write_file_handler_invalid_args() {
         let h = WriteFileHandler;
         let result = h.execute(&serde_json::json!({"bad": "args"}), Path::new("."));
@@ -141,6 +267,12 @@ mod tests {
             body
         );
         let rejected = h.execute(&serde_json::json!({"path":outside_file}), workspace.path());
+        assert!(!rejected.success);
+        assert!(!rejected.content.contains("must not be visible"));
+        let rejected = h.execute(
+            &serde_json::json!({"path":outside_file,"tail":true,"limit":20}),
+            workspace.path(),
+        );
         assert!(!rejected.success);
         assert!(!rejected.content.contains("must not be visible"));
         assert_eq!(
@@ -406,7 +538,10 @@ mod tests {
 
     #[test]
     fn test_recall_memories_handler() {
-        let (_db, arc) = db();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let arc = Arc::new(Mutex::new(conn));
         // Insert a test memory
         {
             let db = arc.lock().unwrap();
@@ -416,7 +551,8 @@ mod tests {
         let h = RecallMemoriesHandler {
             db: Some(arc.clone()),
         };
-        // Fallback to keyword search when vector store unavailable
+        // Exercise the current schema and its real keyword index, without
+        // fabricating a partial table or requiring a vector cache.
         let result = h.execute(
             &serde_json::json!({"query": "Python", "limit": 5}),
             Path::new("."),

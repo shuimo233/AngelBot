@@ -1,6 +1,6 @@
 [package]
 name = "angelbot"
-version = "0.1.0"
+version = "0.2.0"
 description = "AngelBot - 个人 AI Agent 桌面应用"
 authors = ["AngelBot contributors"]
 repository = "https://github.com/shuimo233/AngelBot"

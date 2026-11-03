@@ -408,6 +408,15 @@ impl LlmProvider for DynamicLlmProvider {
         self.inner.supports_tool_images()
     }
 
+    #[cfg(test)]
+    fn latest_request_fingerprint(&self) -> Option<crate::llm::ProviderRequestFingerprint> {
+        self.inner.latest_request_fingerprint()
+    }
+    #[cfg(test)]
+    fn latest_response_metadata(&self) -> Option<crate::llm::ProviderResponseMetadata> {
+        self.inner.latest_response_metadata()
+    }
+
     async fn chat(
         &self,
         messages: &[crate::llm::Message],

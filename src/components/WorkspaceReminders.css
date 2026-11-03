@@ -22,6 +22,20 @@
 }
 
 .workspace-reminders-title { font-weight: 600; }
+.workspace-automation-indicator {
+  padding: 6px 8px; border: 0; border-radius: var(--ui-radius-control);
+  background: transparent; color: var(--color-text-secondary); font: inherit;
+  font-size: 12px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+}
+.workspace-automation-indicator:hover { background: var(--ui-hover); color: var(--color-text); }
+.workspace-automation-indicator:focus-visible { outline: 2px solid var(--color-accent-border); outline-offset: 2px; }
+.right-panel .workspace-reminders { width: auto; margin: 12px 0; }
+.right-panel .workspace-reminders-content { max-height: none; }
+.right-panel .workspace-reminders-counts { display: block; margin-left: 16px; }
+.right-panel .workspace-reminders-results li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; }
+.right-panel .workspace-reminders-results .messages-empty-item-name { grid-column: 1 / -1; max-width: none; }
+.right-panel .workspace-reminders-result-detail { grid-column: 1; }
+.right-panel .workspace-reminders-results li > button { grid-column: 2; grid-row: 2; align-self: start; }
 .workspace-reminders-counts { margin-left: 10px; color: var(--color-muted); }
 .workspace-reminders-content {
   display: grid;

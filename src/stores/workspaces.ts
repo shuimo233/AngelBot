@@ -3,26 +3,25 @@ import { createProjectWorkspace, getWorkspaces, openWorkspace, type Workspace } 
 import { useSessionsStore } from './sessions';
 
 /**
- * Resolve an unambiguous project mention before a Personal-space turn starts.
+ * Cheap admission only: names identify possible contexts, never user intent.
  *
  * This deliberately uses only the user-maintained project names already shown
  * in the sidebar. It never asks the model to infer a filesystem target, and it
- * leaves generic Personal-space conversation where it is.
+ * leaves actual routing to a bounded semantic decision or explicit UI choice.
  */
-export function projectWorkspaceForMessage(
+export function projectCandidatesForMessage(
   content: string,
   workspaces: Workspace[],
   activeWorkspaceId: string | null,
-): Workspace | null {
+): Workspace[] {
   if (workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.kind !== 'personal') {
-    return null;
+    return [];
   }
   const normalizedContent = content.trim().toLocaleLowerCase();
-  if (!normalizedContent) return null;
+  if (!normalizedContent) return [];
   return workspaces
     .filter((workspace) => workspace.kind === 'project' && workspace.name.trim().length >= 2)
-    .filter((workspace) => normalizedContent.includes(workspace.name.trim().toLocaleLowerCase()))
-    .sort((left, right) => right.name.length - left.name.length)[0] ?? null;
+    .filter((workspace) => normalizedContent.includes(workspace.name.trim().toLocaleLowerCase()));
 }
 
 interface WorkspaceState {

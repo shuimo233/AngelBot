@@ -1379,8 +1379,13 @@ mod tests {
         // Loading efficiently must not cap a private branch at the legacy
         // 100-row window or return a partial success on a late malformed row.
         for index in 0..105 {
-            conn.execute("INSERT INTO messages (id,session_id,role,content,created_at) VALUES(?1,'s','user',?2,?3)",
+            conn.execute("INSERT INTO messages (id,session_id,role,content,created_at,parent_id) VALUES(?1,'s','user',?2,?3,(SELECT leaf_message_id FROM sessions WHERE id='s'))",
                 params![format!("tail-{index}"), format!("tail-content-{index}"), 100 + index]).unwrap();
+            conn.execute(
+                "UPDATE sessions SET leaf_message_id=?1 WHERE id='s'",
+                [format!("tail-{index}")],
+            )
+            .unwrap();
         }
         let long =
             crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 1000).unwrap();
@@ -1404,6 +1409,7 @@ mod tests {
     fn store() -> ForegroundRunStore {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, leaf_message_id TEXT, updated_at INTEGER);
+            CREATE TABLE context_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),summary TEXT NOT NULL,anchor_message_id TEXT REFERENCES messages(id),compressed_at INTEGER NOT NULL);
             CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, parent_id TEXT, is_provisional INTEGER DEFAULT 0, created_at INTEGER, tool_calls TEXT, tool_call_id TEXT, tool_name TEXT, metadata TEXT);
             CREATE TABLE task_runs (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, goal TEXT, status TEXT, plan TEXT, confirmation_state TEXT DEFAULT 'none', resumable INTEGER DEFAULT 0, step_count INTEGER DEFAULT 0, completed_step_count INTEGER DEFAULT 0, continuation_context TEXT DEFAULT '', created_at INTEGER, updated_at INTEGER);
             CREATE TABLE delegations (id TEXT PRIMARY KEY, parent_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE);
@@ -1664,7 +1670,8 @@ mod tests {
             crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 20)
                 .unwrap()
                 .len(),
-            1
+            2,
+            "an unanchored legacy compressed flag cannot hide original input"
         );
     }
 

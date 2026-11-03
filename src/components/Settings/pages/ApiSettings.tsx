@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { chatgptPlanStatus, chatgptPlanSignIn, chatgptPlanChangeAccount, chatgptPlanCancelSignIn, chatgptPlanDisconnect, chatgptPlanModels, testModelConnection, type ChatgptPlanStatus, type ChatgptPlanModel, type ToolRoundTrip } from '$lib/commands/settings';
 import {
   ALL_PROVIDERS,
@@ -39,12 +39,13 @@ export function ApiSettings() {
   const [toolRoundTrip, setToolRoundTrip] = useState<ToolRoundTrip | null>(null);
   const [planStatus, setPlanStatus] = useState<ChatgptPlanStatus | null>(null);
   const [planModels, setPlanModels] = useState<ChatgptPlanModel[]>([]);
+  const [planModelsLoading, setPlanModelsLoading] = useState(false);
+  const [planModelsError, setPlanModelsError] = useState('');
   const [planBusy, setPlanBusy] = useState<'idle' | 'checking' | 'signing-in' | 'disconnecting'>('idle');
   const [planError, setPlanError] = useState('');
   const [planNotice, setPlanNotice] = useState(false);
   const planOperation = useRef(0);
   const testOperation = useRef(0);
-  const modelListId = useId();
 
   useEffect(() => {
     if (!apiConfigLoaded) void loadApiConfig();
@@ -57,6 +58,7 @@ export function ApiSettings() {
   const authMode = apiConfig.authMode ?? (meta.requiresKey ? 'api_key' : 'none');
   const isPlan = authMode === 'chatgpt_plan';
   const models = isPlan ? planModels.map((model) => ({ value: model.id, label: model.name })) : getModelsForProvider(provider);
+  const listedModel = models.some((model) => model.value === apiConfig.model);
   const hasCredentials = Boolean(apiConfig.apiKey.trim() || apiConfig.hasApiKey);
   const environmentManaged = apiConfig.credentialSource === 'environment';
   const endpointRequired = meta.endpointMode === 'required';
@@ -65,6 +67,8 @@ export function ApiSettings() {
   const planReady = Boolean(planStatus?.connected && planStatus.planEnabled && !planStatus.needsSignIn && planStatus.credentialRef);
   const missingCredentials = isPlan ? !planReady : authMode === 'api_key' && !hasCredentials;
   const canTest = !missingModel && !missingEndpoint && !missingCredentials;
+  const [connectionOpen, setConnectionOpen] = useState(() => !apiConfigLoaded
+    || (isPlan ? !apiConfig.planConnected : authMode === 'api_key' && !hasCredentials));
 
   const applyPlanStatus = (status: ChatgptPlanStatus) => {
     setPlanStatus(status);
@@ -95,10 +99,14 @@ export function ApiSettings() {
 
   useEffect(() => {
     setPlanModels([]);
+    setPlanModelsLoading(false);
+    setPlanModelsError('');
     if (!isPlan || !planStatus?.connected || !planStatus.planEnabled || planStatus.needsSignIn) return;
     let cancelled = false;
+    setPlanModelsLoading(true);
     void chatgptPlanModels().then((models) => { if (!cancelled) setPlanModels(models); })
-      .catch((error: unknown) => { if (!cancelled) setPlanError(`无法读取账号模型列表，可手动填写已授权模型：${String(error)}`); });
+      .catch((error: unknown) => { if (!cancelled) setPlanModelsError(`无法读取账号模型列表，可手动填写已授权模型：${String(error)}`); })
+      .finally(() => { if (!cancelled) setPlanModelsLoading(false); });
     return () => { cancelled = true; };
   }, [isPlan, planStatus?.connected, planStatus?.planEnabled, planStatus?.needsSignIn, planStatus?.credentialRef]);
 
@@ -239,158 +247,185 @@ export function ApiSettings() {
         </dl>
       </section>
 
-      <section className="model-config-section" aria-labelledby="model-provider-heading">
+      <section className="model-config-section" aria-labelledby="model-default-heading">
         <header>
-          <h3 id="model-provider-heading">服务商与模型</h3>
-          <p>选择当前默认模型；服务商新增的模型标识可直接填写。</p>
+          <h3 id="model-default-heading">默认模型</h3>
+          <p>对话和子代理使用此模型。可从候选中选择，也可填写新的模型标识。</p>
         </header>
         <div className="model-field-grid">
-          <label className="model-field">
-            <span>服务商</span>
-            <Select value={provider} onChange={(event) => handleProviderChange(event.target.value as ApiProvider)}>
-              {ALL_PROVIDERS.map((item) => (
-                <option key={item.id} value={item.id}>{item.name}</option>
-              ))}
-            </Select>
-          </label>
-          {(provider === 'openai' || provider === 'custom') && (
-            <label className="model-field">
-              <span>认证方式</span>
-              <Select value={authMode} onChange={(event) => {
-                const nextMode = event.target.value as ApiConfig['authMode'];
-                updateConnection(nextMode === 'chatgpt_plan'
-                  ? { authMode: nextMode, protocol: 'openai_responses', baseUrl: 'https://api.openai.com/v1', apiKey: '', hasApiKey: false, credentialSource: 'none', credentialRef: planStatus?.credentialRef ?? null, planEnabled: Boolean(planStatus?.planEnabled), planConnected: Boolean(planStatus?.connected) }
-                  : { authMode: nextMode, ...(nextMode === 'none' ? { apiKey: '', hasApiKey: false, credentialSource: 'none' as const } : {}), credentialRef: null, planEnabled: false, planConnected: false, planAccountLabel: null });
-                setShowApiKey(false);
-              }}>
-                <option value="api_key">API Key（独立 API 计费）</option>
-                {provider === 'openai' ? <option value="chatgpt_plan">ChatGPT 套餐</option> : <option value="none">免认证（显式）</option>}
+          {(isPlan || models.length > 0) && (
+            <label className="model-field model-candidate-field">
+              <span>选择模型</span>
+              <Select
+                aria-label="选择模型"
+                value={listedModel ? apiConfig.model : ''}
+                disabled={models.length === 0}
+                onChange={(event) => updateConnection({ model: event.target.value })}
+              >
+                <option value="" disabled>
+                  {planModelsLoading ? '正在读取账号模型…'
+                    : planModelsError ? '列表读取失败，可手动填写'
+                      : !models.length ? planReady ? '账号未提供候选，可手动填写' : '授权后读取账号模型'
+                        : apiConfig.model ? '自定义模型（见模型标识）' : '请选择或手动填写'}
+                </option>
+                {models.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}
               </Select>
-            </label>
-          )}
-          {(provider === 'custom' || provider === 'openai') && (
-            <label className="model-field">
-              <span>协议</span>
-              <Select value={apiConfig.protocol ?? 'openai_chat_completions'} disabled={isPlan}
-                onChange={(event) => updateConnection({ protocol: event.target.value as ApiConfig['protocol'] })}>
-                <option value="openai_chat_completions">OpenAI Chat Completions</option>
-                <option value="openai_responses">OpenAI Responses</option>
-                {provider === 'custom' && <option value="anthropic_messages">Anthropic Messages</option>}
-              </Select>
+              <small role={planModelsError ? 'alert' : undefined}>
+                {planModelsError || (isPlan ? '候选来自当前授权账号；读取列表不会替换已填写的模型。' : '选择后填入模型标识；也可以直接填写未列出的新模型。')}
+              </small>
             </label>
           )}
           <label className="model-field">
             <span>{provider === 'azure' ? '部署名称' : '模型标识'}</span>
             <Input
               type="text"
-              list={models.length ? modelListId : undefined}
               aria-label={provider === 'azure' ? '部署名称' : '模型标识'}
               value={apiConfig.model}
               onChange={(event) => updateConnection({ model: event.target.value })}
               placeholder={provider === 'azure' ? '例如 production-gpt' : '输入或选择模型'}
               autoComplete="off"
             />
-            {models.length > 0 && (
-              <datalist id={modelListId}>
-                {models.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}
-              </datalist>
-            )}
             <small>{isPlan ? '列表来自当前授权账号，也可手动填写该账号允许的模型标识。' : '支持直接填写服务商新增的模型标识。'}</small>
           </label>
         </div>
       </section>
 
-      {isPlan && (
-        <section className="model-config-section" aria-labelledby="chatgpt-plan-heading">
-          <header><h3 id="chatgpt-plan-heading">使用 ChatGPT 套餐</h3><p>符合条件的请求使用共享套餐额度或可用 credits；不等于无限用量，也不会自动切换付费 API。</p></header>
-          <p role="status">{planBusy === 'checking' ? '正在读取账号状态…' : planStatus?.connected ? `${planStatus.accountLabel || 'ChatGPT 账号'} · ${planStatus.planEnabled && !planStatus.needsSignIn ? '已授权套餐用量' : '需要重新授权套餐用量'}` : '尚未连接 ChatGPT 账号'}</p>
-          <div className="model-field-inline">
-            <Button variant="primary" busy={planBusy === 'signing-in'} disabled={planBusy !== 'idle'} onClick={() => { void handlePlanSignIn(); }}>Continue with ChatGPT</Button>
-            {planStatus?.connected && <Button variant="secondary" disabled={planBusy !== 'idle'} onClick={() => { void handlePlanSignIn(true); }}>更换账号</Button>}
-            {planBusy === 'signing-in' && <Button onClick={() => { void handlePlanCancel(); }}>取消登录</Button>}
-            {planStatus?.connected && <Button variant="secondary" disabled={planBusy !== 'idle'} onClick={() => { void handlePlanDisconnect(); }}>断开 ChatGPT 连接</Button>}
-          </div>
-          <small>仅点击登录或更换账号才会打开授权页面。当前仅连接一个账号；更换成功后仍需“保存”才会使用新配置，取消不会断开原账号。可在 ChatGPT 设置 → Usage 管理共享额度。</small>
-          {planError && <p className="model-test-error" role="alert">{planError}</p>}
-          <Dialog open={planNotice} title="ChatGPT 套餐授权说明" onClose={dismissPlanNotice}>
-            <p>ChatGPT 套餐用量已授权。保存此配置后，符合条件的 AI 请求将使用套餐额度或可用 credits；额度可在 ChatGPT 设置 → Usage 管理。</p>
-            <Button onClick={dismissPlanNotice}>知道了</Button>
-          </Dialog>
-        </section>
-      )}
-
-      <section className="model-config-section" aria-labelledby="model-connection-heading">
-        <header>
-          <h3 id="model-connection-heading">连接信息</h3>
-          <p>测试使用当前表单内容；确认无误后仍需点击右上角“保存”。</p>
-        </header>
-
-        <div className="model-field">
-          <label htmlFor="model-api-endpoint">API 地址</label>
-          <div className="model-field-inline">
-            <Input
-              id="model-api-endpoint"
-              type="url"
-              value={apiConfig.baseUrl}
-              onChange={(event) => updateConnection({ baseUrl: event.target.value })}
-              placeholder={meta.defaultBaseUrl || 'https://example.com/v1'}
-              aria-describedby="model-endpoint-help"
-              readOnly={isPlan}
-            />
-            {!isPlan && meta.defaultBaseUrl && apiConfig.baseUrl !== meta.defaultBaseUrl && (
-              <Button variant="secondary" className="model-secondary-action" onClick={() => updateConnection({ baseUrl: meta.defaultBaseUrl })}>
-                恢复默认
-              </Button>
-            )}
-          </div>
-          <small id="model-endpoint-help">
-            {isPlan ? '套餐凭据仅发送至官方 https://api.openai.com/v1/responses，不支持自定义网关。' : provider === 'azure'
-              ? '填写资源的 OpenAI v1 端点，例如 https://resource.openai.azure.com/openai/v1。'
-              : meta.isLocal
-                ? '填写本地服务的 OpenAI 兼容地址。'
-                : '通常无需修改；只在使用代理网关或兼容端点时覆盖。'}
-          </small>
-        </div>
-
-        {authMode === 'api_key' ? (
-          <div className="model-field">
-            <label htmlFor="model-api-key">API Key</label>
-            <div className="model-field-inline">
-              <Input
-                id="model-api-key"
-                type={showApiKey ? 'text' : 'password'}
-                value={apiConfig.apiKey}
-                onChange={(event) => updateConnection({ apiKey: event.target.value })}
-                placeholder={environmentManaged
-                  ? `${meta.envKey} 已生效`
-                  : apiConfig.hasApiKey ? '已安全保存；留空则保留原值' : meta.envKey || '输入 API Key'}
-                disabled={environmentManaged}
-                autoComplete="off"
-                aria-describedby="model-key-help"
-              />
-              <Button
-                type="button"
-                variant="secondary"
-                className="model-secondary-action model-key-visibility"
-                onClick={() => setShowApiKey((visible) => !visible)}
-                disabled={environmentManaged}
-                aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
-              >
-                {showApiKey ? '隐藏' : '显示'}
-              </Button>
+      <details className="model-connection-editor" open={connectionOpen}
+        onToggle={event => setConnectionOpen(event.currentTarget.open)}>
+        <summary><span>管理连接</span><span>{meta.name} · {isPlan ? 'ChatGPT 套餐' : authMode === 'none' ? '免认证' : 'API Key'}</span></summary>
+        <div className="model-connection-editor-body">
+          <section className="model-config-section" aria-labelledby="model-provider-heading">
+            <header><h3 id="model-provider-heading">连接方式</h3><p>切换服务商后，请核对模型、地址与凭据，再保存配置。</p></header>
+            <div className="model-field-grid">
+              <label className="model-field">
+                <span>服务商</span>
+                <Select value={provider} onChange={(event) => handleProviderChange(event.target.value as ApiProvider)}>
+                  {ALL_PROVIDERS.map((item) => (
+                    <option key={item.id} value={item.id}>{item.name}</option>
+                  ))}
+                </Select>
+              </label>
+              {(provider === 'openai' || provider === 'custom') && (
+                <label className="model-field">
+                  <span>认证方式</span>
+                  <Select value={authMode} onChange={(event) => {
+                    const nextMode = event.target.value as ApiConfig['authMode'];
+                    updateConnection(nextMode === 'chatgpt_plan'
+                      ? { authMode: nextMode, protocol: 'openai_responses', baseUrl: 'https://api.openai.com/v1', apiKey: '', hasApiKey: false, credentialSource: 'none', credentialRef: planStatus?.credentialRef ?? null, planEnabled: Boolean(planStatus?.planEnabled), planConnected: Boolean(planStatus?.connected) }
+                      : { authMode: nextMode, ...(nextMode === 'none' ? { apiKey: '', hasApiKey: false, credentialSource: 'none' as const } : {}), credentialRef: null, planEnabled: false, planConnected: false, planAccountLabel: null });
+                    setShowApiKey(false);
+                  }}>
+                    <option value="api_key">API Key（独立 API 计费）</option>
+                    {provider === 'openai' ? <option value="chatgpt_plan">ChatGPT 套餐</option> : <option value="none">免认证（显式）</option>}
+                  </Select>
+                </label>
+              )}
+              {(provider === 'custom' || provider === 'openai') && (
+                <label className="model-field">
+                  <span>协议</span>
+                  <Select value={apiConfig.protocol ?? 'openai_chat_completions'} disabled={isPlan}
+                    onChange={(event) => updateConnection({ protocol: event.target.value as ApiConfig['protocol'] })}>
+                    <option value="openai_chat_completions">OpenAI Chat Completions</option>
+                    <option value="openai_responses">OpenAI Responses</option>
+                    {provider === 'custom' && <option value="anthropic_messages">Anthropic Messages</option>}
+                  </Select>
+                </label>
+              )}
             </div>
-            <small id="model-key-help">
-              {environmentManaged
-                ? `当前由环境变量 ${meta.envKey} 管理；请在系统环境中修改。`
-                : apiConfig.hasApiKey && !apiConfig.apiKey
-                  ? '现有密钥不会显示；只有填写新值并保存时才会替换。'
-                  : '保存后仅写入系统凭据库，不写入项目或普通配置文件。'}
-            </small>
-          </div>
-        ) : isPlan ? <p className="model-local-note">OAuth 凭据仅在后端系统凭据库管理，界面不展示或接收 API Key。</p> : (
-          <p className="model-local-note">{meta.isLocal ? '此服务商不需要 API Key。请先确保本地服务已经启动。' : '此连接已显式设为免认证，不会发送 API Key。'}</p>
-        )}
-      </section>
+          </section>
+          {isPlan && (
+            <section className="model-config-section" aria-labelledby="chatgpt-plan-heading">
+              <header><h3 id="chatgpt-plan-heading">使用 ChatGPT 套餐</h3><p>符合条件的请求使用共享套餐额度或可用 credits；不等于无限用量，也不会自动切换付费 API。</p></header>
+              <p role="status">{planBusy === 'checking' ? '正在读取账号状态…' : planStatus?.connected ? `${planStatus.accountLabel || 'ChatGPT 账号'} · ${planStatus.planEnabled && !planStatus.needsSignIn ? '已授权套餐用量' : '需要重新授权套餐用量'}` : '尚未连接 ChatGPT 账号'}</p>
+              <div className="model-field-inline">
+                <Button variant="primary" busy={planBusy === 'signing-in'} disabled={planBusy !== 'idle'} onClick={() => { void handlePlanSignIn(); }}>Continue with ChatGPT</Button>
+                {planStatus?.connected && <Button variant="secondary" disabled={planBusy !== 'idle'} onClick={() => { void handlePlanSignIn(true); }}>更换账号</Button>}
+                {planBusy === 'signing-in' && <Button onClick={() => { void handlePlanCancel(); }}>取消登录</Button>}
+                {planStatus?.connected && <Button variant="secondary" disabled={planBusy !== 'idle'} onClick={() => { void handlePlanDisconnect(); }}>断开 ChatGPT 连接</Button>}
+              </div>
+              <small>仅点击登录或更换账号才会打开授权页面。当前仅连接一个账号；更换成功后仍需“保存”才会使用新配置，取消不会断开原账号。可在 ChatGPT 设置 → Usage 管理共享额度。</small>
+              {planError && <p className="model-test-error" role="alert">{planError}</p>}
+              <Dialog open={planNotice} title="ChatGPT 套餐授权说明" onClose={dismissPlanNotice}>
+                <p>ChatGPT 套餐用量已授权。保存此配置后，符合条件的 AI 请求将使用套餐额度或可用 credits；额度可在 ChatGPT 设置 → Usage 管理。</p>
+                <Button onClick={dismissPlanNotice}>知道了</Button>
+              </Dialog>
+            </section>
+          )}
+
+          <section className="model-config-section" aria-labelledby="model-connection-heading">
+            <header>
+              <h3 id="model-connection-heading">连接信息</h3>
+              <p>测试使用当前表单内容；确认无误后仍需点击右上角“保存”。</p>
+            </header>
+
+            <div className="model-field">
+              <label htmlFor="model-api-endpoint">API 地址</label>
+              <div className="model-field-inline">
+                <Input
+                  id="model-api-endpoint"
+                  type="url"
+                  value={apiConfig.baseUrl}
+                  onChange={(event) => updateConnection({ baseUrl: event.target.value })}
+                  placeholder={meta.defaultBaseUrl || 'https://example.com/v1'}
+                  aria-describedby="model-endpoint-help"
+                  readOnly={isPlan}
+                />
+                {!isPlan && meta.defaultBaseUrl && apiConfig.baseUrl !== meta.defaultBaseUrl && (
+                  <Button variant="secondary" className="model-secondary-action" onClick={() => updateConnection({ baseUrl: meta.defaultBaseUrl })}>
+                    恢复默认
+                  </Button>
+                )}
+              </div>
+              <small id="model-endpoint-help">
+                {isPlan ? '套餐凭据仅发送至官方 https://api.openai.com/v1/responses，不支持自定义网关。' : provider === 'azure'
+                  ? '填写资源的 OpenAI v1 端点，例如 https://resource.openai.azure.com/openai/v1。'
+                  : meta.isLocal
+                    ? '填写本地服务的 OpenAI 兼容地址。'
+                    : '通常无需修改；只在使用代理网关或兼容端点时覆盖。'}
+              </small>
+            </div>
+
+            {authMode === 'api_key' ? (
+              <div className="model-field">
+                <label htmlFor="model-api-key">API Key</label>
+                <div className="model-field-inline">
+                  <Input
+                    id="model-api-key"
+                    type={showApiKey ? 'text' : 'password'}
+                    value={apiConfig.apiKey}
+                    onChange={(event) => updateConnection({ apiKey: event.target.value })}
+                    placeholder={environmentManaged
+                      ? `${meta.envKey} 已生效`
+                      : apiConfig.hasApiKey ? '已安全保存；留空则保留原值' : meta.envKey || '输入 API Key'}
+                    disabled={environmentManaged}
+                    autoComplete="off"
+                    aria-describedby="model-key-help"
+                  />
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="model-secondary-action model-key-visibility"
+                    onClick={() => setShowApiKey((visible) => !visible)}
+                    disabled={environmentManaged}
+                    aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                  >
+                    {showApiKey ? '隐藏' : '显示'}
+                  </Button>
+                </div>
+                <small id="model-key-help">
+                  {environmentManaged
+                    ? `当前由环境变量 ${meta.envKey} 管理；请在系统环境中修改。`
+                    : apiConfig.hasApiKey && !apiConfig.apiKey
+                      ? '现有密钥不会显示；只有填写新值并保存时才会替换。'
+                      : '保存后仅写入系统凭据库，不写入项目或普通配置文件。'}
+                </small>
+              </div>
+            ) : isPlan ? <p className="model-local-note">OAuth 凭据仅在后端系统凭据库管理，界面不展示或接收 API Key。</p> : (
+              <p className="model-local-note">{meta.isLocal ? '此服务商不需要 API Key。请先确保本地服务已经启动。' : '此连接已显式设为免认证，不会发送 API Key。'}</p>
+            )}
+          </section>
+        </div>
+      </details>
 
       {!isPlan && <details className="model-advanced-settings">
         <summary>生成参数</summary>

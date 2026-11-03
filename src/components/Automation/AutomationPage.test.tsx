@@ -1,14 +1,19 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createAutomation, createMaaAutomation, deleteAutomation, getAutomationRuns, getAutomationDashboard, runAutomationNow, setAutomationEnabled, stopAutomationRun, type Automation, type AutomationRun } from '$lib/commands/automation';
-import { getDesktopTrustedApps, type TrustedDesktopApp } from '$lib/commands/desktop';
+import { getDesktopTrustedApps } from '$lib/commands/desktop';
 import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { getWorkspaces } from '$lib/commands/workspace';
 import { useNavigationStore } from '$stores/navigation';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { AutomationPage } from './AutomationPage';
+import { getAutostart, setAutostart } from '$lib/commands/settings';
+import { open } from '@tauri-apps/plugin-dialog';
+
+vi.mock('$lib/commands/settings', () => ({ getAutostart: vi.fn(), setAutostart: vi.fn() }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
 
 vi.mock('$lib/commands/automation', () => ({
   createAutomation: vi.fn(),
@@ -61,14 +66,23 @@ const scriptAutomation = {
   triggerKind: 'schedule', triggerValue: '每天 18:00', enabled: true, scriptPath: 'scripts/daily.ps1',
 };
 const maaAutomation = { ...scriptAutomation, id: 'daily-maa', title: 'MAA 日常队列', executorKind: 'maa', scriptPath: undefined, timeoutSeconds: 3600 };
-const trustedMaaApp: TrustedDesktopApp = {
-  id: 'maa-app', displayName: '测试 MAA', executablePath: 'C:/Game Tools/MAA.exe',
-  capabilities: ['launch'], draftSelector: null, enabled: true, createdAt: 1, updatedAt: 1,
-};
+// Creation is deliberately secondary to the task list. Exercise the visible
+// disclosure before querying fields; do not force test-only component state.
+function openCreation() {
+  const create = screen.queryByRole('button', { name: '添加自动化' });
+  if (create) fireEvent.click(create);
+}
+
+function taskNameInput() {
+  openCreation();
+  return screen.getByLabelText('任务名称');
+}
 
 describe('AutomationPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getAutostart).mockResolvedValue(false);
+    vi.mocked(setAutostart).mockResolvedValue(undefined);
     getAutomationsMock.mockResolvedValue([]);
     getAutomationRunsMock.mockResolvedValue([]);
     getHistoryMock.mockResolvedValue([]);
@@ -80,6 +94,7 @@ describe('AutomationPage', () => {
       return { ...item, latestRun, lastSkippedAt: runs[0]?.status === 'skipped' ? runs[0].startedAt : null };
     })) }));
     getDesktopTrustedAppsMock.mockResolvedValue([]);
+    vi.mocked(open).mockResolvedValue(null);
     createMaaAutomationMock.mockResolvedValue(maaAutomation);
     runAutomationNowMock.mockResolvedValue(undefined);
     setAutomationEnabledMock.mockResolvedValue(undefined);
@@ -103,6 +118,102 @@ describe('AutomationPage', () => {
       id: 'automation-a', title: '整理笔记', prompt: '整理笔记', triggerKind: 'schedule', triggerValue: '每天 21:00', enabled: true,
       permissionSummary: '每次运行前询问', executorKind: 'agent', workspaceId: 'personal', scriptArgs: [], timeoutSeconds: 300,
     });
+  });
+
+  it('uses a conversation hint, not a second natural-language configuration flow, and preserves the manual draft', async () => {
+    const user = userEvent.setup();
+    render(<AutomationPage />);
+    await screen.findByText(/可以直接与 AngelBot 讨论/);
+    expect(screen.queryByRole('button', { name: '解析' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '一句话创建' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('任务名称')).not.toBeInTheDocument();
+    expect(getDesktopTrustedAppsMock).not.toHaveBeenCalled();
+    await user.type(taskNameInput(), '整理日常文件');
+    expect(screen.getByRole('heading', { name: '基本信息' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '脚本与参数' })).toBeInTheDocument();
+    expect(screen.getByText('运行选项').closest('details')).not.toHaveAttribute('open');
+    expect(screen.getByRole('button', { name: '选择目录' })).not.toBeVisible();
+    expect(screen.queryByRole('combobox', { name: '任务类型' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'MAA 当前任务队列' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '收起配置' }));
+    await user.click(screen.getByRole('button', { name: '添加自动化' }));
+    expect(screen.getByLabelText('任务名称')).toHaveValue('整理日常文件');
+    await user.click(screen.getByRole('button', { name: '去对话' }));
+    expect(useNavigationStore.getState().currentPage).toBe('chat');
+    expect(useWorkspacesStore.getState().openWorkspace).not.toHaveBeenCalled();
+    expect(createAutomationMock).not.toHaveBeenCalled();
+    expect(createMaaAutomationMock).not.toHaveBeenCalled();
+  });
+  it('shows task summaries first and opens actions only through the shared disclosure', async () => {
+    const user = userEvent.setup();
+    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    render(<AutomationPage />);
+    const summary = await screen.findByLabelText('现有脚本 详情');
+    const details = summary.closest('details')!;
+    expect(details).not.toHaveAttribute('open');
+    expect(getHistoryMock).not.toHaveBeenCalled();
+    await user.click(summary);
+    expect(details).toHaveAttribute('open');
+    expect(screen.getByRole('button', { name: '立即运行' })).toBeVisible();
+    getAutomationsMock.mockResolvedValue([{ ...scriptAutomation, enabled: false }]);
+    fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
+    await waitFor(() => expect(summary).toHaveTextContent('已暂停'));
+    expect(details).toHaveAttribute('open');
+    await user.click(summary);
+    expect(details).not.toHaveAttribute('open');
+    expect(runAutomationNowMock).not.toHaveBeenCalled();
+    expect(deleteAutomationMock).not.toHaveBeenCalled();
+  });
+
+  it('selects generic scripts and working directories while preserving a cancelled selection and surfacing picker failures', async () => {
+    const user = userEvent.setup();
+    render(<AutomationPage />);
+    await user.type(taskNameInput(), '整理文件');
+    expect(screen.getByText('保存副本运行，原文件不变。')).toBeVisible();
+    const details = screen.getByText('脚本使用说明').closest('details')!;
+    expect(details).not.toHaveAttribute('open');
+    const copyDetails = screen.getByText(/源文件更新不会自动同步/);
+    expect(copyDetails).not.toBeVisible();
+    await user.click(screen.getByText('脚本使用说明'));
+    expect(copyDetails).toBeVisible();
+    await user.click(screen.getByText('脚本使用说明'));
+    vi.mocked(open).mockResolvedValueOnce('C:/approved/report.ps1');
+    await user.click(screen.getByRole('button', { name: '选择脚本' }));
+    expect(screen.getByLabelText('脚本路径')).toHaveValue('C:/approved/report.ps1');
+    expect(open).toHaveBeenLastCalledWith(expect.objectContaining({ directory: false, multiple: false, defaultPath: undefined, filters: [{ name: '本地脚本', extensions: ['py', 'js', 'mjs', 'cjs', 'ps1', 'bat', 'cmd'] }] }));
+    await user.click(screen.getByText('运行选项'));
+    vi.mocked(open).mockResolvedValueOnce('C:/approved/reports');
+    await user.click(screen.getByRole('button', { name: '选择目录' }));
+    expect(screen.getByLabelText('脚本工作目录（可选）')).toHaveValue('C:/approved/reports');
+    await user.click(screen.getByText('运行选项'));
+    expect(screen.getByRole('button', { name: '选择目录' })).not.toBeVisible();
+    expect(screen.getByText(/自定义工作目录 · 300 秒超时/)).toBeVisible();
+    await user.click(screen.getByText('运行选项'));
+    expect(screen.getByLabelText('脚本工作目录（可选）')).toHaveValue('C:/approved/reports');
+    await user.click(screen.getByRole('button', { name: '选择脚本' }));
+    expect(screen.getByLabelText('脚本路径')).toHaveValue('C:/approved/report.ps1');
+    vi.mocked(open).mockRejectedValueOnce(new Error('选择器暂不可用'));
+    await user.click(screen.getByRole('button', { name: '选择脚本' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('选择器暂不可用');
+    expect(createAutomationMock).not.toHaveBeenCalled();
+    expect(createMaaAutomationMock).not.toHaveBeenCalled();
+  });
+
+  it('previews an arbitrary source as a managed copy and invalidates review after edits', async () => {
+    const user = userEvent.setup();
+    render(<AutomationPage />);
+    await user.type(taskNameInput(), '日报');
+    await user.type(screen.getByLabelText('脚本路径'), 'D:/external/report.py');
+    expect(screen.queryByText(/脚本路径范围/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '预览规则' }));
+    expect(screen.getByRole('status')).toHaveTextContent('D:/external/report.py');
+    expect(screen.getByRole('status')).toHaveTextContent('AngelBot 托管目录');
+    expect(screen.getByRole('status')).toHaveTextContent('只运行可信脚本');
+    expect(screen.getByRole('status')).toHaveTextContent('不含依赖');
+    expect(screen.getByRole('status')).toHaveTextContent('300 秒');
+    await user.type(screen.getByLabelText('任务名称'), '（修改）');
+    expect(screen.queryByRole('button', { name: '创建任务' })).not.toBeInTheDocument();
+    expect(createAutomationMock).not.toHaveBeenCalled();
   });
 
   it('uses one dashboard read and lazily loads history with explicit failure retry', async () => {
@@ -136,6 +247,7 @@ describe('AutomationPage', () => {
     render(<AutomationPage />);
     const card = await screen.findByRole('article', { name: '现有脚本' });
     await waitFor(() => expect(card).toHaveFocus());
+    expect(card.querySelector('.automation-card-details')).toHaveAttribute('open');
     const refresh = screen.getByRole('button', { name: '刷新' });
     refresh.focus();
     fireEvent.click(refresh);
@@ -176,67 +288,47 @@ describe('AutomationPage', () => {
     unmount();
   });
 
-  it('binds an Agent automation to the selected workspace before creation', async () => {
+  it('stages clock edits in an overlay and preserves the form on cancel or Escape', async () => {
     const user = userEvent.setup();
     render(<AutomationPage />);
 
-    await user.type(screen.getByPlaceholderText('每天晚上九点提醒我整理当天笔记'), '每天 21:00 提醒我整理笔记');
-    await user.click(screen.getByRole('button', { name: '解析' }));
-
-    await screen.findByText('归属工作区');
-    const workspace = screen.getByRole('combobox', { name: /^归属工作区/ });
-    expect(workspace).toHaveValue('personal');
-    await user.selectOptions(workspace, 'project-a');
-    await user.click(screen.getByRole('button', { name: '创建任务' }));
-
-    await waitFor(() => expect(createAutomationMock).toHaveBeenCalledWith(expect.objectContaining({
-      executorKind: 'agent',
-      workspaceId: 'project-a',
-      triggerKind: 'schedule',
-      triggerValue: '每天 21:00',
-    })));
-  });
-
-  it.each([
-    ['每周一 09:30 提醒我写周报', '重复自动化目前只支持每天'],
-    ['工作日 08:30 提醒我站会', '重复自动化目前只支持每天'],
-    ['明天 15:00 提醒我打电话', '一次性提醒请在对话中创建'],
-  ])('does not create a daily automation from unsupported timing: %s', async (description, guidance) => {
-    const user = userEvent.setup();
-    render(<AutomationPage />);
-
-    await user.type(screen.getByPlaceholderText('每天晚上九点提醒我整理当天笔记'), description);
-    await user.click(screen.getByRole('button', { name: '解析' }));
-    const createButton = screen.queryByRole('button', { name: '创建任务' });
-    if (createButton) await user.click(createButton);
-
+    await user.type(taskNameInput(), '生成日报');
+    const trigger = screen.getByRole('button', { name: '选择执行时间' });
+    expect(screen.queryByRole('textbox', { name: '每天执行时间' })).not.toBeInTheDocument();
+    await user.click(trigger);
+    const dialog = screen.getByRole('dialog', { name: '选择执行时间' });
+    expect(dialog.closest('.automation-page')).toBeNull();
+    expect(within(dialog).getByRole('slider', { name: '小时表盘' })).toHaveAttribute('aria-valuenow', '9');
+    await user.click(within(dialog).getByRole('button', { name: '18 时' }));
+    expect(within(dialog).getByRole('slider', { name: '分钟表盘' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '每天执行时间' })).toHaveTextContent('09:00');
+    await user.click(within(dialog).getByRole('button', { name: '取消' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    await user.click(trigger);
+    expect(screen.getByRole('slider', { name: '小时表盘' })).toHaveAttribute('aria-valuenow', '9');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '每天执行时间' })).toHaveTextContent('09:00');
     expect(createAutomationMock).not.toHaveBeenCalled();
-    expect(screen.getByRole('alert')).toHaveTextContent(guidance);
-  });
-
-  it.each(['每周一 09:30', '工作日 08:30', '明天 15:00'])('does not submit unsupported timing from the script form: %s', async (timing) => {
-    const user = userEvent.setup();
-    render(<AutomationPage />);
-
-    await user.type(screen.getByLabelText('任务名称'), '生成日报');
-    await user.clear(screen.getByRole('textbox', { name: /^触发时间/ }));
-    await user.type(screen.getByRole('textbox', { name: /^触发时间/ }), timing);
-    await user.type(screen.getByLabelText('脚本路径'), 'scripts/report.py');
-    await user.click(screen.getByRole('button', { name: '预览规则' }));
-    const createButton = screen.queryByRole('button', { name: '创建任务' });
-    if (createButton) await user.click(createButton);
-
-    expect(createAutomationMock).not.toHaveBeenCalled();
-    expect(screen.getByRole('alert')).toHaveTextContent('重复自动化目前只支持每天');
   });
 
   it('previews and creates a script only with the canonical daily schedule', async () => {
     const user = userEvent.setup();
     render(<AutomationPage />);
 
-    await user.type(screen.getByLabelText('任务名称'), '生成日报');
-    await user.clear(screen.getByRole('textbox', { name: /^触发时间/ }));
-    await user.type(screen.getByRole('textbox', { name: /^触发时间/ }), '9:30');
+    await user.type(taskNameInput(), '生成日报');
+    await user.click(screen.getByRole('button', { name: '选择执行时间' }));
+    await user.click(screen.getByRole('button', { name: '09 时' }));
+    await user.click(screen.getByRole('button', { name: '30 分' }));
+    // Exact minutes remain available without a second text input.
+    const minutes = screen.getByRole('slider', { name: '分钟表盘' });
+    fireEvent.keyDown(minutes, { key: 'ArrowRight' });
+    expect(minutes).toHaveAttribute('aria-valuenow', '31');
+    fireEvent.keyDown(minutes, { key: 'ArrowLeft' });
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '每天执行时间' })).toHaveTextContent('09:30');
     await user.type(screen.getByLabelText('脚本路径'), 'scripts/report.py');
     await user.click(screen.getByRole('button', { name: '预览规则' }));
     expect(screen.getByRole('status')).toHaveTextContent('生成日报 · 每天 09:30');
@@ -251,7 +343,7 @@ describe('AutomationPage', () => {
     const user = userEvent.setup();
     render(<AutomationPage />);
 
-    await user.type(screen.getByLabelText('任务名称'), '运行现有流程');
+    await user.type(taskNameInput(), '运行现有流程');
     await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.ps1');
     fireEvent.change(screen.getByRole('textbox', { name: /^参数/ }), {
       target: { value: '--profile\r\nC:\\Game Tools\\daily.json\r\n\r\n  spaced argument  \r\n"literal quotes"' },
@@ -264,44 +356,71 @@ describe('AutomationPage', () => {
     })));
   });
 
-  it('creates a parsed script without promising confirmation before each run', async () => {
+  it('switches to the existing Main executor without saving hidden script settings', async () => {
     const user = userEvent.setup();
     render(<AutomationPage />);
-
-    await user.type(screen.getByPlaceholderText('每天晚上九点提醒我整理当天笔记'), '每天 21:00 运行脚本 scripts/daily.ps1 执行现有流程');
-    await user.click(screen.getByRole('button', { name: '解析' }));
-    expect(screen.getByText(/不会在每次运行前询问/)).toBeInTheDocument();
-    expect(screen.getByText(/脚本结束或超时会回收其自有进程树/)).toBeInTheDocument();
+    await user.type(taskNameInput(), '每日事项汇总');
+    await user.type(screen.getByLabelText('脚本路径'), 'scripts/old.py');
+    await user.selectOptions(screen.getByLabelText(/^是否使用模型/), 'agent');
+    expect(screen.queryByLabelText('脚本路径')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/^归属空间/)).toHaveValue('personal');
+    expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
+    await user.type(screen.getByLabelText('任务说明'), '汇总今天待处理的事项，给出简短清单');
+    await user.click(screen.getByRole('button', { name: '预览规则' }));
+    expect(screen.getByRole('status')).toHaveTextContent('是 · 当前已保存的模型');
     await user.click(screen.getByRole('button', { name: '创建任务' }));
-
     await waitFor(() => expect(createAutomationMock).toHaveBeenCalledWith(expect.objectContaining({
-      executorKind: 'script', scriptPath: 'scripts/daily.ps1', scriptArgs: [],
-      permissionSummary: '仅执行已配置的本地脚本；输出和退出码会保存在运行记录中。',
+      executorKind: 'agent', workspaceId: 'personal', prompt: '汇总今天待处理的事项，给出简短清单',
+      scriptPath: undefined, scriptArgs: [], workingDir: undefined,
     })));
+    expect(setAutostart).not.toHaveBeenCalled();
+    expect(runAutomationNowMock).not.toHaveBeenCalled();
   });
 
-  it.each(['manual', 'parsed'])('shows native batch validation errors in the %s creation form', async entry => {
+  it('requires explicit startup registration and never executes while creating a startup task', async () => {
+    const user = userEvent.setup();
+    render(<AutomationPage />);
+    await user.type(taskNameInput(), '登录后整理');
+    await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.ps1');
+    await user.selectOptions(screen.getByRole('combobox', { name: /^触发方式/ }), 'startup');
+    expect(screen.queryByLabelText('每天执行时间')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
+    expect(setAutostart).not.toHaveBeenCalled();
+    vi.mocked(setAutostart).mockRejectedValueOnce('Windows 拒绝注册');
+    await user.click(await screen.findByRole('button', { name: '启用 AngelBot 开机启动' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Windows 拒绝注册');
+    expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: '启用 AngelBot 开机启动' }));
+    await user.click(screen.getByRole('button', { name: '预览规则' }));
+    expect(screen.getByRole('status')).toHaveTextContent('从下次 Windows 登录开始触发');
+    await user.selectOptions(screen.getByRole('combobox', { name: /^触发方式/ }), 'schedule');
+    expect(screen.queryByRole('button', { name: '创建任务' })).not.toBeInTheDocument();
+    vi.mocked(getAutostart).mockResolvedValue(true);
+    await user.selectOptions(screen.getByRole('combobox', { name: /^触发方式/ }), 'startup');
+    await waitFor(() => expect(screen.getByRole('button', { name: '预览规则' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '预览规则' }));
+    await user.click(screen.getByRole('button', { name: '创建任务' }));
+    await waitFor(() => expect(createAutomationMock).toHaveBeenCalledWith(expect.objectContaining({
+      triggerKind: 'startup', triggerValue: '登录 Windows 后', executorKind: 'script',
+    })));
+    expect(setAutostart).toHaveBeenCalledWith(true);
+    expect(runAutomationNowMock).not.toHaveBeenCalled();
+  });
+
+  it('shows native batch validation errors without claiming the script was saved', async () => {
     const user = userEvent.setup();
     const reason = '批处理脚本路径和参数不能包含 shell 元字符、引号或控制字符';
     createAutomationMock.mockRejectedValueOnce(reason);
     render(<AutomationPage />);
-
-    if (entry === 'manual') {
-      await user.type(screen.getByLabelText('任务名称'), '现有脚本');
-      await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.cmd');
-      await user.click(screen.getByRole('button', { name: '预览规则' }));
-    } else {
-      await user.type(screen.getByPlaceholderText('每天晚上九点提醒我整理当天笔记'), '每天 21:00 运行脚本 scripts/daily.cmd 执行现有流程');
-      await user.click(screen.getByRole('button', { name: '解析' }));
-    }
+    await user.type(taskNameInput(), '现有脚本');
+    await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.cmd');
+    await user.click(screen.getByRole('button', { name: '预览规则' }));
     expect(screen.getByText(/脚本结束或超时会回收其自有进程树/)).toBeInTheDocument();
-    expect(screen.getByText(/批处理（.bat\/.cmd）不接受引号或 shell 元字符/)).toBeInTheDocument();
+    expect(screen.getByText(/批处理（.bat\/\.cmd）不接受引号或 shell 元字符/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '创建任务' }));
-
     expect(await screen.findByRole('alert')).toHaveTextContent(reason);
     expect(screen.getByRole('button', { name: '创建任务' })).toBeEnabled();
   });
-
   it('refreshes completed script results on desktop updates and removes the listener on unmount', async () => {
     getAutomationsMock.mockResolvedValue([{
       ...agentAutomation, id: 'daily-script', title: '现有脚本', executorKind: 'script',
@@ -320,36 +439,20 @@ describe('AutomationPage', () => {
     expect(getDashboardMock).toHaveBeenCalledTimes(2);
     expect(getHistoryMock).not.toHaveBeenCalled();
     expect(container.querySelector('.automation-status')).toHaveTextContent('脚本已结束');
-    expect(screen.getByText(/每日任务仅在 AngelBot 运行时检查执行/)).toBeInTheDocument();
-    expect(screen.getByText(/运行结果依据脚本退出码，不表示软件打开或日常任务已完成/)).toBeInTheDocument();
-    expect(screen.getByText(/GUI 辅助工具需要支持按需启动与明确的任务控制接口/)).toBeInTheDocument();
-    expect(screen.getByText(/本页只执行等待自身任务结束的脚本/)).toBeInTheDocument();
+    expect(screen.getByText('定时任务需保持 AngelBot 运行。')).toBeVisible();
+    openCreation();
+    expect(screen.getByText(/退出码不保证外部业务完成/)).not.toBeVisible();
+    await userEvent.click(screen.getByText('脚本使用说明'));
+    expect(screen.getByText(/退出码不保证外部业务完成/)).toBeVisible();
+    expect(screen.getByText(/GUI 辅助工具需要明确的任务控制接口/)).toBeInTheDocument();
+    expect(screen.getByText(/仅启动软件后退出的脚本不代表其中任务已执行/)).toBeInTheDocument();
     expect(screen.queryByText(/GUI 辅助工具优先使用已有定时功能/)).not.toBeInTheDocument();
-    expect(screen.getByText(/暂停仅影响后续定时执行，不会停止已启动的脚本/)).toBeInTheDocument();
+    expect(screen.getByText(/暂停仅影响后续调度，不会停止已启动的脚本/)).toBeInTheDocument();
 
     const loadCount = getAutomationsMock.mock.calls.length;
     unmount();
     fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
     expect(getAutomationsMock).toHaveBeenCalledTimes(loadCount);
-  });
-
-  it('invalidates the parsed daily draft when the description changes to a one-time reminder', async () => {
-    const user = userEvent.setup();
-    render(<AutomationPage />);
-    const description = screen.getByPlaceholderText('每天晚上九点提醒我整理当天笔记');
-    await user.type(description, '每天 21:00 提醒我整理笔记');
-    await user.click(screen.getByRole('button', { name: '解析' }));
-    expect(screen.getByRole('button', { name: '创建任务' })).toBeInTheDocument();
-
-    await user.clear(description);
-    await user.type(description, '明天 15:00 提醒我打电话');
-    const createButton = screen.queryByRole('button', { name: '创建任务' });
-    if (createButton) await user.click(createButton);
-
-    expect(createAutomationMock).not.toHaveBeenCalled();
-    expect(screen.queryByRole('button', { name: '创建任务' })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '解析' }));
-    expect(screen.getByRole('alert')).toHaveTextContent('一次性提醒请在对话中创建');
   });
 
   it('presents a completed one-time reminder as a local notification, not a script', async () => {
@@ -714,88 +817,6 @@ describe('AutomationPage', () => {
     await act(async () => { finishOldLoad([{ ...scriptAutomation, title: '旧版本标题' }]); });
     expect(screen.getByText('现有脚本')).toBeInTheDocument();
     expect(screen.queryByText('旧版本标题')).not.toBeInTheDocument();
-  });
-
-  it('creates the current MAA queue only from a launch-enabled trusted application after explicit confirmation', async () => {
-    const user = userEvent.setup();
-    getDesktopTrustedAppsMock.mockResolvedValue([
-      trustedMaaApp,
-      { ...trustedMaaApp, id: 'disabled', displayName: '已禁用 MAA', enabled: false },
-      { ...trustedMaaApp, id: 'observe-only', displayName: '仅观察 MAA', capabilities: ['observe'] },
-      { ...trustedMaaApp, id: 'other-app', displayName: '其他辅助工具', executablePath: 'C:/Game Tools/Helper.exe' },
-    ]);
-    render(<AutomationPage />);
-    await user.selectOptions(screen.getByRole('combobox', { name: '任务类型' }), 'maa');
-    expect(await screen.findByRole('option', { name: '测试 MAA' })).toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: '已禁用 MAA' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: '仅观察 MAA' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: '其他辅助工具' })).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText('任务名称'), 'MAA 日常队列');
-    await user.selectOptions(screen.getByRole('combobox', { name: /^归属工作区/ }), 'project-a');
-    expect(screen.getByRole('checkbox', { name: /^按 MAA 当前配置启动模拟器/ })).not.toBeChecked();
-    expect(screen.getByLabelText('超时（秒）')).toHaveValue('3600');
-    await user.click(screen.getByRole('button', { name: '预览规则' }));
-    const createButton = screen.getByRole('button', { name: '确认并创建 MAA 任务' });
-    expect(createButton).toBeDisabled();
-    expect(createMaaAutomationMock).not.toHaveBeenCalled();
-    await user.click(screen.getByRole('checkbox', { name: /^我确认无人值守运行 MAA/ }));
-    await user.click(createButton);
-    await waitFor(() => expect(createMaaAutomationMock).toHaveBeenCalledWith({
-      title: 'MAA 日常队列', triggerValue: '每天 18:00', workspaceId: 'project-a',
-      appId: 'maa-app', launchEmulator: false, timeoutSeconds: 3600,
-    }));
-    expect(createAutomationMock).not.toHaveBeenCalled();
-  });
-
-  it('guides missing MAA trust to existing settings without enabling creation', async () => {
-    const user = userEvent.setup();
-    render(<AutomationPage />);
-    await user.selectOptions(screen.getByRole('combobox', { name: '任务类型' }), 'maa');
-    await user.type(screen.getByLabelText('任务名称'), 'MAA 日常队列');
-    expect(screen.getByText(/设置 → 电脑操作 → 受信任应用/)).toBeInTheDocument();
-    expect(screen.getByRole('combobox', { name: /^受信任的 MAA 应用/ })).toBeDisabled();
-    expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
-    expect(createMaaAutomationMock).not.toHaveBeenCalled();
-  });
-
-  it('requires renewed MAA confirmation after an edit and sends emulator launch only when opted in', async () => {
-    const user = userEvent.setup();
-    getDesktopTrustedAppsMock.mockResolvedValue([trustedMaaApp]);
-    render(<AutomationPage />);
-    await user.selectOptions(screen.getByRole('combobox', { name: '任务类型' }), 'maa');
-    await screen.findByRole('option', { name: '测试 MAA' });
-    await user.type(screen.getByLabelText('任务名称'), 'MAA 日常队列');
-    await user.click(screen.getByRole('checkbox', { name: /^按 MAA 当前配置启动模拟器/ }));
-    await user.click(screen.getByRole('button', { name: '预览规则' }));
-    await user.click(screen.getByRole('checkbox', { name: /^我确认无人值守运行 MAA/ }));
-    const timing = screen.getByRole('textbox', { name: /^触发时间/ });
-    await user.clear(timing);
-    await user.type(timing, '19:45');
-    expect(screen.queryByRole('button', { name: '确认并创建 MAA 任务' })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '预览规则' }));
-    const confirmation = screen.getByRole('checkbox', { name: /^我确认无人值守运行 MAA/ });
-    expect(confirmation).not.toBeChecked();
-    await user.click(confirmation);
-    await user.click(screen.getByRole('button', { name: '确认并创建 MAA 任务' }));
-    await waitFor(() => expect(createMaaAutomationMock).toHaveBeenCalledWith(expect.objectContaining({
-      triggerValue: '每天 19:45', workspaceId: 'personal', launchEmulator: true,
-    })));
-  });
-
-  it('surfaces a MAA creation refusal without claiming creation succeeded', async () => {
-    const user = userEvent.setup();
-    getDesktopTrustedAppsMock.mockResolvedValue([trustedMaaApp]);
-    createMaaAutomationMock.mockRejectedValueOnce('MAA 应用不再受信任，请重新选择');
-    render(<AutomationPage />);
-    await user.selectOptions(screen.getByRole('combobox', { name: '任务类型' }), 'maa');
-    await screen.findByRole('option', { name: '测试 MAA' });
-    await user.type(screen.getByLabelText('任务名称'), 'MAA 日常队列');
-    await user.click(screen.getByRole('button', { name: '预览规则' }));
-    await user.click(screen.getByRole('checkbox', { name: /^我确认无人值守运行 MAA/ }));
-    await user.click(screen.getByRole('button', { name: '确认并创建 MAA 任务' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('MAA 应用不再受信任，请重新选择');
-    expect(screen.getByRole('button', { name: '确认并创建 MAA 任务' })).toBeEnabled();
-    expect(getAutomationsMock).toHaveBeenCalledTimes(1);
   });
 
   it.each([

@@ -41,7 +41,7 @@
   --ui-size-base: 14px;
   --ui-size-reading: 16px;
   --ui-size-title: 20px;
-  --ui-size-display: 28px;
+  --ui-size-display: 32px;
   --ui-weight-read: 400;
   --ui-weight-emphasis: 500;
   --ui-weight-title: 600;
@@ -116,6 +116,8 @@
   --top-bar-height: 56px;
   --feature-content-width: 1040px;
   --feature-page-gutter: clamp(20px, 3.4vw, 40px);
+  --conversation-content-width: 760px;
+  --conversation-gutter: clamp(20px, 3vw, 40px);
   --bg-image: none;
   --bg-opacity: .2;
 }

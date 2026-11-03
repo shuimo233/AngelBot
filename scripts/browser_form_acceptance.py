@@ -285,21 +285,34 @@ def verify_restored_upload(owned, written, reopened, restored, business):
     assert business['drafts'][1] == new
 
 
-def run_model_probe(recorded_db=None):
-    """One explicit saved-plan inference, never a business-task quota probe."""
+def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=False, cache_settle_ms=0, cache_continuation=False):
+    """One availability/replay call or two cache calls, never a business retry."""
     (ROOT / 'logs').mkdir(exist_ok=True)
     recorded_db = recorded_db.resolve(strict=True) if recorded_db is not None else None
-    owned = Path(tempfile.mkdtemp(prefix='inference-replay-' if recorded_db else 'model-probe-', dir=ROOT / 'logs'))
+    assert not (recorded_db and cache_comparison)
+    assert not cache_alternate or cache_comparison
+    assert not cache_continuation or cache_comparison and not cache_alternate
+    assert 0 <= cache_settle_ms <= 30000 and (cache_comparison or cache_settle_ms == 0)
+    owned = Path(tempfile.mkdtemp(prefix='cache-comparison-' if cache_comparison else 'inference-replay-' if recorded_db else 'model-probe-', dir=ROOT / 'logs'))
     report_path = owned / 'acceptance.json'
     report = {'status': 'building', 'scope': 'saved-luna-single-provider-call-no-tools',
               'requestCount': None, 'toolCount': 0, 'checkedAt': None}
     if recorded_db:
         report.update(scope='recorded synthetic protocol with reconstructed current host instructions; one provider invocation, no tool execution; not byte-exact replay or business acceptance',
                       sourceDatabaseSha256=hashlib.sha256(recorded_db.read_bytes()).hexdigest())
+    if cache_comparison:
+        report.update(scope='two identical independent synthetic requests; diagnostic compatibility, no tools, browser or business replay; not a cold/warm guarantee')
+        if cache_continuation:
+            report['scope'] = 'two synthetic turns with the production native codec; no tools, browser or business replay; not a cold/warm guarantee'
+        report['comparisonMode'] = 'authorized-alternate-from-catalog' if cache_alternate else 'saved-luna'
+        report['sourceSha256'] = {p:hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in (
+            'scripts/browser_form_acceptance.py','src-tauri/src/commands/message_live_tests.rs',
+            'src-tauri/src/commands/message_live_tests/agent_benchmarks.rs',
+            'src-tauri/src/llm/mod.rs','src-tauri/src/llm/openai_responses.rs')}
     def record():
         report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
     record()
-    print(f'MODEL_PROBE_REPORT {report_path}', flush=True)
+    print(f'{"CACHE_COMPARISON_REPORT" if cache_comparison else "MODEL_PROBE_REPORT"} {report_path}', flush=True)
     try:
         with (owned / 'live.log').open('w', encoding='utf-8') as log:
             with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
@@ -311,19 +324,55 @@ def run_model_probe(recorded_db=None):
                 env.update({'ANGELBOT_LIVE_MODEL_JOURNEY': 'recorded-inference',
                             'ANGELBOT_PRIVATE_REPLAY_DB': str(recorded_db),
                             'ANGELBOT_PRIVATE_REPLAY_OUTPUT': str(owned / 'diagnostics.db')})
+            if cache_comparison:
+                env.update(ANGELBOT_LIVE_MODEL_JOURNEY='cache-comparison', ANGELBOT_PRIVATE_CACHE_PROBE_ROOT=str(owned))
+                env['ANGELBOT_CACHE_COMPARISON_SETTLE_MS'] = str(cache_settle_ms)
+                if cache_continuation:
+                    env['ANGELBOT_CACHE_COMPARISON_CONTINUATION'] = '1'
+                if cache_alternate:
+                    env['ANGELBOT_CACHE_COMPARISON_ALTERNATE'] = '1'
             report['status'] = 'running'
             record()
             log.flush()
             result = subprocess.run([str(binary), 'commands::message::live_tests::configured_model_completes_bounded_file_task',
                                      '--exact', '--ignored', '--nocapture', '--test-threads=1'],
                                     cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                    timeout=75, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        prefix = 'RECORDED_INFERENCE_REPORT ' if recorded_db else 'MODEL_AVAILABILITY_REPORT '
+                                    timeout=75 + (30 if cache_alternate else 0) + cache_settle_ms / 1000,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        prefix = 'CACHE_COMPARISON_REPORT ' if cache_comparison else 'RECORDED_INFERENCE_REPORT ' if recorded_db else 'MODEL_AVAILABILITY_REPORT '
         with (owned / 'live.log').open(encoding='utf-8') as log:
             markers = [line.removeprefix(prefix).strip() for line in log if line.startswith(prefix)]
-        if result.returncode or len(markers) != 1 or len(markers[0]) > (1024 if recorded_db else 256):
+        if result.returncode or len(markers) != 1 or len(markers[0]) > (16384 if cache_comparison else 1024 if recorded_db else 256):
             raise RuntimeError('The single-request model probe did not return one terminal report')
         outcome = json.loads(markers[0])
+        if cache_comparison:
+            if (not isinstance(outcome, dict) or set(outcome) != {'status','requestCount','toolCount','requests','diagnosticRef','binding','savedBinding','defaultBindingUnchanged','settleMs','settleElapsedMs','cacheMode','requestShape','nativeReplayUsed'}
+                    or outcome['status'] not in ('instrumentation_unavailable','catalog_unavailable','model_not_listed','binding_changed','timed_out','quota_exceeded','unavailable','unexpected_response','invalid_diagnostics','diagnostics_reported','diagnostics_unavailable','not_reported')
+                    or type(outcome['requestCount']) is not int or not 0 <= outcome['requestCount'] <= 2
+                    or type(outcome['toolCount']) is not int or outcome['toolCount'] != 0
+                    or not isinstance(outcome['requests'],list) or len(outcome['requests']) != outcome['requestCount']
+                    or not (outcome['diagnosticRef'] is None or isinstance(outcome['diagnosticRef'],str) and re.fullmatch(r'diag:evidence_[0-9a-f]{32}',outcome['diagnosticRef']))):
+                raise RuntimeError('The cache comparison returned an invalid bounded report')
+            for name in ('binding','savedBinding'):
+                binding = outcome[name]
+                if binding is not None and (not isinstance(binding,dict) or set(binding) != {'provider','model'}
+                        or any(not isinstance(binding[k],str) or not 0 < len(binding[k]) <= 200 for k in ('provider','model'))):
+                    raise RuntimeError('The cache comparison returned an invalid model binding')
+            if outcome['defaultBindingUnchanged'] is not None and type(outcome['defaultBindingUnchanged']) is not bool:
+                raise RuntimeError('The cache comparison returned an invalid default-binding receipt')
+            if outcome['cacheMode'] != 'implicit_default':
+                raise RuntimeError('The cache comparison returned an unexpected breakpoint condition')
+            if (outcome['requestShape'] != ('native_continuation' if cache_continuation else 'independent')
+                    or outcome['nativeReplayUsed'] is not None and type(outcome['nativeReplayUsed']) is not bool):
+                raise RuntimeError('The cache comparison returned an invalid continuation condition')
+            if (type(outcome['settleMs']) is not int or outcome['settleMs'] != cache_settle_ms
+                    or outcome['settleElapsedMs'] is not None and (type(outcome['settleElapsedMs']) is not int
+                        or outcome['settleElapsedMs'] < cache_settle_ms)):
+                raise RuntimeError('The cache comparison returned an invalid settling interval')
+            report.update(outcome,checkedAt=time.time())
+            record()
+            print(f'CACHE_COMPARISON_STATUS {report["status"]}',flush=True)
+            return 0 if report['status']=='diagnostics_reported' and report['defaultBindingUnchanged'] is True else 2
         expected = {'status', 'requestCount', 'toolCount'}
         if recorded_db:
             expected |= {'historyCount', 'schemaCount', 'diagnosticRef', 'reconstructedNotByteExact'}
@@ -366,14 +415,24 @@ def main():
     modes.add_argument('--daily-report', action='store_true', help='Verify Daily delivery, download, reopen, encrypted restore and a new task in the restored Main; no project')
     modes.add_argument('--upload-report', action='store_true', help='Upload a synthetic Daily CSV, reopen read-only, then verify a new upload task in the same Main after encrypted restore and explicit service reauthorization')
     modes.add_argument('--model-probe', action='store_true', help='One saved Luna plan provider call only; no browser, Main task, tools or business retry')
+    modes.add_argument('--cache-comparison', action='store_true', help='At most two synthetic Luna requests to check cache diagnostic compatibility; no tools or business retries')
+    parser.add_argument('--cache-alternate', action='store_true', help='With explicit user approval and --cache-comparison: use one authorized Sol model from the current plan catalog for at most two requests; never save it as default')
+    parser.add_argument('--cache-settle-ms', type=int, default=0, help='With --cache-comparison: wait 0..30000ms between the two completed independent calls; no additional requests')
+    parser.add_argument('--cache-continuation', action='store_true', help='With --cache-comparison: preserve the first native response and append a second synthetic turn, instead of two independent requests')
     modes.add_argument('--recorded-inference', type=Path, help='Read a retained synthetic restored data.db and diagnose its protocol once; never execute returned tool calls or start a browser')
     modes.add_argument('--restore-only', type=Path, help='Reuse a failed upload acceptance report and its verified retained source; import into a new isolated profile and run only its restored stage')
     modes.add_argument('--continue-delivery', type=Path, help='Continue the same retained Main after its upload/report already succeeded; no new save, upload or file write')
     args = parser.parse_args()
-    if args.model_probe or args.recorded_inference:
+    if args.cache_alternate and not args.cache_comparison:
+        parser.error('--cache-alternate requires --cache-comparison and explicit approval for another plan model')
+    if args.cache_continuation and (not args.cache_comparison or args.cache_alternate):
+        parser.error('--cache-continuation requires --cache-comparison; keep the saved model binding')
+    if not 0 <= args.cache_settle_ms <= 30000 or args.cache_settle_ms and not args.cache_comparison:
+        parser.error('--cache-settle-ms requires --cache-comparison and a value from 0 to 30000')
+    if args.model_probe or args.recorded_inference or args.cache_comparison:
         if args.mcp_cli or args.hold_for_inspection:
             parser.error('--model-probe does not use a browser or inspection window')
-        return run_model_probe(args.recorded_inference) if args.recorded_inference else run_model_probe()
+        return run_model_probe(args.recorded_inference, args.cache_comparison, args.cache_alternate, args.cache_settle_ms, args.cache_continuation)
     if not args.mcp_cli:
         parser.error('--mcp-cli is required for browser tasks')
     cli = args.mcp_cli.resolve(strict=True)

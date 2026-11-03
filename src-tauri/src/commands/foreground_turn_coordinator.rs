@@ -222,20 +222,35 @@ impl<'a> ForegroundTurnCoordinator<'a> {
         };
         let mut agent_config = prepared_context.agent_config;
         let execution_permission = agent_execution_permission(self.state)?;
-        let live_compaction_threshold =
-            crate::commands::message::live_context_compaction_threshold(&agent_config, tool_count)
-                .unwrap_or(crate::agent::compaction::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD);
-        let live_keep_recent_tokens = (live_compaction_threshold / 2).max(2_048);
+        let (live_compaction_threshold, live_keep_recent_tokens) =
+            crate::commands::message::live_context_compaction_budget(
+                &agent_config,
+                crate::commands::foreground_context_assembler::ForegroundContextBudget {
+                    estimated_tool_count: tool_count,
+                    context_window_tokens: resolved_model.context_window_tokens,
+                    max_output_tokens: resolved_model.max_output_tokens,
+                },
+            )?;
 
         let crate::commands::foreground_model_factory::ResolvedForegroundModel {
             provider,
             thinking_settings,
-            identity: _,
+            identity: model_identity,
+            context_window_tokens: _,
+            max_output_tokens: _,
         } = resolved_model;
+        let provider: Box<dyn crate::llm::LlmProvider> =
+            Box::new(crate::llm::tracked::TrackedProvider::new(
+                provider,
+                crate::llm::UsageTracker::new(self.state.db.clone()),
+                session_id.clone(),
+                model_identity.model,
+            ));
         let emitter = self.lifecycle_control.clone();
         let tool_surface = match &tool_mode {
             ForegroundTurnToolMode::Standard => ForegroundToolSurface::new(self.state, self.app)
                 .with_memory_reading(agent_config.preferences.use_long_term_memory)
+                .with_current_run(foreground_run.reply_id.clone())
                 .build_for_session_with_mcp_revisions(session_id.clone())?,
             ForegroundTurnToolMode::ReviewedDeliverySummary { delivery_id } => {
                 ForegroundToolSurface::new(self.state, self.app)
@@ -247,6 +262,7 @@ impl<'a> ForegroundTurnCoordinator<'a> {
             agent_config.work_dir = Some(root);
         }
         let supports_tool_images = provider.supports_tool_images();
+        let context_projector = tool_surface.context_projector;
         let mut agent = AgentRunner::with_registry(provider, agent_config, tool_surface.registry)
             .with_emitter(emitter.clone())
             .with_tool_lifecycle_hook(emitter)
@@ -256,6 +272,9 @@ impl<'a> ForegroundTurnCoordinator<'a> {
             .with_thinking_settings(thinking_settings)
             .with_execution_permission(execution_permission)
             .with_context_compaction_budget(live_compaction_threshold, live_keep_recent_tokens);
+        if let Some(projector) = context_projector {
+            agent = agent.with_tool_context_projector(projector);
+        }
         if matches!(&tool_mode, ForegroundTurnToolMode::Standard) {
             if let (Some(delegation_identity), Some(sandbox_root), Some(delegated_model_binding)) =
                 (delegation_identity, sandbox_root, delegated_model_binding)
@@ -291,17 +310,6 @@ impl<'a> ForegroundTurnCoordinator<'a> {
                 prepared_context.attention_context.as_deref(),
             )
             .await;
-        if let Some(usage) = agent.latest_usage() {
-            let tracker = crate::llm::UsageTracker::new(self.state.db.clone());
-            let _ = tracker.record_usage(
-                Some(&request.session_id),
-                agent.provider_name(),
-                "active-model",
-                usage.input_tokens,
-                usage.output_tokens,
-                None,
-            );
-        }
 
         let outcome = match project_private_slice_outcome(&goal, ai_response) {
             Ok(projected) => projected,
@@ -500,6 +508,8 @@ mod tests {
                 })
                 .unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_completed = completed.clone();
             let input = ForegroundTurnInput {
                 goal: request.content.clone(),
                 session_id: request.session_id.clone(),
@@ -531,6 +541,8 @@ mod tests {
                         fail_after_write,
                     }),
                     thinking_settings: None,
+                    context_window_tokens: 8_192,
+                    max_output_tokens: 1_024,
                     identity: ForegroundModelIdentity {
                         provider: "synthetic".into(),
                         model: "capture".into(),
@@ -544,7 +556,9 @@ mod tests {
                 sandbox_root: None,
                 delegated_model_binding: None,
                 tool_mode: ForegroundTurnToolMode::Standard,
-                after_completion: None,
+                after_completion: Some(Box::new(move || {
+                    hook_completed.store(true, Ordering::SeqCst);
+                })),
                 confirmed_output: None,
                 cancellation: crate::agent::ToolCancellation::new(),
             };
@@ -556,6 +570,13 @@ mod tests {
             let result = ForegroundTurnCoordinator::new(&state, None, control, store)
                 .run(input)
                 .await;
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                state.db.lock().unwrap().query_row::<bool, _, _>(
+                    "SELECT status='completed' FROM task_runs WHERE session_id='personal-main' AND message_id='reply'",
+                    [], |r| r.get(0),
+                ).unwrap()
+            );
             let stored_reply = ForegroundRunStore::new(state.db.clone())
                 .project_session("personal-main")
                 .unwrap()

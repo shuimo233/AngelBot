@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { open as openDirectoryDialog } from '@tauri-apps/plugin-dialog';
 import { SettingsSection } from '../components/SettingsSection';
+import { TextField } from '../../../ui';
 import { clearAllUserData, exportData, exportEncryptedData, importData, importEncryptedData } from '$lib/commands/settings';
 import { confirmRestoredProjectDirectories } from '$lib/commands/workspace';
 import { useWorkspacesStore } from '$stores/workspaces';
@@ -117,10 +118,7 @@ export function DataSettings() {
       <button type="button" className="data-action-btn" disabled={busy || pendingDirectories.every((item) => excludedDirectories.includes(item.id))} onClick={() => void confirmDirectories()}>{confirmingDirectories ? '正在确认…' : `确认选中的 ${pendingDirectories.filter((item) => !excludedDirectories.includes(item.id)).length} 个目录`}</button>
     </SettingsSection>}
     <SettingsSection title="数据备份" description="导出或导入 AngelBot 本地数据">
-      <label className="text-field">
-        <span className="text-field-label">备份密码（可选）</span>
-        <input type="password" autoComplete="new-password" value={backupPassword} onChange={(event) => setBackupPassword(event.target.value)} placeholder="至少 12 个字符；仅用于本次操作，不会保存" />
-      </label>
+      <TextField label="备份密码（可选）" type="password" autoComplete="new-password" value={backupPassword} onChange={(event) => setBackupPassword(event.target.value)} placeholder="至少 12 个字符；仅用于本次操作，不会保存" />
       <p className="settings-muted">普通备份不包含 MCP 专用密钥；设置备份密码后，加密备份可携带这些密钥。恢复时会写入系统凭据库，不会回显原值。</p>
       <p className="settings-muted">备份包含日常结果文件（每个最多 16 MiB，合计 64 MiB，最多 1024 个）；超限会提示，不会静默遗漏。普通备份中的文件内容未加密，私人资料建议使用备份密码。恢复保留现有结果，同名内容冲突时停止，不会覆盖。</p>
       <p className="settings-muted">新版备份保留项目、主对话、会话分支及主 Agent 工具回执；恢复后需在此页一次确认本机项目目录。它不包含项目文件原件、子代理工作树或自动化执行队列，不能代替整机备份；请另行保留原项目文件。旧版备份未保存的关联无法补回。</p>
@@ -131,7 +129,7 @@ export function DataSettings() {
     </SettingsSection>
     <SettingsSection title="存储位置" description="数据存储路径"><div className="storage-path"><code>%LOCALAPPDATA%/angelbot/</code></div></SettingsSection>
     <SettingsSection title="危险操作" description="永久删除本地会话、记忆、任务和设置，无法恢复。">
-      <label className="text-field"><span className="text-field-label">输入“清空”以确认</span><input value={clearConfirmation} onChange={(event) => setClearConfirmation(event.target.value)} /></label>
+      <TextField label="输入“清空”以确认" value={clearConfirmation} onChange={(event) => setClearConfirmation(event.target.value)} />
       <button className="danger-action-btn" type="button" disabled={busy || clearConfirmation !== '清空'} onClick={handleClear}><span className="action-icon"><TrashIcon /></span><span className="action-info"><span className="action-title">{clearing ? '正在清空…' : '永久清空本地数据'}</span><span className="action-desc">不会清除日常结果文件或系统 Keychain 中的 API 密钥</span></span></button>
     </SettingsSection>
   </div>;

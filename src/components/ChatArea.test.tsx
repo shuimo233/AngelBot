@@ -6,6 +6,7 @@ import { ContentBlockRenderer } from '$components/ContentBlockRenderer';
 import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { useSessionsStore } from '$stores/sessions';
 import { useWorkspacesStore } from '$stores/workspaces';
+import { useWorkspaceActivityStore } from '$stores/workspaceActivity';
 import { useMessagesStore, type LiveBlock } from '$stores/messages';
 import { fromRustConfig, useSettingsStore } from '$stores/settings';
 import { useThinkingEffortStore } from '$stores/thinkingEffort';
@@ -14,6 +15,7 @@ import type { Message } from '$types';
 import type { WorkspaceAutomationStatus } from '$lib/commands/automation';
 import type { ApiProviderConfig } from '$lib/commands/settings';
 import * as messageCommands from '$lib/commands/message';
+import * as workspaceCommands from '$lib/commands/workspace';
 
 const automationFixture = vi.hoisted(() => ({ items: [] as WorkspaceAutomationStatus[] }));
 const quotaNotice = '当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。';
@@ -36,7 +38,7 @@ vi.mock('$lib/commands/session', () => ({
   }),
 }));
 
-// The empty-state card reads automations and knowledge; keep those off the
+// The header reads automations and the empty state reads knowledge; keep them off the
 // fetch-based IPC path so existing call-count assertions stay valid. Plain
 // functions survive this file's vi.restoreAllMocks() in beforeEach. The fixture
 // also exercises real reminder recall without changing the ordered fetch mocks.
@@ -48,13 +50,6 @@ vi.mock('$lib/commands/memory', () => ({
 }));
 vi.mock('$lib/commands/usage', () => ({
   getSessionUsage: () => Promise.resolve([]),
-}));
-// The branch navigator is a separate workspace-history concern. Keep its
-// command transport out of ChatArea's message-loading fixtures so these tests
-// continue to describe transcript behaviour rather than IPC call ordering.
-vi.mock('$lib/commands/session-tree', () => ({
-  getBranchTree: () => Promise.resolve({ branches: [] }),
-  switchToMessageBranch: vi.fn(),
 }));
 
 const makeSession = (id: string, title: string) => ({
@@ -155,7 +150,7 @@ describe('ChatArea', () => {
     render(<ChatArea />);
 
     expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/直接说出想处理的事/)).toBeInTheDocument();
+    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
     expect(screen.getByPlaceholderText('给 AngelBot 发消息…')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   });
@@ -391,7 +386,68 @@ describe('ChatArea', () => {
     } finally { useMessagesStore.setState({ subscribeToAgentEvents: originalSubscribe }); }
   });
 
+  it.each(['daily', 'clarify', 'error'] as const)('keeps a project mention in daily or asks without dispatching (%s)', async (decision) => {
+    const user = userEvent.setup();
+    const session = makeSession('daily-main', '日常');
+    useWorkspacesStore.setState({ activeWorkspaceId: 'personal', workspaces: [
+      { id: 'personal', name: '日常', kind: 'personal', activeSessionId: session.id, createdAt: 1, updatedAt: 1 },
+      { id: 'project', name: 'Named Project', kind: 'project', activeSessionId: 'project-main', createdAt: 1, updatedAt: 1 },
+    ] });
+    useSessionsStore.setState({ activeSession: session, activeSessionId: session.id, sessions: [session] });
+    const resolve = vi.spyOn(workspaceCommands, 'resolveWorkspaceIntent');
+    if (decision === 'error') resolve.mockRejectedValue(new Error('归属判断暂不可用'));
+    else resolve.mockResolvedValue({ kind: decision });
+    const sent: { sessionId: string }[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body));
+      if (cmd === 'send_message') {
+        sent.push(args.req);
+        return new Response(JSON.stringify({ ok: true, data: { id: 'reply', sessionId: session.id, role: 'assistant', content: '继续聊。', createdAt: 1 } }));
+      }
+      return new Response(JSON.stringify({ ok: true, data: [] }));
+    });
+    render(<ChatArea />);
+    const text = '想到 Named Project 就有些紧张，先陪我聊聊';
+    await user.type(screen.getByRole('textbox'), text);
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(resolve).toHaveBeenCalledWith(session.id, text));
+    if (decision !== 'daily') {
+      await screen.findByRole('button', { name: '留在日常' });
+      expect(sent).toHaveLength(0);
+      expect(screen.getByRole('textbox')).toHaveValue(text);
+      await user.click(screen.getByRole('button', { name: '留在日常' }));
+      await user.click(screen.getByRole('button', { name: '发送' }));
+    }
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0].sessionId).toBe(session.id);
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(useWorkspacesStore.getState().activeWorkspaceId).toBe('personal');
+  });
+
+  it('discards a late ownership decision after the source draft changes', async () => {
+    const user = userEvent.setup();
+    const session = makeSession('daily-main', '日常');
+    useWorkspacesStore.setState({ activeWorkspaceId: 'personal', workspaces: [
+      { id: 'personal', name: '日常', kind: 'personal', activeSessionId: session.id, createdAt: 1, updatedAt: 1 },
+      { id: 'project', name: 'Named Project', kind: 'project', activeSessionId: 'project-main', createdAt: 1, updatedAt: 1 },
+    ] });
+    useSessionsStore.setState({ activeSession: session, activeSessionId: session.id, sessions: [session] });
+    let finish!: (intent: workspaceCommands.WorkspaceIntent) => void;
+    vi.spyOn(workspaceCommands, 'resolveWorkspaceIntent').mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const fetch = vi.mocked(globalThis.fetch);
+    render(<ChatArea />);
+    await user.type(screen.getByRole('textbox'), '请继续 Named Project');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByRole('button', { name: '取消判断' });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '我改主意了' } });
+    await act(async () => { finish({ kind: 'project', projectId: 'project' }); });
+    expect(screen.getByRole('textbox')).toHaveValue('我改主意了');
+    expect(fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).cmd)).not.toContain('send_message');
+    expect(useWorkspacesStore.getState().activeWorkspaceId).toBe('personal');
+  });
+
   it.each([false, true])('routes prompt and files only to the exact bound project session, refusing target drift (%s)', async (drift) => {
+    vi.spyOn(workspaceCommands, 'resolveWorkspaceIntent').mockResolvedValue({ kind: 'project', projectId: 'project' });
     const user = userEvent.setup();
     const personalSession = makeSession('route-personal', '日常');
     const projectSession = makeSession('route-project', 'Named Project');
@@ -447,6 +503,7 @@ describe('ChatArea', () => {
   });
 
   it('never restores a late failed project-route draft after leaving and returning to its source', async () => {
+    vi.spyOn(workspaceCommands, 'resolveWorkspaceIntent').mockResolvedValue({ kind: 'project', projectId: 'project' });
     const user = userEvent.setup();
     const personalSession = makeSession('route-source', '日常');
     const otherSession = makeSession('route-other', 'Other');
@@ -484,7 +541,7 @@ describe('ChatArea', () => {
     } finally { useWorkspacesStore.setState({ openWorkspace: originalOpen }); }
   });
 
-  it('recalls only the current workspace reminders in an existing conversation and refreshes trigger and cancellation changes', async () => {
+  it('keeps historical schedules out of chat while refreshing scoped live automation signals', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(2026, 9, 3, 15, 0, 0));
     try {
@@ -531,33 +588,85 @@ describe('ChatArea', () => {
 
       render(<ChatArea />);
       expect(await screen.findByText('已有的主对话仍然可读。')).toBeInTheDocument();
-      expect(await screen.findByText('待执行 2 · 今日已触发 0')).toBeInTheDocument();
-      await user.click(screen.getByText('事项回看'));
-      expect(screen.getByText(reminder.title)).toBeVisible();
-      expect(screen.getByText(cancellable.title)).toBeVisible();
+      expect(screen.queryByText('事项回看')).not.toBeInTheDocument();
+      expect(screen.queryByText(reminder.title)).not.toBeInTheDocument();
+      expect(screen.queryByText(cancellable.title)).not.toBeInTheDocument();
       expect(screen.queryByText(otherWorkspace.title)).not.toBeInTheDocument();
 
       automationFixture.items = [
-        { ...reminder, enabled: false, nextRunAt: null, lastRunAt: now - 1 },
+        { ...reminder, enabled: false, nextRunAt: null, lastRunAt: now - 1,
+          latestRun: {id:'live-run',status:'running',startedAt:now-1,summary:'',exitCode:null} },
         cancellable, otherWorkspace,
       ];
       act(() => fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT)));
-      expect(await screen.findByText('待执行 1 · 今日已触发 1')).toBeInTheDocument();
-      expect(within(screen.getByRole('region', { name: '今日已触发' })).getByText(reminder.title)).toBeVisible();
-      expect(within(screen.getByRole('region', { name: '待执行' })).queryByText(reminder.title)).not.toBeInTheDocument();
+      expect(await screen.findByRole('button',{name:'自动化 · 1 项进行中'})).toBeVisible();
+      expect(screen.queryByRole('region',{name:'今日已触发'})).not.toBeInTheDocument();
 
       // Completion of a real ChatArea send refreshes recall after the backend
       // cancels a reminder; no manual refresh event is supplied for this phase.
       await user.type(screen.getByPlaceholderText('给 AngelBot 发消息…'), '取消剩余提醒');
       await user.click(screen.getByRole('button', { name: '发送' }));
       expect(await screen.findByText('已取消剩余提醒。')).toBeInTheDocument();
-      expect(await screen.findByText('待执行 0 · 今日已触发 1')).toBeInTheDocument();
+      expect(await screen.findByRole('button',{name:'自动化 · 1 项进行中'})).toBeVisible();
       expect(screen.queryByText(cancellable.title)).not.toBeInTheDocument();
       expect(screen.queryByText(otherWorkspace.title)).not.toBeInTheDocument();
-      expect(screen.getByText(reminder.title)).toBeVisible();
-      expect(screen.getByText(/不代表任务已完成或系统通知已送达/)).toBeVisible();
+      expect(screen.queryByText(reminder.title)).not.toBeInTheDocument();
+      automationFixture.items = automationFixture.items.map(item => item.latestRun
+        ? {...item, latestRun:{...item.latestRun,status:'completed'}} : item);
+      act(() => fireEvent(window,new Event(AUTOMATIONS_UPDATED_EVENT)));
+      await waitFor(() => expect(screen.queryByRole('button',{name:/自动化 ·/})).not.toBeInTheDocument());
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('uses inline message editing without a separate branch button or branch-tree query', async () => {
+    const user = userEvent.setup();
+    const session = makeSession('editable-history', '日常');
+    vi.spyOn(messageCommands, 'getMessages').mockResolvedValue([
+      { id: 'past-request', sessionId: session.id, role: 'user', content: '此前的要求', createdAt: 1 },
+    ]);
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    render(<ChatArea />);
+    await screen.findByText('此前的要求');
+    expect(screen.queryByRole('button', { name: '查看会话分支' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看对话历史与分支' })).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) =>
+      JSON.parse(String(init?.body ?? '{}')).cmd === 'get_branch_tree')).toBe(false);
+    await user.click(screen.getByRole('button', { name: '编辑' }));
+    expect(screen.getByRole('textbox', { name: '编辑后的消息内容' })).toHaveValue('此前的要求');
+    expect(screen.getByRole('button', { name: '重新发送' })).toBeEnabled();
+  });
+
+  it('keeps old attention as a scoped workbench count rather than another conversation card', async () => {
+    const session = makeSession('attention-main', '日常');
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session, sessions: [session] });
+    useWorkspacesStore.setState({ activeWorkspaceId: 'personal', workspaces: [{
+      id: 'personal', name: '日常', kind: 'personal', activeSessionId: session.id, createdAt: 1, updatedAt: 1,
+    }] });
+    const previousActivity = useWorkspaceActivityStore.getState();
+    useWorkspaceActivityStore.setState({ workspaceId: 'personal', sessionId: session.id, error: null,
+      projection: { workspaceId: 'personal', cursor: 1, work: [], pendingDecisions: [],
+        attention: { openCount: 2, message: '旧任务需要继续处理' } } });
+    const openWorkbench = vi.fn();
+    try {
+      const { container } = render(<ChatArea onToggleWorkbench={openWorkbench} />);
+      const count = container.querySelector('.chat-header-attention-count');
+      expect(count).toHaveTextContent('2');
+      expect(screen.queryByText('旧任务需要继续处理')).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: '打开工作台' }));
+      expect(openWorkbench).toHaveBeenCalledTimes(1);
+      act(() => useWorkspaceActivityStore.setState({ sessionId: 'previous-main' }));
+      expect(container.querySelector('.chat-header-attention-count')).toBeNull();
+      act(() => useWorkspaceActivityStore.setState({ sessionId: session.id, error: '状态读取失败' }));
+      expect(container.querySelector('.chat-header-attention-count')).toBeNull();
+      act(() => {
+        useWorkspaceActivityStore.setState({ error: null });
+        useSessionsStore.setState({ activeSessionId: 'new-main', activeSession: makeSession('new-main', 'New') });
+      });
+      expect(container.querySelector('.chat-header-attention-count')).toBeNull();
+    } finally {
+      act(() => useWorkspaceActivityStore.setState(previousActivity));
     }
   });
 
@@ -640,6 +749,44 @@ describe('ChatArea', () => {
     });
   });
 
+  it('keeps the decision to read older messages scoped to the current conversation', async () => {
+    const firstSession = makeSession('session-1', 'First');
+    const secondSession = makeSession('session-2', 'Second');
+    vi.spyOn(messageCommands, 'getMessages').mockImplementation(async (sessionId) => [{
+      id: `${sessionId}-reply`, sessionId, role: 'assistant',
+      content: `Saved reply for ${sessionId}`, createdAt: Date.now(),
+    }]);
+    useSessionsStore.setState({
+      sessions: [firstSession, secondSession], activeSessionId: firstSession.id, activeSession: firstSession,
+    });
+    const { container } = render(<ChatArea />);
+    await screen.findByText('Saved reply for session-1');
+    const transcript = container.querySelector<HTMLElement>('.messages')!;
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1200 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    transcript.scrollTop = 0;
+    fireEvent.scroll(transcript);
+    const latest = await screen.findByRole('button', { name: '回到最底部' });
+    act(() => useMessagesStore.getState().appendMessage({
+      id: 'first-new-reply', sessionId: firstSession.id, role: 'assistant',
+      content: 'An update must not interrupt reading older messages.', createdAt: Date.now(),
+    }));
+    expect(transcript.scrollTop).toBe(0);
+
+    await userEvent.click(latest);
+    expect(transcript.scrollTop).toBe(transcript.scrollHeight);
+    act(() => useMessagesStore.getState().appendMessage({
+      id: 'first-latest-reply', sessionId: firstSession.id, role: 'assistant', content: '继续跟随新消息', createdAt: Date.now(),
+    }));
+    expect(transcript.scrollTop).toBe(transcript.scrollHeight);
+
+    act(() => useSessionsStore.setState({ activeSessionId: secondSession.id, activeSession: secondSession }));
+    await screen.findByText('Saved reply for session-2');
+    await waitFor(() => expect(transcript.scrollTop).toBe(transcript.scrollHeight));
+  });
+
   it('keeps text and file-reference drafts in their original session across switches and remounts', async () => {
     const firstSession = makeSession('session-1', 'First');
     const secondSession = makeSession('session-2', 'Second');
@@ -707,6 +854,7 @@ describe('ChatArea', () => {
   });
 
   it.each(['switch', 'leave'] as const)('does not dispatch a late project route after the user chooses to %s', async (action) => {
+    vi.spyOn(workspaceCommands, 'resolveWorkspaceIntent').mockResolvedValue({ kind: 'project', projectId: 'project' });
     const user = userEvent.setup();
     const source = makeSession('source-main', '日常');
     const target = makeSession('target-main', 'Named Project');

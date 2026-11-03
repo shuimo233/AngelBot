@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { useKnowledgeStore } from '$stores/knowledge';
 import { useNavigationStore } from '$stores/navigation';
 import { useWorkspacesStore } from '$stores/workspaces';
-import { WorkspaceReminders } from './WorkspaceReminders';
 
 export { pickTodayAutomations } from './WorkspaceReminders';
 
@@ -144,20 +143,14 @@ export function ChatEmptyState({
 
   return (
     <div className="messages-empty">
-      <div className="messages-empty-icon" aria-hidden="true">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M6 8.5h12M6 12h8M6 15.5h5" />
-          <path d="M4 4.5h16v15H8l-4 2v-17z" />
-        </svg>
-      </div>
       <div className="messages-empty-context">
         {isProject ? `项目 · ${activeWorkspace?.name ?? ''}` : '个人空间'}
       </div>
       <div className="messages-empty-title">{greetingForHour(new Date().getHours())}</div>
       <div className="messages-empty-hint">
         {isProject
-          ? '直接描述目标。AngelBot 会在这个项目的文件、历史与受控委派范围内继续工作。'
-          : '直接说出想处理的事。需要具体项目文件时，AngelBot 会切换到对应项目再继续。'}
+          ? '接着上次的事继续，或说说这次的目标。文件和任务进展都在右侧工作台。'
+          : '整理想法、处理文件，或安排一件日常小事。从一句话开始就好。'}
       </div>
 
       {onDraftSelect && showStarters && (
@@ -179,8 +172,6 @@ export function ChatEmptyState({
           </div>
         </section>
       )}
-
-      <WorkspaceReminders workspaceId={activeWorkspace?.id} />
 
       {suggestions.length > 0 && (
         <ul className="messages-empty-suggestions">

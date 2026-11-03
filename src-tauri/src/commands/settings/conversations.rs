@@ -91,6 +91,16 @@ fn validate(data: &Snapshot) -> Result<(), String> {
             return Err("备份消息缺少所属会话。".to_owned());
         }
     }
+    for checkpoint in &data.context_summaries {
+        if let Some(anchor) = checkpoint.get("anchor_message_id").and_then(Value::as_str) {
+            if !messages
+                .get(anchor)
+                .is_some_and(|m| m["session_id"] == checkpoint["session_id"])
+            {
+                return Err("备份摘要的来源不属于对应会话。".to_owned());
+            }
+        }
+    }
     for (rows, owner) in [(&sessions, "project_id"), (&messages, "session_id")] {
         validate_parents(rows, owner, "parent_id")?;
     }
@@ -258,6 +268,118 @@ pub(super) fn restore_legacy(conn: &Connection, import: &Value) -> Result<Value,
     Ok(counts)
 }
 
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::agent::{
+        event::{AgentEvent, AgentRunJournal},
+        tool::ToolHandler,
+    };
+    use crate::commands::foreground_tool_sources::ForegroundToolSources;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn durable_sources_backup_preserves_version_and_scope_without_execution() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('source-session','Synthetic',1,1);
+          INSERT INTO messages(id,session_id,role,content,created_at,is_provisional) VALUES('source-run','source-session','assistant','Inspected',1,0);
+          INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES('source-run','source-session','source-run','Inspect task','completed','[]',1,1);
+          UPDATE sessions SET leaf_message_id='source-run' WHERE id='source-session';").unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        AgentRunJournal::new(db.clone(), "source-run".into())
+            .append(
+                "source-session",
+                &AgentEvent::ToolExecutionEnd {
+                    call_id: "call".into(),
+                    tool_name: "inspect".into(),
+                    success: true,
+                    output: json!({"state":"paused","reason":"user request"}).to_string(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        db.lock().unwrap().execute("INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger,anchor_message_id)
+          VALUES('checkpoint','source-session','Task remains paused at user request',2,1,0,'auto_token_threshold','source-run')",[]).unwrap();
+        let (reference, original, snapshot) = {
+            let conn = db.lock().unwrap();
+            let (id, payload): (String, String) = conn
+                .query_row("SELECT id,payload FROM agent_run_events", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            (
+                crate::agent::tool_source::reference(&id).unwrap(),
+                payload,
+                serde_json::to_value(snapshot(&conn).unwrap()).unwrap(),
+            )
+        };
+        drop(db);
+        let mut restored = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&restored).unwrap();
+        let tx = restored.transaction().unwrap();
+        restore(&tx, &snapshot).unwrap();
+        tx.commit().unwrap();
+        let payload: String = restored
+            .query_row("SELECT payload FROM agent_run_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            payload, original,
+            "portable backup must retain the original seal, not reserialize or reseal it"
+        );
+        let mut active_snapshot = snapshot.clone();
+        active_snapshot["task_runs"][0]["status"] = json!("running");
+        let mut active = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&active).unwrap();
+        let tx = active.transaction().unwrap();
+        restore(&tx, &active_snapshot).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            active
+                .query_row::<i64, _, _>("SELECT count(*) FROM context_summaries", [], |r| r.get(0))
+                .unwrap(),
+            0,
+            "normalizing an unfinished source invalidates its old summary, not its history"
+        );
+        assert_eq!(
+            active
+                .query_row::<i64, _, _>("SELECT count(*) FROM messages", [], |r| r.get(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            active
+                .query_row::<String, _, _>("SELECT payload FROM agent_run_events", [], |r| r.get(0))
+                .unwrap(),
+            original
+        );
+        let window = crate::commands::foreground_history::ConversationWindow::load(
+            &restored,
+            "source-session",
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            window.summary.as_deref(),
+            Some("Task remains paused at user request")
+        );
+        assert!(
+            window.ids.is_empty(),
+            "restored working context must not replay checkpointed history"
+        );
+        let sources = ForegroundToolSources::new(
+            Arc::new(Mutex::new(restored)),
+            "source-session".into(),
+            None,
+            true,
+        );
+        let result = sources.execute(&json!({"source_ref":reference}), std::path::Path::new("."));
+        assert!(result.success, "{}", result.content);
+        let result: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(result["values"]["reason"], "user request");
+    }
+}
+
 /// Runs inside the ordinary import transaction. Existing populated Main paths
 /// win in merge mode; a fresh installation's empty Main may adopt its old leaf.
 pub(super) fn restore(conn: &Connection, import: &Value) -> Result<Value, String> {
@@ -330,8 +452,10 @@ pub(super) fn restore(conn: &Connection, import: &Value) -> Result<Value, String
         session["additional_read_dirs"] = json!("[]");
     }
     counts["sessions"] = json!(super::batch_import(conn, "sessions", &data.sessions)?);
+    let mut changed_sources = HashSet::new();
     for message in &mut data.messages {
         if message["is_provisional"] == 1 {
+            changed_sources.insert(text(message, "id")?.to_owned());
             message["is_provisional"] = json!(0);
             message["content"] = json!("备份时此任务尚未完成。恢复仅保留历史，不会继续执行或重试；请先核对实际结果，再发起新请求。");
         }
@@ -364,6 +488,7 @@ pub(super) fn restore(conn: &Connection, import: &Value) -> Result<Value, String
     }
     let mut terminal_run_ids = HashSet::new();
     for run in &mut data.task_runs {
+        let before = run.clone();
         let id = text(run, "id")?.to_owned();
         let terminal = matches!(
             text(run, "status")?,
@@ -378,12 +503,16 @@ pub(super) fn restore(conn: &Connection, import: &Value) -> Result<Value, String
             run["status"] = json!("needs_attention");
             run["confirmation_state"] = json!("none");
         }
+        if *run != before {
+            changed_sources.insert(text(run, "message_id")?.to_owned());
+        }
     }
     for facts in &mut data.task_run_facts {
         let run_id = text(facts, "task_run_id")?;
         let mut value: crate::agent::task_facts::TaskFacts =
             serde_json::from_str(text(facts, "facts_json")?)
                 .map_err(|_| "备份任务事实格式无效，未提交恢复。".to_owned())?;
+        let before = value.clone();
         value.pending_confirmation = None;
         // Older successful receipts can omit this optional fact. Preserve that
         // history only when its original parent run already had a terminal state.
@@ -399,15 +528,39 @@ pub(super) fn restore(conn: &Connection, import: &Value) -> Result<Value, String
             value.terminal_reason =
                 Some(crate::agent::task_facts::TaskTerminalReason::NeedsAttention);
         }
+        if value != before {
+            changed_sources.insert(text(facts, "message_id")?.to_owned());
+        }
         facts["facts_json"] = json!(serde_json::to_string(&value).map_err(|e| e.to_string())?);
     }
+    if !changed_sources.is_empty() {
+        let mut statement=conn.prepare("WITH RECURSIVE affected(id,session_id) AS (
+              SELECT id,session_id FROM messages WHERE id IN (SELECT value FROM json_each(?1))
+              UNION SELECT m.id,m.session_id FROM messages m JOIN affected a ON m.parent_id=a.id WHERE m.session_id=a.session_id
+            ) SELECT id FROM affected").map_err(|e|e.to_string())?;
+        let invalid = statement
+            .query_map(
+                [serde_json::to_string(&changed_sources).map_err(|e| e.to_string())?],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        data.context_summaries.retain(|row| {
+            !row["anchor_message_id"]
+                .as_str()
+                .is_some_and(|id| invalid.contains(id))
+        });
+    }
     for (table, rows) in [
-        ("context_summaries", &data.context_summaries),
         ("session_branches", &data.session_branches),
         ("task_runs", &data.task_runs),
         ("task_run_facts", &data.task_run_facts),
         ("agent_steps", &data.agent_steps),
         ("agent_run_events", &data.agent_run_events),
+        // Install derived context only after its complete source graph. Normal
+        // runtime inserts must still invalidate existing covered checkpoints.
+        ("context_summaries", &data.context_summaries),
     ] {
         counts[table] = json!(super::batch_import(conn, table, rows)?);
     }

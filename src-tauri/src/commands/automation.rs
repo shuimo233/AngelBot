@@ -24,6 +24,9 @@ const MAX_TIMEOUT_SECONDS: u64 = 3600;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
 const AUTOMATION_CLAIM_TTL_SECONDS: i64 = MAX_TIMEOUT_SECONDS as i64 + 60;
 
+#[path = "automation_script_store.rs"]
+mod script_store;
+
 // Read surfaces share one effective receipt priority. History is chronological
 // after this bounded selection; old terminal failures do not remain on top.
 const RECEIPT_PRIORITY_SQL: &str =
@@ -289,6 +292,45 @@ fn validated_next_run_at(trigger_kind: &str, trigger_value: &str, now: i64) -> R
     }
 }
 
+fn definition_next_run_at(
+    conn: &Connection,
+    kind: &str,
+    value: &str,
+    now: i64,
+) -> Result<Option<i64>, String> {
+    if kind == "startup" {
+        if value != "登录 Windows 后" {
+            return Err("无法识别开机触发配置".into());
+        }
+        if !crate::commands::settings::autostart_registered(conn)? {
+            return Err("请先在自动化配置中启用 AngelBot 开机启动".into());
+        }
+        // Saving/enabling is not a startup event. Only the desktop host arms it.
+        return Ok(None);
+    }
+    validated_next_run_at(kind, value, now).map(Some)
+}
+
+/// Called once by the desktop host, after recovery. Never resume an old startup
+/// occurrence on an ordinary relaunch; a new OS launch uses the existing queue.
+pub(crate) fn prepare_startup_automations(
+    conn: &mut Connection,
+    os_launch: bool,
+    now: i64,
+) -> Result<(), String> {
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE automations SET next_run_at=NULL WHERE trigger_kind='startup'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    if os_launch && crate::commands::settings::autostart_registered(&transaction)? {
+        transaction.execute("UPDATE automations SET next_run_at=?1,updated_at=?1 WHERE trigger_kind='startup' AND enabled=1", [now]).map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn parse_script_args(raw: &str) -> Result<Vec<String>, String> {
     let args: Vec<String> =
         serde_json::from_str(raw).map_err(|_| "脚本参数必须是字符串数组".to_string())?;
@@ -314,16 +356,35 @@ fn validate_script_path(
     script_path: &str,
     working_dir: Option<&str>,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let root = crate::commands::file::resolve_work_dir(state, None)?;
-    let root = std::fs::canonicalize(&root).map_err(|e| format!("无法解析工作目录：{}", e))?;
     let script = std::fs::canonicalize(script_path.trim())
         .map_err(|e| format!("无法解析脚本文件：{}", e))?;
     if !script.is_file() {
         return Err("脚本路径不是文件".to_string());
     }
+    let managed_root = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        if conn.path().is_some_and(|path| !path.is_empty()) {
+            Some(script_store::root(&conn)?)
+        } else {
+            None
+        }
+    };
+    let managed = managed_root.as_ref().is_some_and(|root| {
+        let supplied = Path::new(script_path.trim());
+        supplied.starts_with(root)
+            || supplied.starts_with(crate::commands::file::display_work_dir(root))
+    });
+    let root = if managed {
+        managed_root.unwrap()
+    } else {
+        let root = crate::commands::file::resolve_work_dir(state, None)?;
+        std::fs::canonicalize(&root).map_err(|e| format!("无法解析工作目录：{e}"))?
+    };
     if !script.starts_with(&root) {
         return Err("脚本必须位于当前工作目录内".to_string());
     }
+    crate::commands::file::resolve_in_existing_root(&root, Path::new(script_path.trim()), true)
+        .map_err(|e| e.to_string())?;
 
     let work_dir = match working_dir.filter(|value| !value.trim().is_empty()) {
         Some(value) => std::fs::canonicalize(value.trim())
@@ -333,8 +394,8 @@ fn validate_script_path(
             .map(Path::to_path_buf)
             .ok_or_else(|| "脚本缺少父目录".to_string())?,
     };
-    if !work_dir.is_dir() || !work_dir.starts_with(&root) {
-        return Err("脚本工作目录必须位于当前工作目录内".to_string());
+    if !work_dir.is_dir() || (!managed && !work_dir.starts_with(&root)) {
+        return Err("脚本工作目录不可用，或不在旧任务的工作目录范围内".to_string());
     }
     Ok((script, work_dir))
 }
@@ -733,17 +794,36 @@ pub fn create_automation_impl(
         );
     }
 
-    if executor_kind == "script" {
-        let path = script_path
-            .as_deref()
-            .ok_or_else(|| "脚本任务需要脚本路径".to_string())?;
-        let (script, work_dir) = validate_script_path(state, path, working_dir.as_deref())?;
-        // Validate the same executable/argv contract before saving an enabled
-        // definition. Constructing Command has no process-launch side effects.
-        script_command(&script, &script_args, &work_dir)?;
-    }
     let now = Utc::now().timestamp();
-    let next_run_at = Some(validated_next_run_at(&trigger_kind, &trigger_value, now)?);
+    if trigger_kind == "startup" && executor_kind != "script" {
+        return Err("该执行方式不支持开机触发".into());
+    }
+    let next_run_at = definition_next_run_at(
+        &*state.db.lock().map_err(|error| error.to_string())?,
+        &trigger_kind,
+        &trigger_value,
+        now,
+    )?;
+    let snapshot = if executor_kind == "script" {
+        Some(script_store::Snapshot::prepare(
+            &*state.db.lock().map_err(|e| e.to_string())?,
+            script_path.as_deref().ok_or("脚本任务需要脚本路径")?,
+        )?)
+    } else {
+        None
+    };
+    let (script_path, working_dir) = if let Some(copy) = &snapshot {
+        let (script, work_dir) =
+            validate_script_path(state, &copy.path.to_string_lossy(), working_dir.as_deref())?;
+        // Constructing Command validates argv but never launches the script.
+        script_command(&script, &script_args, &work_dir)?;
+        (
+            Some(crate::commands::file::display_work_dir(&script)),
+            working_dir.map(|_| crate::commands::file::display_work_dir(&work_dir)),
+        )
+    } else {
+        (script_path, working_dir)
+    };
     let item = Automation {
         id: Uuid::new_v4().to_string(),
         title,
@@ -762,6 +842,9 @@ pub fn create_automation_impl(
         last_run_at: None,
     };
     persist_automation(&state.db, &item, now)?;
+    if let Some(copy) = snapshot {
+        copy.commit();
+    }
     Ok(item)
 }
 
@@ -783,7 +866,12 @@ pub(crate) fn create_agent_automation_definition(
         return Err("Agent 自动化需要任务说明".to_string());
     }
     let now = Utc::now().timestamp();
-    let next_run_at = Some(validated_next_run_at(&trigger_kind, &trigger_value, now)?);
+    let next_run_at = definition_next_run_at(
+        &*db.lock().map_err(|error| error.to_string())?,
+        &trigger_kind,
+        &trigger_value,
+        now,
+    )?;
     let exists = db
         .lock()
         .map_err(|e| e.to_string())?
@@ -913,6 +1001,15 @@ pub fn delete_automation(state: State<AppState>, id: String) -> Result<(), Strin
 pub fn delete_automation_impl(state: &AppState, id: &str) -> Result<(), String> {
     let now = Utc::now().timestamp();
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let copied_script: Option<String> = conn
+        .query_row(
+            "SELECT script_path FROM automations WHERE id=?1 AND executor_kind='script'",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
     let maa_path: Option<String> = conn
         .query_row(
             "SELECT app.executable_path FROM maa_automation_options opts
@@ -926,7 +1023,11 @@ pub fn delete_automation_impl(state: &AppState, id: &str) -> Result<(), String> 
     if let Some(path) = maa_path {
         crate::maa_routine::cleanup_install(&path)?;
     }
-    delete_automation_in_conn(&mut conn, id, now)
+    delete_automation_in_conn(&mut conn, id, now)?;
+    if let Some(script) = copied_script {
+        script_store::remove_unreferenced(&conn, &script)?;
+    }
+    Ok(())
 }
 
 /// Lifecycle changes must settle their own durable delivery inputs before they
@@ -993,9 +1094,11 @@ fn set_automation_enabled_scoped_in_conn(
         .optional()
         .map_err(|error| error.to_string())?;
     let (kind, value) = schedule.ok_or_else(|| "当前工作区中未找到该自动化".to_string())?;
-    let next_run_at = enabled
-        .then(|| validated_next_run_at(&kind, &value, now))
-        .transpose()?;
+    let next_run_at = if enabled {
+        definition_next_run_at(&transaction, &kind, &value, now)?
+    } else {
+        None
+    };
     if enabled && script_admission::requires_attention(&transaction, id)? {
         return Err(
             "上次受控执行结果无法确认；请检查后明确点击立即运行重试，再启用定时".to_string(),
@@ -1723,7 +1826,7 @@ fn claim_due_automations(
                 "SELECT id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,
                  executor_kind,script_path,script_args,working_dir,timeout_seconds,next_run_at,last_run_at,workspace_id
                  FROM automations
-             WHERE enabled = 1 AND trigger_kind IN ('schedule', 'once')
+             WHERE enabled = 1 AND trigger_kind IN ('schedule', 'once', 'startup')
                AND next_run_at IS NOT NULL AND next_run_at <= ?1
                 AND (executor_kind IN ('script','maa') OR schedule_claim_token IS NULL OR schedule_claimed_at <= ?2)
              ORDER BY next_run_at ASC, id ASC",
@@ -1751,7 +1854,7 @@ fn claim_due_automations(
             .execute(
                 "UPDATE automations
                  SET schedule_claim_token = ?1, schedule_claimed_at = ?2, updated_at = ?2
-                 WHERE id = ?3 AND enabled = 1 AND trigger_kind IN ('schedule', 'once')
+                 WHERE id = ?3 AND enabled = 1 AND trigger_kind IN ('schedule', 'once', 'startup')
                    AND next_run_at IS NOT NULL AND next_run_at <= ?2
                    AND (schedule_claim_token IS NULL OR schedule_claimed_at <= ?4)",
                 params![token, now, id, stale_before],
@@ -1848,7 +1951,7 @@ fn dispatch_claimed_automation(
             "SELECT id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,executor_kind,script_path,script_args,working_dir,timeout_seconds,next_run_at,last_run_at,workspace_id
              FROM automations
              WHERE id=?1 AND enabled=1 AND schedule_claim_token=?2
-               AND trigger_kind IN ('schedule','once')
+               AND trigger_kind IN ('schedule','once','startup')
                AND next_run_at IS NOT NULL AND next_run_at<=?3",
             params![claim.id, claim.token, now],
             automation_from_row,
@@ -2684,6 +2787,40 @@ mod tests {
 
     use crate::agent::shared_db::SharedDb;
     use crate::db::migrate;
+
+    #[test]
+    fn startup_agent_is_inert_until_login_and_uses_the_existing_main_queue() {
+        let state = crate::tests::test_app_state();
+        {
+            let conn = state.db.lock().unwrap();
+            migrate(&conn).unwrap();
+            conn.execute("INSERT INTO projects(id,name,path,created_at,updated_at,kind) VALUES('startup-project','Project','C:/fixture',1,1,'project')", []).unwrap();
+            conn.execute("INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('autostart_enabled','true',1),('autostart_launch_args',?1,1)", [crate::commands::settings::AUTOSTART_ARGUMENT]).unwrap();
+        }
+        let item = create_agent_automation_definition(
+            state.db.clone(),
+            "Startup summary".into(),
+            "Summarize pending notes".into(),
+            "startup".into(),
+            "登录 Windows 后".into(),
+            "existing permissions".into(),
+            "startup-project".into(),
+            300,
+        )
+        .unwrap();
+        assert!(item.next_run_at.is_none());
+        let now = Utc::now().timestamp();
+        assert_eq!(run_due_automations_impl(&state, now).unwrap(), 0);
+        prepare_startup_automations(&mut state.db.lock().unwrap(), true, now).unwrap();
+        assert_eq!(run_due_automations_impl(&state, now).unwrap(), 1);
+        assert_eq!(run_due_automations_impl(&state, now + 1).unwrap(), 0);
+        let run = get_automation_runs_impl(&state, &item.id).unwrap();
+        assert_eq!(run.len(), 1);
+        assert_eq!(run[0].status, "queued");
+        prepare_startup_automations(&mut state.db.lock().unwrap(), false, now + 2).unwrap();
+        assert_eq!(run_due_automations_impl(&state, now + 2).unwrap(), 0);
+        assert_eq!(get_automation_runs_impl(&state, &item.id).unwrap().len(), 1);
+    }
 
     #[test]
     fn script_args_must_be_strings() {

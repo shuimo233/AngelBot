@@ -1,7 +1,7 @@
 //! Settings commands (scheduled tasks, personality, data export/import)
 use crate::AppState;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use tauri_plugin_notification::NotificationExt;
@@ -573,50 +573,76 @@ fn get_notification_settings_internal(state: &AppState) -> Result<NotificationSe
 #[tauri::command]
 pub fn get_autostart(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let value: String = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'autostart_enabled'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|_| "false".to_string());
-    Ok(value == "true")
+    if !autostart_registered(&conn)? {
+        return Ok(false);
+    }
+    autostart_registration()?
+        .is_enabled()
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) const AUTOSTART_ARGUMENT: &str = "--angelbot-autostart";
+
+pub(crate) fn autostart_registered(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key='autostart_enabled' AND value='true')
+         AND EXISTS(SELECT 1 FROM settings WHERE key='autostart_launch_args' AND value=?1)",
+        [AUTOSTART_ARGUMENT],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn autostart_registration() -> Result<auto_launch::AutoLaunch, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let path = exe.to_str().ok_or("启动路径不是有效文本")?;
+    // auto-launch 0.5's Windows backend does not quote executable paths.
+    #[cfg(windows)]
+    let path = format!("\"{path}\"");
+    auto_launch::AutoLaunchBuilder::new()
+        .set_app_name("AngelBot")
+        .set_app_path(&path)
+        .set_args(&[AUTOSTART_ARGUMENT])
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn save_autostart_with(
+    conn: &mut Connection,
+    enabled: bool,
+    register: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let now = Utc::now().timestamp();
+    for (key, value) in [
+        ("autostart_enabled", if enabled { "true" } else { "false" }),
+        ("autostart_launch_args", AUTOSTART_ARGUMENT),
+    ] {
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO settings (key,value,updated_at) VALUES (?1,?2,?3)",
+                params![key, value, now],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    register()?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn set_autostart(state: tauri::State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    // Persist to settings table
-    let now = Utc::now().timestamp();
-    {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autostart_enabled', ?1, ?2)",
-            params![if enabled { "true" } else { "false" }, now],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    // Register/unregister with the OS
-    let app_name = "AngelBot";
-    match std::env::current_exe() {
-        Ok(exe_path) => {
-            let auto = auto_launch::AutoLaunchBuilder::new()
-                .set_app_name(app_name)
-                .set_app_path(exe_path.to_str().unwrap_or(""))
-                .build()
-                .map_err(|e| format!("Failed to build autostart: {}", e))?;
-
-            if enabled {
-                auto.enable()
-                    .map_err(|e| format!("Failed to enable autostart: {}", e))?;
-            } else {
-                auto.disable()
-                    .map_err(|e| format!("Failed to disable autostart: {}", e))?;
-            }
-            Ok(())
+    let auto = autostart_registration()?;
+    let mut conn = state.db.lock().map_err(|error| error.to_string())?;
+    save_autostart_with(&mut conn, enabled, || {
+        if enabled {
+            auto.enable()
+        } else if auto.is_enabled().map_err(|e| e.to_string())? {
+            auto.disable()
+        } else {
+            return Ok(());
         }
-        Err(e) => Err(format!("Failed to get executable path: {}", e)),
-    }
+        .map_err(|error| format!("无法更新 Windows 开机启动：{error}"))
+    })
 }
 
 // --- API config (delegated to api_config module) ---
@@ -923,7 +949,7 @@ fn export_data_from_connection(
     if include_settings {
         export.settings = Some(query_table(
             &conn,
-            "SELECT key, value, updated_at FROM settings",
+            "SELECT key, value, updated_at FROM settings WHERE key NOT IN ('autostart_enabled','autostart_launch_args')",
         )?);
         export.scheduled_tasks = Some(query_table(
             &conn,
@@ -1504,7 +1530,12 @@ fn import_data_under_gate(
             .filter(|row| {
                 !matches!(
                     row.get("key").and_then(|v| v.as_str()),
-                    Some("work_directory" | "browser_runtime_namespace")
+                    Some(
+                        "work_directory"
+                            | "browser_runtime_namespace"
+                            | "autostart_enabled"
+                            | "autostart_launch_args"
+                    )
                 )
             })
             .cloned()
@@ -2926,21 +2957,43 @@ mod tests {
 
     #[test]
     fn test_autostart_persistence() {
-        let conn = test_db();
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autostart_enabled', 'true', ?1)",
-            params![now],
-        ).unwrap();
-        let enabled: bool = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'autostart_enabled'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .map(|v| v == "true")
-            .unwrap();
-        assert!(enabled);
+        let mut conn = test_db();
+        assert!(!autostart_registered(&conn).unwrap());
+        assert!(
+            save_autostart_with(&mut conn, true, || Err("registration denied".into())).is_err()
+        );
+        assert!(
+            !autostart_registered(&conn).unwrap(),
+            "failed registration must roll back settings"
+        );
+        save_autostart_with(&mut conn, true, || Ok(())).unwrap();
+        assert!(autostart_registered(&conn).unwrap());
+        assert!(save_autostart_with(&mut conn, false, || Err("denied".into())).is_err());
+        assert!(autostart_registered(&conn).unwrap());
+        save_autostart_with(&mut conn, false, || Ok(())).unwrap();
+        assert!(!autostart_registered(&conn).unwrap());
+    }
+
+    #[test]
+    fn autostart_registration_is_local_and_never_restored_from_backup() {
+        let source = test_state();
+        save_autostart_with(&mut source.db.lock().unwrap(), true, || Ok(())).unwrap();
+        let exported = export_data_impl(
+            &source,
+            Some(ExportOptions {
+                scope: Some("settings".into()),
+            }),
+        )
+        .unwrap();
+        assert!(!exported.contains("autostart_enabled"));
+        assert!(!exported.contains("autostart_launch_args"));
+        let target = test_state();
+        let payload = serde_json::json!({"version":1,"settings":[
+            {"key":"autostart_enabled","value":"true","updated_at":1},
+            {"key":"autostart_launch_args","value":AUTOSTART_ARGUMENT,"updated_at":1}
+        ]});
+        import_data_impl(&target, payload.to_string(), None).unwrap();
+        assert!(!autostart_registered(&target.db.lock().unwrap()).unwrap());
     }
 
     // ── Scheduled Tasks ──────────────────────────────────────────────────────────

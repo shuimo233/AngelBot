@@ -186,6 +186,10 @@ pub mod task_understanding;
 pub mod terminal_cleanup;
 #[path = "tools/tool.rs"]
 pub mod tool;
+#[path = "conversation/tool_context.rs"]
+pub(crate) mod tool_context;
+#[path = "support/tool_source.rs"]
+pub(crate) mod tool_source;
 #[path = "planning/tot.rs"]
 pub mod tot;
 #[path = "planning/tot_integration.rs"]

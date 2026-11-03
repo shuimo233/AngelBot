@@ -404,21 +404,37 @@ pub fn resolve_work_dir(
 pub(crate) fn personal_files_root(
     conn: &rusqlite::Connection,
 ) -> Result<std::path::PathBuf, String> {
+    app_owned_directory(conn, "results")
+}
+
+/// Callers provide a fixed host-owned directory name, never a model path.
+pub(crate) fn app_owned_directory(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> Result<std::path::PathBuf, String> {
+    if Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err("托管目录名称无效。".to_owned());
+    }
     let database = conn
         .path()
         .filter(|path| !path.is_empty())
-        .ok_or_else(|| "日常结果区需要持久化数据库。".to_owned())?;
+        .ok_or_else(|| "托管文件区需要持久化数据库。".to_owned())?;
     let parent = std::fs::canonicalize(
         Path::new(database)
             .parent()
-            .ok_or_else(|| "日常结果区位置不可用。".to_owned())?,
+            .ok_or_else(|| "托管文件区位置不可用。".to_owned())?,
     )
     .map_err(|e| e.to_string())?;
-    let root = parent.join("results");
+    let root = parent.join(name);
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let canonical = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
     if canonical != root {
-        return Err("日常结果区不能重定向到其它目录。".to_owned());
+        return Err("托管文件区不能重定向到其它目录。".to_owned());
     }
     Ok(canonical)
 }
@@ -519,8 +535,10 @@ pub fn read_file_core(work_dir: &Path, path: &str) -> Result<String, String> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileTextSnapshot {
-    resolved_path: String,
-    content: String,
+    pub(crate) resolved_path: String,
+    pub(crate) content: String,
+    #[serde(skip)]
+    pub(crate) document_format: Option<DocumentFormat>,
 }
 
 pub(crate) fn read_file_snapshot_core(
@@ -533,9 +551,9 @@ pub(crate) fn read_file_snapshot_core(
     }
     let resolved = resolve_and_validate(work_dir, Path::new(trimmed), true)
         .map_err(|error| error.to_string())?;
-    let content = if let Some(format) = DocumentFormat::from_path(Path::new(trimmed))
-        .or_else(|| DocumentFormat::from_path(&resolved))
-    {
+    let document_format = DocumentFormat::from_path(Path::new(trimmed))
+        .or_else(|| DocumentFormat::from_path(&resolved));
+    let content = if let Some(format) = document_format {
         let mut bytes = Vec::new();
         std::fs::File::open(&resolved)
             .map_err(|error| error.to_string())?
@@ -556,6 +574,7 @@ pub(crate) fn read_file_snapshot_core(
     Ok(FileTextSnapshot {
         resolved_path: display_work_dir(&resolved),
         content,
+        document_format,
     })
 }
 

@@ -74,6 +74,7 @@ impl LlmProvider for AnthropicProvider {
         tools: Option<&[ToolSchema]>,
         thinking: Option<&ThinkingSettings>,
     ) -> Result<LlmResponse, String> {
+        *self.last_usage.lock().unwrap() = None;
         let (system_prompt, user_messages) = self.split_system_message(messages);
         let anthropic_messages = self.build_anthropic_messages(&user_messages);
 
@@ -252,14 +253,17 @@ impl AnthropicProvider {
 
     /// Parse Anthropic's response format back to unified LlmResponse
     fn parse_response(&self, resp: Value) -> Result<LlmResponse, String> {
+        *self.last_usage.lock().unwrap() = None;
         if let (Some(input), Some(output)) = (
             resp["usage"]["input_tokens"].as_u64(),
             resp["usage"]["output_tokens"].as_u64(),
         ) {
-            *self.last_usage.lock().unwrap() = Some(ProviderUsage {
-                input_tokens: input as u32,
-                output_tokens: output as u32,
-            });
+            *self.last_usage.lock().unwrap() = u32::try_from(input)
+                .ok()
+                .zip(u32::try_from(output).ok())
+                .map(|(input, output)| {
+                    ProviderUsage::from_anthropic_usage(input, output, &resp["usage"])
+                });
         }
         let content = resp["content"].as_array().ok_or_else(|| {
             format!(

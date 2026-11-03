@@ -16,6 +16,23 @@ impl AutomationClock {
         if app.try_state::<Self>().is_some() {
             return;
         }
+        let state = app.state::<crate::AppState>();
+        let ready = state
+            .db
+            .lock()
+            .map_err(|error| error.to_string())
+            .and_then(|mut conn| {
+                crate::commands::automation::prepare_startup_automations(
+                    &mut conn,
+                    std::env::args_os()
+                        .any(|arg| arg == crate::commands::settings::AUTOSTART_ARGUMENT),
+                    chrono::Utc::now().timestamp(),
+                )
+            });
+        if let Err(error) = ready {
+            eprintln!("[Automation] Startup admission failed; clock not started: {error}");
+            return;
+        }
         let (shutdown, receiver) = watch::channel(false);
         let handle = app.clone();
         tauri::async_runtime::spawn(run_clock(SCAN_INTERVAL, receiver, move || {

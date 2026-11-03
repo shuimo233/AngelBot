@@ -318,6 +318,21 @@ mod tests {
     }
 
     #[test]
+    fn configured_icon_is_available_for_the_window_and_tray() {
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let icon = context
+            .default_window_icon()
+            .expect("the configured application icon must be embedded");
+        assert!(icon.width() > 0 && icon.width() <= 256);
+        assert_eq!(icon.width(), icon.height());
+        assert_eq!(
+            icon.rgba().len(),
+            (icon.width() * icon.height() * 4) as usize
+        );
+        assert!(icon.rgba().chunks_exact(4).any(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
     fn runtime_health_exposes_degraded_startup_without_hiding_the_app() {
         let mut state = test_app_state();
         let ready = commands::runtime_health::runtime_health(&state);
@@ -416,6 +431,8 @@ mod tests {
                 serde_json::json!({ "data": "test", "password": "test" }),
             ),
             ("clear_all_user_data", serde_json::json!({})),
+            ("get_autostart", serde_json::json!({})),
+            ("set_autostart", serde_json::json!({"enabled":true})),
             (
                 "confirm_restored_project_directories",
                 serde_json::json!({"directories":[]}),
@@ -1081,6 +1098,29 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
         "get_workspaces" => commands::workspace::get_workspaces_impl(state)
             .map(|v| serde_json::json!({"ok":true,"data":v}))
             .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e})),
+        "resolve_workspace_intent" => {
+            // Dev HTTP has no native credential host. The same resolver works
+            // for available non-keychain profiles; plan/keychain failures are
+            // explicit and never fall back to another provider or API billing.
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|_| "无法启动归属判断。".to_owned())
+                .and_then(|runtime| {
+                    runtime.block_on(commands::workspace::intent::resolve_impl(
+                        state,
+                        None,
+                        args.get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                        args.get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                    ))
+                });
+            match result {
+                Ok(intent) => serde_json::json!({"ok":true,"data":intent}),
+                Err(error) => serde_json::json!({"ok":false,"error":error}),
+            }
+        }
         "open_workspace" => commands::workspace::open_workspace_impl(
             state,
             args.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
@@ -1928,6 +1968,9 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .map(|v| serde_json::json!({"ok": true, "data": v}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
+        "get_autostart" | "set_autostart" => {
+            serde_json::json!({"ok": false, "error": "开机启动设置仅可在桌面应用中使用；开发 HTTP 不访问或修改系统自启。"})
+        }
         "create_automation" => {
             let title = args
                 .get("title")
@@ -2428,6 +2471,7 @@ pub fn run() {
             commands::settings::get_work_directory,
             commands::settings::set_work_directory,
             commands::workspace::get_workspaces,
+            commands::workspace::intent::resolve_workspace_intent,
             commands::workspace::create_project_workspace,
             commands::workspace::open_workspace,
             commands::workspace::confirm_restored_project_directories,
@@ -2564,9 +2608,11 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
-            let _tray = TrayIconBuilder::new()
-                .menu(&menu)
-                .tooltip("AngelBot")
+            let mut tray = TrayIconBuilder::new().menu(&menu).tooltip("AngelBot");
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            let _tray = tray
                 .on_menu_event(|app, event| match tray_menu_action(event.id.as_ref()) {
                     TrayMenuAction::Quit => {
                         if let Some(clock) = app.try_state::<automation_clock::AutomationClock>() {

@@ -18,6 +18,18 @@ describe('LearnedHabits', () => {
     vi.mocked(dismissLearnedPreference).mockResolvedValue(undefined);
   });
 
+  it('distinguishes a user-stated preference from a tentative observation', async () => {
+    vi.mocked(getLearnedPreferences).mockResolvedValue([
+      { ...habit, explicit: true },
+      { ...habit, id: 'tentative', content: '可能喜欢轻松的问候', ready: false, explicit: false },
+    ]);
+    render(<LearnedHabits enabled />);
+    expect(await screen.findByText('你明确表达的偏好')).toBeInTheDocument();
+    expect(screen.getByText('观察到的习惯')).toBeInTheDocument();
+    expect(screen.getByText('还在了解')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `不再沿用：${habit.content}` })).toBeEnabled();
+  });
+
   it('shows actual learned records, permits dismissal while paused, and reloads persisted state', async () => {
     const user = userEvent.setup();
     const view = render(<LearnedHabits enabled />);

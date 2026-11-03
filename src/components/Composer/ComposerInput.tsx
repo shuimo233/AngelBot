@@ -646,6 +646,7 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
 
           {/* ── CENTER: textarea ── */}
           <textarea
+            className="composer-textarea"
             ref={textareaRef}
             value={value}
             onChange={(e) => onChange(e.target.value)}
@@ -661,21 +662,6 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
             }
             rows={1}
             disabled={disabled}
-            style={{
-              flex: 1,
-              background: 'none',
-              border: 'none',
-              outline: 'none',
-              resize: 'none',
-              color: 'var(--color-text)',
-              fontSize: 15,
-              lineHeight: 1.65,
-              fontFamily: 'inherit',
-              minHeight: 24,
-              maxHeight: 220,
-              overflow: 'auto',
-              padding: '4px 0',
-            }}
           />
 
           {/* ── RIGHT: send / stop ── */}
@@ -696,33 +682,9 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
             ) : (
               <button
                 type="button"
+                className="composer-submit"
                 disabled={!canSend}
                 onClick={handleSend}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  width: 36,
-                  height: 32,
-                  padding: 0,
-                  border: '1px solid var(--color-border-muted)',
-                  borderRadius: 'var(--radius-control)',
-                  background: canSend ? 'var(--color-accent)' : 'var(--color-surface)',
-                  color: canSend ? '#fff' : 'var(--color-muted)',
-                  cursor: canSend ? 'pointer' : 'not-allowed',
-                  fontSize: 13,
-                  opacity: canSend ? 1 : 0.45,
-                  transition: 'background 0.12s, color 0.12s, border-color 0.12s',
-                  flexShrink: 0,
-                }}
-                onMouseEnter={(e) => {
-                  if (!canSend) return;
-                  e.currentTarget.style.background = 'var(--color-accent-hover)';
-                }}
-                onMouseLeave={(e) => {
-                  if (!canSend) return;
-                  e.currentTarget.style.background = 'var(--color-accent)';
-                }}
                 title="发送"
               >
                 <SendIcon />

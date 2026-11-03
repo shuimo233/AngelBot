@@ -13,6 +13,7 @@ interface SettingsModalProps {
 export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: SettingsModalProps) {
   const [activePage, setActivePage] = useState<SettingsPage>('personality');
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveError, setSaveError] = useState('');
   const [closeRequested, setCloseRequested] = useState(false);
   const loadProfile = useSettingsStore((s) => s.loadProfile);
   const loadApiConfig = useSettingsStore((s) => s.loadApiConfig);
@@ -46,6 +47,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
       ++openGeneration.current;
       setCloseRequested(false);
       setSaveState('idle');
+      setSaveError('');
       loadProfile();
       savedProfile.current = useSettingsStore.getState().profile;
       loadApiConfig();
@@ -81,6 +83,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
   const handleSave = async () => {
     const generation = openGeneration.current;
     setSaveState('saving');
+    setSaveError('');
     try {
       if (activePage === 'personality') persistProfile();
       if (activePage === 'api') await persistApiConfig();
@@ -89,8 +92,15 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
       if (activePage === 'api') savedApiConfig.current = state.apiConfig;
       if (activePage === 'personality') savedProfile.current = state.profile;
       setSaveState(activePageRef.current !== activePage || (activePage === 'api' && state.apiConfig !== state.activeApiConfig) ? 'idle' : 'saved');
-    } catch {
-      if (openGeneration.current === generation) setSaveState('error');
+    } catch (error) {
+      if (openGeneration.current === generation) {
+        if (activePageRef.current !== activePage) {
+          setSaveState('idle');
+          return;
+        }
+        setSaveError(error instanceof Error ? error.message : String(error));
+        setSaveState('error');
+      }
     }
   };
 
@@ -120,7 +130,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
             {saveState === 'error'
               ? activePage === 'api' && apiConfigLoadError
                 ? `无法确认模型配置已生效。${apiConfigLoadError}`
-                : activePage === 'api' ? '模型配置未保存，请检查必填项后重试' : '性格修改未保存，请重试'
+                : `${activePage === 'api' ? '模型配置' : '性格修改'}保存未能确认成功${saveError ? `：${saveError}` : '，请检查后重试'}`
               : activePage === 'api' ? '模型与凭据修改需保存' : activePage === 'personality' ? '性格修改需保存' : activePage === 'webSearch' ? '联网搜索配置需在页面内保存' : '此页设置即时生效'}
           </span>
           {requiresExplicitSave && (

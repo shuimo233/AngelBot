@@ -115,10 +115,11 @@ interface ReminderSnapshot {
 export interface WorkspaceRemindersProps {
   workspaceId: string | null | undefined;
   defaultOpen?: boolean;
+  compact?: boolean;
 }
 
 /** Read-only automation recall for the one Main conversation; never schedules work. */
-export function WorkspaceReminders({ workspaceId, defaultOpen = false }: WorkspaceRemindersProps) {
+export function WorkspaceReminders({ workspaceId, defaultOpen = false, compact = false }: WorkspaceRemindersProps) {
   const [snapshot, setSnapshot] = useState<ReminderSnapshot | null>(null);
   const [failedWorkspaceId, setFailedWorkspaceId] = useState<string | null>(null);
   const refreshRef = useRef<() => void>(() => {});
@@ -175,6 +176,20 @@ export function WorkspaceReminders({ workspaceId, defaultOpen = false }: Workspa
   const attentionCount = results.filter(needsAttention).length;
   const runningCount = results.filter(item => item.latestRun?.status === 'running').length;
   const endedCount = results.filter(item => item.latestRun && ['completed', 'cancelled'].includes(item.latestRun.status)).length;
+  if (compact) {
+    const queuedCount = results.filter(item => item.latestRun?.status === 'queued').length;
+    // Historical schedules/results live in the workbench. Only actionable
+    // automation state earns space beside the conversation's header controls.
+    if (!runningCount && !queuedCount && !attentionCount && !refreshFailed) return null;
+    const summary = refreshFailed ? '自动化 · 暂未更新' : [
+      '自动化', attentionCount > 0 && `${attentionCount} 项需处理`,
+      runningCount > 0 && `${runningCount} 项进行中`, queuedCount > 0 && `${queuedCount} 项排队中`,
+    ].filter(Boolean).join(' · ');
+    return <button type="button" className="workspace-automation-indicator" onClick={() => setPage('tasks')}
+      title={`${summary}；打开自动化查看当前工作区的运行记录`}>
+      {summary}
+    </button>;
+  }
   if (!pending.length && !triggered.length && !results.length && !refreshFailed && !currentSnapshot?.truncated) return null;
 
   return (

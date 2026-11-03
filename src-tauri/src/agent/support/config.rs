@@ -100,6 +100,7 @@ pub struct AdaptiveConstraint {
     pub value: String,
     pub scope: String,
     pub confidence: f64,
+    pub explicit: bool,
 }
 
 /// Bounded, text-only guidance from a locally installed SKILL.md.
@@ -136,6 +137,10 @@ pub struct AgentConfig {
     /// Background interaction preferences learned from repeated behaviour.
     /// Explicit user settings always take precedence.
     pub adaptive_constraints: Vec<AdaptiveConstraint>,
+    /// Eligible saved defaults not included in the bounded working projection.
+    pub adaptive_constraints_omitted: usize,
+    /// Host-verified, task-selected explicit candidates; never a completeness claim.
+    pub adaptive_constraints_task_matches: usize,
     /// Installed skill guidance, loaded from AngelBot's managed local store.
     pub skill_instructions: Vec<SkillPromptInstruction>,
     /// Core memory blocks (persistent identity/context, Issue #25)
@@ -197,6 +202,8 @@ impl Default for AgentConfig {
             relevant_memories: Vec::new(),
             saved_constraint_context: None,
             adaptive_constraints: Vec::new(),
+            adaptive_constraints_omitted: 0,
+            adaptive_constraints_task_matches: 0,
             skill_instructions: Vec::new(),
             core_memories: Vec::new(),
             knowledge_graph_context: None,

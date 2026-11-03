@@ -49,6 +49,23 @@ describe('ApiSettings', () => {
     expect(screen.getByRole('button', { name: '测试连接' })).toBeEnabled();
   });
 
+  it('keeps a configured connection collapsed while preserving edits across disclosure changes', async () => {
+    const user = userEvent.setup();
+    useSettingsStore.setState(state => ({ apiConfig: { ...state.apiConfig, hasApiKey: true, credentialSource: 'keychain' } }));
+    render(<ApiSettings />);
+    const summary = screen.getByText('管理连接').closest('summary')!;
+    const details = summary.closest('details')!;
+    expect(details).not.toHaveAttribute('open');
+    expect(screen.getByLabelText('模型标识')).toBeVisible();
+    await user.click(summary);
+    expect(details).toHaveAttribute('open');
+    await user.type(screen.getByLabelText('API 地址'), '/gateway');
+    await user.click(summary);
+    await user.click(summary);
+    expect(screen.getByLabelText('API 地址')).toHaveValue('https://api.anthropic.com/gateway');
+    expect(saveApiConfig).not.toHaveBeenCalled();
+  });
+
   it('shows the runtime protocol and applies the provider default endpoint', async () => {
     const user = userEvent.setup();
     render(<ApiSettings />);
@@ -62,6 +79,61 @@ describe('ApiSettings', () => {
     expect(screen.getByDisplayValue(
       'https://generativelanguage.googleapis.com/v1beta/openai',
     )).toBeInTheDocument();
+  });
+
+  it('offers visible provider model choices while retaining manual model identifiers', async () => {
+    const user = userEvent.setup();
+    render(<ApiSettings />);
+    await user.selectOptions(screen.getByLabelText('服务商'), 'deepseek');
+    const choices = screen.getByRole('combobox', { name: '选择模型' });
+    const available = within(choices).getAllByRole('option').filter((option) => !option.hasAttribute('disabled'));
+    expect(available.length).toBeGreaterThan(1);
+    const selected = available[1] as HTMLOptionElement;
+    await user.selectOptions(choices, selected.value);
+    expect(screen.getByLabelText('模型标识')).toHaveValue(selected.value);
+    await user.clear(screen.getByLabelText('模型标识'));
+    await user.type(screen.getByLabelText('模型标识'), 'custom-new-model');
+    expect(choices).toHaveValue('');
+    expect(screen.getByLabelText('模型标识')).toHaveValue('custom-new-model');
+    expect(saveApiConfig).not.toHaveBeenCalled();
+  });
+
+  it('keeps a manually chosen model when the account catalog arrives late', async () => {
+    const user = userEvent.setup();
+    vi.mocked(chatgptPlanStatus).mockResolvedValue({ connected: true, planEnabled: true, needsSignIn: false, credentialRef: 'offline-ref', accountLabel: 'offline-account' });
+    let resolve!: (models: Awaited<ReturnType<typeof chatgptPlanModels>>) => void;
+    vi.mocked(chatgptPlanModels).mockImplementation(() => new Promise((done) => { resolve = done; }));
+    render(<ApiSettings />);
+    await user.selectOptions(screen.getByLabelText('服务商'), 'openai');
+    await user.selectOptions(screen.getByLabelText('认证方式'), 'chatgpt_plan');
+    await waitFor(() => expect(chatgptPlanModels).toHaveBeenCalledOnce());
+    expect(screen.getByRole('combobox', { name: '选择模型' })).toBeDisabled();
+    expect(screen.getByRole('option', { name: '正在读取账号模型…' })).toBeInTheDocument();
+    await user.clear(screen.getByLabelText('模型标识'));
+    await user.type(screen.getByLabelText('模型标识'), 'manual-authorized-model');
+    await act(async () => { resolve([{ id: 'account-model', name: 'Account model' }]); });
+    const choices = screen.getByRole('combobox', { name: '选择模型' });
+    expect(choices).toBeEnabled();
+    expect(screen.getByLabelText('模型标识')).toHaveValue('manual-authorized-model');
+    await user.selectOptions(choices, 'account-model');
+    expect(screen.getByLabelText('模型标识')).toHaveValue('account-model');
+    expect(saveApiConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['failed', 'empty'] as const)('distinguishes a %s account catalog from a missing model capability', async (outcome) => {
+    const user = userEvent.setup();
+    vi.mocked(chatgptPlanStatus).mockResolvedValue({ connected: true, planEnabled: true, needsSignIn: false, credentialRef: 'offline-ref', accountLabel: 'offline-account' });
+    if (outcome === 'failed') vi.mocked(chatgptPlanModels).mockRejectedValueOnce(new Error('offline catalog unavailable'));
+    else vi.mocked(chatgptPlanModels).mockResolvedValueOnce([]);
+    render(<ApiSettings />);
+    await user.selectOptions(screen.getByLabelText('服务商'), 'openai');
+    await user.selectOptions(screen.getByLabelText('认证方式'), 'chatgpt_plan');
+    await screen.findByRole('option', { name: outcome === 'failed' ? '列表读取失败，可手动填写' : '账号未提供候选，可手动填写' });
+    expect(screen.getByRole('combobox', { name: '选择模型' })).toBeDisabled();
+    expect(screen.getByLabelText('模型标识')).toBeEnabled();
+    expect(screen.getByRole('button', { name: '测试连接' })).toBeEnabled();
+    if (outcome === 'failed') expect(screen.getByRole('alert')).toHaveTextContent('offline catalog unavailable');
+    expect(saveApiConfig).not.toHaveBeenCalled();
   });
 
   it('explains environment-managed credentials instead of offering a misleading edit', () => {
