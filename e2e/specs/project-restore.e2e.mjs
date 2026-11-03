@@ -139,6 +139,7 @@ async function openDataSettings() {
   await browser.$('button[aria-label="设置"]').click();
   const dialog = await browser.$('[role="dialog"][aria-modal="true"]');
   await dialog.waitForDisplayed({ timeout: 10_000 });
+  await dialog.$('button=记忆与数据').click();
   await dialog.$('button=数据').click();
   return dialog;
 }
@@ -146,8 +147,10 @@ async function openDataSettings() {
 async function openFiles() {
   if (!await browser.$('.right-panel').isExisting()) await browser.$('[aria-label="打开工作台"]').click();
   await browser.$('.right-panel').waitForDisplayed({ timeout: 10_000 });
-  const menu = await browser.$('//button[contains(@class,"workbench-menu-item")][.//span[text()="文件"]]');
-  if (await menu.isExisting()) await menu.click();
+  const files = await browser.$('.workbench-tabs').$('button=文件');
+  await files.waitForDisplayed({ timeout: 10_000 });
+  await files.click();
+  assert.equal(await files.getAttribute('aria-pressed'), 'true');
 }
 
 async function previewText() {
