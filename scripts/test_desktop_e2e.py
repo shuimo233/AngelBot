@@ -1717,9 +1717,88 @@ class DesktopE2eArtifactTests(unittest.TestCase):
             self.assertEqual(len(roots), 1)
             self.assertFalse(roots[0].exists(), 'owned config must be cleaned on success and failure')
 
+        for summary, expected in (
+                ('test result: ok. 0 passed; 0 failed; 0 ignored;', False),
+                ('test result: ok. 0 passed; 0 failed; 3 ignored;', False),
+                ('unrecognized test output', False),
+                ('\x1b[32mtest result: ok. 2 passed; 0 failed; 0 ignored;\x1b[0m', True)):
+            with patch.object(verify, 'executable_available', return_value=True), \
+                    patch.object(verify, 'platform_command', side_effect=lambda command: command), \
+                    patch.object(verify.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=summary)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(verify.run_check(verify.Check('required contracts', ('cargo',), minimum_rust_tests=1), True), expected)
+
+    def test_ci_failure_evidence_is_bounded_best_effort_and_synthetic_only(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { readFile, writeFile, access } from 'node:fs/promises';
+const [url, owned] = process.argv.slice(1);
+process.chdir(owned);
+Object.assign(process.env, { ANGELBOT_DESKTOP_E2E_BINARY_PATH: path.join(owned, 'unused.exe'),
+  GITHUB_ACTIONS: 'true', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' });
+for (const key of ['ANGELBOT_DESKTOP_E2E_REPLY_EXPORT', 'ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY', 'ANGELBOT_DESKTOP_E2E_PROJECT_RESTORE']) delete process.env[key];
+globalThis.window = { __angelbotE2ePersonalSessionId: 'personal-fixture', __angelbotE2eProjectSessionId: 'project-fixture' };
+globalThis.document = { querySelector: () => ({ textContent: 'D'.repeat(8000) }) };
+let captures = 0;
+globalThis.browser = {
+  tauri: { execute: fn => fn({ core: { invoke: async (command, args) => {
+    assert.equal(command, 'get_messages');
+    assert.ok(['personal-fixture', 'project-fixture'].includes(args.sessionId));
+    return Array.from({ length: 12 }, () => ({ role: 'assistant', content: 'C'.repeat(5000),
+      native_private_items: 'MUST_NOT_EXPORT', taskRun: { status: 'failed', private: 'MUST_NOT_EXPORT' },
+      toolCalls: Array(10).fill({ id: 'call', name: 'synthetic', arguments: 'MUST_NOT_EXPORT' }),
+      toolResults: Array(10).fill({ callId: 'call', success: false, output: 'O'.repeat(5000) }) }));
+  } } }) },
+  saveScreenshot: async file => { captures++; await writeFile(file, 'synthetic image double'); },
+};
+const { config } = await import(url);
+const original = new Error('original failure');
+await config.afterTest({ title: 'synthetic' }, null, { passed: true });
+assert.equal(captures, 0);
+await config.afterTest({ title: 'synthetic' }, null, { passed: false, error: original, duration: 7 });
+const artifact = attempt => path.join(owned, 'src-tauri/target/e2e/failure', `123-${attempt}`, 'failure.json');
+const report = JSON.parse(await readFile(artifact(1), 'utf8'));
+assert.equal(report.state.sessions.length, 2);
+assert.equal(report.state.sessions[0].messages.length, 5);
+const row = report.state.sessions[0].messages[0];
+assert.equal(row.content.length, 1000);
+assert.equal(row.results.length, 3);
+assert.equal(row.results[0].output.length, 500);
+assert.equal(report.state.visibleConversation.length, 4000);
+assert.ok(!JSON.stringify(report).includes('MUST_NOT_EXPORT'));
+assert.equal(original.message, 'original failure');
+process.env.GITHUB_RUN_ATTEMPT = '2';
+browser.tauri.execute = async () => { throw new Error('diagnostic unavailable'); };
+browser.saveScreenshot = async () => { throw new Error('screenshot unavailable'); };
+await config.afterTest({ title: 'synthetic' }, null, { passed: false, error: original });
+const failed = JSON.parse(await readFile(artifact(2), 'utf8'));
+assert.match(failed.error, /original failure/);
+assert.match(failed.diagnosticsError, /diagnostic unavailable/);
+assert.match(failed.screenshotError, /screenshot unavailable/);
+process.env.ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY = 'manual';
+process.env.GITHUB_RUN_ATTEMPT = '3';
+const manual = (await import(url + '?manual')).config;
+await manual.afterTest({ title: 'private probe' }, null, { passed: false, error: original });
+await assert.rejects(access(artifact(3)));
+console.log('bounded synthetic diagnostics checked');
+'''
+        with tempfile.TemporaryDirectory(prefix='angelbot-ci-artifact-') as directory:
+            result = subprocess.run(['node', '--input-type=module', '-e', script,
+                                     (REPO_ROOT/'e2e/wdio.conf.mjs').as_uri(), directory],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertIn('bounded synthetic diagnostics checked', result.stdout)
+
     def test_native_storage_is_explicit_and_never_passes_by_skipping_on_other_systems(self):
         native_checks = verify.PROFILES['native-storage']
         self.assertEqual(len(native_checks), 1)
+        self.assertEqual(native_checks[0].minimum_rust_tests, 1)
+        contracts = [check for check in verify.PROFILES['full'] if '--features' in check.command]
+        self.assertEqual(len(contracts), 1)
+        self.assertIn('desktop-e2e', contracts[0].command)
+        self.assertIn('commands::foreground_model_factory::desktop_e2e::desktop_e2e_tests::', contracts[0].command)
+        self.assertEqual(contracts[0].minimum_rust_tests, 1)
         self.assertIn('--exact', native_checks[0].command)
         self.assertIn('--ignored', native_checks[0].command)
         self.assertIn('llm::chatgpt_auth::tests::native_profile_cutover_keeps_windows_vault_binding',

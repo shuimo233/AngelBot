@@ -31,6 +31,7 @@ TAURI_MANIFEST = "src-tauri/Cargo.toml"
 class Check:
     name: str
     command: tuple[str, ...]
+    minimum_rust_tests: int = 0
 
 
 CHECKS = {
@@ -51,6 +52,15 @@ CHECKS = {
             "Rust library tests",
             ("cargo", "test", "--manifest-path", TAURI_MANIFEST, "--lib", "--", "--test-threads=1"),
         ),
+        # The scripted model is feature-gated and is not compiled by --lib alone.
+        # These are offline protocol tests, not a window or live-model journey.
+        Check(
+            "desktop E2E protocol contracts",
+            ("cargo", "test", "--manifest-path", TAURI_MANIFEST, "--features", "desktop-e2e", "--lib",
+             "commands::foreground_model_factory::desktop_e2e::desktop_e2e_tests::",
+             "--", "--test-threads=1"),
+            minimum_rust_tests=1,
+        ),
     ),
 }
 
@@ -67,7 +77,7 @@ PROFILES = {
             "cargo", "test", "--manifest-path", TAURI_MANIFEST, "--lib",
             "llm::chatgpt_auth::tests::native_profile_cutover_keeps_windows_vault_binding",
             "--", "--exact", "--ignored", "--nocapture", "--test-threads=1",
-        )),
+        ), minimum_rust_tests=1),
     ),
 }
 
@@ -115,14 +125,30 @@ def run_check(check: Check, fail_fast: bool) -> bool:
             # The Rust override is cfg(test) only: normal builds ignore it.
             # Its lifecycle belongs to this parent, including failed checks.
             env["ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR"] = config_root
-            result = subprocess.run(platform_command(check.command), cwd=ROOT, check=False, env=env)
+            capture = (dict(stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+                       if check.minimum_rust_tests else {})
+            result = subprocess.run(platform_command(check.command), cwd=ROOT, check=False, env=env, **capture)
     except OSError as error:
         print(f"<== {check.name}: FAIL (could not execute or clean up: {error})")
         return False
+    enough_tests = True
+    if check.minimum_rust_tests:
+        print(result.stdout or "", end="")
+        clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
+        counts = re.findall(r"test result: ok\. (\d+) passed;", clean)
+        enough_tests = bool(counts) and int(counts[-1]) >= check.minimum_rust_tests
+        if result.returncode == 0 and not enough_tests:
+            print(f"[FAIL] {check.name}: expected at least {check.minimum_rust_tests} executed Rust test(s); no qualifying result.")
     elapsed = time.monotonic() - started
-    outcome = "PASS" if result.returncode == 0 else f"FAIL ({result.returncode})"
+    passed = result.returncode == 0 and enough_tests
+    if passed:
+        outcome = "PASS"
+    elif result.returncode:
+        outcome = f"FAIL ({result.returncode})"
+    else:
+        outcome = "FAIL (executed-test gate)"
     print(f"<== {check.name}: {outcome} ({elapsed:.1f}s)")
-    return result.returncode == 0
+    return passed
 
 
 def main() -> int:

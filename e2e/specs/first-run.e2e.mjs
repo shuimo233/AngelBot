@@ -191,6 +191,9 @@ describe('first-run desktop experience', () => {
     assert.match(location, /^https?:\/\/tauri\.localhost\//);
     const screenshotDir = join(process.cwd(), 'src-tauri', 'target', 'e2e');
     mkdirSync(screenshotDir, { recursive: true });
+    const journeyStarted = Date.now();
+    const phase = name => console.log(`Desktop phase ${name}: ${Date.now() - journeyStarted}ms`);
+    phase('startup');
     console.log(`Main stop evidence: ${mainStopEvidenceDir}`);
 
     const initialWorkspaces = await browser.tauri.execute(({ core }) => core.invoke('get_workspaces'));
@@ -458,6 +461,7 @@ describe('first-run desktop experience', () => {
 
     // Request-mode side effects must stay visible and rejectable in the main
     // conversation. Reject the prompt so the E2E run never opens host UI.
+    phase('automation-confirmation');
     await browser.tauri.execute(({ core }) => core.invoke('set_agent_execution_permission', {
       permission: 'ask',
     }));
@@ -465,12 +469,16 @@ describe('first-run desktop experience', () => {
     const confirmationSendButton = await browser.$('button[title="发送"]');
     await confirmationSendButton.waitForEnabled({ timeout: 5_000 });
     await confirmationSendButton.click();
-    await browser.pause(1_000);
-    const confirmationTimeline = await browser.tauri.execute(({ core }) => core.invoke('get_messages', {
-      sessionId: window.__angelbotE2ePersonalSessionId,
-    }));
-    const confirmationMessage = confirmationTimeline.findLast((message) =>
-      message.toolCalls?.some((call) => call.name === 'open_windows_setting'));
+    let confirmationTimeline;
+    let confirmationMessage;
+    await browser.waitUntil(async () => {
+      confirmationTimeline = await browser.tauri.execute(({ core }) => core.invoke('get_messages', {
+        sessionId: window.__angelbotE2ePersonalSessionId,
+      }));
+      confirmationMessage = confirmationTimeline.findLast(message => message.toolCalls?.some(call =>
+        call.id === 'desktop-e2e-open-sound-settings' && call.name === 'open_windows_setting'));
+      return confirmationMessage?.taskFacts?.pending_confirmation?.tool_name === 'open_windows_setting';
+    }, { timeout: 20_000, timeoutMsg: 'settings action did not reach its exact pending confirmation' });
     assert.ok(
       confirmationMessage,
       `the second foreground turn must consume the Windows-settings script: ${JSON.stringify(confirmationTimeline)}`,
@@ -494,32 +502,8 @@ describe('first-run desktop experience', () => {
     const redirectSendButton = await browser.$('button[title="发送"]');
     await redirectSendButton.waitForEnabled({ timeout: 5_000 });
     await redirectSendButton.click();
-    try {
-      // The streaming row can be replaced when the durable reply is promoted.
-      // Reacquire its current node rather than waiting on a detached element.
-      await waitForVisible(browser, '//*[contains(text(), "已取消打开 Windows 声音设置，并先说明如何调整声音")]', { timeout: 20_000 });
-    } catch (error) {
-      let state;
-      try {
-        state = await browser.tauri.execute(async ({ core }) => {
-          const messages = await core.invoke('get_messages', { sessionId: window.__angelbotE2ePersonalSessionId });
-          return {
-            messages: messages.slice(-5).map(({ role, content, taskRun, toolResults }) => ({
-              role, content: content?.slice(0, 1000),
-              run: taskRun && { status: taskRun.status, resumable: taskRun.resumable, confirmation: taskRun.confirmationState },
-              results: toolResults?.slice(-3).map(({ callId, success, confirmationStatus, output }) => ({
-                callId: callId?.slice(0, 128), success, confirmationStatus,
-                output: typeof output === 'string' ? output.slice(0, 500) : undefined,
-              })),
-            })),
-            visibleConversation: document.querySelector('.messages')?.textContent?.slice(-4000),
-          };
-        });
-      } catch (diagnosticError) {
-        state = { diagnosticError: String(diagnosticError).slice(0, 500) };
-      }
-      throw new Error(`redirected reply was not visible: ${JSON.stringify(state)}`, { cause: error });
-    }
+    // Failure evidence is collected once by the runner, before profile cleanup.
+    await waitForVisible(browser, '//*[contains(text(), "已取消打开 Windows 声音设置，并先说明如何调整声音")]', { timeout: 20_000 });
 
     let redirectedTimeline;
     await browser.waitUntil(async () => {
@@ -1185,58 +1169,18 @@ describe('first-run desktop experience', () => {
     assert.equal(readFileSync(approvedFilePath, 'utf8'), approvedFileContent);
 
     const approvedFileSelector = '[aria-label="在工作台中定位 approved-by-e2e.txt"]';
-    try {
-      // A successful tool receipt precedes the final message. Streaming and
-      // persisted citations use different nodes, so resolve the final visible
-      // citation on each poll rather than holding an intermediate element.
-      await browser.waitUntil(async () => {
-        if (!await browser.execute(() =>
-          document.querySelector('.message-bubble--content-stream') === null)) return false;
-        return (await browser.$(approvedFileSelector)).isDisplayed();
-      }, {
-        timeout: 20_000,
-        interval: 200,
-        timeoutMsg: 'the final approved file citation was not displayed',
-      });
-    } catch (error) {
-      const replyState = await browser.tauri.execute(async ({ core }) => {
-        const messages = await core.invoke('get_messages', {
-          sessionId: window.__angelbotE2eProjectSessionId,
-        });
-        const writeTurn = messages.findLast((message) =>
-          message.toolCalls?.some((call) => call.id === 'desktop-e2e-approved-write'));
-        return {
-          writeStatus: writeTurn?.taskRun?.status,
-          citationPersisted: messages.some((message) =>
-            message.role === 'assistant' && message.content.includes('angelbot-file:approved-by-e2e.txt')),
-        };
-      }).catch(() => ({ unavailable: true }));
-      const displayState = await browser.execute(() => ({
-        fileLinks: [...document.querySelectorAll('.message-file-link')].map((link) => link.getAttribute('aria-label')),
-        liveBubbles: document.querySelectorAll('.message-bubble--content-stream').length,
-        liveCitation: [...document.querySelectorAll('.content-block-text')].some((block) =>
-          block.textContent.includes('查看 E2E 文件')),
-        locatorAncestors: (() => {
-          const ancestors = [];
-          let node = document.querySelector('[aria-label="在工作台中定位 approved-by-e2e.txt"]');
-          while (node && ancestors.length < 10) {
-            const style = getComputedStyle(node);
-            const bounds = node.getBoundingClientRect();
-            ancestors.push({ tag: node.tagName, className: node.className,
-              open: node instanceof HTMLDetailsElement ? node.open : undefined,
-              display: style.display, visibility: style.visibility,
-              height: bounds.height, top: bounds.top, width: bounds.width, left: bounds.left,
-              opacity: style.opacity, contentVisibility: style.contentVisibility,
-              checkVisibility: node.checkVisibility?.({ contentVisibilityAuto: true,
-                opacityProperty: true, visibilityProperty: true }) });
-            node = node.parentElement;
-          }
-          return ancestors;
-        })(),
-      })).catch(() => ({ unavailable: true }));
-      await browser.saveScreenshot(join(screenshotDir, 'file-locator-failure.png'));
-      throw new Error(`${error.message}; ${JSON.stringify({ replyState, displayState })}`, { cause: error });
-    }
+    // A successful tool receipt precedes the final message. Streaming and
+    // persisted citations use different nodes, so resolve the final visible
+    // citation on each poll rather than holding an intermediate element.
+    await browser.waitUntil(async () => {
+      if (!await browser.execute(() =>
+        document.querySelector('.message-bubble--content-stream') === null)) return false;
+      return (await browser.$(approvedFileSelector)).isDisplayed();
+    }, {
+      timeout: 20_000,
+      interval: 200,
+      timeoutMsg: 'the final approved file citation was not displayed',
+    });
     const approvedFileLocator = await browser.$(approvedFileSelector);
     await approvedFileLocator.click();
     const approvedFileEntry = await browser.$('//button[contains(@class,"file-item")][contains(.,"approved-by-e2e.txt")]');
@@ -1432,19 +1376,14 @@ describe('first-run desktop experience', () => {
       await browser.execute(() => document.querySelector('.agent-run-confirmation-summary, .content-block-tool-confirmation-summary')?.scrollIntoView({ block: 'center', behavior: 'instant' }));
       await browser.pause(250);
       const cardText = await confirmationSummary.getText();
-      try {
-        await browser.waitUntil(() => browser.execute(() => {
-          const summary = document.querySelector('.agent-run-confirmation-summary, .content-block-tool-confirmation-summary');
-          const host = summary?.closest('.messages');
-          if (!summary || !host) return false;
-          const bounds = summary.getBoundingClientRect();
-          const viewport = host.getBoundingClientRect();
-          return bounds.top >= viewport.top && bounds.bottom <= viewport.bottom;
-        }), { timeout: 2_000, interval: 100, timeoutMsg: 'stop consent scope is outside the reading viewport' });
-      } catch (error) {
-        await browser.saveScreenshot(join(mainStopEvidenceDir, 'main-automation-stop-visibility-failure.png'));
-        throw error;
-      }
+      await browser.waitUntil(() => browser.execute(() => {
+        const summary = document.querySelector('.agent-run-confirmation-summary, .content-block-tool-confirmation-summary');
+        const host = summary?.closest('.messages');
+        if (!summary || !host) return false;
+        const bounds = summary.getBoundingClientRect();
+        const viewport = host.getBoundingClientRect();
+        return bounds.top >= viewport.top && bounds.bottom <= viewport.bottom;
+      }), { timeout: 2_000, interval: 100, timeoutMsg: 'stop consent scope is outside the reading viewport' });
       assert.match(cardText, /停止当前工作区中这次受控执行/);
       assert.match(cardText, /不会撤回/);
       assert.match(cardText, /等待清理结果/);
@@ -1793,7 +1732,8 @@ describe('first-run desktop experience', () => {
       return core.invoke('get_messages', { sessionId: personal.activeSessionId });
     });
     const imageApproveSelector = 'button=允许发送图像一次';
-    const waitForOwnedDesktopConsent = async (selector, expectedLabels, failureScreenshot) => {
+    phase('window-image');
+    const waitForOwnedDesktopConsent = async (selector, expectedLabels) => {
       let lastConsentState = {};
       try {
         await browser.waitUntil(async () => {
@@ -1821,35 +1761,12 @@ describe('first-run desktop experience', () => {
           return Object.values(lastConsentState).every(Boolean);
         }, { timeout: 20_000, timeoutMsg: 'desktop consent did not identify the exact owned app and operation scope' });
       } catch (error) {
-        await browser.saveScreenshot(join(screenshotDir, failureScreenshot));
         console.error('Owned window desktop consent failure:', JSON.stringify(lastConsentState));
-        const taskMessages = await readImageJourneyMessages();
-        const observations = taskMessages
-          .flatMap((message) => message.toolResults ?? [])
-          .filter((result) => result.callId.startsWith('cu-')).slice(-8).map((result) => {
-            let output;
-            try { output = JSON.parse(result.output); } catch { output = null; }
-            return {
-              callId: result.callId, success: result.success,
-              confirmationRequired: result.confirmationRequired,
-              confirmationStatus: result.confirmationStatus,
-              outputKeys: output && typeof output === 'object' ? Object.keys(output) : [],
-              errorCode: output?.code, appMatches: output?.appId === 'desktop-e2e-window',
-              hasRegionRef: typeof output?.regionRef === 'string', truncated: output?.truncated,
-              regionCount: output?.regions?.length, controlCount: output?.controls?.length,
-              diagnostics: output?.diagnostics,
-            };
-          });
-        console.error('Owned window task observation diagnostics:', JSON.stringify(observations));
-        console.error('Owned window task call order:', JSON.stringify(taskMessages
-          .flatMap((message) => (message.toolCalls ?? []).filter((call) => call.id.startsWith('cu-'))
-            .map((call) => ({ callId: call.id, name: call.name })))));
         throw error;
       }
     };
     const waitForImageConsent = () => waitForOwnedDesktopConsent(imageApproveSelector,
-      ['已核对授权应用', '当前配置的模型', '窗口可能包含私人内容'],
-      'desktop-window-image-consent-failure.png');
+      ['已核对授权应用', '当前配置的模型', '窗口可能包含私人内容']);
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').setValue('先展示测试窗口图像的确认范围，我会拒绝。');
     await browser.$('button[title="发送"]').click();
     await waitForImageConsent();
@@ -1867,21 +1784,7 @@ describe('first-run desktop experience', () => {
     const allowImageOnce = await browser.$(imageApproveSelector);
     await allowImageOnce.click();
     const imageReply = '已看到测试窗口中的两组色块；这是只读观察，没有点击或填写。';
-    try {
-      await waitForVisible(browser, `//*[contains(text(), "${imageReply}")]`, { timeout: 20_000 });
-    } catch (error) {
-      await browser.saveScreenshot(join(screenshotDir, 'desktop-window-image-failure.png'));
-      const recent = (await readImageJourneyMessages()).slice(-4).map((message) => ({
-        role: message.role,
-        content: message.content?.slice(0, 1200),
-        results: message.toolResults?.map((result) => ({
-          callId: result.callId, success: result.success, confirmationStatus: result.confirmationStatus,
-          output: result.output?.slice(0, 1200),
-        })),
-      }));
-      console.error('Owned window image handoff failure:', JSON.stringify(recent));
-      throw error;
-    }
+    await waitForVisible(browser, `//*[contains(text(), "${imageReply}")]`, { timeout: 20_000 });
     await browser.waitUntil(async () => !(await browser.$('button[title="停止运行"]').isExisting()),
       { timeout: 10_000, timeoutMsg: 'composed image continuation did not settle' });
     const imageMessages = await readImageJourneyMessages();
@@ -1918,6 +1821,7 @@ describe('first-run desktop experience', () => {
 
     // Grant only the already implemented UIA control capability to this owned
     // app. Model replies must obtain fresh opaque references after each effect.
+    phase('window-controls');
     await browser.tauri.execute(({ core }) => core.invoke('save_desktop_trusted_app', {
       app: {
         id: 'desktop-e2e-window', displayName: 'Owned window observation fixture',
@@ -1945,10 +1849,10 @@ describe('first-run desktop experience', () => {
     const checkSelector = 'button=允许勾选复选框一次';
     const uncheckSelector = 'button=允许取消勾选复选框一次';
     const controlScope = ['已核对目标', 'Fixture region A', 'Region checkbox'];
-    await waitForOwnedDesktopConsent(checkSelector, controlScope, 'desktop-window-task-consent-failure.png');
+    await waitForOwnedDesktopConsent(checkSelector, controlScope);
     await waitForOwnedCheckboxState(false, 0, 0);
     await browser.$(checkSelector).click();
-    await waitForOwnedDesktopConsent(uncheckSelector, controlScope, 'desktop-window-task-consent-failure.png');
+    await waitForOwnedDesktopConsent(uncheckSelector, controlScope);
     await waitForOwnedCheckboxState(true, 1, 0);
     await browser.saveScreenshot(join(screenshotDir, 'desktop-window-task-second-consent.png'));
     await browser.$(uncheckSelector).click();
@@ -2063,5 +1967,6 @@ describe('first-run desktop experience', () => {
     assert.ok((followup.toolResults ?? []).every((result) =>
       result.toolName === 'context_compaction' && result.success), 'followup must not repeat external actions');
     await waitForOwnedCheckboxState(false, 1, 1);
+    phase('complete');
   });
 });

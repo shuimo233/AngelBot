@@ -521,7 +521,11 @@ fn desktop_e2e_scoped_checkbox(
     let controls: Vec<_> = observation
         .controls
         .iter()
-        .filter(|control| control.name.as_deref() == Some(control_name))
+        // UIA may also expose the checkbox's caption as a same-name text node.
+        // Only typed checkbox candidates participate in action ambiguity.
+        .filter(|control| {
+            control.role == "checkBox" && control.name.as_deref() == Some(control_name)
+        })
         .collect();
     if call.arguments
         != serde_json::json!({"app_id":app_id,"mode":"controls","region_ref":region_ref})
@@ -1044,7 +1048,10 @@ mod desktop_e2e_tests {
                 format!(
                     "Result: {}",
                     json!({"appId":"desktop-e2e-window","regionRef":region_ref,"truncated":false,
-                    "controls":[{"depth":1,"role":"checkBox","name":"Region checkbox","enabled":true,"capabilities":["toggle"],"controlRef":control_ref,"state":{"toggle":if index == 1 { "on" } else { "off" }}}]})
+                    "controls":[
+                        {"depth":1,"role":"checkBox","name":"Region checkbox","enabled":true,"capabilities":["toggle"],"controlRef":control_ref,"state":{"toggle":if index == 1 { "on" } else { "off" }}},
+                        {"depth":2,"role":"text","name":"Region checkbox","enabled":true,"capabilities":[]}
+                    ]})
                 ),
             );
             if index < 2 {
