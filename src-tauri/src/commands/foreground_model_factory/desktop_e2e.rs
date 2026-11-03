@@ -298,8 +298,15 @@ impl LlmProvider for DesktopE2eProvider {
                 "desktop E2E model script exhausted after {index} replies"
             )),
         })();
-        let response =
-            result.map_err(|error| format!("{error} [desktop-e2e index={index} stage={stage}]"))?;
+        let response = result.map_err(|error| {
+            // These are synthetic protocol assertions, not provider responses.
+            // Keep the failing stage visible without exporting private history.
+            eprintln!(
+                "[ERROR] desktop-e2e index={index} stage={stage}: {}",
+                error.chars().take(400).collect::<String>()
+            );
+            format!("{error} [desktop-e2e index={index} stage={stage}]")
+        })?;
         // Validation failures are retried by the real runner. Keep the same
         // scripted response until it is successfully emitted, preserving the
         // original failure rather than skipping ahead to script exhaustion.

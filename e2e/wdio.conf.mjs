@@ -52,7 +52,11 @@ export const config = {
     try {
       report.state = await boundedDiagnostic(browser.tauri.execute(async ({ core }) => {
         const clip = (value, limit) => typeof value === 'string' ? value.slice(0, limit) : undefined;
-        const ids = [...new Set([window.__angelbotE2ePersonalSessionId, window.__angelbotE2eProjectSessionId])]
+        // Reloads clear window globals. Recover only the fixed synthetic
+        // personal workspace, never enumerate other projects' conversations.
+        const personalId = window.__angelbotE2ePersonalSessionId
+          ?? (await core.invoke('get_workspaces')).find(item => item.kind === 'personal')?.activeSessionId;
+        const ids = [...new Set([personalId, window.__angelbotE2eProjectSessionId])]
           .filter(id => typeof id === 'string').slice(0, 2);
         const sessions = [];
         for (const sessionId of ids) {
@@ -62,6 +66,9 @@ export const config = {
               role: message.role, content: clip(message.content, 1000),
               run: message.taskRun && { status: message.taskRun.status, resumable: message.taskRun.resumable,
                 confirmation: message.taskRun.confirmationState },
+              facts: message.taskFacts && { terminalReason: clip(message.taskFacts.terminal_reason, 100),
+                contextSummary: clip(message.taskFacts.context_summary, 500),
+                failedSteps: message.taskFacts.failed_steps?.slice(-3).map(step => clip(step, 500)) },
               calls: message.toolCalls?.slice(-3).map(call => ({ id: clip(call.id, 128), name: clip(call.name, 100) })),
               results: message.toolResults?.slice(-3).map(result => ({ callId: clip(result.callId, 128),
                 success: result.success, confirmation: result.confirmationStatus, output: clip(result.output, 500) })),

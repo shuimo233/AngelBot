@@ -1743,10 +1743,16 @@ globalThis.document = { querySelector: () => ({ textContent: 'D'.repeat(8000) })
 let captures = 0;
 globalThis.browser = {
   tauri: { execute: fn => fn({ core: { invoke: async (command, args) => {
+    if (command === 'get_workspaces') return [
+      { kind: 'project', activeSessionId: 'MUST_NOT_READ' },
+      { kind: 'personal', activeSessionId: 'personal-fixture' },
+    ];
     assert.equal(command, 'get_messages');
     assert.ok(['personal-fixture', 'project-fixture'].includes(args.sessionId));
     return Array.from({ length: 12 }, () => ({ role: 'assistant', content: 'C'.repeat(5000),
       native_private_items: 'MUST_NOT_EXPORT', taskRun: { status: 'failed', private: 'MUST_NOT_EXPORT' },
+      taskFacts: { terminal_reason: 'provider_unavailable', context_summary: 'F'.repeat(5000),
+        failed_steps: Array(10).fill('E'.repeat(5000)), private: 'MUST_NOT_EXPORT' },
       toolCalls: Array(10).fill({ id: 'call', name: 'synthetic', arguments: 'MUST_NOT_EXPORT' }),
       toolResults: Array(10).fill({ callId: 'call', success: false, output: 'O'.repeat(5000) }) }));
   } } }) },
@@ -1768,6 +1774,18 @@ assert.equal(row.results[0].output.length, 500);
 assert.equal(report.state.visibleConversation.length, 4000);
 assert.ok(!JSON.stringify(report).includes('MUST_NOT_EXPORT'));
 assert.equal(original.message, 'original failure');
+process.env.GITHUB_RUN_ATTEMPT = '4';
+delete window.__angelbotE2ePersonalSessionId; // A page reload clears in-memory fixture globals.
+await config.afterTest({ title: 'synthetic after reload' }, null, { passed: false, error: original });
+const reloaded = JSON.parse(await readFile(artifact(4), 'utf8'));
+assert.equal(reloaded.state.sessions.length, 2);
+const personal = reloaded.state.sessions.find(item => item.sessionId === 'personal-fixture');
+assert.ok(personal, 'failure evidence must include the current synthetic personal session after reload');
+assert.equal(personal.messages[0].facts.terminalReason, 'provider_unavailable');
+assert.equal(personal.messages[0].facts.contextSummary.length, 500);
+assert.equal(personal.messages[0].facts.failedSteps.length, 3);
+assert.equal(personal.messages[0].facts.failedSteps[0].length, 500);
+assert.ok(!JSON.stringify(reloaded).includes('MUST_NOT_EXPORT'));
 process.env.GITHUB_RUN_ATTEMPT = '2';
 browser.tauri.execute = async () => { throw new Error('diagnostic unavailable'); };
 browser.saveScreenshot = async () => { throw new Error('screenshot unavailable'); };
