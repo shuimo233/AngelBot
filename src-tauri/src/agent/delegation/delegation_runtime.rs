@@ -112,6 +112,7 @@ pub struct WorkerDispatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
+    DeliverySubmitted,
     Cancelled,
     Paused,
     LeaseExpired,
@@ -526,6 +527,12 @@ where
         )
     }
 
+    /// A producer exited without a delivery. Keep this distinct from policy
+    /// rejection so the Main Agent does not report a model failure as a grant change.
+    pub fn worker_failed(&mut self, attempt_id: &str) -> RuntimeResult<()> {
+        self.seal_attempt(attempt_id, StopReason::Recovery, "worker_failed", true)
+    }
+
     /// Child completion enters the durable inbox only. It becomes
     /// `awaiting_summary`; no child path can transition a delegation to
     /// `completed` or produce a user-visible response.
@@ -613,7 +620,7 @@ where
             &[],
         )?;
         for id in &delivered {
-            self.seal_delivered_attempt(id)?;
+            self.seal_delivered_attempt(id, StopReason::Recovery, "recovery_delivery_retained")?;
         }
         let unknown = self.active_attempt_ids("1 = 1", &[])?;
         for id in &unknown {
@@ -668,7 +675,7 @@ where
         } else {
             "cancelled"
         };
-        tx.execute("UPDATE delegations SET status = ?1, state_version = state_version + 1, updated_at = ?2 WHERE id = ?3 AND state_version = ?4 AND status IN ('queued', 'running', 'awaiting_confirmation', 'awaiting_summary')", params![target, now, delegation_id, version]).map_err(storage)?;
+        tx.execute("UPDATE delegations SET status = ?1, state_version = state_version + 1, updated_at = ?2 WHERE id = ?3 AND state_version = ?4 AND (status IN ('queued', 'running', 'awaiting_confirmation', 'awaiting_summary') OR (status='needs_decision' AND ?5))", params![target, now, delegation_id, version, reason == StopReason::Cancelled]).map_err(storage)?;
         append_event_tx(
             &tx,
             attempt_id,
@@ -687,10 +694,23 @@ where
             .map_err(DelegationRuntimeError::Sandbox)
     }
 
-    /// Stop a producer after its structured delivery is durable, while keeping
-    /// the Main-Agent decision path open. This is only used during recovery;
-    /// it never replays a worker or leaves its capability lease active.
-    fn seal_delivered_attempt(&mut self, attempt_id: &str) -> RuntimeResult<()> {
+    /// End producer access without accepting or discarding its durable result.
+    pub fn producer_finished(&mut self, attempt_id: &str) -> RuntimeResult<()> {
+        self.seal_delivered_attempt(
+            attempt_id,
+            StopReason::DeliverySubmitted,
+            "producer_delivery_retained",
+        )
+    }
+
+    /// Keep the Main-Agent decision path open, but never replay the producer
+    /// or leave its capability lease active while awaiting review/confirmation.
+    fn seal_delivered_attempt(
+        &mut self,
+        attempt_id: &str,
+        reason: StopReason,
+        event: &str,
+    ) -> RuntimeResult<()> {
         let now = self.clock.now();
         self.with_connection_mut(|conn| {
             let tx = conn.transaction().map_err(storage)?;
@@ -704,7 +724,12 @@ where
             let sealed = tx
                 .execute(
                     "UPDATE delegation_attempts SET status='sealed', ended_at=?1
-                     WHERE id=?2 AND status='running'",
+                     WHERE id=?2 AND status='running'
+                       AND EXISTS(SELECT 1 FROM delegation_deliveries delivery
+                         JOIN delegations delegation ON delegation.id=delivery.delegation_id
+                         WHERE delivery.attempt_id=delegation_attempts.id
+                           AND delivery.acceptance_status='submitted'
+                           AND delegation.status='awaiting_summary')",
                     params![now, attempt_id],
                 )
                 .map_err(storage)?;
@@ -714,14 +739,14 @@ where
             append_event_tx(
                 &tx,
                 attempt_id,
-                "recovery_delivery_retained",
-                &serde_json::json!({"reason": "Recovery"}).to_string(),
+                event,
+                &serde_json::json!({"reason": format!("{reason:?}")}).to_string(),
                 now,
             )?;
             tx.commit().map_err(storage)
         })?;
         self.worker
-            .stop(attempt_id, StopReason::Recovery)
+            .stop(attempt_id, reason)
             .map_err(DelegationRuntimeError::Worker)?;
         self.sandbox
             .seal_and_revoke(attempt_id)
@@ -1116,6 +1141,7 @@ mod tests {
     }
     fn completed_delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery".into(),
             delivery_revision: 1,

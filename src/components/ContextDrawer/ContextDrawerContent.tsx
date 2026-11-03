@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getContextUsage, type ContextUsage } from '$lib/commands/session';
 import { PROVIDER_REGISTRY } from '$lib/providers';
+import { getToolDisplayName } from '$lib/tool-display';
 import { useMessagesStore } from '$stores/messages';
 import { useSessionsStore } from '$stores/sessions';
 import { useSettingsStore } from '$stores/settings';
@@ -41,11 +42,11 @@ const TOOL_LABELS: Record<string, string> = {
   open_windows_setting: '打开系统设置',
   reveal_workspace_item: '在文件管理器中显示',
   prepare_message_draft: '填写消息草稿',
-  set_trusted_app_text: '填写应用输入框',
+  set_trusted_app_text: '修改应用输入框',
 };
 
 function getToolLabel(name: string) {
-  return TOOL_LABELS[name] ?? (name.startsWith('mcp_') ? 'MCP 工具' : name);
+  return TOOL_LABELS[name] ?? (name.startsWith('mcp_') ? 'MCP 工具' : getToolDisplayName(name));
 }
 
 const TASK_STATUS_LABELS: Record<string, string> = {

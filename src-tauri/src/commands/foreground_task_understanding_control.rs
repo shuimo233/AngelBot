@@ -43,6 +43,13 @@ pub(crate) fn register(
     session_id: String,
     db: Arc<Mutex<Connection>>,
 ) {
+    if !db
+        .lock()
+        .ok()
+        .is_some_and(|conn| active_project_workspace(&conn, &session_id).is_ok())
+    {
+        return;
+    }
     registry.register(
         Tool::new(
             "record_task_understanding",
@@ -64,6 +71,22 @@ pub(crate) fn register(
         .with_label("更新任务理解"),
         Arc::new(ForegroundTaskUnderstandingControl { session_id, db }),
     );
+}
+
+fn active_project_workspace(db: &Connection, session_id: &str) -> Result<String, String> {
+    let workspace: Option<(String, String)> = db
+        .query_row(
+            "SELECT id, kind FROM projects WHERE active_session_id=?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("could not resolve current workspace: {error}"))?;
+    match workspace {
+        Some((id, kind)) if kind == "project" => Ok(id),
+        Some(_) => Err("task understanding is only available in a project workspace".into()),
+        None => Err("current session is not the active conversation of a workspace".into()),
+    }
 }
 
 impl ToolHandler for ForegroundTaskUnderstandingControl {
@@ -101,34 +124,10 @@ impl ToolHandler for ForegroundTaskUnderstandingControl {
                 )
             }
         };
-        let workspace: Option<(String, String)> = match db
-            .query_row(
-                "SELECT id, kind FROM projects WHERE active_session_id=?1",
-                [&self.session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-        {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                return ToolResult::error(
-                    self.name(),
-                    format!("could not resolve current workspace: {error}"),
-                )
-            }
+        let workspace_id = match active_project_workspace(&db, &self.session_id) {
+            Ok(id) => id,
+            Err(error) => return ToolResult::error(self.name(), error),
         };
-        let Some((workspace_id, workspace_kind)) = workspace else {
-            return ToolResult::error(
-                self.name(),
-                "current session is not the active conversation of a workspace",
-            );
-        };
-        if workspace_kind != "project" {
-            return ToolResult::error(
-                self.name(),
-                "task understanding is only available in a project workspace",
-            );
-        }
         let update = NewTaskUnderstandingRecord {
             kind,
             source: UnderstandingSource::Agent,
@@ -197,6 +196,36 @@ mod tests {
         assert_eq!(projection.records.len(), 1);
         assert_eq!(projection.records[0].source, UnderstandingSource::Agent);
         assert_eq!(projection.records[0].scope, UnderstandingScope::Task);
+        drop(db);
+
+        let mut project = ToolRegistry::empty();
+        register(&mut project, handler.session_id.clone(), handler.db.clone());
+        assert!(project.contains("record_task_understanding"));
+        handler
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE projects SET kind='personal'", [])
+            .unwrap();
+        let mut personal = ToolRegistry::empty();
+        register(
+            &mut personal,
+            handler.session_id.clone(),
+            handler.db.clone(),
+        );
+        assert!(!personal.contains("record_task_understanding"));
+        assert!(!personal
+            .get_schemas()
+            .iter()
+            .any(|s| s["function"]["name"] == "record_task_understanding"));
+        assert!(
+            !handler
+                .execute(
+                    &json!({"kind":"assumption","body":"stale project capability"}),
+                    Path::new(".")
+                )
+                .success
+        );
     }
 
     #[test]

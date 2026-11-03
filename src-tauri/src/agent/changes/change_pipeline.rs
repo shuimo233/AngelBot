@@ -8,6 +8,7 @@
 //! operation.  No child receives a canonical workspace path or confirmation
 //! authority.
 
+use rusqlite::{params, OptionalExtension};
 use std::sync::Arc;
 
 use super::{
@@ -56,6 +57,8 @@ pub enum ChangePipelineError {
     WorktreeUnavailable,
     #[error("delegated Change cannot be materialized")]
     MaterializationUnavailable,
+    #[error("canonical write outcome is unknown; inspect existing effects before any retry")]
+    MaterializationIndeterminate,
     #[error("delegated Change storage failed")]
     Storage,
     #[error("delegated Change workflow rejected the request")]
@@ -314,6 +317,32 @@ impl ChangePipeline {
         }
     }
 
+    /// Startup only, before accepting new work. Never inspect or replay Git
+    /// effects here: a process loss after intent persistence is indeterminate.
+    /// A durably verified applied receipt may repair only its exact handoff.
+    pub fn recover(&self, now: i64) -> Result<(), ChangePipelineError> {
+        self.db.with_conn_mut(|conn| {
+            let tx = conn.transaction().map_err(|_| ChangePipelineError::Storage)?;
+            tx.execute("UPDATE delegation_materialization_receipts
+                        SET status='unknown',error_class='application_interrupted',updated_at=?1
+                        WHERE status='applying'", [now])
+                .map_err(|_| ChangePipelineError::Storage)?;
+            tx.execute("UPDATE delegation_change_handoffs AS handoff
+                        SET status='materialized',updated_at=?1,
+                            materialization_id=(SELECT receipt.id FROM delegation_materialization_receipts receipt
+                                WHERE receipt.confirmation_id=handoff.confirmation_id AND receipt.status='applied'
+                                  AND receipt.applied_at IS NOT NULL AND receipt.artifact_id=handoff.artifact_id
+                                  AND receipt.change_set_id=handoff.change_set_id AND receipt.work_package_id=handoff.work_package_id)
+                        WHERE handoff.status='confirmation_pending' AND EXISTS(
+                            SELECT 1 FROM delegation_materialization_receipts receipt
+                            WHERE receipt.confirmation_id=handoff.confirmation_id AND receipt.status='applied'
+                              AND receipt.applied_at IS NOT NULL AND receipt.artifact_id=handoff.artifact_id
+                              AND receipt.change_set_id=handoff.change_set_id AND receipt.work_package_id=handoff.work_package_id)", [now])
+                .map_err(|_| ChangePipelineError::Storage)?;
+            tx.commit().map_err(|_| ChangePipelineError::Storage)
+        }).map_err(|_| ChangePipelineError::Storage)?
+    }
+
     /// Recover the trusted parent scope from durable delivery ownership. This
     /// is used by the pump after a semantic reviewer passes; no scheduler or
     /// worker supplies session/message/run identifiers here.
@@ -352,6 +381,44 @@ impl ChangePipeline {
     /// structured decision state and may explicitly request a fresh attempt.
     pub fn mark_needs_decision(&self, delivery_id: &str, now: i64) {
         let _ = self.handoffs.mark_needs_decision(delivery_id, now);
+    }
+
+    /// Terminal cleanup may discard a stopped candidate only after the
+    /// runtime sealed the exact current attempt. Invalidate old approval in
+    /// the same transaction as its handoff; retain uncertain apply journals.
+    pub fn cancel_stopped_attempt(
+        &self,
+        attempt_id: &str,
+        now: i64,
+    ) -> Result<(), ChangePipelineError> {
+        self.db.with_conn_mut(|conn| {
+            let tx = conn.transaction().map_err(|_| ChangePipelineError::Storage)?;
+            let package_id = tx.query_row(
+                "SELECT d.work_package_id FROM delegations d
+                 JOIN delegation_attempts a ON a.delegation_id=d.id
+                 WHERE a.id=?1 AND a.status='sealed' AND d.status='cancelled'
+                   AND NOT EXISTS(SELECT 1 FROM delegation_attempts newer
+                       WHERE newer.delegation_id=d.id AND newer.attempt_number>a.attempt_number)",
+                [attempt_id], |row| row.get::<_, Option<String>>(0),
+            ).optional().map_err(|_| ChangePipelineError::Storage)?.flatten();
+            let Some(package_id) = package_id else { return Ok(()); };
+            let protected = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM delegation_materialization_receipts
+                 WHERE work_package_id=?1 AND status IN ('applying','unknown','applied'))",
+                [&package_id], |row| row.get::<_, bool>(0),
+            ).map_err(|_| ChangePipelineError::Storage)?;
+            if protected { return Err(ChangePipelineError::MaterializationUnavailable); }
+            tx.execute("UPDATE work_package_confirmations SET status='invalidated',updated_at=?1
+                        WHERE work_package_id=?2 AND status='approved'", params![now, package_id])
+                .map_err(|_| ChangePipelineError::Storage)?;
+            tx.execute("UPDATE work_packages SET status='cancelled',updated_at=?1
+                        WHERE id=?2 AND status IN ('draft','active','frozen','accepted')", params![now, package_id])
+                .map_err(|_| ChangePipelineError::Storage)?;
+            tx.execute("UPDATE delegation_change_handoffs SET status='cancelled',updated_at=?1
+                        WHERE implementation_attempt_id=?2 AND status IN ('preparing','ready','confirmation_pending','needs_decision')",
+                params![now, attempt_id]).map_err(|_| ChangePipelineError::Storage)?;
+            tx.commit().map_err(|_| ChangePipelineError::Storage)
+        }).map_err(|_| ChangePipelineError::Storage)?
     }
 
     /// Record an explicit parent decline without touching the canonical
@@ -605,6 +672,30 @@ impl ChangePipeline {
             .map_err(|_| ChangePipelineError::WorktreeUnavailable)
     }
 
+    /// A durable applied receipt can settle a lost parent acknowledgement
+    /// without opening an already-cleaned worktree or writing again. Unknown
+    /// and incomplete effects deliberately do not qualify.
+    pub(crate) fn is_materialized(
+        &self,
+        delivery_id: &str,
+        revision: i64,
+        attempt_id: &str,
+    ) -> Result<bool, ChangePipelineError> {
+        self.db.with_conn(|conn| conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delegation_change_handoffs handoff
+             JOIN delegation_materialization_receipts receipt ON receipt.id=handoff.materialization_id
+             WHERE handoff.delivery_id=?1 AND handoff.delivery_revision=?2
+               AND handoff.implementation_attempt_id=?3 AND handoff.status='materialized'
+               AND receipt.status='applied' AND receipt.applied_at IS NOT NULL
+               AND receipt.confirmation_id=handoff.confirmation_id
+               AND receipt.artifact_id=handoff.artifact_id
+               AND receipt.change_set_id=handoff.change_set_id
+               AND receipt.work_package_id=handoff.work_package_id)",
+            rusqlite::params![delivery_id,revision,attempt_id], |row| row.get(0),
+        )).map_err(|_|ChangePipelineError::Storage)?
+          .map_err(|_|ChangePipelineError::Storage)
+    }
+
     /// The only canonical write entry point. A parent-confirmed call creates
     /// the durable confirmation then materializes the same verified worktree
     /// artifact; callers must finalize/cleanup the attempt only after success
@@ -616,6 +707,21 @@ impl ChangePipeline {
         ttl_secs: i64,
         now: i64,
     ) -> Result<MaterializationReceipt, ChangePipelineError> {
+        let unresolved = self
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM delegation_materialization_receipts
+             WHERE work_package_id=?1 AND status IN ('applying','unknown'))",
+                    [&prepared.work_package_id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .map_err(|_| ChangePipelineError::Storage)?
+            .map_err(|_| ChangePipelineError::Storage)?;
+        if unresolved {
+            return Err(ChangePipelineError::MaterializationIndeterminate);
+        }
         let confirmation = self
             .workflow
             .confirm_change(
@@ -650,7 +756,12 @@ impl ChangePipeline {
                 prepared.base_revision.clone(),
                 now,
             )
-            .map_err(|_| ChangePipelineError::MaterializationUnavailable)?;
+            .map_err(|error| match error {
+                ChangeWorkflowError::Materialization(MaterializationError::Indeterminate) => {
+                    ChangePipelineError::MaterializationIndeterminate
+                }
+                _ => ChangePipelineError::MaterializationUnavailable,
+            })?;
         self.handoffs
             .mark_materialized(&prepared.delivery_id, &receipt.id, now)
             .map_err(|_| ChangePipelineError::Storage)?;
@@ -711,6 +822,7 @@ mod tests {
 
     fn delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery_change".into(),
             delivery_revision: 1,
@@ -956,9 +1068,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reviewed_change_requires_parent_confirmation_before_exact_materialization() {
-        let canonical = tempdir().unwrap();
+    fn prepared_change_fixture(
+        root: Option<&Path>,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ChangePipeline,
+        PreparedChange,
+    ) {
+        let canonical = root.map_or_else(tempdir, tempfile::tempdir_in).unwrap();
         fs::create_dir_all(canonical.path().join("src")).unwrap();
         fs::write(canonical.path().join("src/feature.txt"), "original\n").unwrap();
         git(canonical.path(), &["init"]);
@@ -970,7 +1088,7 @@ mod tests {
         git(canonical.path(), &["add", "."]);
         git(canonical.path(), &["commit", "-m", "base"]);
 
-        let storage = tempdir().unwrap();
+        let storage = root.map_or_else(tempdir, tempfile::tempdir_in).unwrap();
         let provider = Arc::new(
             GitWorktreeProvider::new(storage.path(), storage.path().join("manifests")).unwrap(),
         );
@@ -1001,7 +1119,11 @@ mod tests {
             .write_candidate(&access, "src/feature.txt", b"updated\n", 1024)
             .unwrap();
 
-        let db = db();
+        let db = root.map_or_else(db, |root| {
+            let conn = Connection::open(root.join("data.db")).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            SharedDb::new(conn)
+        });
         seed_change_delivery(&db);
         ResourceBindingRepository::new(db.clone())
             .create(&NewResourceBinding {
@@ -1071,15 +1193,9 @@ mod tests {
             "change",
             "implementer",
         );
-        db.with_conn_mut(|conn| {
-            conn.execute(
-                "INSERT INTO delegation_attempts(id,delegation_id,attempt_number,status,sandbox_ref,created_at,started_at,ended_at) VALUES ('reviewer_change','delegation_change',2,'sealed','sandbox://reviewer_change',?1,?1,?1)",
-                [NOW],
-            )?;
-            Ok::<(), rusqlite::Error>(())
-        })
-        .unwrap()
-        .unwrap();
+        // The independent Reviewer has an opaque review-job identity, not a
+        // second producer attempt. The production graph never inserts it in
+        // delegation_attempts, and no review artifact FK requires that row.
         let reviews = ReviewCoordinator::new(db.clone());
         reviews
             .enqueue(
@@ -1117,6 +1233,12 @@ mod tests {
             "original\n",
             "preparing a reviewed candidate must not write the canonical workspace"
         );
+        (canonical, storage, pipeline, prepared)
+    }
+
+    #[test]
+    fn reviewed_change_requires_parent_confirmation_before_exact_materialization() {
+        let (canonical, _storage, pipeline, prepared) = prepared_change_fixture(None);
         let receipt = pipeline
             .confirm_and_materialize(&prepared, true, 3600, NOW)
             .expect("only a parent-confirmed reviewed artifact may materialize");
@@ -1127,5 +1249,361 @@ mod tests {
                 .replace("\r\n", "\n"),
             "updated\n"
         );
+    }
+
+    #[test]
+    fn materialization_failures_keep_exact_receipts_and_never_replay() {
+        use super::super::{
+            materializer::MaterializeRequest,
+            workspace_isolation::{GitCommandOutput, GitCommandRunner},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FaultGit {
+            conflict: bool,
+            picks: AtomicUsize,
+        }
+        impl GitCommandRunner for FaultGit {
+            fn run(&self, cwd: &Path, args: &[String]) -> std::io::Result<GitCommandOutput> {
+                if args.first().is_some_and(|arg| arg == "cherry-pick") {
+                    if args.get(1).is_some_and(|arg| arg == "--abort") {
+                        return Ok(GitCommandOutput {
+                            status: Some(0),
+                            stdout: vec![],
+                        });
+                    }
+                    self.picks.fetch_add(1, Ordering::SeqCst);
+                    if self.conflict {
+                        return Ok(GitCommandOutput {
+                            status: Some(1),
+                            stdout: vec![],
+                        });
+                    }
+                }
+                // A real successful write whose subsequent readback becomes
+                // unavailable must not be described as a safe pre-write failure.
+                if self.picks.load(Ordering::SeqCst) > 0
+                    && args.first().is_some_and(|arg| arg == "rev-parse")
+                {
+                    return Err(std::io::Error::other("synthetic lost readback"));
+                }
+                ProcessGitCommandRunner.run(cwd, args)
+            }
+        }
+
+        for conflict in [true, false] {
+            let (canonical, _storage, pipeline, prepared) = prepared_change_fixture(None);
+            let confirmation = pipeline
+                .workflow
+                .confirm_change(&prepared.scope, &prepared.change_set_id, true, 3600, NOW)
+                .unwrap();
+            let artifact = pipeline
+                .workflow
+                .artifacts
+                .load_ready(&prepared.artifact_id)
+                .unwrap();
+            let runner = Arc::new(FaultGit {
+                conflict,
+                picks: AtomicUsize::new(0),
+            });
+            let root = canonical.path().to_path_buf();
+            let locator = Arc::new(move |_: &WorkPackageScope| Ok(root.clone()));
+            let materializer = Materializer::new(pipeline.db.clone(), runner.clone(), locator);
+            let request = MaterializeRequest {
+                scope: prepared.scope.clone(),
+                confirmation_id: confirmation.id.clone(),
+                artifact,
+                observed_base_revision: prepared.base_revision.clone(),
+                now: NOW,
+            };
+            let error = materializer.materialize(request.clone()).unwrap_err();
+            assert_eq!(
+                error,
+                if conflict {
+                    MaterializationError::GitFailed
+                } else {
+                    MaterializationError::Indeterminate
+                }
+            );
+            let saved: (String, Option<String>) = pipeline.db.with_conn(|conn| conn.query_row(
+                "SELECT status,error_class FROM delegation_materialization_receipts WHERE confirmation_id=?1",
+                [&confirmation.id], |row| Ok((row.get(0)?, row.get(1)?)),
+            )).unwrap().unwrap();
+            assert_eq!(saved.0, if conflict { "refused" } else { "unknown" });
+            assert_eq!(
+                saved.1.as_deref(),
+                Some(if conflict {
+                    "cherry_pick_conflict"
+                } else {
+                    "post_apply_head_unavailable"
+                })
+            );
+            assert!(materializer.materialize(request).is_err());
+            assert_eq!(runner.picks.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fs::read_to_string(canonical.path().join("src/feature.txt"))
+                    .unwrap()
+                    .replace("\r\n", "\n"),
+                if conflict { "original\n" } else { "updated\n" }
+            );
+        }
+    }
+
+    #[test]
+    fn materialization_process_loss_preserves_effects_and_repairs_only_verified_receipts() {
+        use super::super::{
+            materializer::MaterializeRequest,
+            workspace_isolation::{GitCommandOutput, GitCommandRunner},
+        };
+        use std::time::{Duration, Instant};
+        const CHILD_ROOT: &str = "ANGELBOT_PRIVATE_MATERIALIZATION_ROOT";
+        const CHILD_STAGE: &str = "ANGELBOT_PRIVATE_MATERIALIZATION_STAGE";
+        fn head(root: &Path) -> Vec<u8> {
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        }
+        fn hold(root: &Path, canonical: &Path, storage: &Path) -> ! {
+            let marker = serde_json::json!({"pid":std::process::id(),"canonical":canonical,"storage":storage});
+            fs::write(root.join("checkpoint.tmp"), marker.to_string()).unwrap();
+            fs::rename(root.join("checkpoint.tmp"), root.join("checkpoint.json")).unwrap();
+            loop {
+                std::thread::park_timeout(Duration::from_secs(1));
+            }
+        }
+        struct CrashGit {
+            root: std::path::PathBuf,
+            storage: std::path::PathBuf,
+            stage: String,
+        }
+        impl GitCommandRunner for CrashGit {
+            fn run(&self, cwd: &Path, args: &[String]) -> std::io::Result<GitCommandOutput> {
+                if args.first().is_some_and(|arg| arg == "cherry-pick") {
+                    match self.stage.as_str() {
+                        "before_write" => hold(&self.root, cwd, &self.storage),
+                        "partial_write" => {
+                            fs::write(cwd.join("src/feature.txt"), "partial\n")?;
+                            hold(&self.root, cwd, &self.storage);
+                        }
+                        "after_write" => {
+                            let output = ProcessGitCommandRunner.run(cwd, args)?;
+                            assert_eq!(output.status, Some(0));
+                            hold(&self.root, cwd, &self.storage);
+                        }
+                        "journaled" => {}
+                        _ => panic!("unknown crash stage"),
+                    }
+                }
+                ProcessGitCommandRunner.run(cwd, args)
+            }
+        }
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let (canonical, storage, pipeline, prepared) = prepared_change_fixture(Some(&root));
+            let confirmation = pipeline
+                .workflow
+                .confirm_change(&prepared.scope, &prepared.change_set_id, true, 3600, NOW)
+                .unwrap();
+            pipeline
+                .handoffs
+                .mark_confirmation_pending(&prepared.delivery_id, &confirmation.id, NOW)
+                .unwrap();
+            let runner = Arc::new(CrashGit {
+                root: root.clone(),
+                storage: storage.path().into(),
+                stage: std::env::var(CHILD_STAGE).unwrap(),
+            });
+            let canonical_root = canonical.path().to_path_buf();
+            let materializer = Materializer::new(
+                pipeline.db.clone(),
+                runner,
+                Arc::new(move |_: &WorkPackageScope| Ok(canonical_root.clone())),
+            );
+            let receipt = pipeline
+                .workflow
+                .materialize(
+                    &materializer,
+                    prepared.scope,
+                    confirmation.id,
+                    &prepared.artifact_id,
+                    prepared.base_revision,
+                    NOW,
+                )
+                .unwrap();
+            assert_eq!(receipt.status, MaterializationStatus::Applied);
+            hold(&root, canonical.path(), storage.path());
+        }
+
+        struct KillChild(std::process::Child);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for stage in ["before_write", "partial_write", "after_write", "journaled"] {
+            let root = tempdir().unwrap();
+            let output = fs::File::create(root.path().join("child.log")).unwrap();
+            let mut child = KillChild(Command::new(std::env::current_exe().unwrap())
+                .args(["agent::change_pipeline::tests::materialization_process_loss_preserves_effects_and_repairs_only_verified_receipts", "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD_ROOT, root.path()).env(CHILD_STAGE, stage)
+                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !root.path().join("checkpoint.json").exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "child ended before {stage}: {}",
+                    fs::read_to_string(root.path().join("child.log")).unwrap()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "no durable crash checkpoint for {stage}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let marker: serde_json::Value =
+                serde_json::from_slice(&fs::read(root.path().join("checkpoint.json")).unwrap())
+                    .unwrap();
+            assert_eq!(marker["pid"].as_u64().unwrap(), u64::from(child.0.id()));
+            child.0.kill().unwrap();
+            assert!(!child.0.wait().unwrap().success());
+            let canonical = Path::new(marker["canonical"].as_str().unwrap());
+            let storage = Path::new(marker["storage"].as_str().unwrap());
+            let owned_root = root.path().canonicalize().unwrap();
+            assert!(
+                canonical.canonicalize().unwrap().starts_with(&owned_root)
+                    && storage.canonicalize().unwrap().starts_with(&owned_root)
+            );
+            let original_head = head(canonical);
+            let bytes = fs::read(canonical.join("src/feature.txt")).unwrap();
+            assert_eq!(
+                String::from_utf8(bytes.clone())
+                    .unwrap()
+                    .replace("\r\n", "\n"),
+                match stage {
+                    "before_write" => "original\n",
+                    "partial_write" => "partial\n",
+                    _ => "updated\n",
+                }
+            );
+            let db = SharedDb::new(Connection::open(root.path().join("data.db")).unwrap());
+            let provider =
+                Arc::new(GitWorktreeProvider::new(storage, storage.join("manifests")).unwrap());
+            let pipeline = ChangePipeline::new(db.clone(), provider);
+            let before: String = db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT status FROM delegation_materialization_receipts",
+                        [],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                before,
+                if stage == "journaled" {
+                    "applied"
+                } else {
+                    "applying"
+                },
+                "the child must die before normal shutdown or receipt completion"
+            );
+            pipeline.recover(NOW + 1).unwrap();
+            pipeline.recover(NOW + 2).unwrap();
+            assert_eq!(head(canonical), original_head);
+            assert_eq!(
+                fs::read(canonical.join("src/feature.txt")).unwrap(),
+                bytes,
+                "recovery must never abort, overwrite or replay {stage}"
+            );
+            let saved: (String, Option<String>, String, String, i64) = db.with_conn(|conn| conn.query_row(
+                "SELECT status,error_class,confirmation_id,artifact_id,updated_at FROM delegation_materialization_receipts", [],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            )).unwrap().unwrap();
+            assert_eq!(
+                saved.0,
+                if stage == "journaled" {
+                    "applied"
+                } else {
+                    "unknown"
+                }
+            );
+            assert_eq!(
+                saved.1.as_deref(),
+                if stage == "journaled" {
+                    None
+                } else {
+                    Some("application_interrupted")
+                }
+            );
+            assert_eq!(saved.4, if stage == "journaled" { NOW } else { NOW + 1 });
+            assert_eq!(
+                pipeline
+                    .is_materialized("delivery_change", 1, "attempt_change")
+                    .unwrap(),
+                stage == "journaled"
+            );
+            if stage != "journaled" {
+                let prepared = pipeline
+                    .prepare(
+                        &DeliveryScope {
+                            session_id: "session_change".into(),
+                            message_id: "message_change".into(),
+                            parent_run_id: "run_change".into(),
+                        },
+                        "delivery_change",
+                        NOW + 2,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    pipeline.confirm_and_materialize(&prepared, true, 3600, NOW + 2),
+                    Err(ChangePipelineError::MaterializationIndeterminate)
+                ));
+                let count: i64 = db
+                    .with_conn(|conn| {
+                        conn.query_row(
+                            "SELECT count(*) FROM work_package_confirmations",
+                            [],
+                            |row| row.get(0),
+                        )
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "a new approval must not bypass an unknown previous write"
+                );
+            }
+            let canonical_root = canonical.to_path_buf();
+            let materializer = Materializer::new(
+                db,
+                Arc::new(ProcessGitCommandRunner),
+                Arc::new(move |_: &WorkPackageScope| Ok(canonical_root.clone())),
+            );
+            let artifact = pipeline.workflow.artifacts.load_ready(&saved.3).unwrap();
+            let result = materializer.materialize(MaterializeRequest {
+                scope: scope(),
+                confirmation_id: saved.2,
+                observed_base_revision: artifact.base_revision.clone(),
+                artifact,
+                now: NOW + 2,
+            });
+            if stage == "journaled" {
+                assert_eq!(result.unwrap().status, MaterializationStatus::Applied);
+            } else {
+                assert_eq!(result, Err(MaterializationError::Indeterminate));
+            }
+            assert_eq!(
+                head(canonical),
+                original_head,
+                "repeating the exact request must not create a second commit"
+            );
+            assert_eq!(fs::read(canonical.join("src/feature.txt")).unwrap(), bytes);
+        }
     }
 }

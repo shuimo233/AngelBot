@@ -10,6 +10,29 @@ use super::{
     shared_db::SharedDb,
 };
 
+// Recheck the immutable source at every CAS: cancellation or supersession
+// can race an already-running model request. A sealed producer is normal.
+const REVIEW_SOURCE_PENDING: &str = "EXISTS (
+    SELECT 1 FROM delegation_deliveries source
+    JOIN delegations delegation ON delegation.id=source.delegation_id
+    JOIN delegation_attempts producer ON producer.id=source.attempt_id
+    WHERE source.id=delegation_review_jobs.delivery_id
+      AND source.delivery_version=delegation_review_jobs.delivery_revision
+      AND source.attempt_id=delegation_review_jobs.implementation_attempt_id
+      AND source.acceptance_status='submitted'
+      AND delegation.status='awaiting_summary'
+      AND NOT EXISTS (
+          SELECT 1 FROM delegation_attempts newer
+          WHERE newer.delegation_id=producer.delegation_id
+            AND newer.attempt_number>producer.attempt_number
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM delegation_deliveries newer
+          WHERE newer.attempt_id=source.attempt_id
+            AND newer.delivery_version>source.delivery_version
+      )
+)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewJobStatus {
     Queued,
@@ -148,9 +171,11 @@ impl ReviewJobStore {
             .with_conn_mut(|conn| {
                 let changed = conn
                     .execute(
-                        "UPDATE delegation_review_jobs
+                        &format!(
+                            "UPDATE delegation_review_jobs
                          SET status='running', reviewer_attempt_id=?1, started_at=?2, updated_at=?2
-                         WHERE id=?3 AND status='queued'",
+                         WHERE id=?3 AND status='queued' AND {REVIEW_SOURCE_PENDING}"
+                        ),
                         params![reviewer_attempt_id, now, job_id],
                     )
                     .map_err(|_| ReviewStoreError::Storage)?;
@@ -189,9 +214,12 @@ impl ReviewJobStore {
             .with_conn_mut(|conn| {
                 let changed = conn
                     .execute(
-                        "UPDATE delegation_review_jobs
+                        &format!(
+                            "UPDATE delegation_review_jobs
                          SET status=?1, outcome_json=?2, ended_at=?3, updated_at=?3
-                         WHERE id=?4 AND reviewer_attempt_id=?5 AND status='running'",
+                         WHERE id=?4 AND reviewer_attempt_id=?5 AND status='running'
+                           AND {REVIEW_SOURCE_PENDING}"
+                        ),
                         params![
                             status.as_str(),
                             outcome_json,
@@ -214,16 +242,40 @@ impl ReviewJobStore {
     /// shutdown that cancels it), clear only its claim so the immutable
     /// producer subject can be reviewed again.
     pub fn requeue_running(&self, now: i64) -> Result<usize, ReviewStoreError> {
+        self.cancel_obsolete(now)?;
         self.db
             .with_conn_mut(|conn| {
                 conn.execute(
-                    "UPDATE delegation_review_jobs
+                    &format!(
+                        "UPDATE delegation_review_jobs
                      SET status='queued', reviewer_attempt_id=NULL,
                          started_at=NULL, updated_at=?1
-                     WHERE status='running'",
+                     WHERE status='running' AND {REVIEW_SOURCE_PENDING}"
+                    ),
                     params![now],
                 )
                 .map_err(|_| ReviewStoreError::Storage)
+            })
+            .map_err(|_| ReviewStoreError::Storage)?
+    }
+
+    /// Return IDs of unfinished reviews that lost their actionable source.
+    /// Completed verdicts remain historical facts; they are never erased.
+    pub fn cancel_obsolete(&self, now: i64) -> Result<Vec<String>, ReviewStoreError> {
+        self.db
+            .with_conn_mut(|conn| {
+                let mut statement = conn
+                    .prepare(&format!(
+                "UPDATE delegation_review_jobs SET status='cancelled',ended_at=?1,updated_at=?1
+                 WHERE status IN ('queued','running') AND NOT ({REVIEW_SOURCE_PENDING})
+                 RETURNING id"
+            ))
+                    .map_err(|_| ReviewStoreError::Storage)?;
+                let rows = statement
+                    .query_map(params![now], |row| row.get(0))
+                    .map_err(|_| ReviewStoreError::Storage)?;
+                rows.collect::<Result<Vec<String>, _>>()
+                    .map_err(|_| ReviewStoreError::Storage)
             })
             .map_err(|_| ReviewStoreError::Storage)?
     }
@@ -234,14 +286,14 @@ impl ReviewJobStore {
         self.db
             .with_conn(|conn| {
                 let mut statement = conn
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT id,implementation_attempt_id,delivery_id,delivery_revision,
                                 subject_json,status,reviewer_attempt_id,outcome_json,
                                 created_at,updated_at,started_at,ended_at
                          FROM delegation_review_jobs
-                         WHERE status='queued'
-                         ORDER BY created_at,id",
-                    )
+                         WHERE status='queued' AND {REVIEW_SOURCE_PENDING}
+                         ORDER BY created_at,id"
+                    ))
                     .map_err(|_| ReviewStoreError::Storage)?;
                 let rows = statement
                     .query_map([], map_job_row)
@@ -330,7 +382,7 @@ mod tests {
              INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m','s','user','m',1);
              INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES ('r','s','m','g','running','[]',1,1);
              INSERT INTO work_packages(id,session_id,owner_profile_id,workspace_key,task_shape,worker_profile,worker_policy_version,scope_digest,capability_scope_ref,capability_expires_at,candidate_version,created_at,updated_at,status) VALUES ('wp','s',1,'wk','explore','explorer',1,'scope','approved',1000,0,1,1,'active');
-             INSERT INTO delegations(id,session_id,message_id,parent_run_id,work_package_id,objective,brief_json,status,state_version,created_at,updated_at) VALUES ('d','s','m','r','wp','g','{}','running',0,1,1);
+             INSERT INTO delegations(id,session_id,message_id,parent_run_id,work_package_id,objective,brief_json,status,state_version,created_at,updated_at) VALUES ('d','s','m','r','wp','g','{}','awaiting_summary',0,1,1);
              INSERT INTO delegation_attempts(id,delegation_id,attempt_number,status,sandbox_ref,created_at,started_at) VALUES ('a','d',1,'running','sandbox://a',1,1);
              INSERT INTO delegation_deliveries(id,delegation_id,attempt_id,delivery_version,schema_version,payload_json,created_at) VALUES ('delivery','d','a',1,1,'{}',1);",
         ).unwrap();
@@ -347,6 +399,8 @@ mod tests {
                 milestones: vec![],
                 verifications: vec![],
                 artifact_refs: vec!["evidence://one".into()],
+                candidate_artifacts: vec![],
+                file_read_evidence: vec![],
                 risks: vec![],
                 open_questions: vec![],
             },
@@ -380,6 +434,105 @@ mod tests {
             store.claim("job", "review-b", 7).unwrap().status,
             ReviewJobStatus::Running
         );
+    }
+
+    #[test]
+    fn cancelled_review_cannot_settle_or_restart_while_other_work_recovers() {
+        let (db, subject) = setup();
+        db.with_conn_mut(|conn| conn.execute_batch(
+            "INSERT INTO delegations(id,session_id,message_id,parent_run_id,work_package_id,objective,brief_json,status,state_version,created_at,updated_at)
+             SELECT 'd2',session_id,message_id,parent_run_id,work_package_id,objective,brief_json,status,state_version,created_at,updated_at FROM delegations WHERE id='d';
+             INSERT INTO delegation_attempts(id,delegation_id,attempt_number,status,sandbox_ref,created_at,started_at) VALUES('a2','d2',1,'sealed','sandbox://a2',1,1);
+             INSERT INTO delegation_deliveries(id,delegation_id,attempt_id,delivery_version,schema_version,payload_json,created_at) VALUES('delivery2','d2','a2',1,1,'{}',1);"
+        )).unwrap().unwrap();
+        let store = ReviewJobStore::new(db.clone());
+        store
+            .enqueue("job", "a", "delivery", 1, &subject, 2)
+            .unwrap();
+        store.claim("job", "review-a", 3).unwrap();
+        let mut other = subject;
+        other.delivery_id = "delivery2".into();
+        other.implementation_attempt_id = "a2".into();
+        store
+            .enqueue("job2", "a2", "delivery2", 1, &other, 2)
+            .unwrap();
+        store.claim("job2", "review-b", 3).unwrap();
+        db.with_conn_mut(|conn| {
+            conn.execute("UPDATE delegations SET status='cancelled' WHERE id='d'", [])
+        })
+        .unwrap()
+        .unwrap();
+        let outcome = ReviewOutcome {
+            verdict: super::super::review_contract::SemanticReviewVerdict::Passed,
+            summary: "late passing review".into(),
+            findings: vec![],
+            missing_evidence: vec![],
+            evidence_refs: vec![],
+        };
+        assert_eq!(
+            store.record_outcome("job", "review-a", &outcome, 4),
+            Err(ReviewStoreError::InvalidTransition),
+            "cancellation must reject the old reviewer even before the next pump tick"
+        );
+        assert_eq!(
+            store.requeue_running(5).unwrap(),
+            1,
+            "only the still-pending source may recover"
+        );
+        assert_eq!(
+            store.load("job").unwrap().status,
+            ReviewJobStatus::Cancelled
+        );
+        assert_eq!(
+            store
+                .list_queued()
+                .unwrap()
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job2"]
+        );
+        assert_eq!(
+            store.claim("job", "review-after-cancel", 6),
+            Err(ReviewStoreError::InvalidTransition)
+        );
+        store.claim("job2", "review-c", 6).unwrap();
+        assert_eq!(
+            store.record_outcome("job2", "review-b", &outcome, 7),
+            Err(ReviewStoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store
+                .record_outcome("job2", "review-c", &outcome, 7)
+                .unwrap()
+                .status,
+            ReviewJobStatus::Passed
+        );
+        for invalidation in [
+            "UPDATE delegations SET status='cancelled' WHERE id='d'",
+            "UPDATE delegation_deliveries SET acceptance_status='accepted',accepted_by='parent_agent',accepted_at=4 WHERE id='delivery'",
+            "UPDATE delegation_attempts SET status='sealed' WHERE id='a';
+             INSERT INTO delegation_attempts(id,delegation_id,attempt_number,status,sandbox_ref,created_at) VALUES('new-attempt','d',2,'queued','sandbox://new',4)",
+            "INSERT INTO delegation_deliveries(id,delegation_id,attempt_id,delivery_version,schema_version,payload_json,created_at) VALUES('new-delivery','d','a',2,1,'{}',4)",
+        ] {
+            for claimed in [false, true] {
+                let (db, subject) = setup();
+                let store = ReviewJobStore::new(db.clone());
+                store.enqueue("job", "a", "delivery", 1, &subject, 2).unwrap();
+                if claimed { store.claim("job", "old-reviewer", 3).unwrap(); }
+                db.with_conn_mut(|conn| conn.execute_batch(invalidation)).unwrap().unwrap();
+                if claimed {
+                    assert_eq!(store.record_outcome("job", "old-reviewer", &outcome, 4), Err(ReviewStoreError::InvalidTransition));
+                } else {
+                    assert_eq!(store.claim("job", "late-claim", 4), Err(ReviewStoreError::InvalidTransition));
+                }
+                assert_eq!(store.cancel_obsolete(5).unwrap(), vec!["job"]);
+                assert!(store.cancel_obsolete(6).unwrap().is_empty());
+                assert_eq!(store.requeue_running(7).unwrap(), 0);
+                assert!(store.list_queued().unwrap().is_empty());
+                assert_eq!(store.load("job").unwrap().status, ReviewJobStatus::Cancelled);
+            }
+        }
     }
 
     #[test]

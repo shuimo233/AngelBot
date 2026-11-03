@@ -202,7 +202,7 @@ pub enum TerminalBranchKind {
     #[allow(dead_code)]
     MaxToolCalls,
     LlmRepeatedlyFailed,
-    CodingCompletionBlocked,
+    CompletionBlocked,
     ProtocolViolation,
     TooManyToolFailures,
     /// Single turn exceeded the configured wall-clock budget (Issue #096).
@@ -406,6 +406,15 @@ impl LlmProvider for DynamicLlmProvider {
 
     fn supports_tool_images(&self) -> bool {
         self.inner.supports_tool_images()
+    }
+
+    #[cfg(test)]
+    fn latest_request_fingerprint(&self) -> Option<crate::llm::ProviderRequestFingerprint> {
+        self.inner.latest_request_fingerprint()
+    }
+    #[cfg(test)]
+    fn latest_response_metadata(&self) -> Option<crate::llm::ProviderResponseMetadata> {
+        self.inner.latest_response_metadata()
     }
 
     async fn chat(

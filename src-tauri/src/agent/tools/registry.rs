@@ -4,13 +4,149 @@
 //! - `Tool`: metadata/schema (name, description, JSON Schema)
 //! - `ToolHandler`: execution logic (via dynamic dispatch, shared via Arc)
 //!
-//! Issue #47: Registry is wrapped in `Arc<Mutex<HashMap>>` for thread-safe
-//! concurrent access during parallel tool execution.
+//! Issue #47: Registry is wrapped in `Arc<Mutex<BTreeMap>>` for thread-safe
+//! concurrent access and a stable tool-name order across registry views.
 
 use super::tool::{Tool, ToolCall, ToolCategory, ToolExecutionContext, ToolHandler, ToolResult};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+/// Host-produced rejection, before dispatch/approval. Handler errors use the
+/// separate `Error: ...` envelope and must never be decoded as this receipt.
+pub(crate) fn argument_rejection_output(
+    registry: &ToolRegistry,
+    call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    error: &str,
+) -> String {
+    let mut null_corrections = Vec::new();
+    if let (Some(tool), Some(original)) = (registry.get(tool_name), arguments.as_object()) {
+        let mut omitted = original.clone();
+        if let Some(properties) = tool.parameters.get("properties").and_then(Value::as_object) {
+            for (key, value) in original {
+                let required = tool.parameters["required"]
+                    .as_array()
+                    .is_some_and(|keys| keys.iter().any(|field| field.as_str() == Some(key)));
+                let property = properties.get(key).unwrap_or(&Value::Null);
+                if value.is_null()
+                    && !required
+                    && property["nullable"] != true
+                    && matches!(
+                        property["type"].as_str(),
+                        Some("string" | "number" | "integer" | "boolean" | "array" | "object")
+                    )
+                {
+                    omitted.remove(key);
+                    null_corrections.push(key.clone());
+                }
+            }
+        }
+        if !null_corrections.is_empty()
+            && registry
+                .validate_arguments(tool_name, &Value::Object(omitted))
+                .is_err()
+        {
+            null_corrections.clear();
+        }
+    }
+    serde_json::json!({
+        "code": "HOST_ARGUMENTS_REJECTED", "dispatched": false,
+        "call_id": call_id, "tool_name": tool_name,
+        "null_corrections": null_corrections,
+        "message": format!("Tool call for '{tool_name}' was not executed: {error}. Provide every required argument and retry the tool call.")
+    }).to_string()
+}
+
+/// Resolve only a host rejection whose null fields were subsequently corrected
+/// by a real success. Only schema-proven invalid optional nulls may differ;
+/// explicitly nullable values (including clearing/filtering intent) are kept.
+/// All other originally specified values must be equal;
+/// no new keys/targets may be introduced. This changes completion diagnostics,
+/// never arguments, permissions, dispatch, or unknown-effect recovery.
+pub(crate) fn repairs_argument_rejection(
+    call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    output: &str,
+    corrected: &Value,
+) -> bool {
+    let Ok(receipt) = serde_json::from_str::<Value>(output) else {
+        return false;
+    };
+    if call_id.is_empty()
+        || receipt["code"] != "HOST_ARGUMENTS_REJECTED"
+        || receipt["dispatched"] != false
+        || receipt["call_id"] != call_id
+        || receipt["tool_name"] != tool_name
+    {
+        return false;
+    }
+    let (Some(original), Some(corrected)) = (arguments.as_object(), corrected.as_object()) else {
+        return false;
+    };
+    let Some(corrections) = receipt["null_corrections"].as_array() else {
+        return false;
+    };
+    !corrections.is_empty()
+        && corrections.iter().all(|key| {
+            key.as_str()
+                .is_some_and(|key| original.get(key) == Some(&Value::Null))
+        })
+        && original.iter().all(|(key, value)| {
+            corrections.iter().any(|field| field.as_str() == Some(key))
+                || corrected.get(key) == Some(value)
+        })
+        && corrected.keys().all(|key| original.contains_key(key))
+}
+
+/// The caller supplies a later successful receipt, never a dispatch or proposal.
+/// Shared by live task facts and durable transcript projection.
+pub(crate) fn operation_repair_matches(
+    failed_name: &str,
+    failed_id: &str,
+    failed_args: &Value,
+    failed_output: &str,
+    succeeded_name: &str,
+    succeeded_args: &Value,
+) -> bool {
+    // Compaction metrics describe the current context, not an operation target.
+    // A later host-proven reduction repairs an earlier preparation failure even
+    // when the context grew meanwhile. Keep the failed receipt, and do not apply
+    // this exception to model calls, malformed metrics, or unknown outcomes.
+    let recovered_compaction = failed_name == "context_compaction"
+        && failed_id
+            .strip_prefix("context-compaction-")
+            .is_some_and(|suffix| {
+                suffix
+                    .parse::<usize>()
+                    .is_ok_and(|value| value.to_string() == suffix)
+            })
+        && failed_output.starts_with("Context compaction failed: ")
+        && failed_args.as_object().is_some_and(|args| {
+            args.len() == 1 && args.get("before_tokens").and_then(Value::as_u64).is_some()
+        })
+        && succeeded_args.as_object().is_some_and(|args| {
+            args.len() == 2
+                && args
+                    .get("before_tokens")
+                    .and_then(Value::as_u64)
+                    .zip(args.get("after_tokens").and_then(Value::as_u64))
+                    .is_some_and(|(before, after)| after < before)
+        });
+    failed_name == succeeded_name
+        && !ToolResult::is_result_unknown(false, failed_output)
+        && (recovered_compaction
+            || failed_args == succeeded_args
+            || repairs_argument_rejection(
+                failed_id,
+                failed_name,
+                failed_args,
+                failed_output,
+                succeeded_args,
+            ))
+}
 
 /// Result of executing a tool
 #[derive(Debug, Clone)]
@@ -23,11 +159,11 @@ pub struct ToolExecResult {
 
 /// Global registry for all available tools.
 ///
-/// Wrapped in `Arc<Mutex<HashMap>>` for thread-safe concurrent access (Issue #47).
+/// Wrapped in `Arc<Mutex<BTreeMap>>` for thread-safe access and stable name order.
 /// Cloning the registry only clones the Arc pointer (cheap).
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    entries: Arc<Mutex<HashMap<String, ToolEntry>>>,
+    entries: Arc<Mutex<BTreeMap<String, ToolEntry>>>,
 }
 
 struct ToolEntry {
@@ -40,7 +176,7 @@ impl ToolRegistry {
     /// installation has one explicit, auditable entry point.
     pub fn empty() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -80,6 +216,23 @@ impl ToolRegistry {
     pub fn contains(&self, name: &str) -> bool {
         let guard = self.entries.lock().unwrap();
         guard.contains_key(name)
+    }
+
+    /// Remove a capability from a freshly assembled foreground surface. Its
+    /// schema, prompt guidance and handler disappear together.
+    pub(crate) fn unregister(&mut self, name: &str) {
+        self.entries.lock().unwrap().remove(name);
+    }
+
+    /// Host guidance only; keeps the existing handler, schema and approval
+    /// identity intact instead of changing untrusted MCP discovery metadata.
+    pub(crate) fn append_prompt_snippet(&mut self, name: &str, note: &str) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(name) {
+            entry.tool.prompt_snippet = Some(match entry.tool.prompt_snippet.take() {
+                Some(existing) => format!("{existing}\n{note}"),
+                None => note.to_owned(),
+            });
+        }
     }
 
     /// Get all tool schemas for LLM function calling
@@ -361,6 +514,8 @@ pub fn is_side_effect_tool(name: &str) -> bool {
             | "create_automation"
             | "schedule_reminder"
             | "cancel_reminder"
+            | "pause_automation"
+            | "stop_automation_run"
             | "import_skill_from_github"
             | "open_trusted_app"
             | "open_windows_setting"
@@ -368,9 +523,18 @@ pub fn is_side_effect_tool(name: &str) -> bool {
             | "prepare_message_draft"
             | "set_trusted_app_text"
             | "operate_trusted_app_control"
+            | "click_trusted_app_image"
             | "materialize_delegated_change"
             | "delegate_network_exploration"
     ) || name.starts_with("mcp_")
+}
+
+/// Argument-sensitive approval admission shared by the runner and persisted
+/// confirmation resolver. Structural observation remains a read-only tool;
+/// disclosing window pixels follows the user's normal operation permission.
+pub(crate) fn requires_argument_confirmation(name: &str, arguments: &Value) -> bool {
+    name == "observe_trusted_app_window"
+        && arguments.get("mode").and_then(Value::as_str) == Some("image")
 }
 
 /// Actions whose authority must never be inferred from a broad execution
@@ -390,6 +554,7 @@ pub fn requires_immediate_confirmation(name: &str) -> bool {
             | "prepare_message_draft"
             | "set_trusted_app_text"
             | "operate_trusted_app_control"
+            | "click_trusted_app_image"
     )
 }
 
@@ -397,7 +562,8 @@ pub fn requires_immediate_confirmation(name: &str) -> bool {
 mod tests {
     use super::{requires_immediate_confirmation, ToolRegistry};
     use crate::agent::tool::{
-        Tool, ToolCall, ToolCancellation, ToolExecutionContext, ToolHandler, ToolResult,
+        Tool, ToolCall, ToolCancellation, ToolCategory, ToolExecutionContext, ToolHandler,
+        ToolResult,
     };
     use serde_json::json;
     use std::path::Path;
@@ -422,6 +588,84 @@ mod tests {
     }
 
     #[test]
+    fn prompt_snippets_are_name_ordered_without_changing_tools_or_guidance() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn ToolHandler> = Arc::new(RecordingHandler {
+            calls: calls.clone(),
+        });
+        let expected = vec![
+            ("alpha".to_owned(), "原话 \"A\"\n第二行".to_owned()),
+            (
+                "middle".to_owned(),
+                "Keep this guidance unchanged.".to_owned(),
+            ),
+            ("zeta".to_owned(), "Z guidance".to_owned()),
+        ];
+        let mut previous_views = None;
+        for order in [[2, 0, 1], [1, 0, 2]] {
+            let mut registry = ToolRegistry::empty();
+            for index in order {
+                let (name, snippet) = &expected[index];
+                registry.register(
+                    Tool::new(name, "test guidance", json!({"type":"object"}))
+                        .with_prompt_snippet(snippet)
+                        .with_confirmation(index == 2)
+                        .with_category(if index == 1 {
+                            ToolCategory::Extension
+                        } else {
+                            ToolCategory::Core
+                        }),
+                    handler.clone(),
+                );
+            }
+            registry.register(
+                Tool::new("without_guidance", "no snippet", json!({"type":"object"}))
+                    .with_category(ToolCategory::Extension),
+                handler.clone(),
+            );
+            assert_eq!(registry.get_prompt_snippets(), expected);
+            let plain = registry.get_schemas();
+            let enhanced = registry.get_schemas_with_enhanced(true);
+            assert_eq!(plain, registry.get_schemas_with_enhanced(false));
+            for schemas in [&plain, &enhanced] {
+                assert_eq!(
+                    schemas
+                        .iter()
+                        .map(|schema| schema["function"]["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["alpha", "middle", "without_guidance", "zeta"]
+                );
+            }
+            let categories = [ToolCategory::Core, ToolCategory::Extension].map(|category| {
+                registry
+                    .get_by_category(category)
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(categories[0], ["alpha", "zeta"]);
+            assert_eq!(categories[1], ["middle", "without_guidance"]);
+            let views = (plain, enhanced, categories);
+            if let Some(previous) = &previous_views {
+                assert_eq!(&views, previous);
+            }
+            previous_views = Some(views);
+            assert_eq!(registry.len(), 4);
+            for (index, (name, snippet)) in expected.iter().enumerate() {
+                let tool = registry.get(name).unwrap();
+                assert_eq!(&tool.name, name);
+                assert_eq!(tool.prompt_snippet.as_ref(), Some(snippet));
+                assert_eq!(tool.requires_confirmation, index == 2);
+                assert!(Arc::ptr_eq(
+                    &registry.entries.lock().unwrap().get(name).unwrap().handler,
+                    &handler
+                ));
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn protected_actions_always_require_an_exact_decision() {
         for name in [
             "delete_memory",
@@ -431,6 +675,7 @@ mod tests {
             "prepare_message_draft",
             "set_trusted_app_text",
             "operate_trusted_app_control",
+            "click_trusted_app_image",
         ] {
             assert!(requires_immediate_confirmation(name), "{name}");
         }

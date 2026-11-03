@@ -6,7 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::delegation_contract::DelegationDelivery;
+use super::delegation_contract::{
+    validate_candidate_artifact, validate_file_read_evidence, CandidateArtifact, ContractLimits,
+    DelegationDelivery, FileReadEvidence,
+};
 
 const MAX_TEXT: usize = 8 * 1024;
 const MAX_ITEMS: usize = 32;
@@ -33,6 +36,12 @@ pub struct ReviewSubject {
     pub milestones: Vec<String>,
     pub verifications: Vec<String>,
     pub artifact_refs: Vec<String>,
+    /// Preserve declared output identity/description, not just generic evidence
+    /// URIs. Older queued subjects remain readable but lack this evidence.
+    #[serde(default)]
+    pub candidate_artifacts: Vec<CandidateArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_read_evidence: Vec<FileReadEvidence>,
     pub risks: Vec<String>,
     pub open_questions: Vec<String>,
 }
@@ -69,8 +78,11 @@ impl ReviewSubject {
                 .iter()
                 .map(|verification| {
                     format!(
-                        "{} [{}]: {}",
-                        verification.item, verification.method, verification.conclusion
+                        "{} [{}; status={:?}]: {}",
+                        verification.item,
+                        verification.method,
+                        verification.status,
+                        verification.conclusion
                     )
                 })
                 .collect(),
@@ -80,6 +92,8 @@ impl ReviewSubject {
                 .filter_map(|artifact| artifact.evidence_ref.clone())
                 .chain(delivery.evidence_refs.iter().cloned())
                 .collect(),
+            candidate_artifacts: delivery.candidate_artifacts.clone(),
+            file_read_evidence: delivery.file_read_evidence.clone(),
             risks: delivery.risks.clone(),
             open_questions: delivery
                 .open_questions
@@ -108,6 +122,8 @@ pub enum ReviewContractError {
     TooManyItems,
     #[error("review evidence reference is invalid")]
     InvalidReference,
+    #[error("review candidate artifact is invalid")]
+    InvalidArtifact,
 }
 
 impl ReviewSubject {
@@ -134,6 +150,21 @@ impl ReviewSubject {
         }
         for reference in &self.artifact_refs {
             validate_reference(reference)?;
+        }
+        let limits = ContractLimits::default();
+        if self.candidate_artifacts.len() > limits.max_artifacts {
+            return Err(ReviewContractError::TooManyItems);
+        }
+        for artifact in &self.candidate_artifacts {
+            validate_candidate_artifact(artifact, &limits)
+                .map_err(|_| ReviewContractError::InvalidArtifact)?;
+        }
+        if self.file_read_evidence.len() > limits.max_verifications {
+            return Err(ReviewContractError::TooManyItems);
+        }
+        for evidence in &self.file_read_evidence {
+            validate_file_read_evidence(evidence)
+                .map_err(|_| ReviewContractError::InvalidReference)?;
         }
         Ok(())
     }
@@ -215,6 +246,8 @@ mod tests {
             milestones: vec!["done".into()],
             verifications: vec!["checked".into()],
             artifact_refs: vec!["evidence://one".into()],
+            candidate_artifacts: vec![],
+            file_read_evidence: vec![],
             risks: vec![],
             open_questions: vec![],
         }
@@ -228,6 +261,41 @@ mod tests {
         let mut value = subject();
         value.artifact_refs = vec!["C:\\secret.txt".into()];
         assert_eq!(value.validate(), Err(ReviewContractError::InvalidReference));
+        let mut value = subject();
+        value.candidate_artifacts = vec![CandidateArtifact {
+            kind: "file".into(),
+            relative_ref: "output/result.txt".into(),
+            description: "The declared output".into(),
+            evidence_ref: Some("evidence://one".into()),
+        }];
+        assert!(value.validate().is_ok());
+        value.file_read_evidence = vec![FileReadEvidence {
+            evidence_ref: format!("evidence://file-read/{}", uuid::Uuid::new_v4()),
+            relative_ref: "output/result.txt".into(),
+            content_bytes: 3,
+            sha256: "a".repeat(64),
+        }];
+        assert!(value.validate().is_ok());
+        let mut legacy = serde_json::to_value(&value).unwrap();
+        legacy.as_object_mut().unwrap().remove("file_read_evidence");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_artifacts");
+        let legacy: ReviewSubject = serde_json::from_value(legacy).unwrap();
+        assert!(
+            legacy.candidate_artifacts.is_empty(),
+            "old queued reviews must remain readable without inventing missing evidence"
+        );
+        assert!(legacy.validate().is_ok());
+        assert!(legacy.file_read_evidence.is_empty());
+        value.file_read_evidence[0].sha256 = "z".repeat(64);
+        assert_eq!(value.validate(), Err(ReviewContractError::InvalidReference));
+        value.file_read_evidence.clear();
+        for path in ["../escape", "C:\\private.txt", "/private.txt"] {
+            value.candidate_artifacts[0].relative_ref = path.into();
+            assert_eq!(value.validate(), Err(ReviewContractError::InvalidArtifact));
+        }
     }
 
     #[test]

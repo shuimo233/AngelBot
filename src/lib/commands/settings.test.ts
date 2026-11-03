@@ -19,7 +19,8 @@ describe('ChatGPT plan command contracts', () => {
   });
   it('tests the complete unsaved model configuration through the model factory', async () => {
     const config = { provider: 'openai', model: 'selected-model', base_url: 'https://api.openai.com/v1', api_key: '', max_tokens: 4096, temperature: 0.7, protocol: 'openai_responses' as const, auth_mode: 'chatgpt_plan' as const, credential_ref: 'opaque-ref' };
-    await testModelConnection(config);
+    vi.mocked(invoke).mockResolvedValue({ toolRoundTrip: 'verified' });
+    await expect(testModelConnection(config)).resolves.toEqual({ toolRoundTrip: 'verified' });
     expect(invoke).toHaveBeenCalledWith('test_model_connection', { config });
   });
 });

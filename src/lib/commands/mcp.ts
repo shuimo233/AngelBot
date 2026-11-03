@@ -27,6 +27,34 @@ export async function saveMcpServer(server: McpServer): Promise<void> {
   return invoke<void>('save_mcp_server', { server });
 }
 
+export async function prepareBrowserMcp(sessionId: string): Promise<Pick<McpServer, 'id' | 'name' | 'command' | 'args'>> {
+  return invoke('prepare_browser_mcp', { sessionId });
+}
+
+export type BrowserCleanupPreview = {
+  cutoff: number;
+  fingerprint: string;
+  fileCount: number;
+  bytes: number;
+  eligibleFiles: number;
+  files: string[];
+};
+
+export type BrowserCleanupResult = {
+  deletedFiles: number;
+  deletedBytes: number;
+  remainingFiles: number;
+  partial: boolean;
+};
+
+export async function previewBrowserCleanup(): Promise<BrowserCleanupPreview> {
+  return invoke('preview_browser_cleanup');
+}
+
+export async function clearBrowserTempFiles(preview: Pick<BrowserCleanupPreview, 'cutoff' | 'fingerprint'>): Promise<BrowserCleanupResult> {
+  return invoke('clear_browser_temp_files', { request: { cutoff: preview.cutoff, fingerprint: preview.fingerprint } });
+}
+
 /** Write-only credential commands. Neither command returns a stored value. */
 export async function setMcpEnvVar(serverId: string, key: string, value: string): Promise<void> {
   return invoke<void>('set_mcp_env_var', { serverId, key, value });

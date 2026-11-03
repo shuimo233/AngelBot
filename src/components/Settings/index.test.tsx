@@ -48,9 +48,9 @@ describe('SettingsModal model save confirmation through native commands', () => 
     });
   });
 
-  async function openAndEdit() {
+  async function openAndEdit(onClose = () => {}) {
     const user = userEvent.setup();
-    render(<SettingsModal isOpen initialPage="api" onClose={() => {}} />);
+    render(<SettingsModal isOpen initialPage="api" onClose={onClose} />);
     await screen.findByText('offline-account · 已授权套餐用量');
     await waitFor(() => expect(loads).toBe(1));
     await user.clear(screen.getByLabelText('模型标识'));
@@ -70,19 +70,100 @@ describe('SettingsModal model save confirmation through native commands', () => 
     expect(screen.getByLabelText('模型标识')).toHaveValue('new-plan-model');
   });
 
+  it('retains the specific save failure and draft without automatically retrying', async () => {
+    save = async () => { throw new Error('configuration is busy; retry after the active task finishes'); };
+    const user = await openAndEdit();
+    await user.click(screen.getByRole('button', { name: /^保存$/ }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '重试保存' })).toBeEnabled());
+    expect(screen.getByRole('alert')).toHaveTextContent('模型配置保存未能确认成功：configuration is busy; retry after the active task finishes');
+    expect(screen.getByLabelText('模型标识')).toHaveValue('new-plan-model');
+    expect(screen.queryByRole('button', { name: '已保存' })).not.toBeInTheDocument();
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'save_api_config')).toHaveLength(1);
+    expect(loads).toBe(1);
+  });
+
   it('keeps a newer selection unsaved when it was entered during save', async () => {
     const pendingSave = deferred<void>();
     save = () => pendingSave.promise;
-    const user = await openAndEdit();
+    const close = vi.fn();
+    const user = await openAndEdit(close);
     await user.click(screen.getByRole('button', { name: /^保存$/ }));
     expect(screen.getByRole('button', { name: '保存中…' })).toBeDisabled();
     await user.clear(screen.getByLabelText('模型标识'));
     await user.type(screen.getByLabelText('模型标识'), 'newer-plan-model');
+    await user.click(screen.getByRole('button', { name: '关闭' }));
+    expect(screen.getByRole('button', { name: '放弃未保存修改并关闭' })).toBeDisabled();
     await act(async () => { pendingSave.resolve(undefined); });
     await waitFor(() => expect(loads).toBe(2));
     expect(screen.getByLabelText('模型标识')).toHaveValue('newer-plan-model');
     expect(screen.getByRole('button', { name: /^保存$/ })).toBeEnabled();
     expect(useSettingsStore.getState().activeApiConfig.model).toBe('new-plan-model');
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.getByText(/还有未保存的模型或性格修改/)).toBeInTheDocument();
+  });
+
+  it('does not label a late model-save failure as a failure of the newly selected settings page', async () => {
+    let rejectSave!: (reason: Error) => void;
+    save = () => new Promise<void>((_resolve, reject) => { rejectSave = reject; });
+    const user = await openAndEdit();
+    await user.click(screen.getByRole('button', { name: /^保存$/ }));
+    await user.click(screen.getByRole('button', { name: '常规' }));
+    await act(async () => { rejectSave(new Error('offline model save failed')); });
+
+    expect(screen.getByRole('button', { name: /^保存$/ })).toBeEnabled();
+    expect(screen.queryByText(/性格修改保存未能确认成功/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/offline model save failed/)).not.toBeInTheDocument();
+    expect(useSettingsStore.getState().apiConfig.model).toBe('new-plan-model');
+    expect(useSettingsStore.getState().activeApiConfig.model).toBe(savedPlan.model);
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'save_api_config')).toHaveLength(1);
+  });
+
+  it('guards Escape and overlay closure, preserves edits on cancel, and discards only after explicit choice', async () => {
+    const close = vi.fn();
+    const user = await openAndEdit(close);
+    const originalProfile = useSettingsStore.getState().profile;
+    act(() => useSettingsStore.getState().updateProfile({ bio: '未保存的性格修改' }));
+    await user.keyboard('{Escape}');
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.getByText(/还有未保存的模型或性格修改/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '继续编辑' }));
+    expect(screen.getByLabelText('模型标识')).toHaveValue('new-plan-model');
+    expect(useSettingsStore.getState().profile.bio).toBe('未保存的性格修改');
+    await user.click(document.querySelector('.settings-overlay')!);
+    expect(close).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '放弃未保存修改并关闭' }));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(useSettingsStore.getState().apiConfig.model).toBe(savedPlan.model);
+    expect(useSettingsStore.getState().profile).toEqual(originalProfile);
+    expect(nativeInvoke.mock.calls.map(([command]) => command)).not.toContain('save_api_config');
+  });
+
+  it('does not mistake background plan readiness changes for unsaved model edits', async () => {
+    const close = vi.fn();
+    const user = userEvent.setup();
+    render(<SettingsModal isOpen initialPage="api" onClose={close} />);
+    await screen.findByText('offline-account · 已授权套餐用量');
+    act(() => useSettingsStore.getState().invalidatePlanBinding(null));
+    await user.keyboard('{Escape}');
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/还有未保存的模型或性格修改/)).not.toBeInTheDocument();
+  });
+
+  it('keeps unsaved edits when an external settings shortcut changes the page', async () => {
+    const close = vi.fn();
+    const frame = render(<SettingsModal isOpen initialPage="api" onClose={close} />);
+    await screen.findByText('offline-account · 已授权套餐用量');
+    act(() => {
+      useSettingsStore.getState().updateApiConfig({ model: 'unsaved-model' });
+      useSettingsStore.getState().updateProfile({ bio: '未保存的性格内容' });
+    });
+    frame.rerender(<SettingsModal isOpen initialPage="personality" onClose={close} />);
+    expect(useSettingsStore.getState().apiConfig.model).toBe('unsaved-model');
+    expect(useSettingsStore.getState().profile.bio).toBe('未保存的性格内容');
+    expect(loads).toBe(1);
+    await userEvent.keyboard('{Escape}');
+    expect(close).not.toHaveBeenCalled();
+    expect(screen.getByText(/还有未保存的模型或性格修改/)).toBeInTheDocument();
   });
 
   it('clears saved confirmation after a subsequent model edit', async () => {

@@ -129,9 +129,9 @@ mod tests {
                );
                CREATE TABLE delegation_deliveries (
                    id TEXT, delegation_id TEXT, payload_json TEXT,
-                   created_at INTEGER, delivery_version INTEGER
+                   created_at INTEGER, delivery_version INTEGER, attempt_id TEXT
                );
-               CREATE TABLE delegation_attempts (id TEXT, delegation_id TEXT);
+               CREATE TABLE delegation_attempts (id TEXT, delegation_id TEXT, attempt_number INTEGER, status TEXT);
                CREATE TABLE delegation_attempt_events (
                    attempt_id TEXT, sequence INTEGER, event_type TEXT,
                    payload_json TEXT, created_at INTEGER
@@ -144,7 +144,12 @@ mod tests {
                    ('workspace-b', 'session-b');
                INSERT INTO delegations VALUES
                    ('delegation-a', 'session-a', 'inspect project A', 'running', '{}', 10),
-                   ('delegation-b', 'session-b', 'inspect project B', 'completed', '{}', 20);"#,
+                   ('delegation-b', 'session-b', 'inspect project B', 'completed', '{}', 20);
+               ALTER TABLE delegations ADD COLUMN work_package_id TEXT;
+               UPDATE delegations SET work_package_id='package-b' WHERE id='delegation-b';
+               CREATE TABLE delegation_materialization_receipts (work_package_id TEXT,status TEXT,updated_at INTEGER);
+               INSERT INTO delegation_attempts VALUES ('attempt-b','delegation-b',1,'sealed');
+               INSERT INTO delegation_materialization_receipts VALUES ('package-b','unknown',30);"#,
         )
         .unwrap();
         seed_attention_read_tables(&conn, &["session-a", "session-b"]);
@@ -155,6 +160,14 @@ mod tests {
         assert_eq!(projection.delegations.len(), 1);
         assert_eq!(projection.delegations[0].id, "delegation-a");
         assert_eq!(projection.delegations[0].goal, "inspect project A");
+        assert!(projection.pending_decisions.is_empty());
+        let other = get_workspace_activity_projection_impl(&conn, "workspace-b").unwrap();
+        assert_eq!(other.delegations[0].status, "needs_decision");
+        assert!(other.delegations[0]
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("正式项目"));
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub enum DelegationServiceError {
     ReviewPending,
     ReviewRejected,
     Review,
+    StopUnavailable,
+    MaterializationInProgress,
     CleanupPending(String),
 }
 
@@ -92,6 +94,12 @@ impl std::fmt::Display for DelegationServiceError {
             Self::ReviewPending => f.write_str("delivery review is not complete"),
             Self::ReviewRejected => f.write_str("delivery review did not pass"),
             Self::Review => f.write_str("reviewer execution failed"),
+            Self::StopUnavailable => {
+                f.write_str("delegated work is unavailable or its attempt has changed")
+            }
+            Self::MaterializationInProgress => {
+                f.write_str("canonical materialization outcome requires inspection; do not retry or discard its recovery evidence")
+            }
             Self::CleanupPending(attempt) => {
                 write!(f, "terminal cleanup is pending for attempt {attempt}")
             }
@@ -99,6 +107,28 @@ impl std::fmt::Display for DelegationServiceError {
     }
 }
 impl std::error::Error for DelegationServiceError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStopStatus {
+    Stopped,
+    AlreadyStopped,
+    AlreadyFinished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DelegationStopOutcome {
+    pub status: DelegationStopStatus,
+    pub cleanup_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DelegatedWorkSummary {
+    pub delegation_id: String,
+    pub attempt_id: String,
+    pub goal: String,
+    pub status: String,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ServiceReport {
@@ -111,35 +141,39 @@ pub struct ServiceReport {
     pub reviewed_delivery_follow_ups_queued: usize,
 }
 
-/// Type-erased lifecycle seam for `AppState`.  Tauri should not expose the
-/// scheduler's worker/clock/policy generics; all calls remain serialized by
-/// this one handle and delegate to the same service instance.
-/// Internal lifecycle seam between the pump and its concrete execution loop.
-/// Main-Agent callers use `DelegationServiceHandle` rather than the loop.
+/// Internal adapter seam hiding the scheduler's worker/clock/policy generics.
+/// Every operation is required: missing business wiring must fail to compile,
+/// not silently look like a stopped service. Callers use the shared handle.
 pub(crate) trait DelegationServiceLoop: Send {
     fn start(&mut self) -> Result<ServiceReport, DelegationServiceError>;
     fn tick(&mut self) -> Result<ServiceReport, DelegationServiceError>;
     fn shutdown(&mut self) -> Result<(), DelegationServiceError>;
     fn poll_workers(&mut self, limits: &ContractLimits) -> Result<usize, DelegationServiceError>;
     fn active_worker_attempts(&self) -> usize;
+    fn list_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DelegatedWorkSummary>, DelegationServiceError>;
+    fn stop_for_session(
+        &mut self,
+        session_id: &str,
+        delegation_id: &str,
+        attempt_id: &str,
+    ) -> Result<DelegationStopOutcome, DelegationServiceError>;
     fn materialize_change_for_session(
         &mut self,
-        _session_id: &str,
-        _delivery_id: &str,
-        _ttl_secs: i64,
-        _limits: &ContractLimits,
-    ) -> Result<DecisionOutcome, DelegationServiceError> {
-        Err(DelegationServiceError::ChangeReviewNotReady)
-    }
+        session_id: &str,
+        delivery_id: &str,
+        ttl_secs: i64,
+        limits: &ContractLimits,
+    ) -> Result<DecisionOutcome, DelegationServiceError>;
     fn decline_change_for_session(
         &mut self,
-        _session_id: &str,
-        _delivery_id: &str,
-        _ttl_secs: i64,
-        _limits: &ContractLimits,
-    ) -> Result<(), DelegationServiceError> {
-        Err(DelegationServiceError::ChangeReviewNotReady)
-    }
+        session_id: &str,
+        delivery_id: &str,
+        ttl_secs: i64,
+        limits: &ContractLimits,
+    ) -> Result<(), DelegationServiceError>;
     fn heartbeat(
         &mut self,
         heartbeat: super::delegation_runtime::Heartbeat,
@@ -156,41 +190,40 @@ pub(crate) trait DelegationServiceLoop: Send {
         decision: ParentDecision,
         reason: Option<&str>,
         limits: &ContractLimits,
-    ) -> Result<DecisionOutcome, DelegationServiceError> {
-        let _ = (session_id, delivery_id, decision, reason, limits);
-        Err(DelegationServiceError::Inbox)
-    }
+    ) -> Result<DecisionOutcome, DelegationServiceError>;
     fn retry_for_session(
         &mut self,
         session_id: &str,
         delivery_id: &str,
         reason: &str,
         limits: &ContractLimits,
-    ) -> Result<RetryContinuation, DelegationServiceError> {
-        let _ = (session_id, delivery_id, reason, limits);
-        Err(DelegationServiceError::Inbox)
-    }
+    ) -> Result<RetryContinuation, DelegationServiceError>;
 }
 
+/// One serialized service for Main controls and background polling. Limits
+/// are bound by the composition root, never chosen by individual callers.
 pub struct DelegationServiceHandle {
     inner: std::sync::Arc<std::sync::Mutex<Box<dyn DelegationServiceLoop>>>,
+    limits: ContractLimits,
 }
 
 impl Clone for DelegationServiceHandle {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            limits: self.limits.clone(),
         }
     }
 }
 
 impl DelegationServiceHandle {
-    pub(crate) fn new<Svc>(service: Svc) -> Self
+    pub(crate) fn new<Svc>(service: Svc, limits: ContractLimits) -> Self
     where
         Svc: DelegationServiceLoop + 'static,
     {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(Box::new(service))),
+            limits,
         }
     }
 
@@ -208,11 +241,11 @@ impl DelegationServiceHandle {
             .tick()
     }
 
-    pub fn poll_workers(&self, limits: &ContractLimits) -> Result<usize, DelegationServiceError> {
+    pub fn poll_workers(&self) -> Result<usize, DelegationServiceError> {
         self.inner
             .lock()
             .map_err(|_| DelegationServiceError::Runtime)?
-            .poll_workers(limits)
+            .poll_workers(&self.limits)
     }
 
     pub fn active_worker_attempts(&self) -> Result<usize, DelegationServiceError> {
@@ -230,6 +263,28 @@ impl DelegationServiceHandle {
             .shutdown()
     }
 
+    pub fn stop_for_session(
+        &self,
+        session_id: &str,
+        delegation_id: &str,
+        attempt_id: &str,
+    ) -> Result<DelegationStopOutcome, DelegationServiceError> {
+        self.inner
+            .lock()
+            .map_err(|_| DelegationServiceError::Runtime)?
+            .stop_for_session(session_id, delegation_id, attempt_id)
+    }
+
+    pub fn list_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DelegatedWorkSummary>, DelegationServiceError> {
+        self.inner
+            .lock()
+            .map_err(|_| DelegationServiceError::Runtime)?
+            .list_for_session(session_id)
+    }
+
     pub fn heartbeat(
         &self,
         heartbeat: super::delegation_runtime::Heartbeat,
@@ -243,12 +298,11 @@ impl DelegationServiceHandle {
     pub fn submit_delivery(
         &self,
         delivery: DelegationDelivery,
-        limits: &ContractLimits,
     ) -> Result<(), DelegationServiceError> {
         self.inner
             .lock()
             .map_err(|_| DelegationServiceError::Runtime)?
-            .submit_delivery(delivery, limits)
+            .submit_delivery(delivery, &self.limits)
     }
 
     pub fn decide_for_session(
@@ -257,12 +311,11 @@ impl DelegationServiceHandle {
         delivery_id: &str,
         decision: ParentDecision,
         reason: Option<&str>,
-        limits: &ContractLimits,
     ) -> Result<DecisionOutcome, DelegationServiceError> {
         self.inner
             .lock()
             .map_err(|_| DelegationServiceError::Runtime)?
-            .decide_for_session(session_id, delivery_id, decision, reason, limits)
+            .decide_for_session(session_id, delivery_id, decision, reason, &self.limits)
     }
 
     pub fn retry_for_session(
@@ -270,12 +323,11 @@ impl DelegationServiceHandle {
         session_id: &str,
         delivery_id: &str,
         reason: &str,
-        limits: &ContractLimits,
     ) -> Result<RetryContinuation, DelegationServiceError> {
         self.inner
             .lock()
             .map_err(|_| DelegationServiceError::Runtime)?
-            .retry_for_session(session_id, delivery_id, reason, limits)
+            .retry_for_session(session_id, delivery_id, reason, &self.limits)
     }
 
     pub fn materialize_change_for_session(
@@ -283,12 +335,11 @@ impl DelegationServiceHandle {
         session_id: &str,
         delivery_id: &str,
         ttl_secs: i64,
-        limits: &ContractLimits,
     ) -> Result<DecisionOutcome, DelegationServiceError> {
         self.inner
             .lock()
             .map_err(|_| DelegationServiceError::Runtime)?
-            .materialize_change_for_session(session_id, delivery_id, ttl_secs, limits)
+            .materialize_change_for_session(session_id, delivery_id, ttl_secs, &self.limits)
     }
 
     pub fn decline_change_for_session(
@@ -296,12 +347,11 @@ impl DelegationServiceHandle {
         session_id: &str,
         delivery_id: &str,
         ttl_secs: i64,
-        limits: &ContractLimits,
     ) -> Result<(), DelegationServiceError> {
         self.inner
             .lock()
             .map_err(|_| DelegationServiceError::Runtime)?
-            .decline_change_for_session(session_id, delivery_id, ttl_secs, limits)
+            .decline_change_for_session(session_id, delivery_id, ttl_secs, &self.limits)
     }
 
     /// Fail-closed startup adapter used until the async worker bridge is
@@ -325,7 +375,7 @@ impl DelegationServiceHandle {
             WorkspaceAdmission::new(),
             FailClosedTerminalCleanup,
         )?;
-        Ok(Self::new(service))
+        Ok(Self::new(service, ContractLimits::default()))
     }
 }
 
@@ -418,6 +468,11 @@ where
             ServiceState::Stopped => return Err(DelegationServiceError::Stopped),
             ServiceState::Running => return Ok(ServiceReport::default()),
             ServiceState::Created => {}
+        }
+        if let Some(pipeline) = &self.change_pipeline {
+            pipeline
+                .recover(self.scheduler.runtime().now())
+                .map_err(|_| DelegationServiceError::Runtime)?;
         }
         // Delivery persistence and reviewer enqueue use independent durable
         // writes. Repair their crash window before recovery seals workers or
@@ -542,6 +597,28 @@ where
                 .report_failure(attempt_id)
                 .map_err(|_| DelegationServiceError::Scheduler)?;
             self.finish_attempt(attempt_id)?;
+        } else {
+            let delivered = self
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM delegation_attempts a
+                 JOIN delegations d ON d.id=a.delegation_id
+                 JOIN delegation_deliveries delivery ON delivery.attempt_id=a.id
+                 WHERE a.id=?1 AND a.status='running' AND d.status='awaiting_summary'
+                   AND delivery.acceptance_status='submitted')",
+                        [attempt_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                })
+                .map_err(|_| DelegationServiceError::Runtime)?
+                .map_err(|_| DelegationServiceError::Runtime)?;
+            if delivered {
+                self.scheduler
+                    .runtime_mut()
+                    .producer_finished(attempt_id)
+                    .map_err(|_| DelegationServiceError::Runtime)?;
+            }
         }
         Ok(())
     }
@@ -667,7 +744,7 @@ where
             .db
             .with_conn(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT delivery.id
+                    "SELECT delivery.id,package.task_shape,review.status
                      FROM delegation_deliveries delivery
                      JOIN delegations delegation ON delegation.id = delivery.delegation_id
                      JOIN work_packages package ON package.id = delegation.work_package_id
@@ -677,20 +754,32 @@ where
                       AND review.implementation_attempt_id = delivery.attempt_id
                      WHERE delivery.acceptance_status = 'submitted'
                        AND delegation.status = 'awaiting_summary'
-                       AND package.task_shape = 'explore'
-                       AND package.worker_profile = 'explorer'
-                       AND review.status = 'passed'",
+                       AND package.task_shape IN ('explore','change')
+                       AND review.status IN ('passed','failed','needs_decision')",
                 )?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
                 rows.collect::<Result<Vec<_>, rusqlite::Error>>()
             })
             .map_err(|_| DelegationServiceError::Review)?
             .map_err(|_| DelegationServiceError::Review)?;
         let queue = DelegatedDeliveryFollowUpQueue::new(self.db.clone());
         let mut queued = 0;
-        for delivery_id in delivery_ids {
+        for (delivery_id, task_shape, review_status) in delivery_ids {
+            if task_shape == "change" && review_status == "passed" {
+                if let Some(pipeline) = self.change_pipeline.as_ref() {
+                    if pipeline.prepare_by_delivery(&delivery_id, now).is_err() {
+                        pipeline.mark_needs_decision(&delivery_id, now);
+                    }
+                }
+            }
             if queue
-                .enqueue_reviewed_explorer_delivery(&delivery_id, now)
+                .enqueue_reviewed_delivery(&delivery_id, now)
                 .map_err(|_| DelegationServiceError::Review)?
                 .newly_enqueued()
             {
@@ -704,8 +793,8 @@ where
         if job.status != ReviewJobStatus::Queued {
             return Ok(());
         }
-        let reviewer_attempt_id = format!("reviewer_attempt_{}", job.id);
-        let claimed = self
+        let reviewer_attempt_id = format!("reviewer_attempt_{}", uuid::Uuid::new_v4().simple());
+        let claimed = match self
             .review
             .as_ref()
             .ok_or(DelegationServiceError::Review)?
@@ -714,8 +803,13 @@ where
                 &job.implementation_attempt_id,
                 &reviewer_attempt_id,
                 self.scheduler.runtime().now(),
-            )
-            .map_err(|_| DelegationServiceError::Review)?;
+            ) {
+            Ok(claimed) => claimed,
+            // Cancellation may race recovery loading this job. One stale
+            // source must not prevent independent jobs from starting.
+            Err(ReviewStoreError::InvalidTransition) => return Ok(()),
+            Err(_) => return Err(DelegationServiceError::Review),
+        };
         let enqueue_result = self
             .review_executor
             .as_mut()
@@ -737,7 +831,23 @@ where
         Ok(())
     }
 
+    fn cancel_obsolete_reviews(&mut self) -> Result<(), DelegationServiceError> {
+        let obsolete = match self.review.as_ref() {
+            Some(coordinator) => coordinator
+                .cancel_obsolete(self.scheduler.runtime().now())
+                .map_err(|_| DelegationServiceError::Review)?,
+            None => Vec::new(),
+        };
+        if let Some(executor) = self.review_executor.as_mut() {
+            for job_id in obsolete {
+                executor.cancel(&job_id);
+            }
+        }
+        Ok(())
+    }
+
     fn poll_review_events(&mut self) -> Result<usize, DelegationServiceError> {
+        self.cancel_obsolete_reviews()?;
         let Some(executor) = self.review_executor.as_mut() else {
             return Ok(0);
         };
@@ -769,8 +879,8 @@ where
                 let review_job = coordinator
                     .load(&event.job_id)
                     .map_err(|_| DelegationServiceError::Review)?;
+                let now = self.scheduler.runtime().now();
                 if outcome.verdict == super::review_contract::SemanticReviewVerdict::Passed {
-                    let now = self.scheduler.runtime().now();
                     if self
                         .is_change_attempt(&review_job.implementation_attempt_id)
                         .map_err(|_| DelegationServiceError::Runtime)?
@@ -783,13 +893,14 @@ where
                                 pipeline.mark_needs_decision(&review_job.delivery_id, now);
                             }
                         }
-                    } else if DelegatedDeliveryFollowUpQueue::new(self.db.clone())
-                        .enqueue_reviewed_explorer_delivery(&review_job.delivery_id, now)
-                        .map_err(|_| DelegationServiceError::Review)?
-                        .newly_enqueued()
-                    {
-                        reviewed_delivery_follow_ups_queued += 1;
                     }
+                }
+                if DelegatedDeliveryFollowUpQueue::new(self.db.clone())
+                    .enqueue_reviewed_delivery(&review_job.delivery_id, now)
+                    .map_err(|_| DelegationServiceError::Review)?
+                    .newly_enqueued()
+                {
+                    reviewed_delivery_follow_ups_queued += 1;
                 }
                 Ok(())
             })();
@@ -927,19 +1038,31 @@ where
             .change_pipeline
             .as_ref()
             .ok_or(DelegationServiceError::ChangeReviewNotReady)?;
-        let prepared = pipeline
-            .prepare(scope, delivery_id, now)
-            .map_err(|_| DelegationServiceError::ChangeReviewNotReady)?;
-        if !approve {
-            pipeline
-                .decline(&prepared, ttl_secs, now)
+        if !pipeline
+            .is_materialized(delivery_id, revision, &attempt_id)
+            .map_err(|_| DelegationServiceError::ChangeReviewNotReady)?
+        {
+            let prepared = pipeline
+                .prepare(scope, delivery_id, now)
                 .map_err(|_| DelegationServiceError::ChangeReviewNotReady)?;
-            self.cancel(&attempt_id)?;
+            if !approve {
+                pipeline
+                    .decline(&prepared, ttl_secs, now)
+                    .map_err(|_| DelegationServiceError::ChangeReviewNotReady)?;
+                self.cancel(&attempt_id)?;
+                return Err(DelegationServiceError::ChangeReviewNotReady);
+            }
+            pipeline
+                .confirm_and_materialize(&prepared, true, ttl_secs, now)
+                .map_err(|error| match error {
+                    super::change_pipeline::ChangePipelineError::MaterializationIndeterminate => {
+                        DelegationServiceError::MaterializationInProgress
+                    }
+                    _ => DelegationServiceError::ChangeReviewNotReady,
+                })?;
+        } else if !approve {
             return Err(DelegationServiceError::ChangeReviewNotReady);
         }
-        pipeline
-            .confirm_and_materialize(&prepared, true, ttl_secs, now)
-            .map_err(|_| DelegationServiceError::ChangeReviewNotReady)?;
         let outcome =
             DeliveryInbox::accept(self.scheduler.runtime_mut(), scope, delivery_id, limits)
                 .map_err(|_| DelegationServiceError::Inbox)?;
@@ -947,7 +1070,10 @@ where
             outcome,
             DecisionOutcome::Accepted(_) | DecisionOutcome::AlreadyAccepted(_)
         ) {
-            self.finish_attempt(&attempt_id)?;
+            match self.finish_attempt(&attempt_id) {
+                Ok(()) | Err(DelegationServiceError::CleanupPending(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(outcome)
     }
@@ -960,6 +1086,7 @@ where
     ) -> Result<DecisionOutcome, DelegationServiceError> {
         self.ensure_running()?;
         let attempt_id = self.attempt_for_delivery(scope, delivery_id)?;
+        self.ensure_materialization_resolved(&attempt_id)?;
         let outcome =
             DeliveryInbox::needs_decision(self.scheduler.runtime_mut(), scope, delivery_id, limits)
                 .map_err(|_| DelegationServiceError::Inbox)?;
@@ -981,6 +1108,7 @@ where
     ) -> Result<RetryContinuation, DelegationServiceError> {
         self.ensure_running()?;
         let attempt_id = self.attempt_for_delivery(scope, delivery_id)?;
+        self.ensure_materialization_resolved(&attempt_id)?;
         let outcome = DeliveryInbox::retry(
             self.scheduler.runtime_mut(),
             scope,
@@ -995,11 +1123,102 @@ where
 
     fn cancel(&mut self, attempt_id: &str) -> Result<(), DelegationServiceError> {
         self.ensure_running()?;
-        self.scheduler
-            .runtime_mut()
-            .cancel(attempt_id)
-            .map_err(|_| DelegationServiceError::Runtime)?;
+        self.ensure_materialization_resolved(attempt_id)?;
+        if self.scheduler.runtime_mut().cancel(attempt_id).is_err()
+            && !self.attempt_is_durably_terminalized(attempt_id)?
+        {
+            return Err(DelegationServiceError::Runtime);
+        }
         self.finish_attempt(attempt_id)
+    }
+
+    /// Main supplies only the exact task/attempt pair observed in its current
+    /// session. This shared service serializes stop against retry and apply.
+    /// An old attempt must never cancel a newer retry of the same task.
+    pub fn stop_for_session(
+        &mut self,
+        session_id: &str,
+        delegation_id: &str,
+        attempt_id: &str,
+    ) -> Result<DelegationStopOutcome, DelegationServiceError> {
+        self.ensure_running()?;
+        let (status, unresolved_apply, applied) = self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT d.status,
+                    EXISTS(SELECT 1 FROM delegation_materialization_receipts receipt
+                           WHERE receipt.work_package_id=d.work_package_id AND receipt.status IN ('applying','unknown')),
+                    EXISTS(SELECT 1 FROM delegation_materialization_receipts receipt
+                           WHERE receipt.work_package_id=d.work_package_id AND receipt.status='applied')
+                 FROM delegations d JOIN delegation_attempts a ON a.delegation_id=d.id
+                 WHERE d.session_id=?1 AND d.id=?2 AND a.id=?3
+                   AND NOT EXISTS(SELECT 1 FROM delegation_attempts newer
+                       WHERE newer.delegation_id=d.id AND newer.attempt_number>a.attempt_number)",
+                rusqlite::params![session_id, delegation_id, attempt_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?)),
+            ).optional()
+        }).map_err(|_| DelegationServiceError::Runtime)?
+          .map_err(|_| DelegationServiceError::Runtime)?
+          .ok_or(DelegationServiceError::StopUnavailable)?;
+        if unresolved_apply {
+            return Err(DelegationServiceError::MaterializationInProgress);
+        }
+        if applied || matches!(status.as_str(), "completed" | "failed") {
+            return Ok(DelegationStopOutcome {
+                status: DelegationStopStatus::AlreadyFinished,
+                cleanup_pending: false,
+            });
+        }
+        let already_stopped = status == "cancelled";
+        let cleanup = if already_stopped {
+            self.finish_attempt(attempt_id)
+        } else {
+            self.cancel(attempt_id)
+        };
+        let mut cleanup_pending = match cleanup {
+            Ok(()) => false,
+            Err(DelegationServiceError::CleanupPending(_)) => true,
+            Err(error) => return Err(error),
+        };
+        // Invalidate the reviewer claim now, before a late model reply can
+        // prepare a candidate. No event polling/summary wake is consumed here.
+        if self.cancel_obsolete_reviews().is_err() {
+            self.record_cleanup_pending(attempt_id, "review cancellation pending");
+            cleanup_pending = true;
+        }
+        Ok(DelegationStopOutcome {
+            status: if already_stopped {
+                DelegationStopStatus::AlreadyStopped
+            } else {
+                DelegationStopStatus::Stopped
+            },
+            cleanup_pending,
+        })
+    }
+
+    /// On-demand bounded host facts, including tasks that have not delivered
+    /// yet. Reopening Main need not restore raw worker histories to stop work.
+    pub fn list_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DelegatedWorkSummary>, DelegationServiceError> {
+        self.ensure_running()?;
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT d.id,a.id,d.objective,d.status
+                 FROM delegations d JOIN delegation_attempts a ON a.delegation_id=d.id
+                 WHERE d.session_id=?1
+                   AND d.status IN ('queued','running','awaiting_summary','awaiting_confirmation','needs_decision')
+                   AND NOT EXISTS(SELECT 1 FROM delegation_attempts newer
+                       WHERE newer.delegation_id=d.id AND newer.attempt_number>a.attempt_number)
+                 ORDER BY d.updated_at DESC,d.id LIMIT 12"
+            )?;
+            let rows = statement.query_map([session_id], |row| Ok(DelegatedWorkSummary {
+                delegation_id: row.get(0)?, attempt_id: row.get(1)?,
+                goal: row.get::<_, String>(2)?.chars().take(240).collect(), status: row.get(3)?,
+            }))?;
+            rows.collect::<Result<Vec<_>, rusqlite::Error>>()
+        }).map_err(|_| DelegationServiceError::Runtime)?
+          .map_err(|_| DelegationServiceError::Runtime)
     }
 
     /// Resolve a delivery using only the Main-Agent's trusted session scope.
@@ -1063,6 +1282,7 @@ where
         self.ensure_running()?;
         let scope = self.scope_for_session(session_id, delivery_id)?;
         let attempt_id = self.attempt_for_delivery(&scope, delivery_id)?;
+        self.ensure_materialization_resolved(&attempt_id)?;
         if !self.is_change_attempt(&attempt_id)? {
             return Err(DelegationServiceError::ChangeReviewNotReady);
         }
@@ -1194,7 +1414,26 @@ where
             .map_err(|_| DelegationServiceError::Runtime)
     }
 
+    fn ensure_materialization_resolved(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(), DelegationServiceError> {
+        let unresolved = self.db.with_conn(|conn| conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delegation_attempts a
+             JOIN delegations d ON d.id=a.delegation_id
+             JOIN delegation_materialization_receipts receipt ON receipt.work_package_id=d.work_package_id
+             WHERE a.id=?1 AND receipt.status IN ('applying','unknown'))",
+            [attempt_id], |row| row.get::<_, bool>(0),
+        )).map_err(|_| DelegationServiceError::Runtime)?.map_err(|_| DelegationServiceError::Runtime)?;
+        if unresolved {
+            Err(DelegationServiceError::MaterializationInProgress)
+        } else {
+            Ok(())
+        }
+    }
+
     fn finish_attempt(&mut self, attempt_id: &str) -> Result<(), DelegationServiceError> {
+        self.ensure_materialization_resolved(attempt_id)?;
         // `finalize_attempt` commits the durable seal before asking the
         // short-lived worker/sandbox adapters to stop.  Those adapters are
         // deliberately best-effort at this boundary: a failure after the
@@ -1215,8 +1454,14 @@ where
         // admission CAS token.  Run it before the broad admission fallback so
         // an external sandbox failure is persisted as recoverable cleanup
         // work instead of being hidden behind a generic admission error.
-        let cleanup = self.cleanup.cleanup_attempt(attempt_id);
         let now = self.scheduler.runtime().now();
+        if let Some(pipeline) = self.change_pipeline.as_ref() {
+            if let Err(error) = pipeline.cancel_stopped_attempt(attempt_id, now) {
+                self.record_cleanup_pending(attempt_id, &error.to_string());
+                return Err(DelegationServiceError::CleanupPending(attempt_id.into()));
+            }
+        }
+        let cleanup = self.cleanup.cleanup_attempt(attempt_id);
         let admission = self
             .db
             .with_conn_mut(|conn| self.admission.release_attempt(conn, attempt_id, now))
@@ -1273,6 +1518,11 @@ where
                  JOIN delegation_resource_bindings b ON b.attempt_id = a.id
                  WHERE a.status = 'sealed' AND b.cleanup_status != 'cleaned'
                    AND NOT EXISTS (
+                     SELECT 1 FROM delegations d
+                     JOIN delegation_materialization_receipts receipt ON receipt.work_package_id=d.work_package_id
+                     WHERE d.id=a.delegation_id AND receipt.status IN ('applying','unknown')
+                   )
+                   AND NOT EXISTS (
                      SELECT 1 FROM delegation_deliveries delivery
                      JOIN delegations delegation ON delegation.id=delivery.delegation_id
                      JOIN work_packages package ON package.id=delegation.work_package_id
@@ -1288,9 +1538,11 @@ where
             .map_err(|_| DelegationServiceError::Runtime)?
             .map_err(|_| DelegationServiceError::Runtime)?;
         for attempt_id in attempts {
-            if let Err(error) = self.cleanup.cleanup_attempt(&attempt_id) {
+            if let Err(error) = self.finish_attempt(&attempt_id) {
                 // One unavailable resource must not prevent other tasks starting.
-                self.record_cleanup_pending(&attempt_id, &error);
+                if !matches!(error, DelegationServiceError::CleanupPending(_)) {
+                    self.record_cleanup_pending(&attempt_id, &error.to_string());
+                }
             }
         }
         Ok(())
@@ -1368,12 +1620,44 @@ where
         DelegationService::shutdown(self)
     }
 
+    fn list_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DelegatedWorkSummary>, DelegationServiceError> {
+        DelegationService::list_for_session(self, session_id)
+    }
+
+    fn stop_for_session(
+        &mut self,
+        session_id: &str,
+        delegation_id: &str,
+        attempt_id: &str,
+    ) -> Result<DelegationStopOutcome, DelegationServiceError> {
+        DelegationService::stop_for_session(self, session_id, delegation_id, attempt_id)
+    }
+
     fn poll_workers(&mut self, limits: &ContractLimits) -> Result<usize, DelegationServiceError> {
         DelegationService::poll_workers(self, limits)
     }
 
     fn active_worker_attempts(&self) -> usize {
         DelegationService::active_worker_attempts(self)
+    }
+
+    fn materialize_change_for_session(
+        &mut self,
+        session_id: &str,
+        delivery_id: &str,
+        ttl_secs: i64,
+        limits: &ContractLimits,
+    ) -> Result<DecisionOutcome, DelegationServiceError> {
+        DelegationService::materialize_change_for_session(
+            self,
+            session_id,
+            delivery_id,
+            ttl_secs,
+            limits,
+        )
     }
 
     fn decline_change_for_session(
@@ -1464,6 +1748,173 @@ impl From<DelegatedSchedulerError> for DelegationServiceError {
 impl From<InboxError> for DelegationServiceError {
     fn from(_: InboxError) -> Self {
         Self::Inbox
+    }
+}
+
+/// Shared recording adapter for the host/foreground wiring contracts. Domain
+/// behavior is exercised separately against the real service and temporary DB.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, PartialEq)]
+    pub enum ServiceCall {
+        Start,
+        Poll(ContractLimits),
+        Tick,
+        Shutdown,
+        List(String),
+        Stop(String, String, String),
+        Decide(
+            String,
+            String,
+            ParentDecision,
+            Option<String>,
+            ContractLimits,
+        ),
+        Retry(String, String, String, ContractLimits),
+        Materialize(String, String, i64, ContractLimits),
+        Decline(String, String, i64, ContractLimits),
+    }
+
+    struct RecordingService(Arc<Mutex<Vec<ServiceCall>>>);
+
+    pub fn recording_service(
+        limits: ContractLimits,
+    ) -> (DelegationServiceHandle, Arc<Mutex<Vec<ServiceCall>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service = DelegationServiceHandle::new(RecordingService(calls.clone()), limits);
+        (service, calls)
+    }
+
+    impl DelegationServiceLoop for RecordingService {
+        fn list_for_session(
+            &self,
+            session_id: &str,
+        ) -> Result<Vec<DelegatedWorkSummary>, DelegationServiceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(ServiceCall::List(session_id.into()));
+            Ok(vec![])
+        }
+        fn stop_for_session(
+            &mut self,
+            session_id: &str,
+            delegation_id: &str,
+            attempt_id: &str,
+        ) -> Result<DelegationStopOutcome, DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Stop(
+                session_id.into(),
+                delegation_id.into(),
+                attempt_id.into(),
+            ));
+            Ok(DelegationStopOutcome {
+                status: DelegationStopStatus::Stopped,
+                cleanup_pending: false,
+            })
+        }
+        fn start(&mut self) -> Result<ServiceReport, DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Start);
+            Ok(ServiceReport::default())
+        }
+        fn tick(&mut self) -> Result<ServiceReport, DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Tick);
+            Ok(ServiceReport::default())
+        }
+        fn shutdown(&mut self) -> Result<(), DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Shutdown);
+            Ok(())
+        }
+        fn poll_workers(
+            &mut self,
+            limits: &ContractLimits,
+        ) -> Result<usize, DelegationServiceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(ServiceCall::Poll(limits.clone()));
+            Ok(2)
+        }
+        fn active_worker_attempts(&self) -> usize {
+            0
+        }
+        fn heartbeat(
+            &mut self,
+            _: super::super::delegation_runtime::Heartbeat,
+        ) -> Result<(), DelegationServiceError> {
+            panic!("wiring probe must not receive worker heartbeats")
+        }
+        fn submit_delivery(
+            &mut self,
+            _: DelegationDelivery,
+            _: &ContractLimits,
+        ) -> Result<(), DelegationServiceError> {
+            panic!("wiring probe must not receive producer deliveries")
+        }
+        fn decide_for_session(
+            &mut self,
+            session: &str,
+            delivery: &str,
+            decision: ParentDecision,
+            reason: Option<&str>,
+            limits: &ContractLimits,
+        ) -> Result<DecisionOutcome, DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Decide(
+                session.into(),
+                delivery.into(),
+                decision,
+                reason.map(str::to_string),
+                limits.clone(),
+            ));
+            Err(DelegationServiceError::Inbox)
+        }
+        fn retry_for_session(
+            &mut self,
+            session: &str,
+            delivery: &str,
+            reason: &str,
+            limits: &ContractLimits,
+        ) -> Result<RetryContinuation, DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Retry(
+                session.into(),
+                delivery.into(),
+                reason.into(),
+                limits.clone(),
+            ));
+            Err(DelegationServiceError::Inbox)
+        }
+        fn materialize_change_for_session(
+            &mut self,
+            session: &str,
+            delivery: &str,
+            ttl: i64,
+            limits: &ContractLimits,
+        ) -> Result<DecisionOutcome, DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Materialize(
+                session.into(),
+                delivery.into(),
+                ttl,
+                limits.clone(),
+            ));
+            Err(DelegationServiceError::ChangeReviewNotReady)
+        }
+        fn decline_change_for_session(
+            &mut self,
+            session: &str,
+            delivery: &str,
+            ttl: i64,
+            limits: &ContractLimits,
+        ) -> Result<(), DelegationServiceError> {
+            self.0.lock().unwrap().push(ServiceCall::Decline(
+                session.into(),
+                delivery.into(),
+                ttl,
+                limits.clone(),
+            ));
+            Ok(())
+        }
     }
 }
 
@@ -1608,6 +2059,10 @@ mod tests {
             Ok(std::mem::take(&mut self.0))
         }
 
+        fn cancel(&mut self, job_id: &str) {
+            self.0.retain(|event| event.job_id != job_id);
+        }
+
         fn stop_all(&mut self) {}
     }
 
@@ -1718,6 +2173,7 @@ mod tests {
 
     fn completed_explorer_delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery-a".into(),
             delivery_revision: 1,
@@ -1781,30 +2237,158 @@ mod tests {
     }
 
     #[test]
-    fn terminal_cancel_invokes_cleanup_for_the_attempt() {
+    fn main_stop_is_scoped_idempotent_and_fences_old_attempts() {
         let mut service = service();
+        seed_queued_explorer_attempt(&service.db);
+        assert_eq!(
+            service.stop_for_session("s", "d", "a"),
+            Err(DelegationServiceError::NotStarted)
+        );
+        service.start().unwrap();
+        assert!(service
+            .list_for_session("other-session")
+            .unwrap()
+            .is_empty());
+        let tasks = service.list_for_session("s").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            (&tasks[0].delegation_id, &tasks[0].attempt_id),
+            (&"d".to_string(), &"a".to_string())
+        );
+        for (session, delegation, attempt) in [
+            ("other-session", "d", "a"),
+            ("s", "other", "a"),
+            ("s", "d", "wrong"),
+        ] {
+            assert_eq!(
+                service.stop_for_session(session, delegation, attempt),
+                Err(DelegationServiceError::StopUnavailable)
+            );
+        }
+        assert!(service.cleanup.calls.is_empty());
+        assert_eq!(
+            service.stop_for_session("s", "d", "a").unwrap(),
+            DelegationStopOutcome {
+                status: DelegationStopStatus::Stopped,
+                cleanup_pending: false
+            }
+        );
+        assert_eq!(service.cleanup.calls, vec!["a"]);
+        assert!(service.list_for_session("s").unwrap().is_empty());
+        assert_eq!(
+            service.stop_for_session("s", "d", "a").unwrap().status,
+            DelegationStopStatus::AlreadyStopped
+        );
+        service.db.with_conn_mut(|conn| {
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM delegation_attempt_events WHERE attempt_id='a' AND event_type='attempt_cancelled'", [], |row| row.get(0)).unwrap(), 1);
+            assert_eq!(conn.query_row::<String,_,_>("SELECT status FROM delegation_capability_leases WHERE attempt_id='a'", [], |row| row.get(0)).unwrap(), "revoked");
+            conn.execute_batch("UPDATE delegations SET status='queued' WHERE id='d';
+                INSERT INTO delegation_attempts(id,delegation_id,attempt_number,status,sandbox_ref,created_at)
+                VALUES ('a2','d',2,'queued','sandbox://a2',11);").unwrap();
+        }).unwrap();
+        assert_eq!(
+            service.stop_for_session("s", "d", "a"),
+            Err(DelegationServiceError::StopUnavailable)
+        );
+        assert_eq!(service.list_for_session("s").unwrap()[0].attempt_id, "a2");
         service
             .db
             .with_conn_mut(|conn| {
-                conn.execute("INSERT INTO sessions(id,title,created_at,updated_at) VALUES ('s','s',1,1)", [])?;
-                conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m','s','user','x',1)", [])?;
-                conn.execute("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES ('r','s','m','x','running','[]',1,1)", [])?;
-                conn.execute("INSERT INTO work_packages(id,session_id,owner_profile_id,workspace_key,task_shape,worker_profile,worker_policy_version,scope_digest,capability_scope_ref,capability_expires_at,candidate_version,status,created_at,updated_at) VALUES ('p','s',1,'w','explore','explorer',1,'scope','source',100,0,'active',1,1)", [])?;
-                let brief = DelegationBrief {
-                    schema_version: 1,
-                    identity: DelegationIdentity { session_id: "s".into(), message_id: "m".into(), parent_run_id: "r".into(), delegation_id: "d".into(), attempt_id: "a".into() },
-                    goal: "x".into(), background: vec![], constraints: vec![], allowed_references: vec!["evidence://test".into()], allowed_capabilities: vec![], completion_criteria: vec!["done".into()],
-                };
-                DelegationRepository::create_queued(conn, &NewDelegation { id: "d".into(), session_id: "s".into(), message_id: "m".into(), parent_run_id: "r".into(), work_package_id: Some("p".into()), idempotency_key: None, objective: "x".into(), brief_json: serde_json::to_string(&brief).unwrap() }, &NewAttempt { id: "a".into(), attempt_number: 1, sandbox_ref: "sandbox://a".into(), outbox_id: "out_a".into(), dispatch_payload_json: "{}".into() }, &NewCapabilityLease { id: "lease_a".into(), read_roots_json: "[]".into(), write_roots_json: "[]".into(), tool_allowlist_json: "[]".into(), network_hosts_json: "[]".into(), budget_json: "{}".into(), expires_at: 100 }, 1).map_err(|_| rusqlite::Error::InvalidQuery)?;
-                Ok::<(), rusqlite::Error>(())
+                conn.execute("UPDATE delegations SET status='failed' WHERE id='d'", [])
             })
             .unwrap()
             .unwrap();
-        service.start().unwrap();
-        service.cancel("a").unwrap();
-        assert_eq!(service.cleanup.calls, vec!["a"]);
+        let previous_cleanup = service.cleanup.calls.len();
+        assert_eq!(
+            service.stop_for_session("s", "d", "a2").unwrap().status,
+            DelegationStopStatus::AlreadyFinished
+        );
+        assert_eq!(
+            service.cleanup.calls.len(),
+            previous_cleanup,
+            "finished work is not discarded"
+        );
+        service.shutdown().unwrap();
+        assert_eq!(
+            service.stop_for_session("s", "d", "a2"),
+            Err(DelegationServiceError::Stopped)
+        );
+        let mut pending = service_with_cleanup(CleanupPendingOnce::default());
+        seed_queued_explorer_attempt(&pending.db);
+        pending.start().unwrap();
+        let result = pending.stop_for_session("s", "d", "a").unwrap();
+        assert_eq!(result.status, DelegationStopStatus::Stopped);
+        assert!(result.cleanup_pending);
+        assert!(pending.list_for_session("s").unwrap().is_empty());
     }
 
+    #[test]
+    fn stop_invalidates_the_reviewer_and_rejects_late_producer_results() {
+        let mut service = service();
+        seed_queued_explorer_attempt(&service.db);
+        let reviews = ReviewCoordinator::new(service.db.clone());
+        service = service.with_review(reviews.clone(), Box::new(NoopReviewExecutor::default()));
+        service.start().unwrap();
+        assert_eq!(service.tick().unwrap().scheduler.dispatched, vec!["a"]);
+        let delivery = completed_explorer_delivery();
+        service
+            .submit_delivery(delivery.clone(), &ContractLimits::default())
+            .unwrap();
+        let review = reviews.load_for_delivery(&delivery.delivery_id, 1).unwrap();
+        assert_eq!(review.status, ReviewJobStatus::Running);
+        let outcome = crate::agent::review_contract::ReviewOutcome {
+            verdict: crate::agent::review_contract::SemanticReviewVerdict::Passed,
+            summary: "late pass".into(),
+            findings: vec![],
+            missing_evidence: vec![],
+            evidence_refs: vec![],
+        };
+        service.stop_for_session("s", "d", "a").unwrap();
+        assert_eq!(
+            reviews.load(&review.id).unwrap().status,
+            ReviewJobStatus::Cancelled
+        );
+        service.review_executor = Some(Box::new(NoopReviewExecutor(vec![
+            crate::agent::review_agent::ReviewExecutionEvent {
+                job_id: review.id.clone(),
+                reviewer_attempt_id: review.reviewer_attempt_id.unwrap(),
+                outcome: Ok(outcome),
+            },
+        ])));
+        assert_eq!(service.poll_review_events().unwrap(), 0);
+        assert_eq!(
+            reviews.load(&review.id).unwrap().status,
+            ReviewJobStatus::Cancelled
+        );
+        let mut late = delivery;
+        late.delivery_revision += 1;
+        assert!(service
+            .submit_delivery(late, &ContractLimits::default())
+            .is_err());
+        service
+            .db
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row::<String, _, _>(
+                        "SELECT status FROM delegations WHERE id='d'",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    "cancelled"
+                );
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM delegated_delivery_follow_ups",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+            })
+            .unwrap();
+    }
     #[test]
     fn accepting_a_delivery_survives_cleanup_pending_after_the_decision_is_durable() {
         let mut service = service_with_cleanup(CleanupPendingOnce::default());
@@ -1885,6 +2469,7 @@ mod tests {
         );
 
         let delivery = DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery-a".into(),
             delivery_revision: 1,
@@ -1946,6 +2531,14 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+        // Completion is exercised only after the real parent acceptance
+        // above, never by bypassing the DB's accepted-delivery invariant.
+        let cleanup_calls = service.cleanup.calls.len();
+        assert_eq!(
+            service.stop_for_session("s", "d", "a").unwrap().status,
+            DelegationStopStatus::AlreadyFinished
+        );
+        assert_eq!(service.cleanup.calls.len(), cleanup_calls);
     }
 
     #[test]
@@ -2044,6 +2637,7 @@ mod tests {
     fn initialize_git_workspace(path: &Path) {
         for args in [
             vec!["init"],
+            vec!["config", "core.autocrlf", "false"],
             vec!["config", "user.email", "angelbot-test@example.invalid"],
             vec!["config", "user.name", "AngelBot Test"],
             vec!["commit", "--allow-empty", "-m", "initial"],
@@ -2145,6 +2739,495 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn model_driven_candidate_is_reviewed_then_materialized_through_main_controls() {
+        use crate::agent::{
+            delegate_work::DelegateWorkHandler,
+            delegated_model_binding::{
+                DelegatedModelBinding, DelegatedModelHostFactory, ModelHostUnavailable,
+            },
+            delegated_runtime_factory::DelegatedRuntimeFactory,
+            explorer_runtime_config::{ExplorerOptIn, ExplorerRuntimeDependencies},
+            tool::{ToolCall, ToolHandler},
+            ToolRegistry,
+        };
+        use crate::llm::{
+            LlmProvider, LlmResponse, Message, StopReason as ModelStop, ThinkingSettings,
+            ToolCall as ModelCall, ToolSchema,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const CONTENT: &str = "candidate flow verified\n";
+        #[derive(Clone, Default)]
+        struct ModelFactory(Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>);
+        struct Model(Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>);
+        impl DelegatedModelHostFactory for ModelFactory {
+            fn resolve_at_delegation(
+                &self,
+                request: &DelegatedModelBindingRequest,
+            ) -> Result<(), ModelHostUnavailable> {
+                if request.provider_profile_ref == "provider:test"
+                    && request.model_ref == "model:test"
+                    && request.credential_handle_ref == "keychain:test"
+                {
+                    Ok(())
+                } else {
+                    Err(ModelHostUnavailable::PolicyMismatch)
+                }
+            }
+            fn create_model_host(
+                &self,
+                binding: &DelegatedModelBinding,
+            ) -> Result<Arc<dyn LlmProvider>, ModelHostUnavailable> {
+                self.resolve_at_delegation(
+                    &DelegatedModelBindingRequest::new(
+                        &binding.provider_profile_ref,
+                        &binding.model_ref,
+                        &binding.credential_handle_ref,
+                        binding.policy_version,
+                    )
+                    .map_err(|_| ModelHostUnavailable::PolicyMismatch)?,
+                )?;
+                Ok(Arc::new(Model(
+                    self.0.clone(),
+                    self.1.clone(),
+                    self.2.clone(),
+                )))
+            }
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for Model {
+            fn name(&self) -> &str {
+                "agent-flow-fixture"
+            }
+            async fn chat(
+                &self,
+                messages: &[Message],
+                tools: Option<&[ToolSchema]>,
+                _: Option<&ThinkingSettings>,
+            ) -> Result<LlmResponse, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if messages[0]
+                    .content
+                    .starts_with("You are an independent review agent")
+                {
+                    assert!(
+                        tools.is_none(),
+                        "Reviewer must remain distinct from the producer"
+                    );
+                    let subject: crate::agent::review_contract::ReviewSubject =
+                        serde_json::from_str(&messages[1].content).unwrap();
+                    assert_eq!(serde_json::to_value(&subject).unwrap()["candidate_artifacts"][0]["relative_ref"],
+                        "src/feature.txt", "Reviewer must receive the actual declared candidate metadata, not only a generic evidence URI");
+                    let subject_value = serde_json::to_value(&subject).unwrap();
+                    let reads = subject_value["file_read_evidence"]
+                        .as_array()
+                        .expect("actual host read receipts must reach Reviewer");
+                    assert_eq!(reads.len(), 2);
+                    assert_eq!(reads[0]["sha256"], reads[1]["sha256"]);
+                    assert_eq!(reads[0]["content_bytes"], reads[1]["content_bytes"]);
+                    assert!(reads[0]["relative_ref"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("briefs/"));
+                    assert_eq!(reads[1]["relative_ref"], "src/feature.txt");
+                    assert_ne!(
+                        reads[0]["evidence_ref"], "evidence://cleanup",
+                        "a host receipt is not a copied producer assertion"
+                    );
+                    if !subject
+                        .verifications
+                        .iter()
+                        .any(|record| record.contains("status=Passed"))
+                    {
+                        return Err("review subject lost the verification status".into());
+                    }
+                    return Ok(LlmResponse::Text {
+                        text: serde_json::to_string(&ReviewOutcome {
+                            verdict: SemanticReviewVerdict::Passed,
+                            summary: "Candidate readback evidence supports the bounded goal."
+                                .into(),
+                            findings: vec![],
+                            missing_evidence: vec![],
+                            evidence_refs: subject.artifact_refs,
+                        })
+                        .unwrap(),
+                        stop_reason: ModelStop::EndTurn,
+                    });
+                }
+                assert!(messages[0]
+                    .content
+                    .starts_with("You are the bounded Implementer worker"));
+                let prompt: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+                if prompt["goal"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Wait until cancellation")
+                {
+                    struct MarkDropped(Arc<AtomicBool>);
+                    impl Drop for MarkDropped {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    let _drop = MarkDropped(self.2.clone());
+                    self.1.store(true, Ordering::SeqCst);
+                    return std::future::pending().await;
+                }
+                assert!(prompt.get("response_contract").is_some());
+                assert!(
+                    prompt.get("identity").is_none(),
+                    "model must not own routing metadata"
+                );
+                assert!(tools.unwrap().iter().all(|tool| matches!(
+                    tool.name.as_str(),
+                    "worker_list" | "worker_read" | "worker_write_candidate"
+                )));
+                let last = messages.iter().rev().find(|message| message.role == "tool");
+                let call = match last.and_then(|message| message.tool_call_id.as_deref()) {
+                    None => ModelCall {
+                        id: "project-list".into(),
+                        name: "worker_list".into(),
+                        arguments: json!({"reference":"."}),
+                    },
+                    Some("project-list") => {
+                        let listing: serde_json::Value =
+                            serde_json::from_str(&last.unwrap().content).unwrap();
+                        assert_eq!(listing["truncated"], false);
+                        assert_eq!(listing["entries"], json!(["briefs/"]));
+                        ModelCall {
+                            id: "brief-list".into(),
+                            name: "worker_list".into(),
+                            arguments: json!({"reference":"briefs"}),
+                        }
+                    }
+                    Some("brief-list") => {
+                        let listing: serde_json::Value =
+                            serde_json::from_str(&last.unwrap().content).unwrap();
+                        assert_eq!(listing["truncated"], false);
+                        let entries = listing["entries"].as_array().unwrap();
+                        assert_eq!(entries.len(), 1);
+                        ModelCall {
+                            id: "brief-read".into(),
+                            name: "worker_read".into(),
+                            arguments: json!({"reference":entries[0]}),
+                        }
+                    }
+                    Some("brief-read") => {
+                        let readback: serde_json::Value =
+                            serde_json::from_str(&last.unwrap().content).unwrap();
+                        assert_eq!(readback["text"], CONTENT);
+                        ModelCall {
+                            id: "candidate-write".into(),
+                            name: "worker_write_candidate".into(),
+                            arguments: json!({"reference":"src/feature.txt","contents":readback["text"]}),
+                        }
+                    }
+                    Some("candidate-write") => {
+                        let source = messages
+                            .iter()
+                            .flat_map(|message| message.tool_calls.iter().flatten())
+                            .find(|call| call.id == "brief-read")
+                            .unwrap()
+                            .arguments["reference"]
+                            .clone();
+                        return Ok(LlmResponse::ToolCalls {
+                            calls: vec![
+                                ModelCall {
+                                    id: "source-read-final".into(),
+                                    name: "worker_read".into(),
+                                    arguments: json!({"reference":source}),
+                                },
+                                ModelCall {
+                                    id: "candidate-read".into(),
+                                    name: "worker_read".into(),
+                                    arguments: json!({"reference":"src/feature.txt"}),
+                                },
+                            ],
+                            text: None,
+                            stop_reason: ModelStop::ToolUse,
+                        });
+                    }
+                    Some("candidate-read") => {
+                        let read_ref = |id: &str| -> serde_json::Value {
+                            let result = messages
+                                .iter()
+                                .find(|message| message.tool_call_id.as_deref() == Some(id))
+                                .unwrap();
+                            serde_json::from_str::<serde_json::Value>(&result.content).unwrap()
+                                ["evidence_ref"]
+                                .clone()
+                        };
+                        assert_ne!(read_ref("brief-read"), read_ref("source-read-final"), "write must invalidate earlier read receipts; final verification must observe files again");
+                        let readback: serde_json::Value =
+                            serde_json::from_str(&last.unwrap().content).unwrap();
+                        assert_eq!(
+                            readback["text"], CONTENT,
+                            "model must see the actual worktree readback"
+                        );
+                        return Ok(LlmResponse::Text { text: json!({
+                            "status":"completed", "executive_summary":"One isolated candidate is ready for independent review.",
+                            "key_facts":[{"statement":"The candidate contents match the requested text.","confidence":"high","evidence_refs":["evidence://cleanup"]}],
+                            "milestones":[], "verifications":[{"item":"candidate readback","method":"worker_read after worker_write_candidate",
+                                "status":"passed","conclusion":"Readback exactly matched the requested text.","evidence_ref":"evidence://cleanup"}],
+                            "candidate_artifacts":[{"kind":"file","relative_ref":"src/feature.txt","description":"Bounded candidate text.","evidence_ref":"evidence://cleanup"}],
+                            "open_questions":[],"risks":[],"evidence_refs":["evidence://cleanup"],
+                            "usage":{"context_truncated":false,"output_truncated":false,"budget_exhausted":false}
+                        }).to_string(), stop_reason: ModelStop::EndTurn });
+                    }
+                    _ => return Err("unexpected worker continuation".into()),
+                };
+                Ok(LlmResponse::ToolCalls {
+                    calls: vec![call],
+                    text: None,
+                    stop_reason: ModelStop::ToolUse,
+                })
+            }
+        }
+
+        let fixture = real_delegation_fixture("agent-flow-session");
+        std::fs::create_dir(fixture.workspace.path().join("briefs")).unwrap();
+        let brief_path = format!("briefs/request-{}.txt", uuid::Uuid::new_v4());
+        std::fs::write(fixture.workspace.path().join(&brief_path), CONTENT).unwrap();
+        for args in [
+            vec!["add", "briefs"],
+            vec!["commit", "-m", "Add bounded input"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(fixture.workspace.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        let db = fixture.db.clone();
+        let (sandbox, cleanup, provider) =
+            production_components_with_provider(db.clone(), fixture.app_data.path()).unwrap();
+        let models = ModelFactory::default();
+        let assembly = DelegatedRuntimeFactory::build(
+            db.clone(),
+            ExplorerOptIn::from_sources(Some("true"), None),
+            ExplorerRuntimeDependencies::all_ready(),
+            sandbox,
+            cleanup,
+            provider,
+            models.clone(),
+        )
+        .unwrap();
+        assert!(assembly.enabled);
+        let pump = assembly.into_pump();
+        struct StopPump(crate::agent::delegation_pump::DelegationPumpHostHandle);
+        impl Drop for StopPump {
+            fn drop(&mut self) {
+                let _ = self.0.shutdown();
+            }
+        }
+        let _stop = StopPump(pump.clone());
+        let handler = DelegateWorkHandler::new(
+            db.arc(),
+            fixture.identity.clone(),
+            fixture.app_data.path().join("delegated/sandboxes"),
+            DelegatedModelBindingRequest::new("provider:test", "model:test", "keychain:test", 1)
+                .unwrap(),
+        );
+        let receipt = handler.execute(&json!({"goal":"Discover the request file under briefs and prepare src/feature.txt with its contents.",
+            "background_refs":["evidence://cleanup"],"task_shape":"change","worker_profile":"implementer"}), fixture.workspace.path());
+        assert!(
+            receipt.success,
+            "Main delegation failed: {}",
+            receipt.content
+        );
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.content).unwrap();
+        let attempt_id = receipt["attempt_id"].as_str().unwrap();
+        pump.start().unwrap();
+        let (delivery_id, reviewer_id) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let row = db.with_conn(|conn| conn.query_row(
+                    "SELECT delivery_id,status,reviewer_attempt_id FROM delegation_review_jobs WHERE implementation_attempt_id=?1",
+                    [attempt_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?)),
+                ).optional()).unwrap().unwrap();
+                if let Some((id, status, reviewer)) = row {
+                    if status == "passed" { break (id, reviewer.expect("passed review must have an independent reviewer identity")); }
+                    assert!(!matches!(status.as_str(), "failed" | "needs_decision"), "review did not pass: {status}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.expect("bounded production worker/review flow timed out");
+        assert_ne!(reviewer_id, attempt_id);
+        let target = fixture.workspace.path().join("src/feature.txt");
+        assert!(
+            !target.exists(),
+            "reviewed candidate must remain isolated until confirmation"
+        );
+
+        let mut main_tools = ToolRegistry::empty();
+        crate::commands::foreground_delegation_control::register(
+            &mut main_tools,
+            fixture.identity.session_id.clone(),
+            Some(pump.service().clone()),
+        );
+        assert!(
+            main_tools
+                .get("materialize_delegated_change")
+                .unwrap()
+                .requires_confirmation
+        );
+        let bypass = main_tools.execute(
+            &ToolCall::new(
+                "review_delegated_delivery".into(),
+                json!({"delivery_id":delivery_id,"decision":"accept"}),
+            ),
+            "generic-accept",
+            fixture.workspace.path(),
+        );
+        assert!(
+            !bypass.result.success,
+            "generic acceptance must not bypass candidate confirmation"
+        );
+        assert!(!target.exists());
+        let queue = DelegatedDeliveryFollowUpQueue::new(db.clone());
+        let binding = queue
+            .load_by_delivery(&delivery_id, 1)
+            .unwrap()
+            .expect("a prepared candidate must return to its Main-Agent conversation");
+        assert_eq!(binding.session_id, fixture.identity.session_id);
+        assert!(!queue
+            .enqueue_reviewed_delivery(&delivery_id, chrono::Utc::now().timestamp())
+            .unwrap()
+            .newly_enqueued());
+        // Exercise the same queue claim and durable summary settlement used
+        // by the foreground pump, without a desktop or a live model account.
+        for (run_id, status, expected) in [
+            (
+                "candidate-summary-failed",
+                "provider_unavailable",
+                crate::agent::delegated_delivery_follow_up::DelegatedDeliveryFollowUpStatus::Queued,
+            ),
+            (
+                "candidate-summary-complete",
+                "completed",
+                crate::agent::delegated_delivery_follow_up::DelegatedDeliveryFollowUpStatus::Summarized,
+            ),
+        ] {
+            let now = chrono::Utc::now().timestamp();
+            let claim = crate::agent::supervision::WorkspaceSupervisor::new(db.clone())
+                .claim_next_follow_up(&binding.workspace_id, now)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.claim.input.id, binding.supervisor_input_id);
+            assert!(claim.claim.input.content.contains("等待用户在主对话确认"));
+            db.with_conn_mut(|conn| {
+                let tx=conn.transaction().unwrap();
+                assert!(matches!(DelegatedDeliveryFollowUpQueue::begin_claimed_in_tx(
+                    &tx,&binding.supervisor_input_id,&claim.claim.claim_token,run_id,now).unwrap(),
+                    crate::agent::delegated_delivery_follow_up::DelegatedDeliveryFollowUpStart::Started(_)));
+                tx.execute("INSERT INTO messages(id,session_id,role,content,created_at,is_provisional) VALUES (?1,?2,'assistant','Candidate src/feature.txt is reviewed but not yet applied; please confirm.',?3,0)",rusqlite::params![run_id,fixture.identity.session_id,now]).unwrap();
+                tx.execute("INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,created_at,updated_at) VALUES (?1,?2,?1,'Summarize reviewed candidate',?3,'[]',?4,?4)",rusqlite::params![run_id,fixture.identity.session_id,status,now]).unwrap();
+                tx.commit().unwrap();
+                crate::commands::delegated_delivery_follow_up::recover_interrupted_reviewed_delivery_follow_ups_in_conn(conn,now).unwrap();
+            }).unwrap();
+            assert_eq!(
+                queue
+                    .load_by_delivery(&delivery_id, 1)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                expected
+            );
+            assert!(
+                !target.exists(),
+                "automatic summary must never apply a candidate"
+            );
+        }
+        // This call represents the user's explicit approval; the real control
+        // handler still owns review/base-state checks and serial materialization.
+        db.with_conn(|conn| {
+            let states: (String, String, String, String) = conn.query_row(
+                "SELECT g.status,d.acceptance_status,a.status,l.status FROM delegations g JOIN delegation_deliveries d ON d.delegation_id=g.id JOIN delegation_attempts a ON a.id=d.attempt_id JOIN delegation_capability_leases l ON l.attempt_id=a.id WHERE d.id=?1",
+                [&delivery_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+            assert_eq!(states, ("awaiting_summary".into(), "submitted".into(), "sealed".into(), "revoked".into()), "the producer must lose access without discarding its pending result");
+        }).unwrap();
+        let applied = main_tools.execute(
+            &ToolCall::new(
+                "materialize_delegated_change".into(),
+                json!({"delivery_id":delivery_id}),
+            ),
+            "confirmed-materialize",
+            fixture.workspace.path(),
+        );
+        assert!(
+            applied.result.success,
+            "confirmed application failed: {}",
+            applied.result.content
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), CONTENT);
+        let repeated = main_tools.execute(
+            &ToolCall::new(
+                "materialize_delegated_change".into(),
+                json!({"delivery_id":delivery_id}),
+            ),
+            "confirmed-materialize-again",
+            fixture.workspace.path(),
+        );
+        assert!(
+            repeated.result.success,
+            "lost-receipt recovery must not repeat the write or report a false failure: {}",
+            repeated.result.content
+        );
+        assert!(repeated.result.content.contains("already_accepted"));
+        let repository = ResourceBindingRepository::new(db.clone());
+        for kind in [ResourceKind::Sandbox, ResourceKind::Worktree] {
+            assert_eq!(
+                repository
+                    .load_for_attempt(attempt_id, kind)
+                    .unwrap()
+                    .cleanup_status,
+                ResourceCleanupStatus::Cleaned
+            );
+        }
+        assert_eq!(
+            models.0.load(Ordering::SeqCst),
+            7,
+            "six bounded discovery/read/write worker turns and one separate Reviewer call, no replay"
+        );
+        let pending = handler.execute_with_context(
+            &json!({"goal":"Wait until cancellation without changing any files.", "background_refs":["evidence://cleanup"],
+                "task_shape":"change","worker_profile":"implementer"}), fixture.workspace.path(),
+            &crate::agent::tool::ToolExecutionContext::new("cancel-in-flight", crate::agent::tool::ToolCancellation::new()),
+        );
+        assert!(
+            pending.success,
+            "the next bounded task must be admitted: {}",
+            pending.content
+        );
+        let pending: serde_json::Value = serde_json::from_str(&pending.content).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !models.1.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the real production worker must reach the pending model request");
+        let stopped = pump.shutdown();
+        assert!(models.2.load(Ordering::SeqCst), "stopping a local worker must drop its in-flight model future, not merely set an unrelated atomic flag");
+        stopped.unwrap();
+        for kind in [ResourceKind::Sandbox, ResourceKind::Worktree] {
+            assert_eq!(
+                repository
+                    .load_for_attempt(pending["attempt_id"].as_str().unwrap(), kind)
+                    .unwrap()
+                    .cleanup_status,
+                ResourceCleanupStatus::Cleaned
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            CONTENT,
+            "cancellation must not alter the earlier accepted output"
+        );
+    }
+
     #[test]
     fn terminal_cancel_cleans_persisted_sandbox_and_git_worktree() {
         for termination in ["cancel", "interrupted", "expired", "disconnected"] {
@@ -2207,8 +3290,23 @@ mod tests {
                     .unwrap();
             }
             service.start().unwrap();
-            if termination == "cancel" {
-                service.cancel(&receipt.attempt_id).unwrap();
+            let service = if termination == "cancel" {
+                let handle = DelegationServiceHandle::new(service, ContractLimits::default());
+                let mut tools = crate::agent::ToolRegistry::empty();
+                crate::commands::foreground_delegation_control::register(
+                    &mut tools,
+                    "cleanup-session".into(),
+                    Some(handle.clone()),
+                );
+                let stopped = tools.execute(&crate::agent::ToolCall::new("stop_delegated_work".into(),
+                    json!({"delegation_id":receipt.delegation_id,"attempt_id":receipt.attempt_id})), "main-stop", _workspace.path());
+                assert!(stopped.result.success, "{}", stopped.result.content);
+                assert!(stopped.result.content.contains("\"status\":\"stopped\""));
+                assert!(handle
+                    .list_for_session("cleanup-session")
+                    .unwrap()
+                    .is_empty());
+                None
             } else if termination == "expired" || termination == "disconnected" {
                 assert_eq!(
                     service.tick().unwrap().scheduler.dispatched,
@@ -2257,9 +3355,16 @@ mod tests {
                         )
                         .unwrap();
                     assert_eq!(status, "needs_decision");
+                    let facts = crate::agent::supervision::delegation_activity_adapter::runtime_failures_for_session(conn, "cleanup-session").unwrap();
+                    assert_eq!(facts.len(), 1);
+                    assert_eq!(facts[0].attempt_id, receipt.attempt_id);
+                    assert_eq!(facts[0].reason, if termination == "expired" { "lease_expired" } else { "execution_ended" });
                 })
                 .unwrap();
-            }
+                Some(service)
+            } else {
+                Some(service)
+            };
 
             let sandbox_after = repository
                 .load_for_attempt(&receipt.attempt_id, ResourceKind::Sandbox)
@@ -2337,7 +3442,13 @@ mod tests {
     }
 
     #[test]
-    fn declined_reviewed_change_uses_the_same_persistent_terminal_cleanup() {
+    fn declined_or_stopped_change_uses_the_same_persistent_terminal_cleanup() {
+        for termination in ["decline", "stop"] {
+            assert_reviewed_change_cleanup(termination);
+        }
+    }
+
+    fn assert_reviewed_change_cleanup(termination: &str) {
         let fixture = real_delegation_fixture("decline-session");
         let db = fixture.db.clone();
         let receipt = issue_local_delegation(&fixture, "decline-call", "change", "implementer");
@@ -2401,6 +3512,7 @@ mod tests {
 
         let delivery_id = "delivery-real-decline";
         let delivery = DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: delivery_id.into(),
             delivery_revision: 1,
@@ -2516,6 +3628,18 @@ mod tests {
             ResourceCleanupStatus::None
         );
         let review = reviews.load_for_delivery(delivery_id, 1).unwrap();
+        let old_claim = review.reviewer_attempt_id.clone().unwrap();
+        let recovered = reviews.recover_runnable(now + 2).unwrap();
+        assert_eq!(recovered.len(), 1);
+        service
+            .start_review_job(recovered.into_iter().next().unwrap())
+            .unwrap();
+        let review = reviews.load_for_delivery(delivery_id, 1).unwrap();
+        assert_ne!(
+            review.reviewer_attempt_id.as_deref(),
+            Some(old_claim.as_str()),
+            "restart recovery must fence the previous reviewer claim, not reuse its identity"
+        );
         let reviewer_attempt_id = review.reviewer_attempt_id.clone().unwrap();
         let valid = crate::agent::review_agent::ReviewExecutionEvent {
             job_id: review.id.clone(),
@@ -2529,6 +3653,14 @@ mod tests {
             }),
         };
         let mut stale = valid.clone();
+        stale.reviewer_attempt_id = old_claim;
+        service.review_executor = Some(Box::new(NoopReviewExecutor(vec![stale])));
+        assert_eq!(service.poll_review_events().unwrap(), 0);
+        assert_eq!(
+            reviews.load(&review.id).unwrap().status,
+            ReviewJobStatus::Running
+        );
+        let mut stale = valid.clone();
         stale.job_id = "missing-review-job".into();
         let mut invalid = valid.clone();
         invalid.outcome.as_mut().unwrap().summary.clear();
@@ -2540,9 +3672,126 @@ mod tests {
         );
         service.poll_review_events().unwrap();
 
-        service
-            .decline_change_for_session(&fixture.identity.session_id, delivery_id, 3600, &limits)
+        if termination == "decline" {
+            service
+                .decline_change_for_session(
+                    &fixture.identity.session_id,
+                    delivery_id,
+                    3600,
+                    &limits,
+                )
+                .unwrap();
+        } else {
+            let scope = service
+                .scope_for_session(&fixture.identity.session_id, delivery_id)
+                .unwrap();
+            let prepared = service
+                .change_pipeline
+                .as_ref()
+                .unwrap()
+                .prepare(&scope, delivery_id, now)
+                .unwrap();
+            let confirmation = db
+                .with_conn_mut(|conn| {
+                    crate::agent::work_package::WorkPackageRepository::confirm(
+                        conn,
+                        &prepared.scope,
+                        &prepared.change_set_id,
+                        true,
+                        3600,
+                        now,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            db.with_conn_mut(|conn| conn.execute(
+            "INSERT INTO delegation_materialization_receipts
+                (id,confirmation_id,change_set_id,work_package_id,scope_digest,artifact_id,
+                 base_commit,reviewed_commit_sha,reviewed_diff_hash,changed_paths_json,status,created_at,updated_at)
+             SELECT 'unknown-stop',?1,change_set_id,work_package_id,scope_digest,id,
+                 base_commit,commit_sha,diff_hash,changed_paths_json,'unknown',?2,?2
+             FROM delegation_review_artifacts WHERE change_set_id=?3",
+             rusqlite::params![confirmation.id, now, prepared.change_set_id]
+        )).unwrap().unwrap();
+            assert_eq!(
+                service.stop_for_session(
+                    &fixture.identity.session_id,
+                    &receipt.delegation_id,
+                    &receipt.attempt_id
+                ),
+                Err(DelegationServiceError::MaterializationInProgress)
+            );
+            assert!(matches!(
+                service.needs_decision(&scope, delivery_id, &limits),
+                Err(DelegationServiceError::MaterializationInProgress)
+            ));
+            assert!(matches!(
+                service.retry(&scope, delivery_id, "inspect first", &limits),
+                Err(DelegationServiceError::MaterializationInProgress)
+            ));
+            assert!(matches!(
+                service.decline_change_for_session(
+                    &fixture.identity.session_id,
+                    delivery_id,
+                    3600,
+                    &limits
+                ),
+                Err(DelegationServiceError::MaterializationInProgress)
+            ));
+            assert!(matches!(
+                service.materialize_change_for_session(
+                    &fixture.identity.session_id,
+                    delivery_id,
+                    3600,
+                    &limits
+                ),
+                Err(DelegationServiceError::MaterializationInProgress)
+            ));
+            assert_eq!(
+                repository
+                    .load_for_attempt(&receipt.attempt_id, ResourceKind::Worktree)
+                    .unwrap()
+                    .cleanup_status,
+                ResourceCleanupStatus::None,
+                "unknown effects must retain their recovery resources"
+            );
+            // Deterministic recovery fixture: no apply was performed. Only a
+            // verified no-effect journal allows the stop/discard path again.
+            db.with_conn_mut(|conn| conn.execute(
+            "UPDATE delegation_materialization_receipts SET status='refused' WHERE id='unknown-stop'", []
+        )).unwrap().unwrap();
+            assert_eq!(
+                service
+                    .stop_for_session(
+                        &fixture.identity.session_id,
+                        &receipt.delegation_id,
+                        &receipt.attempt_id
+                    )
+                    .unwrap()
+                    .status,
+                DelegationStopStatus::Stopped
+            );
+            assert!(service
+                .materialize_change_for_session(
+                    &fixture.identity.session_id,
+                    delivery_id,
+                    3600,
+                    &limits
+                )
+                .is_err());
+            db.with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row::<String, _, _>(
+                        "SELECT status FROM work_package_confirmations WHERE id=?1",
+                        [&confirmation.id],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    "invalidated"
+                );
+            })
             .unwrap();
+        }
 
         // Replay the table rebuild with populated, linked rows. Empty-schema
         // migration tests cannot detect lost artifacts or broken handoff FKs.
@@ -2596,8 +3845,8 @@ mod tests {
             let package_status: String = conn
                 .query_row(
                     "SELECT p.status FROM work_packages p
-                     JOIN delegations d ON d.work_package_id=p.id
-                     WHERE d.id=?1",
+                 JOIN delegations d ON d.work_package_id=p.id
+                 WHERE d.id=?1",
                     [&receipt.delegation_id],
                     |row| row.get(0),
                 )
@@ -2609,7 +3858,14 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(package_status, "declined");
+            assert_eq!(
+                package_status,
+                if termination == "decline" {
+                    "declined"
+                } else {
+                    "cancelled"
+                }
+            );
             assert_eq!(handoff_status, "cancelled");
         })
         .unwrap();

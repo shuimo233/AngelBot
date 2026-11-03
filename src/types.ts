@@ -25,6 +25,7 @@ export type TextAttachment = { name: string; text: string };
 export type Message = {
   id: string;
   sessionId: string;
+  parentId?: string;
   /** Tool rows are legacy persistence details and are hidden when a durable
    *  assistant timeline replays the same execution. */
   role: 'user' | 'assistant' | 'tool';
@@ -209,7 +210,7 @@ export type ApiConfig = {
   /** Whether a provider-matched key already exists outside the renderer. */
   hasApiKey?: boolean;
   /** The stored key is never exposed; this only describes where it is managed. */
-  credentialSource?: 'none' | 'keychain' | 'environment';
+  credentialSource?: 'none' | 'keychain' | 'environment' | 'chatgpt_plan';
   protocol?: 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages';
   authMode?: 'api_key' | 'none' | 'chatgpt_plan';
   /** Non-secret account handle; OAuth tokens never enter the renderer. */
@@ -241,6 +242,9 @@ export type McpServer = {
   envUnavailable: boolean;
   enabled: boolean;
   enabledWorkspaceIds: string[];
+  /** Local discovery exists; this is not a running process or permission. */
+  catalogReady?: boolean;
+  catalogError?: string | null;
   status?: 'connected' | 'disconnected' | 'starting';
 };
 

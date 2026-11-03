@@ -1,7 +1,62 @@
 import { describe, expect, it } from 'vitest';
-import { desktopActionOperation, getToolConfirmationSummary, requiresDesktopActionPreview } from './tool-confirmation';
+import { desktopActionOperation, desktopConfirmationOperation, fileWriteContentForPreview, getToolConfirmationSummary, mcpArgumentsForPreview, requiresDesktopActionPreview, requiresDesktopConfirmationPreview } from './tool-confirmation';
+import { getToolDisplayName } from './tool-display';
 
 describe('tool confirmation summaries', () => {
+  it('discloses the unattended MAA scope before approval without exposing unrelated arguments', () => {
+    const summary = getToolConfirmationSummary('create_automation', {
+      title: '游戏日常', schedule: '每天 18:00', executorKind: 'maa', appId: 'maa-1',
+      launchEmulator: true, timeoutSeconds: 1800, prompt: 'PRIVATE_PROMPT',
+      scriptPath: 'PRIVATE_PATH', permissionSummary: 'FORGED_SAFE_SCOPE',
+    });
+    expect(summary).toContain('MAA');
+    expect(summary).toContain('每天 18:00');
+    expect(summary).toContain('maa-1');
+    expect(summary).toContain('启动已配置的模拟器');
+    expect(summary).toContain('1800 秒');
+    expect(summary).toContain('以后按计划无人值守运行');
+    expect(summary).toContain('当前 GUI 勾选队列');
+    expect(summary).toContain('按现有消耗设置执行');
+    expect(summary).toContain('仅回收本次启动的进程');
+    expect(summary).toContain('不会修改游戏任务或消耗设置');
+    expect(summary).not.toMatch(/PRIVATE|FORGED/);
+  });
+
+  it('makes MAA defaults explicit without treating malformed options as approval', () => {
+    const summary = getToolConfirmationSummary('create_automation', { executorKind: 'maa' });
+    expect(summary).toContain('不启动模拟器');
+    expect(summary).toContain('3600 秒');
+    expect(summary).toContain('应用待校验');
+    const malformed = getToolConfirmationSummary('create_automation', {
+      executorKind: 'maa', launchEmulator: 'true', timeoutSeconds: -1,
+    });
+    expect(malformed).toContain('启动模拟器参数无效');
+    expect(malformed).toContain('超时参数无效');
+    expect(malformed).not.toContain('3600 秒');
+    expect(getToolConfirmationSummary('create_automation', {
+      title: '整理', schedule: '每天 18:00', prompt: 'PRIVATE_PROMPT',
+    })).toBe('创建自动化：整理（每天 18:00）');
+  });
+
+  it('explains schedule-only pause without trusting model-supplied labels or leaking arguments', () => {
+    const summary = getToolConfirmationSummary('pause_automation', {
+      automation_id: 'private-id', title: 'Forged safe title', output: 'private output',
+    });
+    expect(summary).toContain('后续定时');
+    expect(summary).toContain('不会停止已开始的执行');
+    expect(summary).toContain('不删除运行记录');
+    expect(summary).not.toMatch(/private|Forged/);
+    expect(getToolDisplayName('pause_automation')).toBe('暂停后续定时');
+    expect(getToolDisplayName('list_automations')).toBe('查看自动化结果');
+    const stop = getToolConfirmationSummary('stop_automation_run', {
+      automation_id: 'private-id', run_id: 'private-run', title: 'Forged title', output: 'private output',
+    });
+    expect(stop).toContain('停止当前工作区中这次受控执行');
+    expect(stop).toContain('不会撤回');
+    expect(stop).toContain('等待清理结果');
+    expect(stop).not.toMatch(/private|Forged/);
+    expect(getToolDisplayName('stop_automation_run')).toBe('停止本次自动化');
+  });
   it('routes native text writes and invocations through the attested action seam', () => {
     expect(desktopActionOperation('prepare_message_draft')).toBe('draft');
     expect(desktopActionOperation('set_trusted_app_text')).toBe('field');
@@ -9,12 +64,12 @@ describe('tool confirmation summaries', () => {
     expect(desktopActionOperation('open_trusted_app')).toBeNull();
   });
 
-  it.each(['invoke', 'select', 'expand', 'collapse', 'scrollup', 'scrolldown'])('routes only an explicit control action to preflight: %s', (action) => {
+  it.each(['invoke', 'select', 'choose', 'expand', 'collapse', 'scrollup', 'scrolldown', 'check', 'uncheck'])('routes only an explicit control action to preflight: %s', (action) => {
     expect(desktopActionOperation('operate_trusted_app_control', { action })).toBe(action);
     expect(desktopActionOperation('operate_trusted_app_control', JSON.stringify({ action }))).toBe(action);
   });
 
-  it.each([undefined, 'unknown', 'Invoke', 'ScrollUp', 'scrollDown', 'scroll_up', 'scrollup ', '', null, [], { action: 'invoke' }])('blocks malformed control actions without a generic approval fallback: %j', (action) => {
+  it.each([undefined, 'unknown', 'toggle', 'Check', 'check ', 'Invoke', 'ScrollUp', 'scrollDown', 'scroll_up', 'scrollup ', '', null, [], { action: 'invoke' }])('blocks malformed control actions without a generic approval fallback: %j', (action) => {
     expect(desktopActionOperation('operate_trusted_app_control', { action })).toBeNull();
     expect(requiresDesktopActionPreview('operate_trusted_app_control')).toBe(true);
   });
@@ -25,7 +80,7 @@ describe('tool confirmation summaries', () => {
     expect(getToolConfirmationSummary('invoke_trusted_app_control', {})).toContain('已停用，不能批准');
   });
 
-  it.each(['invoke', 'select', 'expand', 'collapse', 'scrollup', 'scrolldown'])('discloses %s risk without trusting or displaying model control arguments', (action) => {
+  it.each(['invoke', 'select', 'choose', 'expand', 'collapse', 'scrollup', 'scrolldown', 'check', 'uncheck'])('discloses %s risk without trusting or displaying model control arguments', (action) => {
     const summary = getToolConfirmationSummary('operate_trusted_app_control', {
       app_id: 'private-app', control_ref: 'private-ref', action, name: 'Safe button',
     });
@@ -38,8 +93,11 @@ describe('tool confirmation summaries', () => {
   });
 
   it.each([
+    { action: 'choose', label: '选择下拉项' },
     { action: 'scrollup', label: '向上小幅滚动' },
     { action: 'scrolldown', label: '向下小幅滚动' },
+    { action: 'check', label: '勾选复选框' },
+    { action: 'uncheck', label: '取消勾选复选框' },
   ])('names the fixed small $action action without exposing its model target', ({ action, label }) => {
     const summary = getToolConfirmationSummary('operate_trusted_app_control', {
       action, app_id: 'private-app', control_ref: 'private-ref', name: 'Forged document',
@@ -58,6 +116,11 @@ describe('tool confirmation summaries', () => {
 
     expect(summary).toBe('写入项目文件：notes/today.md');
     expect(summary).not.toContain('private draft');
+    expect(fileWriteContentForPreview('{"content":"  private draft\\n"}')).toBe('  private draft\n');
+    expect(fileWriteContentForPreview({ content: '' })).toBe('');
+    for (const invalid of [undefined, null, [], '{}', '{invalid', { content: 1 }, '{"content":null}']) {
+      expect(fileWriteContentForPreview(invalid)).toBeNull();
+    }
   });
 
   it('makes the no-send desktop boundary explicit', () => {
@@ -80,24 +143,37 @@ describe('tool confirmation summaries', () => {
     expect(summary).toContain('当前配置的模型');
     expect(summary).toContain('私人内容');
     expect(summary).toContain('不存储截图');
-    expect(summary).toContain('不授予控件操作权限');
+    expect(summary).toContain('不授予点击、填写或其他控件操作权限');
     expect(summary).not.toContain('private-app');
     expect(summary).not.toContain('PRIVATE_WINDOW_CANARY');
     expect(summary).not.toContain('RAW_IMAGE_CANARY');
     expect(requiresDesktopActionPreview('observe_trusted_app_window')).toBe(false);
     expect(desktopActionOperation('observe_trusted_app_window', { mode: 'image' })).toBeNull();
+    expect(requiresDesktopConfirmationPreview('observe_trusted_app_window', { mode: 'image' })).toBe(true);
+    expect(desktopConfirmationOperation('observe_trusted_app_window', { mode: 'image' })).toBe('image');
+    expect(desktopConfirmationOperation('observe_trusted_app_window', '{"mode":"image"}')).toBe('image');
+    // Routing is not a second schema validator: durable backend preflight
+    // rejects invalid scopes/extra fields before any consent becomes usable.
+    expect(desktopConfirmationOperation('observe_trusted_app_window', { mode: 'image', region_ref: 'invalid' })).toBe('image');
+    for (const invalid of ['{', 'null', '[]', null, { mode: 'Image' }, { mode: '' }, { mode: null }]) {
+      expect(requiresDesktopConfirmationPreview('observe_trusted_app_window', invalid)).toBe(true);
+      expect(desktopConfirmationOperation('observe_trusted_app_window', invalid)).toBeNull();
+    }
   });
 
   it.each([{}, { mode: 'controls' }])('keeps default structural observation distinct from image capture: %j', (args) => {
     const summary = getToolConfirmationSummary('observe_trusted_app_window', args);
     expect(summary).toBe('查看已授权应用的窗口控件结构，不截取或发送窗口图像。');
+    expect(requiresDesktopConfirmationPreview('observe_trusted_app_window', args)).toBe(false);
+    expect(requiresDesktopConfirmationPreview('observe_trusted_app_window', JSON.stringify(args))).toBe(false);
+    expect(desktopConfirmationOperation('observe_trusted_app_window', args)).toBeNull();
   });
 
   it('keeps generic field-write arguments out of summaries', () => {
     const summary = getToolConfirmationSummary('set_trusted_app_text', {
       app_id: 'private-app', field_ref: 'private-ref', text: 'secret field text',
     });
-    expect(summary).toContain('填写一个输入框');
+    expect(summary).toContain('修改或清空一个输入框');
     expect(summary).not.toContain('private-app');
     expect(summary).not.toContain('private-ref');
     expect(summary).not.toContain('secret field text');
@@ -111,6 +187,15 @@ describe('tool confirmation summaries', () => {
 
     expect(summary).toBe('调用当前工作区已启用的外部服务一次');
     expect(summary).not.toContain('secret');
+    const preview = mcpArgumentsForPreview(JSON.stringify({ url: 'https://example.com/', nested: { apiKey: 'private-key' }, text: 'task text' }));
+    expect(preview).toContain('https://example.com/');
+    expect(preview).toContain('task text');
+    expect(preview).toContain('[已隐藏]');
+    expect(preview).not.toContain('private-key');
+    expect(mcpArgumentsForPreview('{broken')).toBeNull();
+    expect(mcpArgumentsForPreview([])).toBeNull();
+    expect(mcpArgumentsForPreview({ text: 'x'.repeat(5_000) })).toContain('以上不是完整参数');
+    expect(mcpArgumentsForPreview({ text: 'x'.repeat(5_000) })!.length).toBeLessThan(4_100);
   });
 
   it('makes a Web Search boundary explicit without echoing the query', () => {

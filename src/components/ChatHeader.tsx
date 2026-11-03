@@ -2,6 +2,9 @@ import { useEffect, useState, type CSSProperties } from 'react';
 import { useSessionsStore } from '$stores/sessions';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { useMessagesStore } from '$stores/messages';
+import { useNavigationStore } from '$stores/navigation';
+import { useWorkspaceActivityStore } from '$stores/workspaceActivity';
+import { WorkspaceReminders } from './WorkspaceReminders';
 import { getContextUsage, type ContextUsage } from '$lib/commands/session';
 import { getSessionUsage } from '$lib/commands/usage';
 import './ChatHeader.css';
@@ -10,7 +13,7 @@ import './ChatHeader.css';
  * 会话头部：标题与上下文抽屉入口。
  * 将本轮输入/输出与上下文占用紧邻工作区抽屉入口展示，便于用户把握会话余量。
  */
-export function ChatHeader({ onToggleWorkbench }: { onToggleWorkbench?: () => void }) {
+export function ChatHeader({ onToggleWorkbench, workbenchOpen = false }: { onToggleWorkbench?: () => void; workbenchOpen?: boolean }) {
   const activeSession = useSessionsStore((state) => state.activeSession);
   const workspaces = useWorkspacesStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
@@ -20,6 +23,12 @@ export function ChatHeader({ onToggleWorkbench }: { onToggleWorkbench?: () => vo
   const [tokenTotals, setTokenTotals] = useState({ input: 0, output: 0 });
   const sessionId = activeSession?.id;
   const activeWorkspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+  const attentionCount = useWorkspaceActivityStore((state) =>
+    !state.error && state.workspaceId === activeWorkspaceId
+    && state.sessionId === activeWorkspace?.activeSessionId
+    && state.sessionId === sessionId
+    && state.projection?.workspaceId === activeWorkspaceId
+      ? state.projection.attention?.openCount ?? 0 : 0);
   const workspaceKindLabel = activeWorkspace?.kind === 'project'
     ? '项目'
     : activeWorkspace?.kind === 'personal' ? '个人空间' : '对话';
@@ -66,10 +75,12 @@ export function ChatHeader({ onToggleWorkbench }: { onToggleWorkbench?: () => vo
   return (
     <div className="chat-header chat-header-new">
       <div className="chat-header-left">
+        {activeWorkspace?.kind === 'project' && <button type="button" className="chat-header-workbench-toggle" onClick={() => useNavigationStore.getState().setPage('projects')}>所有项目</button>}
         <span className="chat-header-workspace-kind">{workspaceKindLabel}</span>
         <h1 className="chat-header-session-title">{title}</h1>
       </div>
       <div className="chat-header-right">
+        <WorkspaceReminders workspaceId={activeWorkspace?.id} compact />
         {sessionId && (
           <span
             className="chat-header-context"
@@ -81,9 +92,10 @@ export function ChatHeader({ onToggleWorkbench }: { onToggleWorkbench?: () => vo
           </span>
         )}
         {onToggleWorkbench && (
-          <button type="button" className="chat-header-workbench-toggle" onClick={onToggleWorkbench} title="打开工作台 (Ctrl+.)" aria-label="打开工作台">
+          <button type="button" className="chat-header-workbench-toggle" onClick={onToggleWorkbench} title={`${workbenchOpen ? '收起' : '打开'}工作台 (Ctrl+.)`} aria-label={workbenchOpen ? '收起工作台' : '打开工作台'} aria-expanded={workbenchOpen} aria-controls="conversation-workbench">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M15 3v18" /></svg>
             <span>工作台</span>
+            {attentionCount > 0 && <small className="chat-header-attention-count" title={`${attentionCount} 项工作待处理，可在工作台的任务页查看`}>{attentionCount}</small>}
           </button>
         )}
       </div>

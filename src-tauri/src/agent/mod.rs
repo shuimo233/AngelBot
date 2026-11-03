@@ -186,6 +186,10 @@ pub mod task_understanding;
 pub mod terminal_cleanup;
 #[path = "tools/tool.rs"]
 pub mod tool;
+#[path = "conversation/tool_context.rs"]
+pub(crate) mod tool_context;
+#[path = "support/tool_source.rs"]
+pub(crate) mod tool_source;
 #[path = "planning/tot.rs"]
 pub mod tot;
 #[path = "planning/tot_integration.rs"]
@@ -241,11 +245,18 @@ pub use otel::{AgentOtelBridge, OtelConfig, OtelExporter, OtelTracer, SharedSpan
 pub use planner::{ExecutionPlan, Executor, PlanMode, PlanStep, Planner, TaskComplexity};
 #[allow(unused_imports)]
 pub use prompt::{build_agent_system_prompt, build_simple_system_prompt};
+pub(crate) use registry::operation_repair_matches;
+#[cfg(test)]
+pub(crate) use registry::repairs_argument_rejection;
+pub(crate) use registry::requires_argument_confirmation;
 #[allow(unused_imports)]
 pub use registry::ToolRegistry;
 #[allow(unused_imports)]
 pub use router::{SharedToolRouter, ToolRouter};
 pub use run_state::{derive_run_state, AgentRunStatus, ConfirmationState, RunStateInput};
+#[cfg(test)]
+pub(crate) use runner::AgentStep;
+pub(crate) use runner::STOPPED_RUN_NOTICE;
 pub use runner::{AgentResponse, AgentRunner, AgentSliceOutcome, NativeAgentSliceResult};
 #[allow(unused_imports)]
 pub use scheduler::{analyze_dependencies, topological_sort, SchedulerConfig, ToolScheduler};

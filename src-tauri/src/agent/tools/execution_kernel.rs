@@ -4,12 +4,13 @@
 //! confirmation, persistence, or a tool registry.  A host owns those policy
 //! concerns and uses this module for the repeatable mechanics common to a
 //! foreground conversation and a future delegated worker: cancellation checks,
-//! bounded model retries, ordered execution milestones, and controlled-batch
+//! bounded model timeout attempts, ordered execution milestones, and controlled-batch
 //! boundaries.
 
 use crate::agent::tool::ToolCancellation;
 use crate::llm::{
-    LlmProvider, LlmResponse, Message as LlmMessage, ThinkingSettings, ToolCall, ToolSchema,
+    LlmFailure, LlmProvider, LlmResponse, Message as LlmMessage, ThinkingSettings, ToolCall,
+    ToolSchema,
 };
 use serde_json::Value;
 use std::future::Future;
@@ -40,7 +41,8 @@ pub enum KernelStopReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelModelTurnError {
-    Provider(String),
+    Cancelled,
+    Provider(LlmFailure),
     TimedOut { attempts: usize, timeout: Duration },
 }
 
@@ -392,28 +394,40 @@ impl ExecutionKernel {
         deltas: Option<UnboundedSender<String>>,
     ) -> Result<LlmResponse, KernelModelTurnError> {
         self.check_before_model_turn()
-            .map_err(|_| KernelModelTurnError::Provider("cancelled".to_string()))?;
+            .map_err(|_| KernelModelTurnError::Cancelled)?;
 
         for attempt in 1..=self.max_model_attempts {
+            self.check_before_model_turn()
+                .map_err(|_| KernelModelTurnError::Cancelled)?;
             self.emit(KernelEventKind::ModelTurnStarted, attempt);
-            match tokio::time::timeout(
-                self.model_timeout,
-                provider.chat_stream(messages, tools, thinking, deltas.clone()),
-            )
-            .await
-            {
+            let result = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(KernelModelTurnError::Cancelled),
+                result = tokio::time::timeout(
+                    self.model_timeout,
+                    provider.chat_stream_classified(messages, tools, thinking, deltas.clone()),
+                ) => result,
+            };
+            // Cancellation can arrive in the same poll that produced a model
+            // response. Never settle that response or dispatch its tool calls.
+            self.check_before_model_turn()
+                .map_err(|_| KernelModelTurnError::Cancelled)?;
+            match result {
                 Ok(Ok(response)) => {
                     self.emit(KernelEventKind::ModelTurnFinished, attempt);
                     return Ok(response);
                 }
-                Ok(Err(_error)) if attempt < self.max_model_attempts => {
-                    self.emit(KernelEventKind::ModelTurnRetrying, attempt);
-                    tokio::time::sleep(Duration::from_millis(750)).await;
-                }
+                // An unclassified provider error is not permission to resend
+                // inference (authentication/invalid-body errors cannot heal by
+                // repeating it). Stop; a new host-owned turn may try again.
                 Ok(Err(error)) => return Err(KernelModelTurnError::Provider(error)),
                 Err(_) if attempt < self.max_model_attempts => {
                     self.emit(KernelEventKind::ModelTurnRetrying, attempt);
-                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    tokio::select! {
+                        biased;
+                        _ = self.cancellation.cancelled() => return Err(KernelModelTurnError::Cancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(750)) => {}
+                    }
                 }
                 Err(_) => {
                     return Err(KernelModelTurnError::TimedOut {

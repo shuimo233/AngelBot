@@ -14,7 +14,10 @@ interface SettingsState {
   updateProfile: (profile: Partial<Persona>) => void;
   persistProfile: () => void;
   loadApiConfig: () => Promise<void>;
+  /** Recheck the saved connection without editing its identity or the settings draft. */
+  refreshApiConfigReadiness: () => Promise<void>;
   updateApiConfig: (config: Partial<ApiConfig>) => void;
+  discardApiConfigDraft: () => void;
   invalidatePlanBinding: (credentialRef: string | null) => void;
   persistApiConfig: () => Promise<void>;
 }
@@ -107,7 +110,7 @@ export function toRustConfig(ts: ApiConfig): ApiProviderConfig {
 }
 
 /** Compare public connection identity, never key values or backend-managed key metadata. */
-function matchesSavedConnection(saved: ApiConfig, effective: ApiConfig): boolean {
+function matchesSavedConnection(saved: ApiConfig, effective: ApiConfig, requireReadyPlan = true): boolean {
   const protocol = (config: ApiConfig) => config.protocol
     ?? (getProviderMeta(config.provider)?.protocol === 'anthropic-messages'
       ? 'anthropic_messages' : 'openai_chat_completions');
@@ -120,7 +123,15 @@ function matchesSavedConnection(saved: ApiConfig, effective: ApiConfig): boolean
     && saved.maxTokens === effective.maxTokens
     && saved.temperature === effective.temperature
     && (authMode !== 'chatgpt_plan'
-      || (saved.credentialRef === effective.credentialRef && Boolean(effective.planConnected && effective.planEnabled)));
+      || (saved.credentialRef === effective.credentialRef
+        && (!requireReadyPlan || Boolean(effective.planConnected && effective.planEnabled))));
+}
+
+/** Draft edits only; background readiness changes are not unsaved credentials. */
+export function hasUnsavedApiConfig(draft: ApiConfig, active: ApiConfig): boolean {
+  const usesKey = (draft.authMode ?? 'api_key') === 'api_key';
+  return !matchesSavedConnection(draft, active, false)
+    || (usesKey && (Boolean(draft.apiKey.trim()) || Boolean(draft.hasApiKey) !== Boolean(active.hasApiKey)));
 }
 
 let apiConfigRequest = 0;
@@ -167,9 +178,34 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     }
   },
 
+  refreshApiConfigReadiness: async () => {
+    if (!get().apiConfigLoaded) return; // Initial settings hydration owns the first read.
+    const request = apiConfigRequest;
+    const active = get().activeApiConfig;
+    // A background read must not supersede a load/save or a newer account state.
+    const current = () => request === apiConfigRequest && active === get().activeApiConfig;
+    try {
+      const effective = fromRustConfig(await loadApiConfigCmd());
+      if (!current()) return;
+      if (!matchesSavedConnection(active, effective, false)) {
+        set({ apiConfigLoadError: get().apiConfigLoadError ?? '生效的模型连接已变化，请在模型设置中重新核对。' });
+        return;
+      }
+      // Only explicit settings operations clear an existing load/save error.
+      set({ activeApiConfig: effective, apiConfigLoaded: true });
+    } catch (error) {
+      if (current()) set({
+        apiConfigLoaded: true,
+        apiConfigLoadError: get().apiConfigLoadError
+          ?? (error instanceof Error ? error.message : '无法重新检查模型配置'),
+      });
+    }
+  },
+
   updateApiConfig: (partial) => {
     set((state) => ({ apiConfig: { ...state.apiConfig, ...partial } }));
   },
+  discardApiConfigDraft: () => set((state) => ({ apiConfig: state.activeApiConfig })),
 
   invalidatePlanBinding: (credentialRef) => {
     const active = get().activeApiConfig;

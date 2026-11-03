@@ -86,6 +86,15 @@ def check_release(tag: str | None) -> list[str]:
         errors.append("Tauri identifier must be a stable reverse-domain identifier")
 
     bundle = tauri.get("bundle", {})
+    windows = bundle.get("windows", {})
+    if windows.get("allowDowngrades") is not False or windows.get("nsis", {}).get("installMode") != "currentUser":
+        errors.append("Windows must explicitly use currentUser NSIS installation and disallow downgrades")
+    storage_source = (ROOT / "src-tauri/src/profile_storage.rs").read_text(encoding="utf-8")
+    storage_directory = re.search(r'const DIRECTORY: &str = "([^"]+)"', storage_source)
+    if storage_directory is None or storage_directory.group(1) != identifier:
+        errors.append("durable profile directory must match the installer data identifier")
+    if str(tauri.get("productName", "")).casefold() == str(identifier).casefold():
+        errors.append("per-user program and durable data directories must not overlap")
     if bundle.get("active") is not True:
         errors.append("Tauri bundle.active must be true")
     targets = bundle.get("targets")

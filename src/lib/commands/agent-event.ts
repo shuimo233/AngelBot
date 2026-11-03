@@ -48,6 +48,7 @@ export type AgentEventType =
   | 'MessageEnd'
   | 'ContentBlock'   // Unified text+tool stream
   | 'ToolExecutionStart'
+  | 'ExternalToolDispatchReserved' // Durable recovery fact, not a UI action/result.
   | 'ToolExecutionProgress'
   | 'ToolExecutionEnd'
   | 'TurnEnd'
@@ -76,6 +77,7 @@ export interface EventData {
     block: ContentBlockData;
   };
   ToolExecutionStart: { call_id: string; tool_name: string; arguments: unknown };
+  ExternalToolDispatchReserved: { call_id: string; tool_name: string };
   ToolExecutionProgress: { call_id: string; tool_name: string; progress: string; percent?: number };
   ToolExecutionEnd: { call_id: string; tool_name: string; success: boolean; output: string; error?: string };
   TurnEnd: { turn_id: string; success: boolean; tool_calls_count: number };
@@ -202,6 +204,62 @@ type EventHandler<T extends AgentEventType> = (data: EventData[T]) => void;
 
 type UnlistenFn = () => void;
 
+type SessionObserver = (event: AgentEvent) => void;
+type SessionSubscription = {
+  observers: Set<SessionObserver>;
+  ready: Promise<void>;
+  stop?: UnlistenFn;
+};
+const sessionSubscriptions = new Map<string, SessionSubscription>();
+
+/** Share one native transport; releasing a view must not disconnect Main. */
+export function subscribeAgentSessionEvents(sessionId: string, callback: SessionObserver): {
+  ready: Promise<void>; unsubscribe: UnlistenFn;
+} {
+  // Each lease has its own identity, even if callers reuse a callback.
+  const observer: SessionObserver = (event) => callback(event);
+  let subscription = sessionSubscriptions.get(sessionId);
+  if (!subscription) {
+    const observers = new Set<SessionObserver>();
+    const created: SessionSubscription = {
+      observers,
+      ready: listen<AgentEvent>(`agent_event_${sessionId}`, (event) => {
+        // Reconnection during a callback must not give its replacement the
+        // event already being dispatched; released leases get nothing later.
+        [...observers].forEach((listener) => {
+          if (!observers.has(listener)) return;
+          try { listener(event.payload); }
+          catch (error) { console.error('[AgentEvent] Observer error:', error); }
+        });
+      }).then((stop) => {
+        created.stop = stop;
+        if (observers.size === 0) stop();
+      }, (error) => {
+        observers.clear();
+        if (sessionSubscriptions.get(sessionId) === created) sessionSubscriptions.delete(sessionId);
+        throw error;
+      }),
+    };
+    subscription = created;
+    sessionSubscriptions.set(sessionId, subscription);
+  }
+  const lease = subscription;
+  lease.observers.add(observer);
+  let released = false;
+  return {
+    ready: lease.ready,
+    unsubscribe: () => {
+      if (released) return;
+      released = true;
+      lease.observers.delete(observer);
+      if (lease.observers.size === 0) {
+        if (sessionSubscriptions.get(sessionId) === lease) sessionSubscriptions.delete(sessionId);
+        lease.stop?.();
+      }
+    },
+  };
+}
+
 /**
  * Agent Event Manager
  * Manages event subscriptions and dispatches events to registered handlers.
@@ -210,6 +268,7 @@ class AgentEventManager {
   private handlers: Map<AgentEventType, Set<EventHandler<AgentEventType>>> = new Map();
   private unlistenFns: Map<string, UnlistenFn> = new Map();
   private isListening = false;
+  private generation = 0;
 
   /**
    * Subscribe to a specific agent event type
@@ -235,17 +294,32 @@ class AgentEventManager {
   async subscribeToSession(sessionId: string): Promise<void> {
     if (this.isListening && this.unlistenFns.has(sessionId)) return;
     if (this.isListening) this.destroy();
+    else {
+      // A superseded registration may still be pending. Release its lease now,
+      // without erasing the new caller's already-installed message handlers.
+      this.unlistenFns.forEach((unlisten) => unlisten());
+      this.unlistenFns.clear();
+    }
+    const generation = ++this.generation;
 
     // Register the desktop event listener before sending the request so early
     // TurnStart/MessageDelta events cannot be lost while it is still running.
     let subscribedToDesktopEvents = false;
     try {
-      const unlisten = await listen<AgentEvent>(`agent_event_${sessionId}`, (event) => {
-        this.dispatch(event.payload);
+      const subscription = subscribeAgentSessionEvents(sessionId, (event) => {
+        if (generation === this.generation) this.dispatch(event);
       });
-      this.unlistenFns.set(sessionId, unlisten);
+      this.unlistenFns.set(sessionId, subscription.unsubscribe);
+      await subscription.ready;
+      if (generation !== this.generation) {
+        subscription.unsubscribe();
+        return;
+      }
       subscribedToDesktopEvents = true;
     } catch (error) {
+      if (generation !== this.generation) return;
+      this.unlistenFns.get(sessionId)?.();
+      this.unlistenFns.delete(sessionId);
       // Browser/test and Dev HTTP environments have no Tauri event bridge.
       // Keep the polling path alive there; desktop still receives events via
       // the listener above.
@@ -255,7 +329,7 @@ class AgentEventManager {
     // Polling is only for a browser-only Dev HTTP session.  A desktop runner
     // already pushes the same events through Tauri's event bus; polling there
     // duplicates deltas and can make streamed text appear twice.
-    if (!subscribedToDesktopEvents) this.startPolling(sessionId);
+    if (!subscribedToDesktopEvents) this.startPolling(sessionId, generation);
     this.isListening = true;
   }
 
@@ -292,20 +366,24 @@ class AgentEventManager {
   private pollingInterval: number | null = null;
   private lastEventCount = 0;
 
-  private startPolling(sessionId: string): void {
+  private startPolling(sessionId: string, generation: number): void {
     if (this.pollingInterval) return;
     this.lastEventCount = 0;
 
     this.pollingInterval = window.setInterval(async () => {
+      if (generation !== this.generation) return;
       try {
         const response = await invoke<{ events: AgentEvent[] }>('get_agent_events', {
           channelId: `session-${sessionId}`,
         });
+        if (generation !== this.generation) return;
         // Handle polled events
         if (response.events.length > this.lastEventCount) {
           const newEvents = response.events.slice(this.lastEventCount);
-          newEvents.forEach((event) => this.dispatch(event));
           this.lastEventCount = response.events.length;
+          newEvents.forEach((event) => {
+            if (generation === this.generation) this.dispatch(event);
+          });
         }
       } catch (e) {
         // Silently fail polling
@@ -316,15 +394,16 @@ class AgentEventManager {
   private stopPolling(): void {
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
-    this.pollingInterval = null;
-    this.lastEventCount = 0;
+      this.pollingInterval = null;
+      this.lastEventCount = 0;
     }
   }
 
   /**
-   * Cleanup all subscriptions
+   * Release this Main consumer and its handlers, not other observers' leases.
    */
   destroy(): void {
+    this.generation += 1;
     this.unlistenFns.forEach((unlisten) => unlisten());
     this.unlistenFns.clear();
     this.handlers.clear();
@@ -379,6 +458,8 @@ export function formatAgentEvent(event: AgentEvent): string {
     }
     case 'ToolExecutionStart':
       return `Running tool: ${(event.data as EventData['ToolExecutionStart']).tool_name}`;
+    case 'ExternalToolDispatchReserved':
+      return 'External tool dispatch reserved; outcome is not confirmed';
     case 'ToolExecutionProgress':
       return `${(event.data as EventData['ToolExecutionProgress']).tool_name}: ${(event.data as EventData['ToolExecutionProgress']).progress}`;
     case 'ToolExecutionEnd': {

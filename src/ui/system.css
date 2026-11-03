@@ -54,6 +54,15 @@ code, pre, kbd { font-family: var(--ui-font-mono); }
 .ui-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .ui-divider { height: 1px; border: 0; background: var(--ui-border); }
 
+/* Keep long documents navigable without heavy native scrollbar chrome.
+   High-contrast mode retains the system's own scrollbars. */
+@media (forced-colors: none) {
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--ui-border-strong); border: 2px solid var(--ui-canvas); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--ui-text-secondary); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   :root { --ui-duration-fast: 0ms; --ui-duration-base: 0ms; --ui-duration-enter: 0ms; }
   html:focus-within { scroll-behavior: auto; }

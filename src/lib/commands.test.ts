@@ -1,9 +1,18 @@
 import { createSession, getSessions, sendMessage, getMessages, resolveAgentConfirmation, preflightPendingDesktopAction } from './commands';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { getAutomationDashboard } from './commands/automation';
 
 describe('commands', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('reads the dashboard through its typed command and preserves read failures', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, data: { items: [] } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: 'dashboard unavailable' })));
+    expect(await getAutomationDashboard()).toEqual({ items: [] });
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string).cmd).toBe('get_automation_dashboard');
+    await expect(getAutomationDashboard()).rejects.toThrow('dashboard unavailable');
   });
 
   it('creates and loads a session via Tauri', async () => {

@@ -100,8 +100,8 @@ describe('MemoryGovernanceSettings', () => {
     await userEvent.type(content, 'User really likes Rust');
 
     const item = content.closest('.memory-item') as HTMLElement;
-    await userEvent.click(within(item).getByLabelText('Never forget'));
-    await userEvent.click(within(item).getByRole('button', { name: 'Save' }));
+    await userEvent.click(within(item).getByLabelText('永久保留'));
+    await userEvent.click(within(item).getByRole('button', { name: '保存' }));
 
     await waitFor(() => {
       expect(updateMemory).toHaveBeenCalledWith({
@@ -121,19 +121,19 @@ describe('MemoryGovernanceSettings', () => {
     const content = await screen.findByDisplayValue('User likes Rust');
     const item = content.closest('.memory-item') as HTMLElement;
 
-    await userEvent.click(within(item).getByRole('button', { name: 'History' }));
+    await userEvent.click(within(item).getByRole('button', { name: '历史记录' }));
     expect(await screen.findByText('importance:4->7')).toBeInTheDocument();
     expect(getMemoryHistory).toHaveBeenCalledWith('mem-1');
 
-    await userEvent.click(within(item).getByRole('button', { name: 'Conflicts' }));
+    await userEvent.click(within(item).getByRole('button', { name: '检查冲突' }));
     expect(await screen.findByText('User likes Rust programming')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Merge into this' }));
+    await userEvent.click(screen.getByRole('button', { name: '合并到此条' }));
     await waitFor(() => expect(mergeMemories).toHaveBeenCalledWith('mem-2', 'mem-1'));
 
-    await userEvent.click(within(item).getByRole('button', { name: 'Pin' }));
+    await userEvent.click(within(item).getByRole('button', { name: '永久保留' }));
     await waitFor(() => expect(setMemoryPermanent).toHaveBeenCalledWith('mem-1', true));
 
-    await userEvent.click(within(item).getByRole('button', { name: 'Delete' }));
+    await userEvent.click(within(item).getByRole('button', { name: '删除' }));
     await waitFor(() => expect(deleteMemory).toHaveBeenCalledWith('mem-1'));
   });
 });

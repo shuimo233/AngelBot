@@ -1,11 +1,14 @@
 import { create } from 'zustand';
 
 export type Theme = 'dark' | 'light' | 'system';
+export type AppLayout = 'A' | 'B';
 type ResolvedTheme = Exclude<Theme, 'system'>;
 
 interface ThemeState {
   theme: Theme;
   resolvedTheme: ResolvedTheme;
+  layout: AppLayout;
+  setLayout: (layout: AppLayout) => void;
   setTheme: (theme: Theme) => void;
   toggleTheme: () => void;
 }
@@ -18,6 +21,15 @@ function readTheme(): Theme {
     // Appearance remains usable when browser storage is unavailable.
   }
   return 'light';
+}
+
+function readLayout(): AppLayout {
+  try {
+    if (localStorage.getItem('ui-layout') === 'B') return 'B';
+  } catch {
+    // A remains usable without browser storage.
+  }
+  return 'A';
 }
 
 function systemThemeQuery(): MediaQueryList | undefined {
@@ -42,6 +54,13 @@ const initialTheme = readTheme();
 export const useThemeStore = create<ThemeState>((_set, get) => ({
   theme: initialTheme,
   resolvedTheme: resolveTheme(initialTheme),
+  layout: readLayout(),
+  setLayout: (layout) => {
+    useThemeStore.setState({ layout });
+    try { localStorage.setItem('ui-layout', layout); } catch {
+      // The current layout still changes when persistence is unavailable.
+    }
+  },
   setTheme: (theme) => {
     applyTheme(theme);
     try {
@@ -56,6 +75,7 @@ export const useThemeStore = create<ThemeState>((_set, get) => ({
 /** Attach system-theme changes for the app lifetime, including StrictMode remounts. */
 export function initializeTheme(): () => void {
   const media = systemThemeQuery();
+  useThemeStore.setState({ layout: readLayout() });
   applyTheme(readTheme(), media?.matches ?? false);
 
   const onSystemThemeChange = (event: MediaQueryListEvent) => {

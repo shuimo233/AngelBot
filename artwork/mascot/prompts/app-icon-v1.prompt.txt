@@ -1,0 +1,20 @@
+AngelBot 默认应用图标 v1
+生成日期：2026-10-31
+源图工具：内置 image_gen，透明背景
+源图：../icons/angelbot-app-icon-v1.png
+Windows 图标：../icons/angelbot-app-icon-v1.ico（由项目现有 Tauri CLI 从源图生成多尺寸 ICO）
+角色参考：../sd/default-white.png（主要）；../reference/character-sheet.png（仅正常比例立绘及面部身份）
+构图参考：用户提供的桌面快捷方式截图，仅参考头像式图标的构图，不使用截图中的角色；截图未归档。
+状态：2026-10-31 经用户确认采用。构建派生资源已更新至 src-tauri/icons/；当前桌面窗口不自动重启。
+
+最终生成提示词（原文）：
+
+Use case: stylized-concept.
+Asset type: A finished Windows desktop application icon for AngelBot, ONE single square icon asset, not an icon grid or a presentation sheet.
+Input image roles: Image 1 (sd/default-white.png) is the PRIMARY character identity and simplified Japanese anime drawing reference, use the current redesigned SD character. Image 2 (character-sheet.png) is secondary identity/color guidance; do NOT use the obsolete tiny character in its lower right. Image 3 (desktop shortcuts screenshot) is ONLY a reference for the idea of a compact anime character portrait desktop icon, not a character or design to copy.
+Primary request: create an appealing, distinctive anime character head-and-shoulders app icon of this same AngelBot mascot, professionally composed specifically for recognition at 32, 48 and 64 pixels. It is a new illustration, not the full-body image squeezed into a square.
+Identity invariants: champagne silver-white hair with pale lavender undersides, broad sweeping bangs and curved ahoge, one chunky side braid in front on the VIEWER'S LEFT, large violet eyes, a small confident gentle smile, friendly alert intelligent expression. Preserve the offset tilted gold orbital halo with a SINGLE four-point star on the VIEWER'S UPPER RIGHT and the dark navy bow near that side of her hair. At the lower crop include just enough ivory collar, dark navy neck bow and pale golden shoulder cape to identify the outfit. No costume redesign or mirrored braid.
+Composition: very tight, balanced portrait, head and hair make a strong compact silhouette and the face is the main focal point. Face slightly tilted, looking toward the viewer. Show only head and a small amount of shoulders, NO hands, no full body, no props. Keep the full halo and distinctive hair silhouette inside the canvas. The subject fills roughly 88–92% of the square with a small safe transparent outer margin. A quiet near-square dark navy inset badge behind the portrait, with a restrained warm champagne-gold edge, can separate the pale hair from light wallpapers. A few hair tufts and the halo subtly break that badge silhouette. Keep the outline clean and compact instead of adding filigree.
+Style: refined Japanese anime SD portrait icon, purposeful confident dark outlines, a handful of broad hair shapes, clean cel-shaded color blocks, at most one clear shadow region per material. Attractive original mascot art, not an infant, plush, 3D render, glossy plastic badge, corporate chatbot logo, or emoji. Strong value separation and readable purple eyes; no elaborate costume detail or thin ornamental clutter that disappears at small size.
+Background: genuine transparency outside the compact icon silhouette; alpha transparency, NOT a white or gray rectangular canvas and NOT a painted checkerboard.
+Text: NONE. No AngelBot wordmark, no letters, labels, captions, desktop screenshot, shortcut arrow, watermark, mockup, UI, contact sheet or multiple alternatives. Render only ONE finished standalone app icon.

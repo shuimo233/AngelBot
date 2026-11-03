@@ -7,8 +7,10 @@ mod anthropic;
 pub mod embedding;
 mod openai_compat;
 pub(crate) use openai_compat::openai_compatible_request_headers;
+mod metering;
 mod provider;
 pub mod router;
+pub(crate) mod tracked;
 pub mod usage;
 
 // Issue #103: DeepSeek V4 API rejects legacy `deepseek-chat` / `deepseek-reasoner`
@@ -30,11 +32,16 @@ mod tool_image;
 pub use tool_image::{ToolImage, MAX_TOOL_IMAGES, MAX_TOOL_IMAGE_TOTAL_BYTES};
 pub mod protocol;
 pub use openai_compat::OpenAiCompatibleProvider;
+#[cfg(test)]
+pub(crate) use openai_responses::native_context_shape;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use protocol::{ModelAuthMode, ModelProtocol, ProtocolContinuation};
 #[allow(unused_imports)]
 pub use provider::{create_deepseek_provider, create_provider_from_env, DeepSeekProvider};
 pub use usage::{CostSummary, UsageStats, UsageTracker};
+
+/// Persisted notice only; image bytes never enter the historical replay.
+pub(crate) const TRANSIENT_IMAGE_NOTICE: &str = "[图像瞬时载荷未保留；需要新状态时请重新观察。]";
 
 /// Unified message format for all providers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +208,12 @@ mod thinking_tests {
 
     #[test]
     fn context_window_comes_from_the_selected_model_not_a_user_setting() {
+        for model in ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"] {
+            assert_eq!(
+                context_window_tokens(&config("openai", model, 4096)),
+                1_050_000
+            );
+        }
         assert_eq!(
             context_window_tokens(&config("deepseek", "deepseek-v4-flash", 4096)),
             1_000_000
@@ -217,6 +230,17 @@ mod thinking_tests {
             context_window_tokens(&config("custom", "internal-model", 4096)),
             FALLBACK_CONTEXT_WINDOW_TOKENS
         );
+        for (provider, model) in [
+            ("custom", "gpt-6-luna"),
+            ("openai", "gpt-6-luna-unverified"),
+            ("openai", "gpt-6.1-sol-unverified"),
+            ("custom", "gpt-6.1-sol"),
+        ] {
+            assert_eq!(
+                context_window_tokens(&config(provider, model, 4096)),
+                FALLBACK_CONTEXT_WINDOW_TOKENS
+            );
+        }
     }
 }
 
@@ -268,10 +292,67 @@ impl LlmResponse {
 }
 
 /// Token accounting supplied by a provider for its most recent request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cached_input_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+    pub uncached_input_tokens: Option<u32>,
+    pub cache_write_30m_tokens: Option<u32>,
+    pub cache_write_12h_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
+    pub details_invalid: bool,
+}
+
+/// Prepared-body diagnostics for synthetic acceptance only. Item content and
+/// private protocol values are hashed, not serialized into public evidence.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRequestFingerprint {
+    pub settings: String,
+    pub instructions: String,
+    pub tools: String,
+    pub input: Vec<ProviderInputFingerprint>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInputFingerprint {
+    pub kind: String,
+    pub role: Option<String>,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCacheDiagnostics {
+    pub kind: String,
+    pub reason: Option<String>,
+    pub comparison_reusable_tokens: Option<u32>,
+    pub cache_missed_tokens: Option<u32>,
+    pub details_invalid: bool,
+}
+
+/// Isolated acceptance only. Opaque support identifiers are never serialized
+/// into public reports; callers may retain them in task-owned private evidence.
+#[cfg(test)]
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderResponseMetadata {
+    pub model_matches_requested: Option<bool>,
+    pub service_tier: Option<String>,
+    pub organization_matches_previous: Option<bool>,
+    pub details_invalid: bool,
+    #[serde(skip)]
+    pub request_id: Option<String>,
+    #[serde(skip)]
+    pub organization_fingerprint: Option<String>,
 }
 
 /// Provider-reported reason that the assistant message stopped.
@@ -432,11 +513,69 @@ pub fn resolve_thinking_settings(
     }
 }
 
+/// Closed, non-secret recovery categories supplied by a provider adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmFailureKind {
+    Unclassified,
+    QuotaExceeded,
+}
+
+impl LlmFailureKind {
+    pub fn visible_notice(&self) -> Option<&'static str> {
+        match self {
+            Self::Unclassified => None,
+            Self::QuotaExceeded => Some("当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。"),
+        }
+    }
+}
+
+/// Diagnostics remain private; only the closed kind can select a visible notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmFailure {
+    pub kind: LlmFailureKind,
+    pub diagnostic: String,
+}
+
+impl From<String> for LlmFailure {
+    fn from(diagnostic: String) -> Self {
+        Self {
+            kind: LlmFailureKind::Unclassified,
+            diagnostic,
+        }
+    }
+}
+
+impl From<&str> for LlmFailure {
+    fn from(diagnostic: &str) -> Self {
+        diagnostic.to_owned().into()
+    }
+}
+
 /// Trait for LLM providers
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Get the provider name
     fn name(&self) -> &str;
+    /// Synthetic acceptance only: hashes of the prepared body, never raw
+    /// reasoning, credentials or a promise of server-side cache affinity.
+    #[cfg(test)]
+    fn latest_request_fingerprint(&self) -> Option<ProviderRequestFingerprint> {
+        None
+    }
+    /// Explicit synthetic compatibility probe only; never changes a normal
+    /// provider binding or retries inference when the route rejects the field.
+    #[cfg(test)]
+    fn enable_cache_comparison(&self) -> bool {
+        false
+    }
+    #[cfg(test)]
+    fn latest_cache_diagnostics(&self) -> Option<ProviderCacheDiagnostics> {
+        None
+    }
+    #[cfg(test)]
+    fn latest_response_metadata(&self) -> Option<ProviderResponseMetadata> {
+        None
+    }
     /// Wire support only, not a claim that an arbitrary configured model has vision.
     fn supports_tool_images(&self) -> bool {
         false
@@ -466,6 +605,30 @@ pub trait LlmProvider: Send + Sync {
         _delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<LlmResponse, String> {
         self.chat(messages, tools, thinking).await
+    }
+
+    /// Preserve compatibility for providers without a machine-code classifier.
+    async fn chat_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+    ) -> Result<LlmResponse, LlmFailure> {
+        self.chat(messages, tools, thinking)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn chat_stream_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<LlmResponse, LlmFailure> {
+        self.chat_stream(messages, tools, thinking, delta_sender)
+            .await
+            .map_err(Into::into)
     }
 
     /// Issue #092 / G2: Refresh the API key at runtime without requiring a
@@ -543,6 +706,12 @@ pub fn context_window_tokens(config: &ProviderConfig) -> usize {
     let model = config.model.trim().to_ascii_lowercase();
 
     match (provider.as_str(), model.as_str()) {
+        // https://developers.openai.com/api/docs/models/gpt-6-luna
+        // https://developers.openai.com/api/docs/models/gpt-6-sol
+        // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+        // Public API window, not the smaller default used by Codex/ChatGPT.
+        // Unverified aliases and custom providers retain the safe fallback.
+        ("openai", "gpt-6-luna" | "gpt-6-sol" | "gpt-6.1-sol") => 1_050_000,
         // DeepSeek V4 Pro/Flash expose a 1M-token context window. The legacy
         // `deepseek-chat` / `deepseek-reasoner` names are kept here only so
         // users still on pre-V4 config keep correct context sizing — the API

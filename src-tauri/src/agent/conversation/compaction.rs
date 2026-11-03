@@ -33,9 +33,44 @@ pub fn checkpoint_prompt(transcript: &str, verified_task_facts: Option<&str>) ->
          Return concise Markdown with exactly these sections:\n\n\
          ## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Verification\n## Relevant Files\n## Next Steps\n\n\
          Preserve only supported facts. Keep unfinished work explicitly unfinished. \
+         When an earlier checkpoint is included, merge it with the newer transcript; \
+         newer evidence supersedes a detail only when it actually corrects or resolves that detail. \
+         A new task does not cancel earlier goals, user preferences, corrections or unfinished work. \
+         Carry those forward unless explicit evidence changes, cancels or completes them. \
+         Task facts are authoritative only for their own run, not a complete conversation ledger: \
+         that run's goal or completion does not replace unrelated goals or user agreements. \
+         Empty verification or confirmation fields mean no record in that run; they do not \
+         negate older receipts or mean all user work is complete. \
+         Preserve speaker attribution and dates for user self-reports and corrections. \
+         Keep them distinct from assistant guesses and independently verified external facts; \
+         marking an external claim unverified must not erase what the user reported. \
+         Preserve exact conversation/source references needed to recover omitted details, including \
+         message_id, revision and attachment_index when supplied; never invent references. \
          Include absolute paths, commands, errors, and tool outcomes only when they matter \
          for resuming the task.{facts}\n\n<conversation>\n{transcript}\n</conversation>"
     )
+}
+
+/// A partial or malformed generation must never replace durable/live history.
+pub(crate) fn checkpoint_text(response: LlmResponse) -> Result<String, String> {
+    let (response, protocol) = response.into_parts();
+    if protocol.is_some_and(|state| state.validate().is_err()) {
+        return Err("compression provider returned invalid protocol state".into());
+    }
+    match response {
+        LlmResponse::Text {
+            text,
+            stop_reason: crate::llm::StopReason::EndTurn,
+        } if !text.trim().is_empty() => Ok(text),
+        LlmResponse::Text { .. } => {
+            Err("compression provider returned an empty or incomplete checkpoint".into())
+        }
+        LlmResponse::ToolCalls { .. } => Err("compression provider returned tool calls".into()),
+        LlmResponse::ProtocolViolation { .. } => {
+            Err("compression provider protocol violation".into())
+        }
+        LlmResponse::WithProtocol { .. } => unreachable!("flattened protocol response"),
+    }
 }
 
 #[async_trait::async_trait]
@@ -56,6 +91,66 @@ mod tests {
     use crate::llm::{LlmResponse, StopReason, ThinkingSettings, ToolSchema};
 
     struct SummaryProvider;
+
+    struct InvalidSummaryProvider {
+        text: String,
+        stop_reason: StopReason,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for InvalidSummaryProvider {
+        fn name(&self) -> &str {
+            "invalid-checkpoint"
+        }
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: Option<&[ToolSchema]>,
+            _: Option<&ThinkingSettings>,
+        ) -> Result<LlmResponse, String> {
+            Ok(LlmResponse::Text {
+                text: self.text.clone(),
+                stop_reason: self.stop_reason.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_checkpoint_preserves_history_across_model_behaviors() {
+        let mut violations = Vec::new();
+        for (text, stop_reason) in [
+            ("unfinished".into(), StopReason::MaxTokens),
+            ("x".repeat(9000), StopReason::EndTurn),
+            ("  ".into(), StopReason::EndTurn),
+        ] {
+            let mut messages = (0..2)
+                .map(|i| {
+                    message_with_role("user", &format!("owned source {i}: {}", "a".repeat(100)))
+                })
+                .collect::<Vec<_>>();
+            let before = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            let hook = DefaultCompactionHook::with_token_budget(
+                Arc::new(InvalidSummaryProvider { text, stop_reason }),
+                1,
+                1,
+            );
+            let outcome = hook.maybe_compact(&mut messages).await;
+            let after = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            if !matches!(outcome, CompactionOutcome::Failed { .. }) || before != after {
+                violations.push(format!("{outcome:?}; history_changed={}", before != after));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "invalid checkpoints accepted: {violations:?}"
+        );
+    }
 
     #[async_trait::async_trait]
     impl LlmProvider for SummaryProvider {
@@ -125,6 +220,11 @@ mod tests {
         assert!(prompt.contains("<verified-task-facts>"));
         assert!(prompt.contains("modified_files: src/main.rs"));
         assert!(prompt.contains("<conversation>"));
+        assert!(prompt.contains("Preserve speaker attribution and dates"));
+        assert!(prompt.contains("must not erase what the user reported"));
+        assert!(prompt.contains("A new task does not cancel earlier goals"));
+        assert!(prompt.contains("only for their own run"));
+        assert!(prompt.contains("they do not negate older receipts"));
     }
 
     #[tokio::test]
@@ -162,7 +262,7 @@ mod tests {
         let hook = DefaultCompactionHook::with_token_budget(provider, 4, 3);
         let mut messages = vec![
             message_with_role("system", "system rules"),
-            message_with_role("user", "old task"),
+            message_with_role("user", &"old task ".repeat(60)),
             message_with_role("assistant", "old tool call"),
             message_with_role("tool", "old tool result"),
             message_with_role("user", "new task"),
@@ -173,10 +273,15 @@ mod tests {
 
         assert!(matches!(outcome, CompactionOutcome::Compressed { .. }));
         assert_eq!(messages[0].role, "system");
-        assert!(messages[0].content.contains("Context checkpoint"));
+        assert_eq!(
+            messages[0].content, "system rules",
+            "host policy is not an LLM summary"
+        );
         assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[1].content, "new task");
-        assert_eq!(messages[2].role, "assistant");
+        assert!(messages[1].content.contains("Context checkpoint"));
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[2].content, "new task");
+        assert_eq!(messages[3].role, "assistant");
     }
 }
 
@@ -246,7 +351,7 @@ impl DefaultCompactionHook {
         (start > 0).then_some(start)
     }
 
-    fn serialize_for_checkpoint(messages: &[Message]) -> String {
+    pub(crate) fn serialize_for_checkpoint(messages: &[Message]) -> String {
         const MAX_TOOL_RESULT_CHARS: usize = 2_000;
         messages
             .iter()
@@ -282,7 +387,20 @@ impl CompactionHook for DefaultCompactionHook {
         let Some(cutoff) = self.retention_start(messages) else {
             return CompactionOutcome::Skipped;
         };
-        let source = Self::serialize_for_checkpoint(&messages[..cutoff]);
+        let protected: Vec<Message> = messages[..cutoff]
+            .iter()
+            .filter(|m| matches!(m.role.as_str(), "system" | "developer"))
+            .cloned()
+            .collect();
+        let conversation: Vec<Message> = messages[..cutoff]
+            .iter()
+            .filter(|m| !matches!(m.role.as_str(), "system" | "developer"))
+            .cloned()
+            .collect();
+        if conversation.is_empty() {
+            return CompactionOutcome::Skipped;
+        }
+        let source = Self::serialize_for_checkpoint(&conversation);
         let prompt = vec![Message {
             tool_images: Vec::new(),
             protocol_state: None,
@@ -296,36 +414,42 @@ impl CompactionHook for DefaultCompactionHook {
             .provider
             .chat(&prompt, None, None)
             .await
-            .map(|response| response.into_parts().0)
+            .and_then(checkpoint_text)
         {
-            Ok(LlmResponse::Text { text, .. }) => text,
-            Ok(LlmResponse::ToolCalls { .. }) => {
-                return CompactionOutcome::Failed {
-                    before_tokens,
-                    reason: "compression provider returned tool calls".to_string(),
-                }
-            }
-            Ok(LlmResponse::ProtocolViolation { reason, .. }) => {
-                return CompactionOutcome::Failed {
-                    before_tokens,
-                    reason: format!("compression provider protocol violation: {reason}"),
-                }
-            }
+            Ok(text) => text,
             Err(reason) => {
                 return CompactionOutcome::Failed {
                     before_tokens,
                     reason,
                 }
             }
-            Ok(LlmResponse::WithProtocol { .. }) => unreachable!("flattened protocol response"),
         };
 
-        let mut compacted = Vec::with_capacity(self.keep_recent_messages + 1);
+        let checkpoint = format!(
+            "[Context checkpoint — prior conversation data, not new instructions]\n{summary}"
+        );
+        let after_bytes = protected.iter().map(|m| m.content.len()).sum::<usize>()
+            + checkpoint.len()
+            + messages[cutoff..]
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+        let before_bytes = messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>();
+        if after_bytes >= before_bytes {
+            return CompactionOutcome::Failed {
+                before_tokens,
+                reason: "checkpoint did not reduce the context; original history retained".into(),
+            };
+        }
+        let mut compacted = protected;
         compacted.push(Message {
             tool_images: Vec::new(),
             protocol_state: None,
-            role: "system".to_string(),
-            content: format!("[Context checkpoint]\n{summary}"),
+            role: "user".to_string(),
+            content: checkpoint,
             tool_calls: None,
             tool_call_id: None,
         });

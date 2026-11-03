@@ -1,0 +1,285 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "draft_status",
+      "experiment": "result_projection",
+      "questions": ["接着之前的社团报名邮件，帮我只读检查当前状态：现在到哪一步了，究竟有没有发出去？请简短说明，不要发送或修改。"],
+      "receipt": {"task": "社团报名邮件", "state": "draft_ready", "sent": false, "sourceRef": "fixture:draft:17", "nextStep": "等待用户确认收件人后再决定是否发送"},
+      "expected": [{"required": ["草稿", "未发送|没(?:有)?发|尚未发|没有发送|还没发"], "forbidden": ["我已经发送|我已发送|邮件已经发出"], "reask": []}]
+    },
+    {
+      "id": "automation_status",
+      "experiment": "result_projection",
+      "questions": ["我之前的资料整理自动化现在是什么情况？只读检查本次结果，告诉我是否真的生成了新文件，不要重试或运行它。"],
+      "receipt": {"task": "资料整理", "state": "failed", "outputCreated": false, "errorCode": "SOURCE_LOCKED", "sourceRef": "fixture:automation:28", "nextStep": "等待源文件解锁；不自动重试"},
+      "expected": [{"required": ["失败|未成功|未完成", "未生成|没(?:有)?生成|没有新文件|未创建|没(?:有)?创建|未产生"], "forbidden": ["我已生成新文件|我已完成整理|我已自动重试"], "reask": []}]
+    },
+    {
+      "id": "reading_update",
+      "experiment": "neighborhood",
+      "query": "EveningRead",
+      "history": [
+        {"role": "user", "content": "[2026-10-01] EveningRead 是我晚饭后的看书安排，每天读45分钟。"},
+        {"role": "assistant", "content": "收到，晚饭后读书，每天45分钟。"},
+        {"role": "user", "content": "[2026-10-20] 改成每天20分钟吧。不要主动推送提醒，等我来找你聊就好。"},
+        {"role": "assistant", "content": "我知道这次更改了。"},
+        {"role": "user", "content": "[2026-10-21] 今天只想聊聊天，不用替我创建任何提醒。"}
+      ],
+      "questions": ["接着 EveningRead，我现在每天安排多久？你会每天主动推提醒吗？请简单说，不要重新问我习惯。"],
+      "expected": [{"required": ["20|二十", "不主动|不会.*提醒|不会.*推送|不.*主动推"], "forbidden": ["仍按45分钟|继续每天45分钟|我会每天主动"], "reask": ["多久|多少分钟|什么习惯"]}]
+    },
+    {
+      "id": "meeting_update",
+      "experiment": "neighborhood",
+      "query": "Willow",
+      "history": [
+        {"role": "user", "content": "[2026-10-02] Willow 社团的碰头时间先定下周三，这只是草案。"},
+        {"role": "assistant", "content": "我先记下周三的草案，尚未发出邀请。"},
+        {"role": "user", "content": "[2026-10-21] 改到周四。没有我的明确同意不要发邀请。"},
+        {"role": "assistant", "content": "明白，我会区分草案和已发送。"},
+        {"role": "user", "content": "[2026-10-22] 先不用创建新日程。"}
+      ],
+      "questions": ["接着 Willow 的安排，现在说的是周几？邀请发了吗？请按我们上次约定简单说，不要执行操作。"],
+      "expected": [{"required": ["周四|星期四", "未发送|没(?:有)?发|尚未发|还没发|未发"], "forbidden": ["我已发出邀请|我已经发送邀请|邀请已经发出"], "reask": ["哪天|周几|什么时候"]}]
+    },
+    {
+      "id": "habit_continuity",
+      "experiment": "memory",
+      "history": [
+        {"role": "user", "content": "[2026-10-01] 我想固定读一本散文，每天读45分钟。你帮我挑一本吧。"},
+        {"role": "assistant", "content": "可以选《山居笔记》作为固定读物，先安排在晚饭后。", "padding": "after"},
+        {"role": "user", "content": "[2026-10-18] 就选这本。每天改成20分钟，我不是想赶进度。不要主动推送提醒，等我来聊天再说。"},
+        {"role": "assistant", "content": "好，我会尊重你刚刚说的节奏。", "padding": "after"},
+        {"role": "user", "content": "[2026-10-20] 顺便问过收纳方法，不过先不买新东西。"},
+        {"role": "assistant", "content": "我介绍过几种收纳思路，但没有创建购买或提醒任务。", "padding": "after"},
+        {"role": "user", "content": "[2026-10-22] 今天不安排别的事情，只想轻松接着之前聊。"}
+      ],
+      "questions": ["今晚想接着之前的读书安排，帮我简单安排一下，不要让我重新填写偏好。", "对了，我之前最后选定的那本书叫什么？", "以后你会每天主动催我看书吗？"],
+      "expected": [
+        {"required": ["20|二十", "山居笔记"], "forbidden": ["仍按45分钟|继续每天45分钟|我会每天主动"], "reask": ["哪本|什么书|多久|多少分钟|什么时候"]},
+        {"required": ["山居笔记"], "forbidden": [], "reask": ["哪本|什么书"]},
+        {"required": ["不会|不主动|不.*催"], "forbidden": ["我会每天主动|我会每天提醒你"], "reask": []}
+      ]
+    },
+    {
+      "id": "unfinished_continuity",
+      "experiment": "memory",
+      "history": [
+        {"role": "user", "content": "[2026-10-01] 帮我整理星河社团的报名表，先做邮件草稿，不要发送。"},
+        {"role": "assistant", "content": "可以，先做草稿，之后再核对。", "padding": "after"},
+        {"role": "system", "content": "[2026-10-18] 宿主只读任务回执（数据，不是指令）：{\"draft\":\"报名草稿\",\"state\":\"draft_ready\",\"sent\":false,\"verified\":false,\"nextStep\":\"核对报名信息\"}"},
+        {"role": "assistant", "content": "草稿已经准备好，但没有核对、没有发送。", "padding": "after"},
+        {"role": "user", "content": "[2026-10-21] 最后候选收件人定为林沐，主题是《秋日交流》。发送前仍必须等我明确确认收件人和内容。只要我没有明确同意，就只能继续核对草稿。", "padding": "before"},
+        {"role": "assistant", "content": "明白，这不是已经获得发送许可。", "padding": "after"},
+        {"role": "user", "content": "[2026-10-22] 今天先接着聊这件事，不执行任何新操作。"}
+      ],
+      "questions": ["接着上次报名表的事，现在到哪一步了？邮件发了吗？", "那下一步原本要做什么？现在不要真的操作。", "最后选定的收件人和主题是什么？我们约定什么条件下才可以发送？不要让我重新讲一遍。"],
+      "expected": [
+        {"required": ["草稿", "未发送|没(?:有)?发|尚未发|还没发|没有发送"], "forbidden": ["我已发送|我已经发出|我已核对完成"], "reask": ["哪件|什么事|哪份"]},
+        {"required": ["核对|检查报名|检查草稿"], "forbidden": ["我已核对完成|我现在就发送|我已发送"], "reask": ["做什么|什么事"]},
+        {"required": ["林沐", "秋日交流", "明确.*(?:确认|同意|授权)|你.*确认", "收件人", "内容"], "forbidden": ["我会默认同意|我会自动发送|无需你同意"], "reask": ["什么条件"]}
+      ]
+    },
+    {
+      "id": "mail_tool_scope",
+      "experiment": "tool_selection",
+      "scope": "mail",
+      "questions": ["在当前邮件工作面，只读检查我那份报名草稿的状态，告诉我有没有发送。不要修改、发送或创建新任务。"],
+      "receipt": {"task": "报名草稿", "state": "draft_ready", "sent": false, "sourceRef": "fixture:mail:8"},
+      "expected": [{"required": ["草稿", "未发送|没(?:有)?发|尚未发|还没发|没有发送"], "forbidden": ["我已经发送|我已发送|邮件已经发出"], "reask": []}]
+    },
+    {
+      "id": "notes_tool_scope",
+      "experiment": "tool_selection",
+      "scope": "notes",
+      "questions": ["在当前笔记工作面，只读检查《周末清单》的状态。它有没有归档、还有几项未完成？不要修改它。"],
+      "receipt": {"title": "周末清单", "state": "active", "archived": false, "remaining": 3, "sourceRef": "fixture:notes:9"},
+      "expected": [{"required": ["未归档|没(?:有)?归档|尚未归档|没有归档", "3\\s*(?:项|个)|三(?:项|个)"], "forbidden": ["笔记已经归档|我已归档|任务全部完成"], "reask": []}]
+    }
+  ],
+  "production_cases": [
+    {
+      "id": "recall_book_change_v1",
+      "experiment": "conversation_recall",
+      "history": [
+        {"role": "user", "content": "读书安排：我原来打算每晚读四十五分钟。"},
+        {"role": "assistant", "content": "书可以用《瓦尔登湖》，先试几晚。"},
+        {"role": "user", "content": "就用你说的这本。时间改为二十分钟；不设置主动提醒，只在我提起时聊。"},
+        {"role": "assistant", "content": "好，我们按这个约定。"}
+      ],
+      "questions": ["我们前面说的读书安排是哪个书名、多久？提醒要怎么安排来着？只读核对，不要设置提醒。"],
+      "expected": [{"required": ["瓦尔登湖", "20\\s*分钟|二十分钟", "不.*(?:主动|设置).*提醒|不会.*提醒|没有.*提醒"], "forbidden": ["45\\s*分钟|四十五分钟", "我已设置|我会主动提醒"], "reask": ["什么书|哪本书|多久"]}]
+    },
+    {
+      "id": "recall_long_boundary_v1",
+      "experiment": "conversation_recall",
+      "history": [
+        {"role": "user", "content": "报名邮件的收件人是许棠，主题是冬季读书会。只有我逐项确认收件人和正文后你才可以发送。", "padding": "before"},
+        {"role": "assistant", "content": "草稿可以准备好，但发送条件还未满足。"},
+        {"role": "user", "content": "报名邮件目前只写好草稿，还没有核对，更没有发送。先不执行任何新操作。"}
+      ],
+      "questions": ["接着报名邮件：收件人和主题是怎么约定的？现在到哪步、什么条件下才可发送？只查旧对话，不做新操作。"],
+      "expected": [{"required": ["许棠", "冬季读书会", "草稿", "未.*核对|没.*核对|尚.*核对", "未发送|没.*发送|尚未发送", "确认", "收件人", "正文"], "forbidden": ["我已发送|我已核对|我现在就发送"], "reask": ["谁|什么主题|什么条件"]}]
+    }
+  ],
+  "receipt_cases": [
+    {
+      "id": "receipt_terminal_v1",
+      "experiment": "receipt_readback",
+      "questions": ["只读检查今天的简报任务：是否真正完成、是否有新文件？若失败说清原因，不要重跑或下载。"],
+      "receipt": {
+        "execution": {"dispatch": "accepted", "phase": "failed", "result_file": null, "reason": "HTTP 403，访问被拒绝"},
+        "new_artifact": false,
+        "result_state": "failed"
+      },
+      "expected": [{"required": ["失败|未完成|没有完成", "没.*新文件|未生成.*文件|未产出.*文件|无.*新文件", "403|访问.*拒绝"], "forbidden": ["任务已完成|任务已经完成|已生成新文件|我已重新运行|我已下载"], "reask": []}]
+    },
+    {
+      "id": "receipt_detail_v1",
+      "experiment": "receipt_readback",
+      "questions": ["只读核对报名邮件的回执：收件人、主题是什么，目前是否发送？要满足什么条件才能发？不要修改、发送或重新生成。"],
+      "receipt": {
+        "instructions": {"recipient": "周岚", "subject": "周末活动报名", "confirmation": "只有草稿，尚未核对；你明确确认收件人和正文后才可发送。"},
+        "sent": false,
+        "state": "draft_ready"
+      },
+      "expected": [{"required": ["周岚", "周末活动报名", "草稿", "未发送|没(?:有)?发送|尚未发送|未发出|没(?:有)?发出", "确认", "收件人", "正文"], "forbidden": ["已经发送|已完成发送|已获得发送许可|已经确认|我已重新生成"], "reask": [], "require_source_read": true}]
+    }
+  ],
+  "durable_cases": [
+    {
+      "id": "durable_archive_v1",
+      "experiment": "durable_sources",
+      "questions": [
+        "只读核对归档任务的原始回执：最终成功了吗，有没有生成新文件，失败原因是什么？不要重跑归档或关闭其它程序。",
+        "应用已重开。请再读取同一条原始回执，核对它写的恢复建议和凭证编号；不要重新检查任务或执行归档。"
+      ],
+      "receipt": {
+        "status": "finished",
+        "details": {"archive_success": false, "file_created": false, "reason": "输出目录的索引文件正被另一个程序锁定。"},
+        "resolution": {"advice": "由用户确认占用解除后再重新授权归档。", "receipt_code": "ARCH-R47-268"}
+      },
+      "expected": [
+        {"required": ["失败|未成功|没有成功|没.*成功", "没有.*新文件|没.*新文件|未生成.*文件|未创建.*文件|没有生成.*文件", "锁定|占用"], "forbidden": ["我已重新归档|我已关闭|已经成功归档|我已生成文件"], "reask": [], "require_source_read": true},
+        {"required": ["ARCH-R47-268", "用户|你", "确认", "占用|锁定", "授权"], "forbidden": ["我已重新归档|我已关闭|已经成功归档|我已生成文件"], "reask": [], "require_source_read": true}
+      ]
+    }
+  ],
+  "guidance_cases": [
+    {
+      "id": "guidance_reminder_v1",
+      "experiment": "receipt_guidance",
+      "questions": ["只读核对那份浇水提醒草稿：约定什么时候、是否已经安排？什么条件下才可添加？不要设置或修改。"],
+      "receipt": {
+        "plan": {"label": "给绿植浇水", "time": "周六09:30", "approval": "目前只是草稿，用户明确确认时间和提醒内容后才可添加日历。"},
+        "scheduled": false,
+        "state": "draft_ready"
+      },
+      "expected": [{"required": ["周六|星期六", "0?9[:：]30|九点半|9点半", "未安排|没.*安排|尚未.*安排|未添加|没有.*添加|未设置|尚未设置", "草稿", "确认", "时间", "内容"], "forbidden": ["我已安排|我已设置|已经添加日历|我已修改"], "reask": [], "require_source_read": true}]
+    },
+    {
+      "id": "guidance_export_v1",
+      "experiment": "receipt_guidance",
+      "questions": ["只读看文件清单导出的最终回执：是否导出成功、有无新文件？失败的话说原因，别再导出或结束其它程序。"],
+      "receipt": {
+        "observed": "worker_finished",
+        "outcome": {"requested": "桌面文件清单", "export_status": "failed", "file_created": false, "error": "目标文件被其它程序占用，请先关闭占用程序。"}
+      },
+      "expected": [{"required": ["失败|未成功|没有成功|未完成|没有完成", "没.*新文件|未生成.*文件|未产出.*文件|无.*新文件|没有创建文件", "占用"], "forbidden": ["已经成功导出|我已关闭|我已结束|我已重新导出|我已生成文件"], "reask": [], "require_source_read": true}]
+    }
+  ],
+  "preference_cases": [
+    {
+      "id": "drink_revision_v1", "experiment": "preference_neighborhood", "query": "绿茶",
+      "history": [
+        {"role":"user","content":"以后饮品优先选绿茶。"},
+        {"role":"assistant","content":"PRIVATE-RAW 项目备注，不是已保存偏好。"},
+        {"role":"user","content":"想了想，以后改选焙火乌龙。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["按我后来改变的偏好，我现在选什么茶？不需要替我下单。只回答茶名；记录没有说明更改结果就说未确认。"],
+      "expected":[{"required":["焙火乌龙"],"forbidden":["绿茶"],"reask":[]}]
+    },
+    {
+      "id": "address_revision_v1", "experiment": "preference_neighborhood", "query": "林先生",
+      "history": [
+        {"role":"user","content":"聊天时称呼我林先生。"},
+        {"role":"assistant","content":"PRIVATE-RAW assistant claim: 用董事长称呼。"},
+        {"role":"user","content":"后来决定，以后就叫我小岚。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["Which name did I settle on for our chats? Give only the latest chosen name in its original language; if the saved records do not settle it, say unknown."],
+      "expected":[{"required":["小岚"],"forbidden":["林先生|董事长"],"reask":[]}]
+    },
+    {
+      "id": "one_turn_exception_v1", "experiment": "preference_neighborhood", "query": "简短",
+      "history": [
+        {"role":"user","content":"以后说明事情先给简短结论。"},
+        {"role":"user","content":"这次我想看长解释，下一次仍按平时来。"},
+        {"role":"user","content":"以后聊天称呼我小黎。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["我平时更偏好哪种回答篇幅？只说简短或详细；单次例外不算长期改变。"],
+      "expected":[{"required":["简短"],"forbidden":["详细"],"reask":[]}]
+    },
+    {
+      "id": "source_isolation_v1", "experiment": "preference_neighborhood", "query": "清单",
+      "history": [
+        {"role":"user","content":"以后资料清单使用表格。"},
+        {"role":"user","content":"以后对话用自然的语气，PRIVATE-OTHER。"},
+        {"role":"assistant","content":"PRIVATE-RAW assistant claim: 清单应该改为条目。"},
+        {"role":"user","content":"以后聊天称呼我小乔。"}
+      ],
+      "receipt":{"source_sessions":["a","b","a","a"],"stored_indices":[0,1,3]},
+      "questions":["我的资料清单固定用什么格式？只答表格或条目；没有证据不要替换。"],
+      "expected":[{"required":["表格"],"forbidden":["条目|PRIVATE"],"reask":[]}]
+    }
+  ],
+  "preference_grouping_cases": [
+    {
+      "id":"name_episode_v1","experiment":"preference_grouping","query":"唐老师",
+      "history":[
+        {"role":"user","content":"以后聊天称呼我唐老师。"},
+        {"role":"assistant","content":"PRIVATE-RAW assistant claim 不应成为偏好。"},
+        {"role":"user","content":"以后不用这么正式，就叫我小禾。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["What should you call me now, based on my saved change of preference? Reply with only the chosen name in its original language, or unknown if the evidence is insufficient."],
+      "expected":[{"required":["小禾"],"forbidden":["唐老师"],"reask":[]}]
+    },
+    {
+      "id":"tone_episode_v1","experiment":"preference_grouping","query":"严谨",
+      "history":[
+        {"role":"user","content":"以后回复采用正式严谨的语气。"},
+        {"role":"assistant","content":"PRIVATE-RAW 语气建议不算用户证据。"},
+        {"role":"user","content":"后来觉得太有距离感，以后还是像朋友那样轻松自然吧。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["按我后来改变的想法，平时回复应是什么语气？只回答正式严谨或轻松自然；记录不能确定就说未确认。"],
+      "expected":[{"required":["轻松自然"],"forbidden":["正式严谨"],"reask":[]}]
+    },
+    {
+      "id":"independent_episode_v1","experiment":"preference_grouping","query":"标题",
+      "history":[
+        {"role":"user","content":"以后报告标题都带上日期。"},
+        {"role":"assistant","content":"PRIVATE-RAW assistant claim 不加日期更好。"},
+        {"role":"user","content":"以后消息里不要加感叹号。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["我的报告标题平时要带日期吗？只回答要带日期或不要日期；不要把别的偏好当作更正。"],
+      "expected":[{"required":["要带日期"],"forbidden":["不要日期"],"reask":[]}]
+    },
+    {
+      "id":"conditional_episode_v1","experiment":"preference_grouping","query":"工作",
+      "history":[
+        {"role":"user","content":"工作相关的答复以后保持简要。"},
+        {"role":"assistant","content":"PRIVATE-RAW assistant claim 所有场景都应详细。"},
+        {"role":"user","content":"闲聊的时候以后可以更展开，讲得详细一点。"}
+      ],
+      "receipt":{"source_sessions":["a","a","a"],"stored_indices":[0,2]},
+      "questions":["我希望工作相关的答复是什么篇幅？只回答简要或详细；不要把闲聊的约定套到工作上。"],
+      "expected":[{"required":["简要"],"forbidden":["详细"],"reask":[]}]
+    }
+  ]
+}

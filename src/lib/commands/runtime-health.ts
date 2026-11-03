@@ -12,7 +12,8 @@ export interface RuntimeHealthIssue {
     | 'semantic_memory_unavailable'
     | 'settings_defaults'
     | 'delegation_disabled'
-    | 'delegation_unavailable';
+    | 'delegation_unavailable'
+    | 'storage_migration';
   severity: 'notice' | 'warning' | 'critical';
   title: string;
   detail: string;

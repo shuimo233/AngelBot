@@ -1,8 +1,9 @@
 import { invoke } from '../invoke';
 
 export type DesktopCapability = 'launch' | 'observe' | 'observeImage' | 'draft' | 'fill' | 'interact';
-export type DesktopControlAction = 'invoke' | 'select' | 'expand' | 'collapse' | 'scrollup' | 'scrolldown';
-export type DesktopActionOperation = 'draft' | 'field' | DesktopControlAction;
+export type DesktopControlAction = 'invoke' | 'select' | 'choose' | 'expand' | 'collapse' | 'scrollup' | 'scrolldown' | 'check' | 'uncheck';
+export type DesktopActionOperation = 'draft' | 'field' | 'imageclick' | DesktopControlAction;
+export type DesktopConfirmationOperation = DesktopActionOperation | 'image';
 
 export interface TrustedDesktopApp {
   id: string;

@@ -16,10 +16,106 @@ use crate::commands::foreground_text_attachments;
 use crate::llm::{Message as LlmMessage, ToolCall as LlmToolCall};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 const PRIVATE_TRANSCRIPT_KEY: &str = "privateProtocolTranscript";
+
+mod working_view;
+pub(crate) use working_view::main_working_history;
+pub(crate) use working_view::working_history;
+
+pub(crate) struct ConversationAnchor {
+    pub id: String,
+    parent: Option<String>,
+    pub role: String,
+    pub visible: bool,
+}
+pub(crate) struct ConversationBranch {
+    pub anchors: Vec<ConversationAnchor>,
+    pub incomplete: bool,
+    pub leaf: Option<String>,
+}
+
+/// One selected ancestry for replay and source recall. A bounded reader may
+/// request a window; full protocol replay must never silently truncate a turn.
+/// UNION makes a corrupt cycle finite before host-side validation rejects it.
+/// Callers own the connection/read snapshot; no model supplies a leaf pointer.
+pub(crate) fn conversation_branch(
+    conn: &Connection,
+    session: &str,
+    limit: Option<usize>,
+) -> Result<ConversationBranch, String> {
+    let leaf: Option<Option<String>> = conn
+        .query_row(
+            "SELECT leaf_message_id FROM sessions WHERE id=?1",
+            [session],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let leaf = leaf.ok_or("Conversation is unavailable")?;
+    let sql_limit = match limit {
+        Some(0) => return Err("Conversation branch window must be positive".into()),
+        Some(n) => i64::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("Invalid branch window")?,
+        None => -1,
+    };
+    let mut statement = conn.prepare(
+        "WITH RECURSIVE active(id,parent_id,role,is_provisional) AS (
+          SELECT id,parent_id,role,is_provisional FROM messages WHERE id=?2 AND session_id=?1
+          UNION
+          SELECT m.id,m.parent_id,m.role,m.is_provisional FROM messages m JOIN active a ON m.id=a.parent_id
+          WHERE m.session_id=?1 LIMIT ?3
+        ) SELECT id,parent_id,role,is_provisional FROM active"
+    ).map_err(|e|e.to_string())?;
+    let rows = statement
+        .query_map(params![session, leaf, sql_limit], |r| {
+            Ok(ConversationAnchor {
+                id: r.get(0)?,
+                parent: r.get(1)?,
+                role: r.get(2)?,
+                visible: r.get::<_, i64>(3)? == 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut nodes = HashMap::new();
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        if row.id.len() > 128 || row.id.chars().any(char::is_control) {
+            return Err("Invalid conversation ancestry identity".into());
+        }
+        nodes.insert(row.id.clone(), row);
+    }
+    let mut cursor = leaf.clone();
+    let mut anchors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut incomplete = false;
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            return Err("Invalid or cyclic conversation ancestry".into());
+        }
+        let node = nodes
+            .remove(&id)
+            .ok_or("Conversation ancestry is incomplete or unavailable")?;
+        cursor = node.parent.clone();
+        anchors.push(node);
+        if limit.is_some_and(|limit| anchors.len() > limit) {
+            anchors.pop();
+            incomplete = true;
+            break;
+        }
+    }
+    anchors.retain(|a| a.visible);
+    anchors.reverse();
+    Ok(ConversationBranch {
+        anchors,
+        incomplete,
+        leaf,
+    })
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +184,153 @@ fn private_transcript_from_metadata(
     }
     validate_private_transcript(&ledger.messages)?;
     Ok(Some(ledger.messages))
+}
+
+/// Legacy text is checkpointable only when its visible original is sufficient
+/// to recover it. Private/unindexed protocol stays on the native fallback.
+pub(crate) fn checkpoint_row_text(
+    role: &str,
+    content: &str,
+    metadata: Option<&str>,
+) -> Result<Option<String>, String> {
+    if content.contains(crate::llm::TRANSIENT_IMAGE_NOTICE) {
+        return Ok(None);
+    }
+    if role == "assistant" {
+        if let Some(messages) = private_transcript_from_metadata(metadata)? {
+            if messages.len() != 1
+                || messages[0].role != "assistant"
+                || messages[0].content != content
+                || messages[0].protocol_state.is_some()
+                || messages[0].tool_calls.is_some()
+                || messages[0]
+                    .content
+                    .contains(crate::llm::TRANSIENT_IMAGE_NOTICE)
+            {
+                return Ok(None);
+            }
+        }
+    }
+    foreground_text_attachments::render_stored(content, role, metadata).map(Some)
+}
+
+/// One source snapshot for persisted checkpoints. Reuse Main's completed view
+/// rather than asking a text summarizer to interpret opaque provider items.
+/// Legacy transparent history keeps its old representation; unsafe runs defer.
+pub(crate) struct CheckpointHistory {
+    pub window: ConversationWindow,
+    pub messages: Vec<(String, String, String)>,
+}
+impl CheckpointHistory {
+    pub(crate) fn load(
+        conn: &Connection,
+        session: &str,
+        before: i64,
+        allow_working: bool,
+    ) -> Result<Option<Self>, String> {
+        let window = ConversationWindow::load(conn, session, before)?;
+        let ids = serde_json::to_string(&window.ids).map_err(|e| e.to_string())?;
+        let (managed,unsettled): (bool,bool) = conn.query_row(
+            "SELECT count(*)>0,COALESCE(max(t.status!='completed' OR t.confirmation_state='pending'),0) FROM task_runs t JOIN json_each(?2) s ON s.value=t.message_id
+             JOIN messages m ON m.id=t.message_id AND m.session_id=t.session_id
+             WHERE t.session_id=?1 AND m.created_at<?3",
+            params![session,ids,before],|r|Ok((r.get(0)?,r.get(1)?)),
+        ).map_err(|e|e.to_string())?;
+        if unsettled && !allow_working {
+            return Ok(None);
+        }
+        if allow_working {
+            let raw = hydrate_llm_history(conn, session, before)?;
+            let view = working_history(conn, session, before, raw, true)?;
+            if view.applied {
+                let mut messages: Vec<_> = view
+                    .message_ids
+                    .into_iter()
+                    .zip(view.messages)
+                    .map(|(id, m)| (id, m.role, m.content))
+                    .collect();
+                if !checkpoint_references(conn, session, &mut messages)? {
+                    return Ok(None);
+                }
+                return Ok(Some(Self { window, messages }));
+            }
+            if managed {
+                return Ok(None);
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT m.id,m.role,m.content,m.metadata FROM messages m JOIN json_each(?2) s ON s.value=m.id
+             WHERE m.session_id=?1 AND m.created_at<?3 ORDER BY CAST(s.key AS INTEGER)",
+        ).map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map(params![session, ids, before], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (id, role, content, metadata) = row.map_err(|e| e.to_string())?;
+            let Some(text) = checkpoint_row_text(&role, &content, metadata.as_deref())? else {
+                return Ok(None);
+            };
+            messages.push((id, role, text));
+        }
+        if !checkpoint_references(conn, session, &mut messages)? {
+            return Ok(None);
+        }
+        Ok(Some(Self { window, messages }))
+    }
+}
+
+fn checkpoint_references(
+    conn: &Connection,
+    session: &str,
+    messages: &mut [(String, String, String)],
+) -> Result<bool, String> {
+    for (id, _, text) in messages {
+        let Some(reference) =
+            super::foreground_context_recall::checkpoint_reference(conn, session, id)?
+        else {
+            return Ok(false);
+        };
+        text.push_str("\n<conversation-source>");
+        text.push_str(&reference.to_string());
+        text.push_str("</conversation-source>");
+    }
+    Ok(true)
+}
+
+/// The existing summary table is a working-context projection, not a second
+/// memory store. Its anchor must still belong to the selected visible branch.
+pub(crate) struct ConversationWindow {
+    pub ids: Vec<String>,
+    pub summary: Option<String>,
+}
+impl ConversationWindow {
+    pub(crate) fn load(conn: &Connection, session: &str, before: i64) -> Result<Self, String> {
+        let branch = conversation_branch(conn, session, None)?;
+        let ids: Vec<String> = branch.anchors.into_iter().map(|a| a.id).collect();
+        let encoded = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
+        let selected:Option<(usize,String)>=conn.query_row(
+            "SELECT CAST(s.key AS INTEGER),c.summary FROM context_summaries c
+             JOIN json_each(?2) s ON s.value=c.anchor_message_id
+             JOIN messages m ON m.id=c.anchor_message_id AND m.session_id=c.session_id
+             WHERE c.session_id=?1 AND m.created_at<?3 ORDER BY CAST(s.key AS INTEGER) DESC,c.compressed_at DESC,c.rowid DESC LIMIT 1",
+            params![session,encoded,before],|r|Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        let (start, summary) = selected
+            .map(|(position, text)| (position + 1, Some(text)))
+            .unwrap_or((0, None));
+        Ok(Self {
+            ids: ids.into_iter().skip(start).collect(),
+            summary,
+        })
+    }
 }
 
 /// Keep the native tool receipt in sync when a durable confirmation settles.
@@ -185,15 +428,13 @@ pub(crate) fn parse_inline_tool_calls(json: Option<&str>) -> Option<Vec<ToolCall
 
 /// Decode the same inline column into provider-native tool calls for replay.
 fn parse_inline_llm_tool_calls(json: Option<&str>) -> Option<Vec<LlmToolCall>> {
-    let value: serde_json::Value = serde_json::from_str(json?).ok()?;
-    let calls: Vec<LlmToolCall> = value
-        .as_array()?
-        .iter()
-        .filter_map(|item| {
+    let calls: Vec<LlmToolCall> = parse_inline_tool_calls(json)?
+        .into_iter()
+        .filter_map(|call| {
             Some(LlmToolCall {
-                id: item.get("id")?.as_str()?.to_string(),
-                name: item.get("name")?.as_str()?.to_string(),
-                arguments: item.get("arguments")?.clone(),
+                id: call.id,
+                name: call.name,
+                arguments: serde_json::from_str(&call.arguments).ok()?,
             })
         })
         .collect();
@@ -289,6 +530,8 @@ pub(crate) fn hydrate_llm_history(
     session_id: &str,
     before_created_at: i64,
 ) -> Result<Vec<LlmMessage>, String> {
+    let window = ConversationWindow::load(conn, session_id, before_created_at)?;
+    let ids = serde_json::to_string(&window.ids).map_err(|e| e.to_string())?;
     let has_provisional = conn
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messages') WHERE name = 'is_provisional')",
@@ -302,31 +545,31 @@ pub(crate) fn hydrate_llm_history(
     } else {
         ""
     };
+    // Legacy transcript rows can share a timestamp. Preserve their append
+    // order; role priority or random IDs can put replies before user input.
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT role, content, tool_calls, tool_call_id, metadata, created_at FROM (
-               SELECT role, content, tool_calls, tool_call_id, metadata, created_at, id
-               FROM messages
+            "WITH selected AS (SELECT value AS id FROM json_each(?3)), eligible AS (
+               SELECT m.*,m.rowid AS insertion_order FROM messages m WHERE m.session_id=?1 AND (
+                 m.id IN (SELECT id FROM selected)
+                 OR (m.role='tool' AND EXISTS (
+                   SELECT 1 FROM messages a JOIN selected s ON s.id=a.id
+                   JOIN json_each(CASE WHEN json_valid(a.tool_calls) THEN a.tool_calls ELSE '[]' END) c
+                   WHERE a.session_id=?1 AND a.role='assistant' AND a.created_at=m.created_at
+                     AND CASE WHEN c.type='object' THEN json_extract(c.value,'$.id') END=m.tool_call_id
+                 ))
+               )
+             ) SELECT role, content, tool_calls, tool_call_id, metadata, created_at FROM (
+               SELECT role, content, tool_calls, tool_call_id, metadata, created_at, insertion_order
+               FROM eligible
                WHERE session_id = ?1 AND created_at < ?2{visible}
-                 AND (COALESCE(metadata, '') NOT LIKE '%\"compressed\": true%'
-                      OR metadata LIKE '%\"privateProtocolTranscript\"%')
-               ORDER BY created_at DESC, id DESC
-               LIMIT CASE WHEN EXISTS (
-                 SELECT 1 FROM messages
-                 WHERE session_id = ?1 AND created_at < ?2{visible}
-                   AND role = 'assistant'
-                   AND metadata LIKE '%\"privateProtocolTranscript\"%'
-               ) THEN -1 ELSE 100 END
+               ORDER BY created_at DESC, insertion_order DESC
              )
-             ORDER BY created_at ASC,
-                      CASE WHEN role = 'assistant' THEN 0
-                           WHEN role = 'tool' THEN 1
-                           ELSE 2 END,
-                      id ASC"
+             ORDER BY created_at ASC, insertion_order ASC"
         ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![session_id, before_created_at], |row| {
+        .query_map(params![session_id, before_created_at, ids], |row| {
             let role: String = row.get(0)?;
             let content: String = row.get(1)?;
             let metadata: Option<String> = row.get(4)?;
@@ -349,24 +592,29 @@ pub(crate) fn hydrate_llm_history(
             ))
         })
         .map_err(|e| e.to_string())?;
-    let rows = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    let mut decoded_rows = Vec::with_capacity(rows.len());
+    // Decode from the SQLite iterator and release each raw metadata string.
+    // Keeping every encrypted JSON row beside its decoded ledger doubles the
+    // retained payload before the replay projection is even assembled.
+    let mut decoded_rows = Vec::new();
     let mut private_turn_times = BTreeSet::new();
     for row in rows {
-        let ledger = if row.0 == "assistant" {
-            private_transcript_from_metadata(row.4.as_deref())?
+        let (role, content, tool_calls, tool_call_id, metadata, created_at) =
+            row.map_err(|e| e.to_string())?;
+        let ledger = if role == "assistant" {
+            private_transcript_from_metadata(metadata.as_deref())?
         } else {
             None
         };
         if ledger.is_some() {
-            private_turn_times.insert(row.5);
+            private_turn_times.insert(created_at);
         }
-        decoded_rows.push((row, ledger));
+        decoded_rows.push((
+            (role, content, tool_calls, tool_call_id, created_at),
+            ledger,
+        ));
     }
     let mut history = Vec::new();
-    for ((role, content, tool_calls, tool_call_id, _, created_at), ledger) in decoded_rows {
+    for ((role, content, tool_calls, tool_call_id, created_at), ledger) in decoded_rows {
         if let Some(ledger) = ledger {
             history.extend(ledger);
         } else if role != "tool" || !private_turn_times.contains(&created_at) {
@@ -456,36 +704,121 @@ fn is_soft_paused_agent_response(content: &str) -> bool {
     content.starts_with("已暂停，等待用户介入（")
 }
 
+fn has_unknown_result(message: &Message) -> bool {
+    message.tool_results.iter().flatten().any(|result| {
+        crate::agent::ToolResult::is_result_unknown(
+            result.success,
+            result.error.as_deref().unwrap_or(&result.output),
+        )
+    })
+}
+
+/// Count proven repairs, without cloning tool output bodies or trusting an
+/// empty/stale TaskFacts record. Missing/ambiguous call bindings stay failed.
+fn repaired_failure_count(calls: &[ToolCallInfo], results: &[ToolResultInfo]) -> usize {
+    if results.iter().all(|result| result.success) {
+        return 0;
+    }
+    let by_id: std::collections::BTreeMap<_, _> =
+        calls.iter().map(|call| (call.id.as_str(), call)).collect();
+    if by_id.len() != calls.len()
+        || calls.iter().any(|call| call.id.is_empty())
+        || results
+            .iter()
+            .map(|result| &result.call_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != results.len()
+    {
+        return 0;
+    }
+    let arguments = |result: &ToolResultInfo| -> Option<serde_json::Value> {
+        let call = by_id.get(result.call_id.as_str())?;
+        if call.name != result.tool_name {
+            return None;
+        }
+        let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+        args.is_object().then_some(args)
+    };
+    results
+        .iter()
+        .enumerate()
+        .filter(|(index, failed)| {
+            if failed.success || failed.confirmation_status.as_deref() == Some("pending") {
+                return false;
+            }
+            let Some(failed_args) = arguments(failed) else {
+                return false;
+            };
+            results[index + 1..].iter().any(|succeeded| {
+                succeeded.success
+                    && succeeded.tool_name == failed.tool_name
+                    && arguments(succeeded).is_some_and(|args| {
+                        crate::agent::operation_repair_matches(
+                            &failed.tool_name,
+                            &failed.call_id,
+                            &failed_args,
+                            &failed.output,
+                            &succeeded.tool_name,
+                            &args,
+                        )
+                    })
+            })
+        })
+        .count()
+}
+
+fn receipt_run_state(
+    calls: &[ToolCallInfo],
+    results: &[ToolResultInfo],
+    explicit_continue: bool,
+) -> crate::agent::run_state::DerivedRunState {
+    let repaired = repaired_failure_count(calls, results);
+    let unknown = results
+        .iter()
+        .any(|result| crate::agent::ToolResult::is_result_unknown(result.success, &result.output));
+    derive_run_state(RunStateInput {
+        // A repaired rejection/failed attempt is settled, not a fake success.
+        // Public counts and receipts retain the complete, truthful attempt log.
+        total_steps: calls.len().saturating_sub(repaired),
+        completed_steps: results.iter().filter(|result| result.success).count(),
+        has_pending_confirmation: results.iter().any(|result| {
+            result.confirmation_required && result.confirmation_status.as_deref() == Some("pending")
+        }),
+        has_rejected_confirmation: results
+            .iter()
+            .any(|result| result.confirmation_status.as_deref() == Some("rejected")),
+        has_approved_confirmation: results
+            .iter()
+            .any(|result| result.confirmation_status.as_deref() == Some("approved")),
+        has_failure: unknown || results.iter().filter(|result| !result.success).count() > repaired,
+        has_unknown_result: unknown,
+        provider_terminal_failure: results
+            .iter()
+            .any(|result| is_provider_terminal_failure(&result.tool_name, &result.output)),
+        explicit_continue_after_approval: explicit_continue,
+    })
+}
+
 pub(crate) fn summarize_task_run(message: &Message, goal: String) -> Option<AgentTaskRun> {
-    let tool_calls = message.tool_calls.as_ref()?;
-    if tool_calls.is_empty() {
+    let stopped = message.task_facts.as_ref().is_some_and(|facts| {
+        facts.terminal_reason == Some(crate::agent::task_facts::TaskTerminalReason::Stopped)
+    });
+    let tool_calls = message.tool_calls.as_deref().unwrap_or(&[]);
+    if tool_calls.is_empty() && !stopped {
         return None;
     }
     let results = message.tool_results.as_deref().unwrap_or(&[]);
-    let has_pending_confirmation = results
-        .iter()
-        .any(|r| r.confirmation_required && r.confirmation_status.as_deref() == Some("pending"));
-    let has_failure = results.iter().any(|r| !r.success);
-    let has_provider_terminal_failure = results
-        .iter()
-        .any(|r| is_provider_terminal_failure(&r.tool_name, &r.output));
+    let has_unknown_result = has_unknown_result(message);
     let completed_step_count = results.iter().filter(|r| r.success).count();
-    let run_state = derive_run_state(RunStateInput {
-        total_steps: tool_calls.len(),
-        completed_steps: completed_step_count,
-        has_pending_confirmation,
-        has_rejected_confirmation: results
-            .iter()
-            .any(|r| r.confirmation_status.as_deref() == Some("rejected")),
-        has_approved_confirmation: results
-            .iter()
-            .any(|r| r.confirmation_status.as_deref() == Some("approved")),
-        has_failure,
-        provider_terminal_failure: has_provider_terminal_failure,
-        explicit_continue_after_approval: false,
-    });
-    let (status, confirmation_state, resumable) = if is_soft_paused_agent_response(&message.content)
-    {
+    let run_state = receipt_run_state(tool_calls, results, false);
+    let (status, confirmation_state, resumable) = if stopped {
+        (
+            crate::agent::AgentRunStatus::Stopped.as_str().to_string(),
+            crate::agent::ConfirmationState::None.as_str().to_string(),
+            false,
+        )
+    } else if is_soft_paused_agent_response(&message.content) {
         (
             crate::agent::AgentRunStatus::NeedsAttention
                 .as_str()
@@ -506,7 +839,7 @@ pub(crate) fn summarize_task_run(message: &Message, goal: String) -> Option<Agen
         status,
         plan: tool_calls.iter().map(|call| call.name.clone()).collect(),
         confirmation_state,
-        resumable,
+        resumable: resumable && !has_unknown_result,
         step_count: tool_calls.len(),
         completed_step_count,
     })
@@ -570,8 +903,11 @@ pub(crate) fn hydrate_task_runs_from_db(
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if stored.is_some() {
-            message.task_run = stored;
+        if let Some(mut stored) = stored {
+            // Older rows can carry a stale Continue bit. The actual receipt
+            // still governs projection, just as it does continuation admission.
+            stored.resumable &= !has_unknown_result(message);
+            message.task_run = Some(stored);
         }
     }
     hydrate_task_runs(messages);
@@ -661,6 +997,318 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovered_compaction_allows_approved_continuation_without_rewriting_receipts() {
+        for scenario in [
+            "recovered",
+            "first-iteration",
+            "earlier-success",
+            "unknown",
+            "wrong-id",
+            "wrong-output",
+            "invalid-metrics",
+            "ordinary-tool",
+        ] {
+            let mut failed = crate::agent::AgentStep {
+                call_id: "context-compaction-1".into(),
+                tool_name: "context_compaction".into(),
+                arguments: serde_json::json!({"before_tokens": 4681}),
+                success: false,
+                output: "Context compaction failed: summary did not reduce context".into(),
+                confirmation_required: false,
+                confirmation_status: None,
+                verification: None,
+            };
+            let mut recovered = crate::agent::AgentStep {
+                call_id: "context-compaction-2".into(),
+                tool_name: "context_compaction".into(),
+                arguments: serde_json::json!({"before_tokens": 5971, "after_tokens": 4379}),
+                success: true,
+                output: "Context compacted before LLM call".into(),
+                confirmation_required: false,
+                confirmation_status: None,
+                verification: None,
+            };
+            match scenario {
+                "first-iteration" => failed.call_id = "context-compaction-0".into(),
+                "unknown" => failed.output = r#"Error: {"code":"RESULT_UNKNOWN"}"#.into(),
+                "wrong-id" => failed.call_id = "model-call".into(),
+                "wrong-output" => failed.output = "Unknown tool".into(),
+                "invalid-metrics" => {
+                    recovered.arguments = serde_json::json!({"before_tokens": 4, "after_tokens": 5})
+                }
+                "ordinary-tool" => {
+                    failed.tool_name = "write_file".into();
+                    recovered.tool_name = "write_file".into();
+                }
+                _ => {}
+            }
+            let mut steps = vec![failed, recovered];
+            if scenario == "earlier-success" {
+                steps.swap(0, 1);
+            }
+            steps.push(crate::agent::AgentStep {
+                call_id: "cu-uncheck".into(),
+                tool_name: "operate_trusted_app_control".into(),
+                arguments: serde_json::json!({"action":"uncheck"}),
+                success: true,
+                output: "Confirmation approved: verified uncheck".into(),
+                confirmation_required: false,
+                confirmation_status: Some("approved".into()),
+                verification: None,
+            });
+            let facts = crate::agent::foreground_conversation_state::task_facts_from_steps(
+                "verify checkbox",
+                &steps,
+            );
+            let calls: Vec<_> = steps
+                .iter()
+                .map(|step| ToolCallInfo {
+                    id: step.call_id.clone(),
+                    name: step.tool_name.clone(),
+                    arguments: step.arguments.to_string(),
+                })
+                .collect();
+            let results: Vec<_> = steps
+                .iter()
+                .map(|step| ToolResultInfo {
+                    call_id: step.call_id.clone(),
+                    tool_name: step.tool_name.clone(),
+                    success: step.success,
+                    output: step.output.clone(),
+                    error: None,
+                    confirmation_required: false,
+                    confirmation_status: step.confirmation_status.clone(),
+                })
+                .collect();
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::migrate(&conn).unwrap();
+            conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','test',1,1);
+                INSERT INTO messages(id,session_id,role,content,created_at) VALUES('a','s','assistant','',2);
+                INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,confirmation_state,resumable,step_count,completed_step_count,continuation_context,created_at,updated_at)
+                VALUES('r','s','a','verify checkbox','awaiting_confirmation','[]','pending',1,3,1,'',2,2);").unwrap();
+            persist_tool_results(&conn, "s", 2, Some(&calls), &results).unwrap();
+            refresh_persisted_task_run_from_steps(&conn, "s", "a", 2).unwrap();
+            let (status, resumable): (String, bool) = conn
+                .query_row(
+                    "SELECT status,resumable FROM task_runs WHERE id='r'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let is_recovered = matches!(scenario, "recovered" | "first-iteration");
+            let expected = if is_recovered {
+                "continue_suggested"
+            } else {
+                "needs_attention"
+            };
+            assert_eq!(
+                status, expected,
+                "{scenario}: confirmation must derive the same repaired state"
+            );
+            assert_eq!(
+                facts.has_unhandled_failures(),
+                !is_recovered,
+                "{scenario}: live facts must agree"
+            );
+            assert_eq!(
+                resumable,
+                scenario != "unknown",
+                "unknown results must never become resumable"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT success FROM agent_steps WHERE call_id=?1",
+                    [&steps.iter().find(|step| !step.success).unwrap().call_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0,
+                "the original failed receipt must remain failed"
+            );
+            assert_eq!(results.iter().filter(|result| result.success).count(), 2);
+        }
+    }
+
+    #[test]
+    fn corrected_rejection_stays_completed_after_refresh_and_reopen() {
+        let rejection = serde_json::json!({"code":"HOST_ARGUMENTS_REJECTED","dispatched":false,
+            "call_id":"bad","tool_name":"snapshot","null_corrections":["depth"],"message":"not executed"}).to_string();
+        for (output, expected) in [
+            (rejection.clone(), "completed"),
+            (format!("Error: {rejection}"), "needs_attention"),
+            (
+                "Error: {\"code\":\"RESULT_UNKNOWN\"}".into(),
+                "needs_attention",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("data.db");
+            let conn = Connection::open(&path).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','test',1,1);
+                INSERT INTO messages(id,session_id,role,content,created_at) VALUES('a','s','assistant','Actual state checked',2);").unwrap();
+            let calls = vec![
+                ToolCallInfo {
+                    id: "bad".into(),
+                    name: "snapshot".into(),
+                    arguments: r#"{"target":"a","depth":null}"#.into(),
+                },
+                ToolCallInfo {
+                    id: "good".into(),
+                    name: "snapshot".into(),
+                    arguments: r#"{"target":"a","depth":10}"#.into(),
+                },
+            ];
+            let results = vec![
+                ToolResultInfo {
+                    call_id: "bad".into(),
+                    tool_name: "snapshot".into(),
+                    success: false,
+                    output,
+                    error: None,
+                    confirmation_required: false,
+                    confirmation_status: None,
+                },
+                ToolResultInfo {
+                    call_id: "good".into(),
+                    tool_name: "snapshot".into(),
+                    success: true,
+                    output: "fresh observed state".into(),
+                    error: None,
+                    confirmation_required: false,
+                    confirmation_status: None,
+                },
+            ];
+            let mut message = Message {
+                id: "a".into(),
+                session_id: "s".into(),
+                role: "assistant".into(),
+                content: "Actual state checked".into(),
+                text_attachments: vec![],
+                created_at: 2,
+                parent_id: None,
+                is_deleted: None,
+                tool_calls: Some(calls),
+                tool_results: Some(results),
+                task_run: None,
+                task_facts: Some(TaskFacts::new("observe target a")),
+            };
+            let run = summarize_task_run(&message, "observe target a".into()).unwrap();
+            assert_eq!(run.status, expected);
+            assert_eq!(
+                (run.step_count, run.completed_step_count),
+                (2, 1),
+                "a rejected attempt must not become a fake successful operation"
+            );
+            message.task_run = Some(run);
+            persist_tool_results(
+                &conn,
+                "s",
+                2,
+                message.tool_calls.as_deref(),
+                message.tool_results.as_deref().unwrap(),
+            )
+            .unwrap();
+            persist_task_run(&conn, &message).unwrap();
+            refresh_persisted_task_run_from_steps(&conn, "s", "a", 2).unwrap();
+            drop(conn);
+            let conn = Connection::open(path).unwrap();
+            message.task_run = None;
+            let mut history = vec![message];
+            hydrate_task_runs_from_db(&conn, &mut history).unwrap();
+            assert_eq!(history[0].task_run.as_ref().unwrap().status, expected);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT success FROM agent_steps WHERE call_id='bad'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tool_outcomes_are_not_resumable_in_current_or_legacy_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute_batch("INSERT INTO sessions(id,title,work_dir,created_at,updated_at) VALUES('s','test','.',1,1);
+            INSERT INTO messages(id,session_id,role,content,created_at) VALUES('a','s','assistant','Inspect the target first',2);").unwrap();
+        let mut message = Message {
+            id: "a".into(),
+            session_id: "s".into(),
+            role: "assistant".into(),
+            text_attachments: vec![],
+            content: "Inspect the target first".into(),
+            created_at: 2,
+            parent_id: None,
+            is_deleted: None,
+            task_run: None,
+            task_facts: None,
+            tool_calls: Some(vec![ToolCallInfo {
+                id: "call".into(),
+                name: "mcp_owned_write".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_results: Some(vec![ToolResultInfo {
+                call_id: "call".into(),
+                tool_name: "mcp_owned_write".into(),
+                success: false,
+                output: r#"Error: {"code":"RESULT_UNKNOWN","message":"inspect first"}"#.into(),
+                error: None,
+                confirmation_required: false,
+                confirmation_status: None,
+            }]),
+        };
+        let run = summarize_task_run(&message, "Save draft".into()).unwrap();
+        assert_eq!(run.status, "needs_attention");
+        assert!(
+            !run.resumable,
+            "live unknown results must not offer Continue"
+        );
+        message.task_run = Some(run);
+        persist_tool_results(
+            &conn,
+            "s",
+            2,
+            message.tool_calls.as_deref(),
+            message.tool_results.as_deref().unwrap(),
+        )
+        .unwrap();
+        persist_task_run(&conn, &message).unwrap();
+        refresh_persisted_task_run_from_steps(&conn, "s", "a", 2).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT resumable FROM task_runs WHERE id='a'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+
+        // Existing installations may contain the old resumable bit. Project the
+        // actual receipt without rewriting history or changing schema.
+        conn.execute("UPDATE task_runs SET resumable=1 WHERE id='a'", [])
+            .unwrap();
+        message.task_run = None;
+        let mut history = vec![message];
+        hydrate_task_runs_from_db(&conn, &mut history).unwrap();
+        assert!(!history[0].task_run.as_ref().unwrap().resumable);
+
+        let mut message = history.remove(0);
+        for (success, output, expected) in [
+            (false, "Temporary failure before dispatch", true),
+            (true, r#"{"code":"RESULT_UNKNOWN"}"#, false),
+        ] {
+            let result = &mut message.tool_results.as_mut().unwrap()[0];
+            result.success = success;
+            result.output = output.into();
+            let run = summarize_task_run(&message, "Save draft".into()).unwrap();
+            assert_eq!(run.resumable, expected);
+        }
+    }
+
+    #[test]
     fn history_replays_only_complete_tool_call_pairs() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
@@ -689,13 +1337,54 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute_batch("UPDATE messages SET parent_id='u' WHERE id='a'; UPDATE sessions SET leaf_message_id='a' WHERE id='s';").unwrap();
         let history = hydrate_llm_history(&conn, "s", 10).unwrap();
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[1].tool_calls.as_ref().unwrap().len(), 1);
         assert_eq!(history[1].tool_calls.as_ref().unwrap()[0].id, "complete");
+        assert_eq!(
+            history[1].tool_calls.as_ref().unwrap()[0].arguments,
+            serde_json::json!({}),
+            "frontend JSON-string arguments must be restored as structured model arguments"
+        );
         assert_eq!(history[2].role, "tool");
         assert_eq!(history[2].tool_call_id.as_deref(), Some("complete"));
+
+        let expected = serde_json::json!({ "app_id": "observer", "mode": "image" });
+        for arguments in [serde_json::json!(expected.to_string()), expected.clone()] {
+            conn.execute(
+                "UPDATE messages SET tool_calls = ?1 WHERE id = 'a'",
+                [serde_json::json!([{
+                    "id": "complete",
+                    "name": "delegate_work",
+                    "arguments": arguments,
+                }])
+                .to_string()],
+            )
+            .unwrap();
+            let history = hydrate_llm_history(&conn, "s", 10).unwrap();
+            assert_eq!(history.len(), 3);
+            assert_eq!(
+                history[1].tool_calls.as_ref().unwrap()[0].arguments,
+                expected
+            );
+        }
+
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?1 WHERE id = 'a'",
+            [serde_json::json!([{
+                "id": "complete",
+                "name": "delegate_work",
+                "arguments": "{invalid",
+            }])
+            .to_string()],
+        )
+        .unwrap();
+        let history = hydrate_llm_history(&conn, "s", 10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history[1].tool_calls.is_none());
+        assert!(history.iter().all(|message| message.role != "tool"));
     }
 
     #[test]
@@ -791,7 +1480,7 @@ pub(crate) fn refresh_persisted_task_run_from_steps(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT tool_name, COALESCE(tool_output, ''), success
+            "SELECT COALESCE(call_id, id), tool_name, COALESCE(tool_input, 'null'), COALESCE(tool_output, ''), success
              FROM agent_steps
              WHERE session_id = ?1 AND created_at = ?2
              ORDER BY seq ASC",
@@ -802,7 +1491,9 @@ pub(crate) fn refresh_persisted_task_run_from_steps(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i32>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i32>(4)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -812,38 +1503,52 @@ pub(crate) fn refresh_persisted_task_run_from_steps(
     if steps.is_empty() {
         return Ok(());
     }
-    let plan: Vec<String> = steps.iter().map(|(name, _, _)| name.clone()).collect();
-    let step_count = steps.len() as i64;
-    let completed_step_count = steps.iter().filter(|(_, _, success)| *success == 1).count() as i64;
-    let run_state = derive_run_state(RunStateInput {
-        total_steps: step_count as usize,
-        completed_steps: completed_step_count as usize,
-        has_pending_confirmation: steps
-            .iter()
-            .any(|(_, output, success)| *success != 1 && output.contains("Confirmation required")),
-        has_rejected_confirmation: steps
-            .iter()
-            .any(|(_, output, _)| output.contains("Confirmation rejected")),
-        has_approved_confirmation: steps
-            .iter()
-            .any(|(_, output, success)| *success == 1 && output.contains("Confirmation approved")),
-        has_failure: steps.iter().any(|(_, _, success)| *success != 1),
-        provider_terminal_failure: steps
-            .iter()
-            .any(|(name, output, _)| is_provider_terminal_failure(name, output)),
-        explicit_continue_after_approval: true,
-    });
-    let plan_json = serde_json::to_string(&plan).map_err(|e| e.to_string())?;
-    let continuation_context = steps
-        .iter()
-        .map(|(name, output, success)| {
-            let output = output.chars().take(600).collect::<String>();
-            let state = if *success != 0 {
-                "宸插畬鎴?"
+    let (calls, results): (Vec<_>, Vec<_>) = steps
+        .into_iter()
+        .map(|(id, name, input, output, success)| {
+            let pending = success != 1 && output.contains("Confirmation required");
+            let status = if pending {
+                Some("pending")
+            } else if output.contains("Confirmation rejected") {
+                Some("rejected")
+            } else if success == 1 && output.contains("Confirmation approved") {
+                Some("approved")
             } else {
-                "鏈畬鎴?"
+                None
             };
-            format!("{state} {name}: {output}")
+            (
+                ToolCallInfo {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: input,
+                },
+                ToolResultInfo {
+                    call_id: id,
+                    tool_name: name,
+                    success: success == 1,
+                    output,
+                    error: None,
+                    confirmation_required: pending,
+                    confirmation_status: status.map(str::to_owned),
+                },
+            )
+        })
+        .unzip();
+    let plan: Vec<_> = calls.iter().map(|call| call.name.clone()).collect();
+    let step_count = calls.len() as i64;
+    let completed_step_count = results.iter().filter(|result| result.success).count() as i64;
+    let run_state = receipt_run_state(&calls, &results, true);
+    let plan_json = serde_json::to_string(&plan).map_err(|e| e.to_string())?;
+    let continuation_context = results
+        .iter()
+        .map(|result| {
+            let output = result.output.chars().take(600).collect::<String>();
+            let state = if result.success {
+                "已完成"
+            } else {
+                "未成功"
+            };
+            format!("{state} {}: {output}", result.tool_name)
         })
         .collect::<Vec<_>>()
         .join("\n");

@@ -2,10 +2,11 @@ name: Verify
 
 on:
   pull_request:
-    branches: [dev, main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    # Drafts already run the source gates. Becoming ready changes no test input.
+    types: [opened, synchronize, reopened]
   push:
-    branches: [dev, main]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -103,3 +104,12 @@ jobs:
 
       - name: Run isolated desktop smoke test
         run: npm run test:desktop
+
+      - name: Preserve bounded synthetic failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: src-tauri/target/e2e/failure/${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 7

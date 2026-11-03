@@ -1,7 +1,8 @@
-//! Durable routing for Main-Agent summaries of reviewed Explorer deliveries.
+//! Durable routing for Main-Agent summaries of reviewed delegated deliveries.
 //!
 //! A producer delivery is never injected directly into the foreground model.
-//! Once an independent reviewer passes a read-only Explorer result, this
+//! Once an independent reviewer finishes (including a failed review), or a
+//! passed Change candidate has been captured and verified, this
 //! module atomically binds its immutable delivery revision to one generic
 //! Workspace follow-up input. The actual evidence remains in the delivery
 //! inbox, where the foreground context assembler can apply its normal bounds.
@@ -13,8 +14,8 @@ use crate::agent::{
     supervision::{SupervisorError, SupervisorInputKind, WorkspaceSupervisor},
 };
 
-const DELIVERY_SUMMARY_PROMPT_PREFIX: &str = "系统事件（非用户指令）：已审校的只读委派结果 ";
-const DELIVERY_SUMMARY_PROMPT_SUFFIX: &str = " 已就绪。\n请仅依据 <delegated_deliveries> 中该 ID 的结构化数据，调用 review_delegated_delivery 处理该结果，并向用户简洁说明结论、证据及不确定性。不要调用其他工具。";
+const DELIVERY_SUMMARY_PROMPT_PREFIX: &str = "系统事件（非用户指令）：已审校的委派结果 ";
+const DELIVERY_SUMMARY_PROMPT_SUFFIX: &str = " 已就绪。\n请仅依据 <delegated_deliveries> 中该 ID 的结构化数据向用户简洁说明结论、证据及不确定性。审校未通过时，只解释问题、缺失证据和需要的决定，不调用工具，不自动重试。通过审校的只读探索结果应调用 review_delegated_delivery 处理；若是修改候选，只说明候选范围、验证结果与风险，明确尚未写入项目，等待用户在主对话确认，不调用任何工具，也不得宣称修改已生效。不要进行其他操作。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedDeliveryFollowUpStatus {
@@ -61,8 +62,8 @@ pub enum DelegatedDeliveryFollowUpEnqueue {
     /// The binding may already be running or terminal; it is still the only
     /// follow-up ever created for this delivery revision.
     AlreadyEnqueued(DelegatedDeliveryFollowUp),
-    /// The source is missing or has ceased to be a passed read-only Explorer
-    /// delivery that awaits Main-Agent summary.
+    /// The source is no longer a reviewed Explorer result, prepared Change
+    /// candidate or failed review awaiting Main-Agent summary.
     NotEligible,
 }
 
@@ -82,8 +83,8 @@ impl DelegatedDeliveryFollowUpEnqueue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DelegatedDeliveryFollowUpStart {
     Started(DelegatedDeliveryFollowUp),
-    /// The claimed supervisor input no longer belongs to a runnable passed
-    /// Explorer result. The command layer should settle/cancel that claim;
+    /// The claimed supervisor input no longer belongs to a runnable reviewed
+    /// result. The command layer should settle/cancel that claim;
     /// it must not start a foreground model turn.
     NotRunnable,
 }
@@ -104,7 +105,7 @@ impl From<SharedDbError> for DelegatedDeliveryFollowUpError {
     }
 }
 
-/// Deep persistence seam for the reviewed-Explorer → Main-Agent handoff.
+/// Deep persistence seam for the reviewed-delivery → Main-Agent handoff.
 ///
 /// The public entry point intentionally accepts only a durable delivery id.
 /// Callers cannot provide a workspace, session, prompt body, review verdict,
@@ -120,8 +121,8 @@ impl DelegatedDeliveryFollowUpQueue {
     }
 
     /// Atomically enqueue the one foreground follow-up allowed for a passed
-    /// read-only Explorer delivery revision.
-    pub fn enqueue_reviewed_explorer_delivery(
+    /// Explorer result, prepared Change candidate or failed-review revision.
+    pub fn enqueue_reviewed_delivery(
         &self,
         delivery_id: &str,
         now: i64,
@@ -227,9 +228,13 @@ impl DelegatedDeliveryFollowUpQueue {
                          AND delivery.delivery_version = delegated_delivery_follow_ups.delivery_revision
                          AND delivery.acceptance_status = 'submitted'
                          AND delegation.status = 'awaiting_summary'
-                         AND package.task_shape = 'explore'
-                         AND package.worker_profile = 'explorer'
-                         AND review.status = 'passed'
+                         AND ((package.task_shape = 'explore' AND package.worker_profile = 'explorer')
+                           OR (package.task_shape = 'change' AND package.worker_profile = 'implementer'
+                             AND (review.status IN ('failed','needs_decision') OR EXISTS(SELECT 1 FROM delegation_change_handoffs handoff
+                               WHERE handoff.delivery_id=delivery.id
+                                 AND handoff.delivery_revision=delivery.delivery_version
+                                 AND handoff.status='ready'))))
+                         AND review.status IN ('passed','failed','needs_decision')
                    )",
                 params![foreground_run_id, now, supervisor_input_id, claim_token],
             )
@@ -376,9 +381,13 @@ impl DelegatedDeliveryFollowUpQueue {
                  WHERE delivery.id = ?1
                    AND delivery.acceptance_status = 'submitted'
                    AND delegation.status = 'awaiting_summary'
-                   AND package.task_shape = 'explore'
-                   AND package.worker_profile = 'explorer'
-                   AND review.status = 'passed'
+                   AND ((package.task_shape = 'explore' AND package.worker_profile = 'explorer')
+                     OR (package.task_shape = 'change' AND package.worker_profile = 'implementer'
+                       AND (review.status IN ('failed','needs_decision') OR EXISTS(SELECT 1 FROM delegation_change_handoffs handoff
+                         WHERE handoff.delivery_id=delivery.id
+                           AND handoff.delivery_revision=delivery.delivery_version
+                           AND handoff.status='ready'))))
+                   AND review.status IN ('passed','failed','needs_decision')
                  ORDER BY workspace.updated_at DESC, workspace.id ASC
                  LIMIT 1",
                 [delivery_id],
@@ -470,6 +479,29 @@ impl DelegatedDeliveryFollowUpQueue {
             "follow_up.supervisor_input_id = ?1",
             [supervisor_input_id],
         )
+    }
+
+    /// Only a passed Explorer result may expose acknowledgement. Candidate,
+    /// failed-review and missing/unknown sources get a text-only summary.
+    pub(crate) fn summary_is_text_only(
+        connection: &Connection,
+        session_id: &str,
+        delivery_id: &str,
+    ) -> Result<bool, DelegatedDeliveryFollowUpError> {
+        connection
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM delegation_deliveries delivery
+             JOIN delegations delegation ON delegation.id=delivery.delegation_id
+             JOIN work_packages package ON package.id=delegation.work_package_id
+             JOIN delegation_review_jobs review ON review.delivery_id=delivery.id
+               AND review.delivery_revision=delivery.delivery_version
+             WHERE delivery.id=?1 AND delegation.session_id=?2
+               AND package.task_shape='explore' AND package.worker_profile='explorer'
+               AND review.status='passed')",
+                params![delivery_id, session_id],
+                |row| row.get(0),
+            )
+            .map_err(storage)
     }
 
     fn load_by_delivery_from_connection(
@@ -690,76 +722,74 @@ mod tests {
     }
 
     #[test]
-    fn passed_explorer_delivery_enqueues_exactly_one_redacted_follow_up() {
-        let db = fixture(
-            "explore",
-            "explorer",
-            "passed",
-            "submitted",
-            "awaiting_summary",
-            true,
-        );
-        let queue = DelegatedDeliveryFollowUpQueue::new(db.clone());
+    fn reviewed_delivery_enqueues_exactly_one_redacted_follow_up() {
+        for review_status in ["passed", "failed", "needs_decision"] {
+            let db = fixture(
+                "explore",
+                "explorer",
+                review_status,
+                "submitted",
+                "awaiting_summary",
+                true,
+            );
+            let queue = DelegatedDeliveryFollowUpQueue::new(db.clone());
 
-        let first = queue
-            .enqueue_reviewed_explorer_delivery("delivery", 10)
-            .unwrap();
-        let binding = first.binding().unwrap().clone();
-        assert!(first.newly_enqueued());
-        assert_eq!(binding.workspace_id, "workspace");
-        assert_eq!(binding.session_id, "session");
-        assert_eq!(binding.status, DelegatedDeliveryFollowUpStatus::Queued);
-        assert_eq!(binding.foreground_run_id, None);
+            let first = queue.enqueue_reviewed_delivery("delivery", 10).unwrap();
+            let binding = first.binding().unwrap().clone();
+            assert!(first.newly_enqueued());
+            assert_eq!(binding.workspace_id, "workspace");
+            assert_eq!(binding.session_id, "session");
+            assert_eq!(binding.status, DelegatedDeliveryFollowUpStatus::Queued);
+            assert_eq!(binding.foreground_run_id, None);
 
-        let prompt = db
-            .with_conn(|connection| {
-                connection
-                    .query_row(
-                        "SELECT content FROM workspace_supervisor_inputs WHERE id = ?1",
-                        [&binding.supervisor_input_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .unwrap()
-            })
-            .unwrap();
-        assert!(prompt.contains("delivery"));
-        assert!(!prompt.contains("RAW_CHILD_LOG_MUST_NOT_BE_QUEUED"));
+            let prompt = db
+                .with_conn(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT content FROM workspace_supervisor_inputs WHERE id = ?1",
+                            [&binding.supervisor_input_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .unwrap()
+                })
+                .unwrap();
+            assert!(prompt.contains("delivery"));
+            assert!(!prompt.contains("RAW_CHILD_LOG_MUST_NOT_BE_QUEUED"));
 
-        let duplicate = queue
-            .enqueue_reviewed_explorer_delivery("delivery", 11)
-            .unwrap();
-        assert!(!duplicate.newly_enqueued());
-        assert_eq!(duplicate.binding().unwrap(), &binding);
-        let counts = db
-            .with_conn(|connection| {
-                let bindings: i64 = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM delegated_delivery_follow_ups",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                let inputs: i64 = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM workspace_supervisor_inputs",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                (bindings, inputs)
-            })
-            .unwrap();
-        assert_eq!(counts, (1, 1));
-        assert_eq!(
-            queue
-                .load_by_supervisor_input_id(&binding.supervisor_input_id)
-                .unwrap(),
-            Some(binding)
-        );
+            let duplicate = queue.enqueue_reviewed_delivery("delivery", 11).unwrap();
+            assert!(!duplicate.newly_enqueued());
+            assert_eq!(duplicate.binding().unwrap(), &binding);
+            let counts = db
+                .with_conn(|connection| {
+                    let bindings: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM delegated_delivery_follow_ups",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let inputs: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM workspace_supervisor_inputs",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    (bindings, inputs)
+                })
+                .unwrap();
+            assert_eq!(counts, (1, 1));
+            assert_eq!(
+                queue
+                    .load_by_supervisor_input_id(&binding.supervisor_input_id)
+                    .unwrap(),
+                Some(binding)
+            );
+        }
     }
 
     #[test]
-    fn only_passed_read_only_explorer_results_with_an_active_workspace_are_eligible() {
+    fn unprepared_changes_and_nonpending_or_unowned_results_are_not_eligible() {
         for (
             task_shape,
             worker_profile,
@@ -779,7 +809,7 @@ mod tests {
             (
                 "explore",
                 "explorer",
-                "failed",
+                "queued",
                 "submitted",
                 "awaiting_summary",
                 true,
@@ -818,7 +848,7 @@ mod tests {
                 workspace,
             );
             let result = DelegatedDeliveryFollowUpQueue::new(db)
-                .enqueue_reviewed_explorer_delivery("delivery", 10)
+                .enqueue_reviewed_delivery("delivery", 10)
                 .unwrap();
             assert_eq!(result, DelegatedDeliveryFollowUpEnqueue::NotEligible);
         }
@@ -836,7 +866,7 @@ mod tests {
         );
         let queue = DelegatedDeliveryFollowUpQueue::new(db.clone());
         let binding = queue
-            .enqueue_reviewed_explorer_delivery("delivery", 10)
+            .enqueue_reviewed_delivery("delivery", 10)
             .unwrap()
             .binding()
             .unwrap()
@@ -919,7 +949,7 @@ mod tests {
         );
         let queue = DelegatedDeliveryFollowUpQueue::new(db.clone());
         let binding = queue
-            .enqueue_reviewed_explorer_delivery("delivery", 10)
+            .enqueue_reviewed_delivery("delivery", 10)
             .unwrap()
             .binding()
             .unwrap()
@@ -975,7 +1005,7 @@ mod tests {
         );
         let queue = DelegatedDeliveryFollowUpQueue::new(db.clone());
         let binding = queue
-            .enqueue_reviewed_explorer_delivery("delivery", 10)
+            .enqueue_reviewed_delivery("delivery", 10)
             .unwrap()
             .binding()
             .unwrap()

@@ -12,13 +12,14 @@ archive while creating a separate public repository. On 2026-10-08 the new
 the verified source tree; the predecessor remains private and archived at
 `shuimo233/AngelBot-private-archive-20261007`. No old refs/history were uploaded.
 
-The public repository has one active `Integration PR gates` ruleset for `dev`,
+On 2026-10-26 the owner requested renaming the default branch to `main`. GitHub
+renamed the existing public `dev` without rewriting commits; the same active
+`Integration PR gates` ruleset was retargeted to `refs/heads/main` and read back,
 with PRs, resolved conversations, no force pushes/deletions and no bypass actors.
 Required check sources must be observed in this new repository, not inherited
 from the archive. Bootstrap those requirements only after successful runs, then
-read back the actual ruleset. The absent stable `main` is protected by extending
-the same ruleset when it is deliberately established; do not publish old local
-`main` or add a creation exception just to bypass unavailable checks.
+read back the actual ruleset. Do not publish predecessor archive branches or add
+a creation exception just to bypass unavailable checks.
 
 Protected branches and branch/tag rulesets are available for public repositories
 on GitHub Free; private repositories require an eligible paid plan. This matches
@@ -38,14 +39,11 @@ new commit. [Sensitive-history limitations](https://docs.github.com/en/authentic
 
 ## Lightweight branch and review policy
 
-Repository convention: short-lived `codex/<change>` branches target integration
-branch `dev`; promote tested integration changes to stable `main` through a
-separate PR. Prefer merge commits for long-lived `dev` to `main` promotions, not
-repeated squash merges; keep merge commits enabled and do not require linear
-history on `main` if using this policy.
-[Long-running branches](https://docs.github.com/en/pull-requests/reference/pull-request-merges#squashing-and-merging-a-long-running-branch).
+Repository convention: short-lived `codex/<change>` branches target the sole
+default/integration branch `main` and use squash merging. Development merges do
+not publish releases; there is no `dev` to `main` promotion requirement.
 
-When protection is available, require PRs and successful checks on both branches,
+When protection is available, require PRs and successful checks on `main`,
 block force pushes/deletions, and resolve review conversations. Avoid maintaining
 overlapping classic protections and rulesets: applicable rules are combined.
 [Rule layering](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets#about-rulesets-and-protected-branches).

@@ -30,6 +30,7 @@ mod tests {
         call_count: std::sync::Arc<AtomicUsize>,
         tool_name: String,
         arguments: serde_json::Value,
+        text: Option<String>,
     }
 
     impl ToolCallProvider {
@@ -44,9 +45,11 @@ mod tests {
         }
 
         fn for_tool(tool_name: impl Into<String>, arguments: serde_json::Value) -> Self {
+            let tool_name = tool_name.into();
             Self {
                 call_count: std::sync::Arc::new(AtomicUsize::new(0)),
-                tool_name: tool_name.into(),
+                text: Some(format!("I need to call {}.", tool_name)),
+                tool_name,
                 arguments,
             }
         }
@@ -102,7 +105,7 @@ mod tests {
                     name: self.tool_name.clone(),
                     arguments: self.arguments.clone(),
                 }],
-                text: Some(format!("I need to call {}.", self.tool_name)),
+                text: self.text.clone(),
                 stop_reason: crate::llm::StopReason::ToolUse,
             })
         }
@@ -110,6 +113,7 @@ mod tests {
 
     struct MixedToolCallProvider {
         call_count: Arc<AtomicUsize>,
+        text: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -138,7 +142,7 @@ mod tests {
                         arguments: serde_json::json!({ "path": "report.md", "content": "report" }),
                     },
                 ],
-                text: Some("I will read, then request approval for writing.".to_string()),
+                text: self.text.clone(),
                 stop_reason: crate::llm::StopReason::ToolUse,
             })
         }
@@ -185,6 +189,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorded_inference_probe_never_executes_requested_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = ToolCallProvider::new();
+        let calls = provider.call_count.clone();
+        let runner = AgentRunner::new(
+            Box::new(provider),
+            AgentConfig {
+                work_dir: Some(directory.path().into()),
+                ..default_config()
+            },
+        )
+        .with_execution_permission("full_access".into());
+        let result = runner
+            .probe_recorded_inference(&[Message {
+                role: "user".into(),
+                content: "Captured synthetic request".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_images: vec![],
+                protocol_state: None,
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(result, LlmResponse::ToolCalls { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !directory.path().join("note.txt").exists(),
+            "a diagnostic must never execute returned tool calls"
+        );
+    }
+
+    #[tokio::test]
     async fn test_agent_error_handling() {
         // A transient provider failure is retried once before surfacing an
         // error to the caller.
@@ -198,6 +234,166 @@ mod tests {
         match result {
             AgentResponse::Error(e) => assert!(e.contains("rate limited")),
             _ => panic!("Expected Error, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_completion_verifier_uses_execution_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = format!("report-{}.txt", uuid::Uuid::new_v4());
+        assert!(!std::path::Path::new(&name).exists());
+        let mut registry = crate::agent::ToolRegistry::new();
+        crate::agent::handlers::register_workspace_file_handlers(&mut registry);
+        let runner = AgentRunner::with_registry(
+            Box::new(ToolCallProvider::for_tool(
+                "write_file",
+                serde_json::json!({
+                    "path":name,"content":"actual ordinary report"
+                }),
+            )),
+            AgentConfig {
+                work_dir: Some(directory.path().into()),
+                ..default_config()
+            },
+            registry,
+        )
+        .with_execution_permission("full_access".into());
+        let outcome = runner.run_slice("保存普通文字报告", &[]).await;
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(&name)).unwrap(),
+            "actual ordinary report"
+        );
+        let AgentSliceOutcome::Completed(AgentResponse::TextWithToolCalls { steps, .. }) = outcome
+        else {
+            panic!("a real report under the execution root must complete: {outcome:?}");
+        };
+        let written = steps
+            .iter()
+            .find(|step| step.tool_name == "write_file")
+            .unwrap();
+        assert!(written.success);
+        assert!(written.verification.as_ref().unwrap().matched);
+        assert!(collect_unverified_artifacts(&steps).is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_failure_keeps_known_effect_without_exposing_raw_errors() {
+        struct WriteThenFail {
+            calls: Arc<AtomicUsize>,
+            write_first: bool,
+            failure_kind: crate::llm::LlmFailureKind,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for WriteThenFail {
+            fn name(&self) -> &str {
+                "owned-model-fault"
+            }
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: Option<&[ToolSchema]>,
+                _thinking: Option<&crate::llm::ThinkingSettings>,
+            ) -> Result<LlmResponse, String> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 && self.write_first {
+                    return Ok(LlmResponse::ToolCalls {
+                        calls: vec![crate::llm::ToolCall {
+                            id: "known-write".into(),
+                            name: "write_file".into(),
+                            arguments: serde_json::json!({"path":"receipt.txt","content":"one known effect"}),
+                        }],
+                        text: None,
+                        stop_reason: crate::llm::StopReason::ToolUse,
+                    });
+                }
+                Err("transport closed: Bearer private-model-fault https://private.example/?input=secret".into())
+            }
+            async fn chat_stream_classified(
+                &self,
+                messages: &[Message],
+                tools: Option<&[ToolSchema]>,
+                thinking: Option<&crate::llm::ThinkingSettings>,
+                _sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+            ) -> Result<LlmResponse, crate::llm::LlmFailure> {
+                self.chat(messages, tools, thinking)
+                    .await
+                    .map_err(|diagnostic| crate::llm::LlmFailure {
+                        kind: self.failure_kind,
+                        diagnostic,
+                    })
+            }
+        }
+        for failure_kind in [
+            crate::llm::LlmFailureKind::Unclassified,
+            crate::llm::LlmFailureKind::QuotaExceeded,
+        ] {
+            for write_first in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let events = Arc::new(crate::agent::event::DevEventStore::default());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let runner = AgentRunner::new(
+                    Box::new(WriteThenFail {
+                        calls: calls.clone(),
+                        write_first,
+                        failure_kind,
+                    }),
+                    AgentConfig {
+                        work_dir: Some(directory.path().into()),
+                        ..default_config()
+                    },
+                )
+                .with_execution_permission("full_access".into())
+                .with_session_id("model-fault".into())
+                .with_emitter(events.clone());
+                let response = runner.run("请写入这一份回执并核对", &[]).await;
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    if write_first { 2 } else { 1 },
+                    "quota errors must not retry inference or completed effects"
+                );
+                let visible_events =
+                    serde_json::to_string(&events.events_for("model-fault")).unwrap();
+                if let Some(notice) = failure_kind.visible_notice() {
+                    assert!(visible_events.contains("LlmQuotaExceeded"));
+                    assert!(visible_events.contains(notice));
+                }
+                for secret in ["private-model-fault", "private.example", "input=secret"] {
+                    assert!(
+                        !visible_events.contains(secret),
+                        "raw provider diagnostics must not reach UI events"
+                    );
+                }
+                if write_first {
+                    let AgentResponse::TextWithToolCalls { text, steps } = response else {
+                        panic!("completed operation lost");
+                    };
+                    assert_eq!(
+                        std::fs::read_to_string(directory.path().join("receipt.txt")).unwrap(),
+                        "one known effect"
+                    );
+                    assert_eq!(
+                        steps
+                            .iter()
+                            .filter(|step| step.tool_name == "write_file" && step.success)
+                            .count(),
+                        1
+                    );
+                    assert!(
+                        text.contains("新消息"),
+                        "recovery advice must match the supported normal conversation path"
+                    );
+                    assert!(!text.contains("请继续任务"));
+                    if let Some(notice) = failure_kind.visible_notice() {
+                        assert!(text.contains(notice));
+                    }
+                    for secret in ["private-model-fault", "private.example", "input=secret"] {
+                        assert!(!text.contains(secret));
+                        assert!(steps.iter().all(|step| !step.output.contains(secret)));
+                    }
+                } else {
+                    assert!(!directory.path().join("receipt.txt").exists());
+                    assert!(matches!(response, AgentResponse::Error(_)));
+                }
+            }
         }
     }
 
@@ -219,26 +415,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_side_effect_tool_requires_confirmation() {
-        let config = default_config();
-        let provider = ToolCallProvider::new();
-        let call_count = provider.call_count.clone();
-        let agent = AgentRunner::new(Box::new(provider), config);
-        let result = agent.run("write a note", &[]).await;
-        match result {
-            AgentResponse::TextWithToolCalls { steps, .. } => {
-                assert_eq!(steps.len(), 1);
-                assert_eq!(steps[0].tool_name, "write_file");
-                assert!(steps[0].confirmation_required);
-                assert_eq!(steps[0].confirmation_status.as_deref(), Some("pending"));
-                assert!(!steps[0].success);
+        for expected_text in [
+            None,
+            Some("I need to call write_file.".to_string()),
+            Some("该操作需要你的确认后才能继续。".to_string()),
+        ] {
+            let config = default_config();
+            let mut provider = ToolCallProvider::new();
+            provider.text = expected_text.clone();
+            let call_count = provider.call_count.clone();
+            let agent = AgentRunner::new(Box::new(provider), config);
+            let result = agent.run("write a note", &[]).await;
+            match result {
+                AgentResponse::TextWithToolCalls { text, steps } => {
+                    assert_eq!(
+                        text,
+                        expected_text.unwrap_or_default(),
+                        "preserve genuine model prose without adding host status"
+                    );
+                    assert_eq!(steps.len(), 1);
+                    assert_eq!(steps[0].tool_name, "write_file");
+                    assert!(steps[0].confirmation_required);
+                    assert_eq!(steps[0].confirmation_status.as_deref(), Some("pending"));
+                    assert!(!steps[0].success);
+                }
+                other => panic!("Expected confirmation step, got {:?}", other),
             }
-            other => panic!("Expected confirmation step, got {:?}", other),
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                1,
+                "the runner must not request another model turn before confirmation"
+            );
         }
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            1,
-            "the runner must not request another model turn before confirmation"
-        );
     }
 
     #[tokio::test]
@@ -291,6 +499,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn learned_habit_dismissal_waits_for_normal_owner_confirmation() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        crate::agent::adaptive_constraints::record_preferences(
+            &conn,
+            Some("day-1"),
+            &[crate::agent::evolution::NewMemory {
+                content: "称呼我小林".into(),
+                category: "preference".into(),
+                importance: 8,
+            }],
+            "auto_evolution",
+        )
+        .unwrap();
+        let id = crate::agent::adaptive_constraints::learned_preferences(&conn).unwrap()[0]
+            .id
+            .clone();
+        let db = Arc::new(Mutex::new(conn));
+        let arguments = serde_json::json!({"memory_id":format!("habit:{id}")});
+        let provider = ToolCallProvider::for_tool("forget_memory", arguments.clone());
+        let call_count = provider.call_count.clone();
+        let mut agent = AgentRunner::new(Box::new(provider), default_config());
+        crate::agent::extensions::memory::register(agent.tool_registry_mut(), db.clone());
+
+        match agent.run("不要再沿用小林这个称呼", &[]).await {
+            AgentResponse::TextWithToolCalls { steps, .. } => {
+                assert_eq!(steps.len(), 1);
+                assert_eq!(steps[0].tool_name, "forget_memory");
+                assert!(steps[0].confirmation_required);
+                assert_eq!(steps[0].confirmation_status.as_deref(), Some("pending"));
+                assert!(!steps[0].success);
+            }
+            other => panic!("Expected owner confirmation, got {other:?}"),
+        }
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::agent::adaptive_constraints::learned_preferences(&db.lock().unwrap())
+                .unwrap()
+                .len(),
+            1,
+            "a requested operation is not an approved operation"
+        );
+
+        // The normal confirmation path replays this exact saved call through
+        // the same registry; only that execution may clear the observation.
+        let result = agent.tool_registry_mut().execute(
+            &crate::agent::ToolCall::new("forget_memory".into(), arguments),
+            "approved-habit-stop",
+            std::path::Path::new("."),
+        );
+        assert!(result.result.success);
+        assert!(
+            crate::agent::adaptive_constraints::learned_preferences(&db.lock().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn model_cannot_self_approve_side_effect_tool() {
         let config = default_config();
         let agent = AgentRunner::new(
@@ -326,49 +593,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_tool_batch_completes_read_only_calls_before_confirmation() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let config = default_config();
-        let mut agent = AgentRunner::new(
-            Box::new(MixedToolCallProvider {
-                call_count: call_count.clone(),
-            }),
-            config,
-        );
-        agent.tool_registry_mut().register(
-            Tool::new(
-                "read_file",
-                "Read a file",
-                serde_json::json!({ "type": "object" }),
-            ),
-            Arc::new(CountingHandler {
-                name: "read_file".to_string(),
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        for expected_text in [
+            None,
+            Some("I will read, then request approval for writing.".to_string()),
+        ] {
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let config = default_config();
+            let mut agent = AgentRunner::new(
+                Box::new(MixedToolCallProvider {
+                    call_count: call_count.clone(),
+                    text: expected_text.clone(),
+                }),
+                config,
+            );
+            agent.tool_registry_mut().register(
+                Tool::new(
+                    "read_file",
+                    "Read a file",
+                    serde_json::json!({ "type": "object" }),
+                ),
+                Arc::new(CountingHandler {
+                    name: "read_file".to_string(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            );
 
-        let result = agent.run("read then write", &[]).await;
-        match result {
-            AgentResponse::TextWithToolCalls { steps, .. } => {
-                assert_eq!(steps.len(), 2);
-                // Characterize the foreground host contract before routing
-                // the batch through the shared boundary: safe work still
-                // settles while a sibling side effect waits for the user.
-                assert!(steps.iter().any(|step| {
-                    step.call_id == "call-read"
-                        && step.success
-                        && !step.confirmation_required
-                        && step.confirmation_status.is_none()
-                }));
-                assert!(steps.iter().any(|step| {
-                    step.call_id == "call-write"
-                        && !step.success
-                        && step.confirmation_required
-                        && step.confirmation_status.as_deref() == Some("pending")
-                }));
+            let result = agent.run("read then write", &[]).await;
+            match result {
+                AgentResponse::TextWithToolCalls { text, steps } => {
+                    assert_eq!(text, expected_text.unwrap_or_default());
+                    assert_eq!(steps.len(), 2);
+                    // Characterize the foreground host contract before routing
+                    // the batch through the shared boundary: safe work still
+                    // settles while a sibling side effect waits for the user.
+                    assert!(steps.iter().any(|step| {
+                        step.call_id == "call-read"
+                            && step.success
+                            && !step.confirmation_required
+                            && step.confirmation_status.is_none()
+                    }));
+                    assert!(steps.iter().any(|step| {
+                        step.call_id == "call-write"
+                            && !step.success
+                            && step.confirmation_required
+                            && step.confirmation_status.as_deref() == Some("pending")
+                    }));
+                }
+                other => panic!("Expected mixed tool result, got {:?}", other),
             }
-            other => panic!("Expected mixed tool result, got {:?}", other),
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
         }
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -445,49 +719,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_access_executes_an_admitted_mcp_tool() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut agent = AgentRunner::new(
-            Box::new(ToolCallProvider::for_tool(
-                "mcp_send_email",
-                serde_json::json!({
-                    "to": "user@example.com",
-                    "body": "hello"
-                }),
-            )),
-            default_config(),
-        )
-        .with_execution_permission("full_access".to_string());
-        agent.tool_registry_mut().register(
-            Tool::new(
-                "mcp_send_email",
-                "Send email through MCP",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "to": { "type": "string" },
-                        "body": { "type": "string" }
-                    },
-                    "required": ["to", "body"]
-                }),
-            )
-            .with_confirmation(true),
-            Arc::new(CountingHandler {
-                name: "mcp_send_email".to_string(),
-                calls: calls.clone(),
-            }),
-        );
+    async fn test_auto_mcp_execution_requires_durable_foreground_reservation() {
+        use crate::agent::event::NullEventEmitter;
+        use crate::agent::foreground_lifecycle_control::ForegroundLifecycleControl;
 
-        let result = agent.run("send the email", &[]).await;
-        match result {
-            AgentResponse::TextWithToolCalls { steps, .. } => {
-                assert_eq!(steps.len(), 1);
-                assert!(!steps[0].confirmation_required);
-                assert_eq!(steps[0].confirmation_status, None);
-                assert!(steps[0].success);
-                assert_eq!(calls.load(Ordering::SeqCst), 1);
+        struct ReservedHandler {
+            db: Arc<Mutex<rusqlite::Connection>>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl ToolHandler for ReservedHandler {
+            fn name(&self) -> &str {
+                "mcp_send_email"
             }
-            other => panic!("Expected confirmation step, got {:?}", other),
+            fn execute(&self, _: &serde_json::Value, _: &std::path::Path) -> ToolResult {
+                let reserved: i64 = self.db.lock().unwrap().query_row(
+                    "SELECT count(*) FROM agent_run_events WHERE run_id='run' AND session_id='s'
+                     AND event_type='ExternalToolDispatchReserved'", [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    reserved, 1,
+                    "reservation must commit before the handler starts"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ToolResult::success(self.name(), "synthetic effect recorded")
+            }
+        }
+
+        for permission in ["ask", "full_access", "workspace_auto"] {
+            for fail_reservation in [false, true] {
+                let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+                db.lock().unwrap().execute_batch(
+                    "CREATE TABLE agent_run_events (id TEXT PRIMARY KEY, run_id TEXT, session_id TEXT,
+                     sequence INTEGER, event_type TEXT, payload TEXT, created_at INTEGER);"
+                ).unwrap();
+                if fail_reservation {
+                    db.lock()
+                        .unwrap()
+                        .execute_batch(
+                            "CREATE TRIGGER reject_reservation BEFORE INSERT ON agent_run_events
+                         WHEN NEW.event_type='ExternalToolDispatchReserved'
+                         BEGIN SELECT RAISE(ABORT, 'synthetic admission storage failure'); END;",
+                        )
+                        .unwrap();
+                }
+                let control = Arc::new(ForegroundLifecycleControl::new(
+                    Arc::new(NullEventEmitter),
+                    db.clone(),
+                    "run".into(),
+                ));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut agent = AgentRunner::new(
+                    Box::new(ToolCallProvider::for_tool(
+                        "mcp_send_email",
+                        serde_json::json!({}),
+                    )),
+                    default_config(),
+                )
+                .with_execution_permission(permission.into())
+                .with_session_id("s".into())
+                .with_emitter(control.clone())
+                .with_tool_lifecycle_hook(control);
+                agent.tool_registry_mut().register(
+                    Tool::new(
+                        "mcp_send_email",
+                        "Synthetic external action",
+                        serde_json::json!({"type":"object"}),
+                    )
+                    .with_confirmation(true),
+                    Arc::new(ReservedHandler {
+                        db: db.clone(),
+                        calls: calls.clone(),
+                    }),
+                );
+                let response = agent
+                    .run("perform the synthetic external action", &[])
+                    .await;
+                let AgentResponse::TextWithToolCalls { steps, .. } = response else {
+                    panic!("expected one bounded tool step");
+                };
+                let dispatched = permission != "ask" && !fail_reservation;
+                let blocked = permission != "ask" && fail_reservation;
+                assert_eq!(steps.len(), if blocked { 2 } else { 1 });
+                if blocked {
+                    assert_eq!(steps[1].tool_name, "agent_loop");
+                    assert!(!steps[1].success);
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(dispatched));
+                assert_eq!(steps[0].success, dispatched);
+                assert_eq!(steps[0].confirmation_required, permission == "ask");
+                let reserved: i64 = db.lock().unwrap().query_row(
+                    "SELECT count(*) FROM agent_run_events WHERE event_type='ExternalToolDispatchReserved'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(reserved, i64::from(dispatched));
+                if permission != "ask" && fail_reservation {
+                    assert!(steps[0].output.contains("本次未派发"));
+                }
+            }
         }
     }
 
@@ -559,6 +887,14 @@ mod tests {
             (
                 "operate_trusted_app_control",
                 serde_json::json!({"app_id":"chat", "control_ref":"control", "action":"collapse"}),
+            ),
+            (
+                "operate_trusted_app_control",
+                serde_json::json!({"app_id":"chat", "control_ref":"control", "action":"check"}),
+            ),
+            (
+                "operate_trusted_app_control",
+                serde_json::json!({"app_id":"chat", "control_ref":"control", "action":"uncheck"}),
             ),
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -639,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn task_facts_preserve_verification_and_no_progress_evidence() {
+    fn task_facts_preserve_failure_order_verification_and_no_progress_evidence() {
         let steps = vec![
             AgentStep {
                 call_id: "write-1".to_string(),
@@ -683,6 +1019,46 @@ mod tests {
             facts.terminal_reason,
             Some(crate::agent::task_facts::TaskTerminalReason::NeedsAttention)
         );
+
+        for (outcomes, expected_failures) in [
+            (vec![(true, "a.txt"), (false, "a.txt")], vec!["step-1"]),
+            (vec![(false, "a.txt"), (true, "a.txt")], vec![]),
+            (
+                vec![(true, "a.txt"), (false, "a.txt"), (true, "a.txt")],
+                vec![],
+            ),
+            (
+                vec![(false, "a.txt"), (true, "a.txt"), (false, "a.txt")],
+                vec!["step-2"],
+            ),
+            (vec![(false, "a.txt"), (true, "b.txt")], vec!["step-0"]),
+        ] {
+            let steps: Vec<_> = outcomes
+                .iter()
+                .enumerate()
+                .map(|(index, (success, path))| AgentStep {
+                    call_id: format!("step-{index}"),
+                    tool_name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": path}),
+                    success: *success,
+                    output: if *success { "read" } else { "not readable" }.to_string(),
+                    confirmation_required: false,
+                    confirmation_status: None,
+                    verification: None,
+                })
+                .collect();
+            let facts = task_facts_from_steps("读取这份日常清单", &steps);
+            assert_eq!(facts.failed_steps, expected_failures, "{outcomes:?}");
+            assert_eq!(
+                crate::agent::task_facts::derive_task_phase(&facts, false),
+                if expected_failures.is_empty() {
+                    crate::agent::task_facts::DerivedTaskPhase::Completed
+                } else {
+                    crate::agent::task_facts::DerivedTaskPhase::NeedsAttention
+                },
+                "{outcomes:?}"
+            );
+        }
     }
 
     // ── Issue #079: Tool-call truncation guard ─────────────────────────────────
@@ -1492,14 +1868,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn side_effect_guard_pauses_after_threshold_in_full_access_mode() {
-        // In full_access mode write_file does not require confirmation. The
+    async fn side_effect_guard_pauses_after_threshold_in_workspace_auto_mode() {
+        // Workspace auto admits this write without confirmation. The
         // SideEffectAutoPauseGuard (threshold=3) must soft-pause after the
         // 3rd side-effect call, so the 4th iteration is never requested.
         let write_calls = Arc::new(AtomicUsize::new(0));
         let mut agent =
             AgentRunner::new(Box::new(SideEffectStormProvider::new()), default_config());
-        agent = agent.with_execution_permission("full_access".into());
+        agent = agent.with_execution_permission("workspace_auto".into());
         agent.tool_registry_mut().register(
             Tool::new(
                 "write_file",
@@ -1635,7 +2011,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_side_effect_guard_pauses_before_hard_cap() {
-        // The default `SideEffectAutoPauseGuard` (threshold = 8) must
+        // Outside full access, SideEffectAutoPauseGuard (threshold = 8) must
         // pause the run after ~8 side-effects. There is no longer a
         // hard `MAX_TOOL_CALLS_PER_TURN` cap — termination is governed
         // by soft guards, with the wall-clock guard as the absolute
@@ -1646,7 +2022,7 @@ mod tests {
         };
 
         let mut agent = AgentRunner::new(Box::new(provider), AgentConfig::default())
-            .with_execution_permission("full_access".into());
+            .with_execution_permission("workspace_auto".into());
         agent.tool_registry_mut().register(
             Tool::new("write_file", "Write", serde_json::json!({"type": "object"})),
             Arc::new(NoConfirmWriteHandler {

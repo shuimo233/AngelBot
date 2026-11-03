@@ -1,6 +1,10 @@
 //! Tests for all tool handlers: file, memory, goal, constraint, verify, think.
 #[cfg(test)]
 mod tests {
+    use crate::agent::extensions::constraint::{CheckConstraintHandler, ExtractConstraintsHandler};
+    use crate::agent::extensions::memory::{
+        ForgetMemoryHandler, RecallMemoriesHandler, RememberFactHandler, UpdateMemoryHandler,
+    };
     use crate::agent::handlers::*;
     use crate::agent::tool::{ToolCall, ToolHandler};
     use crate::agent::ToolRegistry;
@@ -45,6 +49,132 @@ mod tests {
         let result = h.execute(&serde_json::json!({"bad": "args"}), Path::new("."));
         assert!(!result.success);
         assert!(result.content.contains("参数"));
+    }
+
+    #[test]
+    fn read_file_windows_preserve_unicode_provenance_and_legacy_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let text = format!("{}尾部标记", "中🪶\n\"\\\u{0000}".repeat(1800));
+        std::fs::write(&path, &text).unwrap();
+        let h = ReadFileHandler::new();
+        let legacy = h.execute(&serde_json::json!({"path":"notes.txt"}), dir.path());
+        assert!(legacy.success, "{}", legacy.content);
+        let full: serde_json::Value = serde_json::from_str(&legacy.content).unwrap();
+        assert_eq!(full["content"], text);
+        assert_eq!(full.as_object().unwrap().len(), 2);
+        let tail = h.execute(
+            &serde_json::json!({"path":"notes.txt","tail":true,"limit":2000}),
+            dir.path(),
+        );
+        assert!(tail.success, "{}", tail.content);
+        assert!(tail.content.starts_with("{\"resolvedPath\":"));
+        assert!(tail.content.len() <= crate::agent::tool_context::MAX_VIEW_BYTES);
+        let end: serde_json::Value = serde_json::from_str(&tail.content).unwrap();
+        assert_eq!(end["resolvedPath"], full["resolvedPath"]);
+        assert!(end["content"].as_str().unwrap().ends_with("尾部标记"));
+        assert_eq!(end["complete"], false);
+        assert_eq!(end["omitted_before"], true);
+        assert_eq!(end["has_more"], false);
+        assert!(end["next_offset"].is_null());
+        assert_eq!(
+            end["offset"].as_u64().unwrap() as usize
+                + end["content"].as_str().unwrap().chars().count(),
+            text.chars().count()
+        );
+        let page = h.execute(
+            &serde_json::json!({"path":"notes.txt","offset":1,"limit":2}),
+            dir.path(),
+        );
+        let page: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+        assert_eq!(page["content"], "🪶\n");
+        assert_eq!(page["next_offset"], 3);
+        let mut restored = String::new();
+        let mut offset = 0;
+        loop {
+            let page = h.execute(
+                &serde_json::json!({"path":"notes.txt","offset":offset,"limit":2000}),
+                dir.path(),
+            );
+            assert!(page.success, "{}", page.content);
+            assert!(page.content.len() <= crate::agent::tool_context::MAX_VIEW_BYTES);
+            let page: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+            restored.push_str(page["content"].as_str().unwrap());
+            let Some(next) = page["next_offset"].as_u64() else {
+                break;
+            };
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(restored, text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let schema = crate::agent::tool::schemas::read_file();
+        assert_eq!(schema["properties"]["offset"]["minimum"], 0);
+        assert_eq!(schema["properties"]["limit"]["maximum"], 2000);
+        assert_eq!(schema["required"], serde_json::json!(["path"]));
+        println!(
+            "FILE_WINDOW_BYTES full={} tail={}",
+            legacy.content.len(),
+            tail.content.len()
+        );
+    }
+
+    #[test]
+    fn read_file_windows_reject_invalid_options_and_keep_office_limitations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "short").unwrap();
+        let h = ReadFileHandler::new();
+        for args in [
+            serde_json::json!({"path":"notes.txt","limit":0}),
+            serde_json::json!({"path":"notes.txt","limit":2001}),
+            serde_json::json!({"path":"notes.txt","offset":-1}),
+            serde_json::json!({"path":"notes.txt","offset":6}),
+            serde_json::json!({"path":"notes.txt","tail":true,"offset":1}),
+            serde_json::json!({"path":"notes.txt","tail":"true"}),
+            serde_json::json!({"path":"notes.txt","line":1}),
+        ] {
+            assert!(!h.execute(&args, dir.path()).success, "{args}");
+        }
+        let complete = h.execute(
+            &serde_json::json!({"path":"notes.txt","limit":2000}),
+            dir.path(),
+        );
+        let complete: serde_json::Value = serde_json::from_str(&complete.content).unwrap();
+        assert_eq!(complete["complete"], true);
+        assert_eq!(complete["content"], "short");
+        let package = crate::document_text::package_fixture(&[
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            (
+                "word/document.xml",
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Office body</w:t></w:r></w:p></w:body></w:document>"#,
+            ),
+        ]);
+        std::fs::write(dir.path().join("notes.DOCX"), &package).unwrap();
+        let legacy = h.execute(&serde_json::json!({"path":"notes.DOCX"}), dir.path());
+        assert!(legacy.success, "{}", legacy.content);
+        let full: serde_json::Value = serde_json::from_str(&legacy.content).unwrap();
+        assert!(full["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::document_text::DOCX_NOTICE));
+        let window = h.execute(
+            &serde_json::json!({"path":"notes.DOCX","tail":true}),
+            dir.path(),
+        );
+        assert!(!window.success);
+        assert!(window.content.contains("Office 文本快照暂不支持局部参数"));
+        assert!(!window.content.contains("Office body"));
+        assert_eq!(
+            std::fs::read(dir.path().join("notes.DOCX")).unwrap(),
+            package
+        );
     }
 
     #[test]
@@ -102,11 +232,53 @@ mod tests {
         let outside_file = outside.path().join("private.txt");
         std::fs::write(&outside_file, "must not be visible").unwrap();
 
-        let result = h.read_file(workspace.path(), outside_file.to_str().unwrap());
+        let result =
+            crate::commands::file::read_file_core(workspace.path(), outside_file.to_str().unwrap());
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .contains("path escapes the work directory"));
+
+        // After restore, document bytes may still mention the original host.
+        // The tool receipt must identify the file actually read here, without
+        // rewriting that document or granting access to its embedded paths.
+        let body = serde_json::json!({"attachment_path":outside_file}).to_string();
+        std::fs::write(workspace.path().join("request.json"), &body).unwrap();
+        let result = h.execute(
+            &serde_json::json!({"path":"request.json"}),
+            workspace.path(),
+        );
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.starts_with("{\"resolvedPath\":"));
+        let receipt: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(
+            receipt["resolvedPath"],
+            crate::commands::file::display_work_dir(
+                &workspace
+                    .path()
+                    .join("request.json")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+        assert_eq!(receipt["content"], body);
+        assert_eq!(
+            crate::commands::file::read_file_core(workspace.path(), "request.json").unwrap(),
+            body
+        );
+        let rejected = h.execute(&serde_json::json!({"path":outside_file}), workspace.path());
+        assert!(!rejected.success);
+        assert!(!rejected.content.contains("must not be visible"));
+        let rejected = h.execute(
+            &serde_json::json!({"path":outside_file,"tail":true,"limit":20}),
+            workspace.path(),
+        );
+        assert!(!rejected.success);
+        assert!(!rejected.content.contains("must not be visible"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("request.json")).unwrap(),
+            body
+        );
     }
 
     #[test]
@@ -223,6 +395,20 @@ mod tests {
         );
         assert!(!result.success);
         assert!(result.content.contains("验证失败"));
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"expectation":"hello"}),
+            serde_json::json!({"expectation":"hello","actual":1}),
+            serde_json::json!({"expectation":" ","actual":"hello"}),
+            serde_json::json!({"expectation":"hello","actual":"\n"}),
+        ] {
+            let invalid = h.execute(&arguments, Path::new("."));
+            assert!(
+                !invalid.success,
+                "missing evidence cannot pass: {arguments}"
+            );
+            assert!(invalid.content.contains("无法核验"));
+        }
     }
 
     // Issue #104: synonym match prevents false negatives where the agent
@@ -352,7 +538,10 @@ mod tests {
 
     #[test]
     fn test_recall_memories_handler() {
-        let (_db, arc) = db();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let arc = Arc::new(Mutex::new(conn));
         // Insert a test memory
         {
             let db = arc.lock().unwrap();
@@ -362,13 +551,15 @@ mod tests {
         let h = RecallMemoriesHandler {
             db: Some(arc.clone()),
         };
-        // Fallback to keyword search when vector store unavailable
+        // Exercise the current schema and its real keyword index, without
+        // fabricating a partial table or requiring a vector cache.
         let result = h.execute(
             &serde_json::json!({"query": "Python", "limit": 5}),
             Path::new("."),
         );
-        // May succeed with results or "没有找到" (no vector store in test)
         assert!(result.success);
+        assert!(result.content.contains("[memory:m1] 用户喜欢 Python 编程"));
+        assert!(result.content.contains("类别:preference"));
     }
 
     #[test]
@@ -503,12 +694,18 @@ mod tests {
     }
 
     #[test]
-    fn test_check_constraint_pass() {
-        let (_db, arc) = db();
+    fn test_check_constraint_uses_current_schema_without_claiming_permission() {
+        let db = crate::db::init(Path::new(":memory:")).unwrap();
+        crate::db::migrate(&db).unwrap();
+        let arc = Arc::new(Mutex::new(db));
         {
             let db = arc.lock().unwrap();
             db.execute("INSERT INTO memories (id,scope,category,content,importance,source,forget_stage,priority,created_at,updated_at)
                 VALUES ('c1','global','constraint','永远使用 Rust',9,'agent','active','constraint',1,1)", []).unwrap();
+            db.execute("INSERT INTO memories (id,scope,category,content,importance,source,forget_stage,priority,created_at,updated_at,superseded_by)
+                VALUES ('old','global','constraint','obsolete rule',9,'agent','active','constraint',1,1,'c1'),
+                       ('forgotten','global','constraint','forgotten rule',9,'agent','forgotten','constraint',1,1,NULL),
+                       ('unbound','session','constraint','unbound session rule',9,'agent','active','constraint',1,1,NULL)", []).unwrap();
         }
         let h = CheckConstraintHandler {
             db: Some(arc.clone()),
@@ -518,6 +715,22 @@ mod tests {
             Path::new("."),
         );
         assert!(result.success);
+        assert!(result.content.contains("永远使用 Rust"));
+        assert!(result.content.contains("这不是权限判定"));
+        assert!(!result.content.contains("obsolete rule"));
+        assert!(!result.content.contains("forgotten rule"));
+        assert!(!result.content.contains("unbound session rule"));
+        assert!(result.content.contains(r#""id":"c1""#));
+        assert!(result.content.contains(r#""omitted":0"#));
+        assert!(!result.content.contains("符合所有已知约束"));
+        assert!(!h.execute(&serde_json::json!({}), Path::new(".")).success);
+        arc.lock()
+            .unwrap()
+            .execute("ALTER TABLE memories RENAME TO unavailable_memories", [])
+            .unwrap();
+        let unavailable = h.execute(&serde_json::json!({"action":"读取文件"}), Path::new("."));
+        assert!(!unavailable.success);
+        assert!(unavailable.content.contains("约束读取失败"));
     }
 
     // ─── Tool registry ──────────────────────────────────────────────────────

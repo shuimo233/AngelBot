@@ -1,6 +1,6 @@
 # Windows computer use：官方边界与 AngelBot 最小落地（2026-09-30）
 
-范围：Windows 桌面当前用户的交互式会话；这是对 [Windows 应用控制研究](windows-application-control.md) 的实施核验，不承诺通用 RPA，也不是已完成的实机兼容性报告。以下「官方事实」均来自 Microsoft 文档；「工程判断」是对 AngelBot 当前代码的推论。
+范围：Windows 桌面当前用户的交互式会话；这是 2026-09-30 的历史评估，不承诺通用 RPA，也不是当前实机兼容性报告。以下「官方事实」来自当时核对的 Microsoft 文档，「工程判断」针对当时代码；最新实现只见[当前路线图](../current-roadmap.md)，后续接口依据见[通用 computer use 评估](windows-generic-computer-use-2026.md)。
 
 ## 官方事实
 

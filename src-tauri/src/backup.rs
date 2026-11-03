@@ -14,6 +14,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod files;
+
 const FORMAT: &str = "angelbot.encrypted-backup";
 const VERSION: u8 = 1;
 const KDF_ALGORITHM: &str = "argon2id";

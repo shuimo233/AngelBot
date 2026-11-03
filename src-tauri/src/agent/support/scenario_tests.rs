@@ -395,15 +395,13 @@ mod scenario_tests {
     }
 
     // -------------------------------------------------------------------------
-    // Scenario 3: Tool Error Recovery
-    // File read fails → agent retries → succeeds
-    // Expected: read fails → retry → success → respond
+    // Scenario 3: Tool Error Partial Results
+    // One file read fails → another succeeds → explain the unresolved operation.
+    // A different target is useful evidence, not recovery of the failed read.
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn scenario_tool_error_recovery() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-
+    async fn scenario_tool_error_preserves_partial_results() {
         let provider = ScenarioProvider::with_tools_and_text(vec![
             // Turn 1: read_file fails
             (
@@ -414,21 +412,32 @@ mod scenario_tests {
                 }]),
                 Some("我来读取这个文件...".to_string()),
             ),
-            // Turn 2: read_file retry
+            // Turn 2: useful read, but not recovery of missing.txt
             (
                 Some(vec![crate::llm::ToolCall {
                     id: "call-r2".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path": "note.txt"}),
                 }]),
-                Some("让我重试读取另一个文件...".to_string()),
+                Some("让我读取另一个文件...".to_string()),
             ),
-            // Turn 3: success
+            // Turn 3: an overbroad success claim must receive completion feedback.
             (None, Some("文件读取成功！内容是：hello world".to_string())),
+            // Turn 4: preserve the useful result and explain the remaining failure.
+            (
+                None,
+                Some("note.txt 内容是 hello world；missing.txt 仍未读取，请核对文件。".to_string()),
+            ),
         ]);
-
-        // First call fails, second succeeds
-        let call_count_clone = call_count.clone();
+        let model_calls = provider.call_idx.clone();
+        let handler = ScenarioToolHandler::new(
+            "read_file",
+            vec![
+                ToolResult::error("read_file", "File not found: missing.txt"),
+                ToolResult::success("read_file", "hello world"),
+            ],
+        );
+        let tool_calls = handler.call_idx.clone();
         let tools = vec![(
             Tool::new(
                 "read_file",
@@ -439,65 +448,28 @@ mod scenario_tests {
                     "required": ["path"]
                 }),
             ),
-            Arc::new(move |_: &str| -> ToolResult {
-                let idx = call_count_clone.fetch_add(1, Ordering::SeqCst);
-                if idx == 0 {
-                    ToolResult::error("read_file", "File not found: missing.txt")
-                } else {
-                    ToolResult::success("read_file", "hello world")
-                }
-            }) as Arc<dyn Fn(&str) -> ToolResult + Send + Sync>,
+            Arc::new(handler) as Arc<dyn ToolHandler>,
         )];
-
-        // Build registry with closure handler
-        let mut runner = AgentRunner::new(Box::new(provider), default_config());
-
-        struct ClosureHandler<F> {
-            f: F,
-            name: String,
-        }
-        impl<F: Fn(&serde_json::Value) -> ToolResult + Send + Sync> ToolHandler for ClosureHandler<F> {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn execute(&self, args: &serde_json::Value, _work_dir: &std::path::Path) -> ToolResult {
-                (self.f)(args)
-            }
-        }
-
-        let f = move |_args: &serde_json::Value| -> ToolResult {
-            let idx = call_count.fetch_add(1, Ordering::SeqCst);
-            if idx == 0 {
-                ToolResult::error("read_file", "File not found: missing.txt")
-            } else {
-                ToolResult::success("read_file", "hello world")
-            }
-        };
-
-        runner.tool_registry_mut().register(
-            Tool::new(
-                "read_file",
-                "Read a file",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }),
-            ),
-            Arc::new(ClosureHandler {
-                name: "read_file".to_string(),
-                f,
-            }) as Arc<dyn ToolHandler>,
-        );
-
+        let runner = build_runner_with_tools(provider, tools);
         let result = runner.run("Read the file", &[]).await;
 
         match result {
             AgentResponse::TextWithToolCalls { text, steps } => {
-                assert_eq!(steps.len(), 2, "Should have 2 tool calls (failed + retry)");
+                assert_eq!(
+                    steps.len(),
+                    3,
+                    "Two operations and one completion diagnostic"
+                );
                 assert!(!steps[0].success, "First call should fail");
                 assert!(steps[1].success, "Second call should succeed");
-                assert!(text.contains("成功") || text.contains("hello"));
+                assert_eq!(steps[2].tool_name, "agent_loop");
+                assert!(!steps[2].success);
+                assert!(text.contains("hello world"));
+                assert!(text.contains("missing.txt 仍未读取"));
+                assert!(text.contains("仍有操作未完成"));
+                assert!(!text.contains("代码修改"));
+                assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(model_calls.load(Ordering::SeqCst), 4);
             }
             other => panic!("Expected TextWithToolCalls, got {:?}", other),
         }

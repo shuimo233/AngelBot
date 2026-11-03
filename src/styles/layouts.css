@@ -1,0 +1,91 @@
+/* A and B share mounted pages. Only navigation density and geometry change. */
+.app-shell[data-layout='A'] { --sidebar-width: 228px; }
+.layout-context-header { display: none; }
+.app-shell[data-layout='B'] {
+  --sidebar-width: 76px;
+  grid-template-areas: 'sidebar context' 'sidebar main';
+  grid-template-columns: 76px minmax(0, 1fr);
+  grid-template-rows: 60px minmax(0, 1fr);
+}
+.app-shell[data-layout='B'].app-shell--chat {
+  grid-template-areas: 'sidebar main';
+  grid-template-columns: 76px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.app-shell[data-layout='B'].app-shell--workbench {
+  grid-template-areas: 'sidebar main right';
+  grid-template-columns: 76px minmax(0, 1fr) var(--right-panel-width);
+}
+.app-shell[data-layout='B']:not(.app-shell--chat) .layout-context-header {
+  grid-area: context;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+  padding: 0 var(--page-gutter, 32px);
+  color: var(--color-muted);
+  font-size: 13px;
+}
+.layout-context-header > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.layout-context-header > span:first-child { color: var(--color-text); font-weight: 500; }
+.app-shell[data-layout='B'] .mobile-topbar,
+.app-shell[data-layout='B'] .sidebar-scrim { display: none; }
+.app-shell[data-layout='B'] .sidebar {
+  grid-area: sidebar;
+  position: relative;
+  inset: auto;
+  width: 76px;
+  transform: none;
+  box-shadow: none;
+  border: 0;
+}
+.app-shell[data-layout='B'] .sidebar-profile-name,
+.app-shell[data-layout='B'] .sidebar-quick-switch > :not(svg),
+.app-shell[data-layout='B'] .sidebar-primary-nav-item > span,
+.app-shell[data-layout='B'] .sidebar-section,
+.app-shell[data-layout='B'] .sidebar-settings > span { display: none; }
+.app-shell[data-layout='B'] .sidebar-quick-switch { justify-content: center; width: 44px; margin: 12px auto 20px; padding: 0; border: 0; background: transparent; }
+.app-shell[data-layout='B'] .sidebar-primary-nav { gap: 10px; padding: 0 16px; }
+.app-shell[data-layout='B'] .sidebar-primary-nav-item { justify-content: center; width: 44px; min-height: 44px; padding: 0; }
+.app-shell[data-layout='B'] .sidebar-primary-nav-item.active { box-shadow: none; background: var(--ui-surface); }
+.app-shell[data-layout='B'] .sidebar-footer { flex-direction: column; margin-top: auto; padding: 16px; border: 0; }
+.app-shell[data-layout='B'] .sidebar-settings { flex: none; justify-content: center; width: 44px; padding: 0; }
+.app-shell[data-layout='B'] .sidebar-feedback:not(:empty) { position: fixed; left: 92px; bottom: 16px; z-index: 450; width: min(360px, calc(100vw - 108px)); padding: 14px; border: 1px solid var(--color-border-muted); border-radius: var(--radius-control); background: var(--ui-surface); box-shadow: var(--ui-shadow-dialog); }
+
+/* The same category navigation becomes a two-level horizontal strip in B. */
+.app-shell[data-layout='B'] .settings-router { flex-direction: column; }
+.app-shell[data-layout='B'] .settings-nav { display: grid; width: auto; grid-template-columns: repeat(5, minmax(0, 1fr)); grid-template-rows: auto auto; gap: 6px; padding: 12px 24px; flex-shrink: 0; overflow: visible; background: transparent; }
+.app-shell[data-layout='B'] .settings-nav-group { display: contents; }
+.app-shell[data-layout='B'] .settings-nav-group-button { grid-row: 1; justify-content: center; padding: 8px; white-space: nowrap; }
+.app-shell[data-layout='B'] .settings-nav-pages { grid-column: 1 / -1; grid-row: 2; display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 0 0; }
+.app-shell[data-layout='B'] .settings-nav-item { width: auto; }
+.app-shell[data-layout='B'] .settings-nav-icon { display: none; }
+.app-shell[data-layout='B'] .settings-nav-group-button[aria-current] { box-shadow: inset 0 -2px var(--color-text); }
+
+/* A keeps a quiet list; B gives the same tasks a time-led reading order. */
+.app-shell[data-layout='B'] .automation-card-summary { grid-template-columns: minmax(116px, 150px) minmax(0, 1fr) auto; }
+.app-shell[data-layout='B'] .automation-card-meta { display: contents; }
+.app-shell[data-layout='B'] .automation-card-meta > p + p::before { content: none; }
+.app-shell[data-layout='B'] .automation-trigger { grid-column: 1; grid-row: 1; font-size: 14px; color: var(--color-text-secondary); }
+.app-shell[data-layout='B'] .automation-card-title { grid-column: 2; grid-row: 1; }
+.app-shell[data-layout='B'] .automation-path { grid-column: 2; grid-row: 2; }
+.app-shell[data-layout='B'] .automation-card-status { grid-column: 3; grid-row: 1 / span 2; }
+
+@media (max-width: 1050px) {
+  .app-shell[data-layout='B'].app-shell--workbench { grid-template-areas: 'sidebar main'; grid-template-columns: 76px minmax(0, 1fr); }
+}
+@media (max-width: 959px) {
+  .app-shell[data-layout='B'].app-shell--workbench .sidebar { grid-area: sidebar; }
+  .app-shell[data-layout='B'] .chat-header-new { padding-left: 24px; }
+}
+@media (max-width: 720px) {
+  .app-shell[data-layout='B'] .settings-nav { padding: 8px 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .app-shell[data-layout='B'] .settings-nav-group-button { grid-row: auto; }
+  .app-shell[data-layout='B'] .settings-nav-pages { grid-row: 3; }
+  .app-shell[data-layout='B'] .automation-card-summary { grid-template-columns: minmax(0, 1fr) auto; }
+  .app-shell[data-layout='B'] .automation-trigger { grid-row: 2; }
+  .app-shell[data-layout='B'] .automation-card-title { grid-column: 1; }
+  .app-shell[data-layout='B'] .automation-path { grid-column: 1; grid-row: 3; }
+  .app-shell[data-layout='B'] .automation-card-status { grid-column: 2; grid-row: 1 / span 3; }
+}

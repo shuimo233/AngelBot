@@ -56,6 +56,8 @@ pub struct RunStateInput {
     pub has_rejected_confirmation: bool,
     pub has_approved_confirmation: bool,
     pub has_failure: bool,
+    /// An external effect may have happened; continuing must not replay it.
+    pub has_unknown_result: bool,
     pub provider_terminal_failure: bool,
     /// An approved side effect ended the current bounded slice.  The user must
     /// explicitly continue instead of the runtime silently starting another
@@ -99,6 +101,7 @@ pub fn derive_run_state(input: RunStateInput) -> DerivedRunState {
         status,
         confirmation,
         resumable: !input.provider_terminal_failure
+            && !input.has_unknown_result
             && (input.has_pending_confirmation
                 || input.has_failure
                 || (input.explicit_continue_after_approval && input.has_approved_confirmation)),

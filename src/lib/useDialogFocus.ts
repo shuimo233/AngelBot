@@ -23,6 +23,8 @@ export function useDialogFocus<T extends HTMLElement>({
 }: DialogFocusOptions) {
   const dialogRef = useRef<T>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!isOpen) return;
@@ -42,7 +44,7 @@ export function useDialogFocus<T extends HTMLElement>({
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
 
@@ -74,7 +76,7 @@ export function useDialogFocus<T extends HTMLElement>({
       window.removeEventListener('keydown', handleKeyDown);
       returnFocusRef.current?.focus({ preventScroll: true });
     };
-  }, [initialFocusSelector, isOpen, onClose]);
+  }, [initialFocusSelector, isOpen]);
 
   return dialogRef;
 }

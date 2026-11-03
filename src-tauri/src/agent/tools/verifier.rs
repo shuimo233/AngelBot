@@ -1,17 +1,6 @@
-// Issue #102: Post-call verification — bridge from tool declarations to disk truth
-//
-// The agent trace records whatever the tool handler returned (e.g. "已创建
-// AgentTestA.txt") but never crosses-checks that claim against the filesystem.
-// `verify_result` (#104) helps the agent judge its own claims, but it still
-// relies on the agent to invoke it. PostCallVerifier runs automatically after
-// every tool call that declared one and records the evidence to the trace so
-// the next request — usually the "complete" step — can surface the gap.
-//
-// Scope: read-only. We deliberately do NOT extend `ToolResult` (that would
-// ripple through the OpenAPI schema and every frontend trace consumer). The
-// evidence travels in `agent_step.metadata` only. The completion gate stays
-// a soft warning (the agent can still call `complete`; the user sees the
-// red mark in the trace and decides whether to undo).
+// Read-only post-call observations attached to AgentStep. This module changes
+// neither ToolResult, task-completion policy nor access permissions. Resolve
+// targets under the tool's execution work_dir, never the process cwd.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,7 +14,8 @@ pub trait PostCallVerifier: Send + Sync {
     /// `args` is the post-`prepare_arguments` JSON the handler ran with.
     /// `result` is what the handler returned (in case the verifier wants to
     /// inspect the success flag or scrape a path out of the content).
-    fn verify(&self, args: &Value, result: &ToolResult) -> VerificationEvidence;
+    /// `work_dir` is the same current scope used by the tool execution.
+    fn verify(&self, args: &Value, result: &ToolResult, work_dir: &Path) -> VerificationEvidence;
 }
 
 /// Where the verifier looked for the artifact.
@@ -74,24 +64,42 @@ use super::tool::ToolResult;
 /// the trace gets a red evidence row.
 pub struct FileExistenceVerifier;
 
+/// None is an unresolved/failed observation, not evidence of absence.
+fn observe_existence(args: &Value, work_dir: &Path) -> (String, Option<bool>) {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let observed = if path.is_empty() {
+        None
+    } else {
+        crate::commands::file::resolve_in_existing_root(work_dir, Path::new(&path), false)
+            .ok()
+            .and_then(|resolved| resolved.try_exists().ok())
+    };
+    (path, observed)
+}
+
 impl PostCallVerifier for FileExistenceVerifier {
-    fn verify(&self, args: &Value, _result: &ToolResult) -> VerificationEvidence {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let actual = !path.is_empty() && Path::new(&path).exists();
-        let matched = actual; // write/edit/create: tool says success ⇒ file should exist
+    fn verify(&self, args: &Value, _result: &ToolResult, work_dir: &Path) -> VerificationEvidence {
+        let (path, observed) = observe_existence(args, work_dir);
+        let matched = observed == Some(true);
         VerificationEvidence {
             kind: "file_exists",
             target: path,
             declared_existence: true,
-            actual_existence: actual,
-            source: VerificationSource::WorkDir,
+            actual_existence: observed.unwrap_or(false),
+            source: if observed.is_some() {
+                VerificationSource::WorkDir
+            } else {
+                VerificationSource::Unresolved
+            },
             matched,
             note: if matched {
                 String::new()
+            } else if observed.is_none() {
+                "无法在当前工作目录内确认产物状态".to_string()
             } else {
                 "工具声称成功，但磁盘上未找到产物".to_string()
             },
@@ -104,21 +112,22 @@ impl PostCallVerifier for FileExistenceVerifier {
 pub struct FileAbsenceVerifier;
 
 impl PostCallVerifier for FileAbsenceVerifier {
-    fn verify(&self, args: &Value, _result: &ToolResult) -> VerificationEvidence {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let actual = !path.is_empty() && Path::new(&path).exists();
+    fn verify(&self, args: &Value, _result: &ToolResult, work_dir: &Path) -> VerificationEvidence {
+        let (path, observed) = observe_existence(args, work_dir);
         VerificationEvidence {
             kind: "file_absent",
             target: path,
             declared_existence: false,
-            actual_existence: actual,
-            source: VerificationSource::WorkDir,
-            matched: !actual,
-            note: if actual {
+            actual_existence: observed.unwrap_or(false),
+            source: if observed.is_some() {
+                VerificationSource::WorkDir
+            } else {
+                VerificationSource::Unresolved
+            },
+            matched: observed == Some(false),
+            note: if observed.is_none() {
+                "无法在当前工作目录内确认产物状态".to_string()
+            } else if observed == Some(true) {
                 "工具声称已删除，但磁盘上仍存在".to_string()
             } else {
                 String::new()
@@ -142,51 +151,97 @@ mod tests {
 
     #[test]
     fn file_existence_verifier_matches_when_path_is_real() {
-        let tmp = std::env::temp_dir().join("angelbot-verifier-exists.txt");
+        let root = tempfile::tempdir().unwrap();
+        let tmp = root.path().join("exists.txt");
         std::fs::write(&tmp, "hello").unwrap();
-        let args = serde_json::json!({"path": tmp.to_string_lossy()});
-        let ev = FileExistenceVerifier.verify(&args, &result_success());
-        assert!(ev.matched);
-        assert!(ev.actual_existence);
-        assert!(ev.note.is_empty());
-        let _ = std::fs::remove_file(&tmp);
+        for path in ["exists.txt".to_owned(), tmp.to_string_lossy().into_owned()] {
+            let ev = FileExistenceVerifier.verify(
+                &serde_json::json!({"path":path}),
+                &result_success(),
+                root.path(),
+            );
+            assert!(ev.matched);
+            assert!(ev.actual_existence);
+            assert_eq!(ev.source, VerificationSource::WorkDir);
+            assert!(ev.note.is_empty());
+        }
+        let other = tempfile::tempdir().unwrap();
+        let ev = FileExistenceVerifier.verify(
+            &serde_json::json!({"path":tmp}),
+            &result_success(),
+            other.path(),
+        );
+        assert!(!ev.matched);
+        assert_eq!(ev.source, VerificationSource::Unresolved);
     }
 
     #[test]
     fn file_existence_verifier_flags_missing_path() {
-        let path = std::env::temp_dir().join("angelbot-verifier-missing-xyz.txt");
-        // ensure it really does not exist
-        let _ = std::fs::remove_file(&path);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing.txt");
         let args = serde_json::json!({"path": path.to_string_lossy()});
-        let ev = FileExistenceVerifier.verify(&args, &result_success());
+        let ev = FileExistenceVerifier.verify(&args, &result_success(), root.path());
         assert!(!ev.matched);
         assert!(!ev.actual_existence);
         assert!(!ev.note.is_empty());
+        let absent_root = root.path().join("removed-workspace");
+        let ev = FileExistenceVerifier.verify(
+            &serde_json::json!({"path":"report.txt"}),
+            &result_success(),
+            &absent_root,
+        );
+        assert!(!ev.matched);
+        assert!(
+            !absent_root.exists(),
+            "a read-only observation must not recreate the workspace"
+        );
     }
 
     #[test]
     fn file_existence_verifier_handles_empty_path() {
+        let root = tempfile::tempdir().unwrap();
         let args = serde_json::json!({"path": ""});
-        let ev = FileExistenceVerifier.verify(&args, &result_success());
+        let ev = FileExistenceVerifier.verify(&args, &result_success(), root.path());
         assert!(!ev.matched);
         assert!(ev.target.is_empty());
     }
 
     #[test]
     fn file_absence_verifier_matches_when_path_is_gone() {
-        let path = std::env::temp_dir().join("angelbot-verifier-absent.txt");
-        let _ = std::fs::remove_file(&path);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("absent.txt");
         let args = serde_json::json!({"path": path.to_string_lossy()});
-        let ev = FileAbsenceVerifier.verify(&args, &result_success());
+        let ev = FileAbsenceVerifier.verify(&args, &result_success(), root.path());
         assert!(ev.matched);
         assert!(ev.note.is_empty());
+        let other = tempfile::tempdir().unwrap();
+        for path in [
+            "".to_owned(),
+            other
+                .path()
+                .join("absent.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            let ev = FileAbsenceVerifier.verify(
+                &serde_json::json!({"path":path}),
+                &result_success(),
+                root.path(),
+            );
+            assert!(
+                !ev.matched,
+                "unknown or out-of-scope is not verified absence"
+            );
+            assert_eq!(ev.source, VerificationSource::Unresolved);
+        }
     }
 
     #[test]
     fn arc_helper_wraps_in_dyn() {
         let v: Arc<dyn PostCallVerifier> = arc(FileExistenceVerifier);
+        let root = tempfile::tempdir().unwrap();
         let args = serde_json::json!({"path": "/nonexistent"});
-        let ev = v.verify(&args, &result_success());
+        let ev = v.verify(&args, &result_success(), root.path());
         assert!(!ev.matched);
     }
 }

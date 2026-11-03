@@ -520,7 +520,8 @@ where
                 let evidence = evidence.map_err(WorkerHostError::NetworkDenied)?;
                 self.append_evidence(vec![evidence])
             }
-            WorkerHostOperation::Read { .. }
+            WorkerHostOperation::List { .. }
+            | WorkerHostOperation::Read { .. }
             | WorkerHostOperation::WriteCandidate { .. }
             | WorkerHostOperation::Network { .. } => Err(WorkerHostError::UnknownOperation),
         }
@@ -670,6 +671,7 @@ mod tests {
 
     fn delivery() -> DelegationDelivery {
         DelegationDelivery {
+            file_read_evidence: vec![],
             schema_version: 1,
             delivery_id: "delivery-1".into(),
             delivery_revision: 1,

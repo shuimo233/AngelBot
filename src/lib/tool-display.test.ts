@@ -18,7 +18,7 @@ describe('tool display', () => {
     expect(getToolDisplayName('inspect_desktop_capabilities')).toBe('检查电脑能力');
     expect(getToolDisplayName('observe_trusted_app_window')).toBe('查看已授权应用窗口');
     expect(getToolDisplayName('reveal_workspace_item')).toBe('在文件管理器中显示');
-    expect(getToolDisplayName('set_trusted_app_text')).toBe('填写应用输入框');
+    expect(getToolDisplayName('set_trusted_app_text')).toBe('修改应用输入框');
     expect(getToolDisplayName('operate_trusted_app_control')).toBe('操作应用控件');
     expect(getToolDisplayName('invoke_trusted_app_control')).toBe('操作应用按钮（旧记录）');
     expect(getToolDisplayName('web_search')).toBe('联网搜索');

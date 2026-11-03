@@ -1,0 +1,5 @@
+.desktop-image-click-preview { margin: 12px 0; max-width: 640px; }
+.desktop-image-click-frame { position: relative; border: 1px solid var(--color-border); line-height: 0; }
+.desktop-image-click-frame img { width: 100%; height: auto; display: block; }
+.desktop-image-click-point { position: absolute; width: 14px; height: 14px; border: 2px solid var(--ui-danger); box-shadow: 0 0 0 1px #fff; transform: translate(-50%, -50%); pointer-events: none; }
+.desktop-image-click-preview figcaption { margin-top: 6px; font-size: inherit; line-height: 1.5; color: var(--color-text-secondary); }

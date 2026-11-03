@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "officialBenchmark": false,
+  "cases": [
+    {
+      "id": "closing_lookup",
+      "question": "以前我对每次回答的最后一句提过什么固定要求？请从保存的交流记录核对，不要凭当前聊天猜测。只查询记忆，不要操作文件或其它应用。\nA. 每次附上推荐阅读\nB. 我没有提过固定要求\nC. 另起一行写“别急，慢慢来。”\nD. 只说“再见”\n只返回 <choice>X</choice>，X 为 A、B、C 或 D。",
+      "answer": "C"
+    },
+    {
+      "id": "temporary_override",
+      "question": "今天这一条不用带收尾语，我只想核对以前保存的长期收尾约定。下面哪条是原记录？只查询记忆，不要操作文件或其它应用。\nA. 结尾列五个问题\nB. 单独一行写“别急，慢慢来。”\nC. 从来不要固定结束语\nD. 没有保存过收尾约定\n只返回 <choice>X</choice>，X 为 A、B、C 或 D。",
+      "answer": "B"
+    }
+  ]
+}

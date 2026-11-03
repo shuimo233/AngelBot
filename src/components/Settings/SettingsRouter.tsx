@@ -38,7 +38,7 @@ export const settingsRegistry: SettingsRegistry = {
     executionPermission: { title: '执行权限', component: ExecutionPermissionSettings },
     fileAccess: { title: '文件访问', component: FileAccessSettings },
     desktopControl: { title: '电脑操作', component: DesktopControlSettings },
-    channels: { title: 'Channels & Remote Access', component: ChannelsPage },
+    channels: { title: '渠道与远程访问', component: ChannelsPage },
   },
 };
 

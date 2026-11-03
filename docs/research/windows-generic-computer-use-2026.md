@@ -90,7 +90,7 @@ UIA 的 `Name` 可本地化且不唯一，`AutomationId` 也仅应视为局部�
 
 桌面响应性同样属于操作边界：[Tauri 官方文档](https://v2.tauri.app/develop/calling-rust/#async-commands) 说明同步 command 默认在主线程执行。AngelBot 的原生预检和确认执行均复用 `async_runtime::spawn_blocking`，避免 UIA 或外部工具等待冻结界面；核心审批实现仍共用原有可测试同步入口。
 
-本节仍区分官方 API 语义与工程策略；新增选择/展开能力不扩大应用授权，也不引入逐家 SaaS 适配。
+本节仍区分官方 API 语义与工程策略；新增选择/展开能力不扩大应用授权，也不引入逐家 SaaS 适配。下面第 3／4 项记录初期角色和隐私收敛策略；2026-10-20 经用户确认，已对启用控件操作的可信应用开放 ComboBox／ListItem 的短名称与对应动作，当前权限边界及验收以[统一路线图](../current-roadmap.md#32-模块进度与剩余边界)为准，不再把初期限制视作现行全部能力。
 
 1. **Select 不是多选追加。** 对尚未选中的元素，`SelectionItemPattern.Select` 清除已有选择后选中目标；provider 约定目标已选中时不做操作。因此不能承诺重复 Select 会清除其他选项，也不能替代 `AddToSelection`/`RemoveFromSelection`。工程策略：回读同一目标当前 `IsSelected == true` 只记为“UI 选择状态已核验”，不声称业务完成或所有同组项目已核验。[Select API](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-iselectionitemprovider-select)、[IsSelected](https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.selectionitempattern.selectionitempatterninformation.isselected?view=netframework-4.8.1)
 
@@ -117,3 +117,91 @@ UIA 的 `Name` 可本地化且不唯一，`AutomationId` 也仅应视为局部�
 4. **沿用同一授权、确认和清理，不再加一套工具。** 工程策略：继续使用 `operate_trusted_app_control`、现有 `interact` 授权与后端可信实时预览；整体完全访问偏好不能替代这次精确单步确认。引用绑定应用、进程、窗口、RuntimeId、名称、角色和操作类型，单次消费并使该应用旧引用失效；下一步必须重新观察。滚动可触发应用懒加载或事件，不能仅凭操作名推断没有后果，不提供键盘/坐标失败回退。
 
 本轮范围与验收限制：仍保留完整快照才签发引用的规则，以及既有控件、字节、节点和深度预算。大量控件的网页、跨进程 provider、多个候选窗口、无有效名称或无 ScrollPattern 的应用可能保守拒绝；这不是通用浏览器内容读取或绝大多数网站任务已完备。确定性验证应覆盖 schema、实时授权撤销、动作替换、单次引用、正常方向、触边 no-op、异常或延迟回读与未知结果；隔离 WPF fixture 再核验真实 ScrollPattern 及独立位置回读，不能以替身通过替代实机证据。
+
+## 2026-10-09 TogglePattern：check/uncheck 单步状态闭环
+
+- **官方：没有直接设定状态的方法。** TogglePattern 只提供状态读取与 `Toggle()`；Microsoft 明确不提供 set-state，以避免绕过三态复选框的状态循环。不能把它当作幂等的 `setChecked(true)`。[Toggle provider 约定](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-implementingtoggle)、[客户端接口](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nn-uiautomationclient-iuiautomationtogglepattern)
+- **官方：循环为 On → Off → Indeterminate（若支持）→ On。** 二态控件省略 Indeterminate；不能按枚举数值排序，或假定任意目标状态都只需调用一次。当前 .NET 客户端使用的 `TogglePattern.Toggle()` 也遵循此规则。[.NET Toggle 方法](https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.togglepattern.toggle?view=windowsdesktop-9.0)、[Win32 Toggle 方法](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtogglepattern-toggle)
+- **实现策略：复用现有明确动作，不暴露 raw toggle。** `operate_trusted_app_control` 增加 `check` / `uncheck`，仅接受完整观察中启用、有有效名称、具备 `toggle` 的 `checkBox` 引用；仍使用 `interact` 授权和后端可信实时预览，精确绑定本次动作并单次消费，完全访问模式不绕过专项确认。不会借 Invoke、键盘或坐标失败回退。
+- **实现策略：请求目标状态，但最多执行一次 Toggle。** 执行前重新读取状态，已经是请求的 On / Off 则不调用；当前为 Indeterminate 时在副作用前拒绝。否则只调用一次 `Toggle()`，随后仅有界回读。三态 provider 仍可能在这一次调用后到达 Indeterminate，此时结果为 `RESULT_UNKNOWN`，不补调用、不反向 Toggle；不声称支持三态状态编排。[官方状态循环约定](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-implementingtoggle)
+- **实现策略：回读仅核验控件，不证明任务完成。** `S_OK` 只表示调用返回；可能发生副作用后取消、超时、目标变化、回读不可用或仍不吻合，都沿用未知结果并停下，不自动重放。成功回读只证明该控件的目标状态，后续任务须重新观察并获取新引用，不能宣称提交、购买或其他业务已完成。[Toggle 返回值](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationtogglepattern-toggle)
+
+## 2026-10-09 密集窗口的分区观察：实现与受限验收
+
+- **不增加工具或权限。** `observe_trusted_app_window` 在 controls 模式接受可选的不透明 `region_ref`；image 模式与分区组合必须拒绝。输出最多八个 Pane / Document / List / Group 只读导航建议，字段仅为 role、name、regionRef，不声称穷举分区；未命名布局的 name 可为空，仍绑定准确路径、角色、原始名称及运行时身份，不能猜测选择器。Group 不因此新增任何动作角色。候选不依赖 ScrollPattern，也不挤占动作元数据预算，仍计入原总输出字节预算。
+- **分区引用不是写入许可。** 安全访问到的局部分支即使处于不完整的全窗口观察中，也可以给出只读建议；选定分区仍须完整观察其子树才签发 fieldRef / controlRef。不完整子树继续拒绝动作引用，不抬高既有控件、节点、深度和输出预算。选定分区根本身仍可作为合格控件观察，嵌套建议只指向其严格后代。
+- **身份与路径留在后端。** 私有短时引用绑定应用、程序、进程、窗口、RuntimeId、名称、角色及真实 Control View 兄弟序号路径；路径不是模型提供的 selector。重新沿路径定位并核对祖先安全性和最终身份，改变或不可读即拒绝，不回退全窗口猜测；RuntimeId 仍只是可复用的短期比较线索。[UIA 身份属性约定](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-usefortesting)
+- **范围进入现有动作租约。** FieldRefLease / ControlRefLease 复制私有不可变 scope，待确认参数与一次性不透明引用共同绑定该范围，无需向模型新增身份字段。字段预检与 SetText 必须实际在此范围内查找，不能保留全窗口 FindAll 后补筛选；副作用前和每次回读重新核对当前祖先归属、目标身份及安全属性。
+- **失效与未知结果保持统一。** 每次动作使该应用全部字段、控件和分区旧引用失效；副作用后范围、目标或回读失效沿用 `RESULT_UNKNOWN`，不重新定位后自动重放。此处是范围收紧与导航能力，不是通用浏览器、跨进程控件或全部业务流程已经兼容。
+
+确定性矩阵已覆盖 partial→只读分区→完整子树→限定范围动作、错误路径与祖先变化、越界目标、image 组合拒绝、单次引用失效及副作用后的身份丢失。既有隔离原生 WPF 旅程通过生产 adapter 和持久确认路径核验区域根滚动、密集分区的重复 ID 字段填写／勾选、可信区域标签、重排旧路径拒绝及重新观察恢复；独立读数证明其他区域未改变。离线 `quick`、`full` 与独立审查通过，具体门槛及数量见 [当前路线图](../current-roadmap.md)。这些证据不替代真实模型、浏览器或第三方应用的业务验收。
+
+## 2026-10-20 Playwright MCP：复用 stdio 的独立网页会话（调研，非验收）
+
+结论：不必把 Windows UIA 扩成 DOM 执行器。可先复用既有 MCP 配置、工作区准入、确认及未知结果处理，以官方 Playwright MCP 启动专用可见 Edge；这不是接管用户已有浏览器，也不是给第三方服务增加系统沙箱。本节核对已发布 `v0.0.83`，不把持续变化的 `main` 文档当作版本契约。[官方发布](https://github.com/microsoft/playwright-mcp/releases/tag/v0.0.83)
+
+1. **运行要求应写 Node ≥20，不仅是顶层声明的 ≥18。** `@playwright/mcp@0.0.83` 固定依赖 `playwright` / `playwright-core@1.64.0-alpha-1790635538000`；对应源码提交 `e8149b8257d32dcf8f72573ecc43e72439da7080` 的依赖自身要求 ≥20。固定版本有利于发现工具 schema 变化，不建议产品草稿用 `@latest`。[MCP 包定义](https://github.com/microsoft/playwright-mcp/blob/v0.0.83/package.json)、[实际依赖要求](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/package.json)
+
+2. **最小配置建议如下，仍由用户明确添加／准入／连接，不默认启动。** Windows 使用 `npx.cmd`；`msedge` 选择已安装 Edge 的 Chromium channel，而不是下载另一套个人浏览器；Windows 默认为可见窗口。没有安装 Edge、Node 或 npm 获取失败时应报告具体缺项，不能偷偷改装浏览器。[CLI 参数源码](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/mcp/program.ts#L34)、[channel 解析与 Windows sandbox 默认值](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/mcp/config.ts#L224)
+
+   ```json
+   {
+     "command": "npx.cmd",
+     "args": [
+       "--yes", "@playwright/mcp@0.0.83",
+       "--browser", "msedge",
+       "--isolated", "--no-webmcp",
+       "--image-responses", "omit"
+     ]
+   }
+   ```
+
+3. **隔离只针对浏览器会话状态。** `--isolated` 启动自有浏览器并创建非持久 context；不加 `--extension`、`--cdp-endpoint`、`--endpoint` 或个人 `--user-data-dir`，不会以这些接管方式连接已有标签页。`isolated` 与 `user-data-dir` 同时提供会明确报错；关闭／重新连接不能承诺保留登录、标签页及操作进度。若日后需要记住登录，应另行确认专用持久 profile 或 `storage-state` 文件的保存、加密备份、清理策略；不是读取个人 profile。持久 profile 同目录不能并发使用。可见浏览器默认无 idle 自动关闭，故 AngelBot 断连／退出的自有子进程清理仍须实测。[浏览器创建与所有权](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/mcp/browserFactory.ts#L53)、[context 与释放](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/mcp/program.ts#L101)、[profile 与初始状态说明](https://github.com/microsoft/playwright-mcp/blob/v0.0.83/README.md#user-profile)
+
+4. **不能把预设称为“受限网页沙箱”。** 默认 core 包含 `browser_run_code_unsafe`，能在服务进程执行任意 JavaScript；也包含页面 `browser_evaluate`、上传等能力。该版本 `filteredTools` 无条件包含 core，正式 CLI／config 没有按工具排除它们的选项，`--caps` 只增加能力。`--no-webmcp` 关闭网页自行注册的动态工具，不会移除 unsafe；`--image-responses omit` 不向模型返回图像，但不禁止 DOM 私人内容读取或截图落盘。沿用“完全启用即信任该 MCP 服务”的既有产品边界时，必须在连接前明确其范围；不能用提示词限制冒充执行隔离。[默认工具筛选](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/backend/tools.ts#L83)、[unsafe 实现](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/backend/runCode.ts#L37)、[配置类型](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/mcp/config.d.ts)
+
+5. **origin、host、文件限制不是同一边界。** `allowed-hosts` 检查 HTTP MCP 服务收到的 Host，目的是 DNS rebinding 防护，并非目标网站许可；stdio 不需要开放该 HTTP 端口。`allowed-origins` / `blocked-origins` 是请求便利护栏，官方明确不构成安全边界、不约束重定向。默认文件路径与 `file:` 导航限制也被官方定性为可绕过的便利护栏；不要默认开启 `--allow-unrestricted-file-access`、`--no-sandbox`、忽略 TLS 或远程端口。普通网页网络请求会离开机器，读取到的内容会进入配置的模型，不能把“本地浏览器”描述成“所有数据都在本地”。[HTTP Host 检查](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/utils/mcp/http.ts#L61)、[版本化参数与安全说明](https://github.com/microsoft/playwright-mcp/blob/v0.0.83/README.md#configuration)、[文件检查实现](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/backend/context.ts#L494)
+
+6. **annotations 只供提示，不证明业务安全或完成。** 官方对 readOnly／assertion 设置 `readOnlyHint=true`，其余设置 `destructiveHint=true`；所有工具 `openWorldHint=true`，未给出 `idempotentHint`。不能据此辨认“填写草稿”与“购买／发送”，仍复用 AngelBot 执行前检查、真实工具身份、确认和结果不明即停的链路；网站内容／工具说明不是授权。初步验收应先用自有网页证明导航→观察→填选→核对→原会话交付及关闭／重启，不做账号登录或真实外部提交，也不由这个结果宣称大多数网站、CAPTCHA、浏览器原生弹窗、下载上传和多代理并发已完备。[annotations 映射](https://github.com/microsoft/playwright/blob/e8149b8257d32dcf8f72573ecc43e72439da7080/packages/playwright-core/src/tools/utils/mcp/tool.ts#L29)
+
+本节未安装软件、未运行浏览器、未修改用户 MCP 配置；连接与真实任务结果以 [当前路线图](../current-roadmap.md) 的后续分层验收为准。需要产品决定的是未来是否保存专用登录状态、是否允许既有会话接管，以及是否要求真正收窄服务进程／工具权限；当前一次性独立会话可以先行，不必为这些可选能力新增并行执行框架。
+
+## 2026-10-20 宿主窗口与控件身份
+
+真实计算器暴露了可见窗口但 `MainWindowHandle=0` 的兼容问题。Windows 8 以后 [`EnumWindows`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows) 只枚举桌面应用顶层窗口；[`EnumChildWindows`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumchildwindows) 才会递归访问宿主内的子窗口。修复复用已有 Win32 枚举，只为控件保留准确可信进程拥有的最外层子 HWND；不按宿主名称或窗口标题授权，不扩大截图目标。
+
+[`GetWindowThreadProcessId`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid) 可重新核对 HWND 的实时所属进程，无效句柄返回零。区域、预览、动作前后均据此核对 PID，再检查路径和 UIA 身份；发现变化时维持拒绝执行／结果未知语义。
+
+用户确认后，结果读取复用原控件观察：仅在明确选择的区域内读取可见 `ControlType.Text` 的短 Name（最多 80 字），不读 Value/Text patterns，不截短后冒充完整结果；静态文字没有动作能力或引用。检查祖先归属、同进程、可见性和密码属性，并排除编辑框及选择字段的后代；不完整观察仍不产生动作引用。整窗结构发现不返回静态正文，不新增点击、填写或截图权限。UIA 元数据由应用提供，文字仍是不可信资料而非指令、授权或业务成功证明；真实验收与剩余缺口仅维护在 [当前路线图](../current-roadmap.md#34-当前有效证据)。
+
+## 2026-10-21 一次确认的下拉选择
+
+用户已允许 interaction 范围内读取 ComboBox／ListItem 的可见短名称，取代前文“首批隐藏这两类名称”的临时限制；无 interact 的应用仍隐藏，字段 Value/Text、密码和隐藏内容仍不读。真实 Main 的分步展开／选择因批准时失焦收起而失败，因此复用 `operate_trusted_app_control` 增加 `choose`，不增加工具或权限层。
+
+一次批准绑定精确 ComboBox 引用及选项（最多 80 个 UTF-16 单元、无控制字符或首尾空白）。执行时复核身份与范围，展开，在该下拉框中以 ordinal 名称匹配唯一可见项，通过 [SelectionContainer](https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.selectionitempattern.selectionitempatterninformation.selectioncontainer?view=windowsdesktop-10.0) 及有界祖先身份确认归属，至多 Select 一次，核验实际选择并收起；已选中不重复 Select。后续只比较此前可见选项的 RuntimeId，不读取收起后选项的 Name。导航开始后失败均保留未知结果，不清理性地盲点、猜坐标或重试；既有 `select` 保留给列表、单选和页签。
+
+成功回执的 `choice={controlName,option,expanded:false}` 仅回显已批准且通过原生身份／状态核验的数据，不证明业务完成。获准的可见 ListItem 可附 `state.selectionContainerRole=list|comboBox`，只读容器类型、不读额外名称；不同容器的同名项不能作为选择失败证据。参数变更、授权撤销、旧预检／引用及单次消费沿用原链路，真实模型与原生／离线证据分别记入当前路线图，不从 WPF 一例推断任意应用兼容。
+
+## 2026-10-24 Codex 主源复核：复用接缝，不引入另一套 harness
+
+本节仅调研，不新增工具、启动应用／模型或改变权限。先检查了本机常用参考位置和既有调研，未找到可直接读取的 Codex 源码 checkout；因此在线核对 `openai/codex` 提交 [`398500106707f0a3217c7cf83edc2bf226cc342f`](https://github.com/openai/codex/commit/398500106707f0a3217c7cf83edc2bf226cc342f)（2026-10-24 00:18 北京时间），补充 [10 月 7 日的既有接缝调研](codex-daily-capability-reference-2026-10-07.md)，不把重复调研视为新实现或验收证据。
+
+**公开范围：**官方确认 CLI、app-server 和 SDK 是开源组件。当前仓库也公开了 Windows computer-use 的 AUMID、publisher／product／binary 权限配置及活动展示，但这些配置不是 Windows 控件／截图／键鼠执行器。本次未找到能直接移植的完整 Windows computer-use helper，不能将桌面端实际控制能力统称为开源实现；也不能由配置字段推断它如何强制执行权限。[官方开源 harness 说明](https://developers.openai.com/blog/codex-as-a-platform)、[权限配置源码](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/config/src/computer_use.rs#L9)、[活动展示源码](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/tui/src/history_cell/computer_activity.rs)
+
+只选择以下三个可用于当前缺口的模式；AngelBot 对应项为工程建议，而非 Codex 行为保证：
+
+1. **稳定工具身份与实际执行器绑定，动作默认串行。** `ToolExecutor` 共同提供 spec、暴露方式和 handle，并默认不允许并行工具调用；宿主可以施加当步策略。`Deferred` 只表示不把完整工具声明放进模型初始清单，仍可后续发现，**不等于按需启动或零后台开销**。AngelBot 应复用既有 registry、权限／预览与 DesktopAdapter；视觉补充、弹窗兼容不另建 runner，同一交互窗口的动作不得因模型支持并行就同时执行。[ToolExecutor 与 Deferred](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/tools/src/tool_executor.rs#L49)、[默认串行与 handle](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/tools/src/tool_executor.rs#L101)
+
+2. **资源所有权、停止请求与确认结束分开。** Codex 的 MCP shutdown 先将 client 置为 Closed，再终止自己拥有的 stdio 进程；统一进程另行区分 interrupt、terminate 与 terminate_confirmed。它们不证明第三方程序的业务已撤销，也不证明所有 MCP 服务会自动闲置退出。AngelBot 已有工具目录缓存、并发按需启动合并及 stop／stop_all，应在这些接缝上加固退出和迟到响应，而非再加常驻服务；截图／UIA helper 只在获准调用内持有资源，不做空闲轮询截图。停止后原程序是否仍在运行、执行后果是否未知，要分别回报。[MCP 资源释放](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/rmcp-client/src/rmcp_client.rs#L1088)、[中断与确认终止](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/core/src/unified_exec/process.rs#L243)
+
+3. **单次终态是共享生命周期约束，不是每个附属模块的状态机。** Codex 的 `notify_tool_finish_if_unclaimed` 用原子闸防止同一调用重复发布终态。AngelBot 可沿用既有 task／run 标识和终态收口，让 computer-use 取消、迟到回执、自动化结果及主对话通知引用同一事实；不把迟到成功覆盖取消，也不由“进程已启动”生成业务完成通知。该模式只约束本地收口，不能冒充外部副作用 exactly-once 或可靠投递协议。[单终态源码](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/codex-rs/core/src/tools/registry.rs#L985)
+
+精简与性能边界（工程判断）：可选能力保留明确入口，但未启用时不创建辅助进程、捕获会话、模型调用或新轮询器；启用后复用现有调度和权限链，资源随拥有它的调用／会话释放。用“未启用无启动、并发首次调用只启动一次、取消后无新动作、断连清理、迟到结果不重复通知”的最小回归证明边界；没有测量前不宣称零性能影响。当前只参考设计、未复制源码；若日后直接复用 Codex 代码，仍需遵守其 Apache-2.0 及适用 NOTICE，不能因 AngelBot 使用 MIT 而忽略第三方声明。[Codex LICENSE](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/LICENSE)、[NOTICE](https://github.com/openai/codex/blob/398500106707f0a3217c7cf83edc2bf226cc342f/NOTICE)
+
+### 已确认的单窗口视觉点击边界
+
+用户允许对 observe＋observeImage＋interact 的可信应用提议一次精确左键点击，所有整体权限下仍须逐次批准。`observe_trusted_app_window(mode=image)` 返回短期 imageRef 与原尺寸，像素仅作当次模型图像输入；`click_trusted_app_image` 不接受桌面坐标或自由键鼠指令。宿主预检重新捕获同一窗口并比对客户区像素，确认卡显示瞬态图像和标点；原 pending step、应用版本、引用、坐标和一次预检共同绑定批准。执行前再次核对，导航／缩放／客户区变化停止。引用只缓存有界元数据／摘要、不缓存像素，旧引用按应用失效，最多 8 个／5 分钟，懒清理而非定时器。没有可核对映射时仍可只读观察，但 imageRef 为 null。
+
+Win32 执行复用原 DesktopAdapter 串行门禁和 WGC 一次性 helper，不新增服务或会话。只接受未缩放图像与 DWM frame 尺寸一致、客户区在 frame 内的情况；[CaptureItem.Size](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.graphicscaptureitem.size?view=winrt-26100)／[ContentSize](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframe.contentsize?view=winrt-26100) 与 [DWM 物理边框](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect)并不保证同一像素原点，因此“尺寸一致”只是保守准入，不能代替独立色块中心的原生验收。客户区坐标临时使用 Per-Monitor V2 DPI，上下文随后恢复；缩放、超限或不兼容窗口不发输入。
+
+确认后仅允许从 AngelBot 自身或目标窗口交接焦点，[SetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow) 被系统拒绝即停止，不抢占其他应用。焦点变化后再次捕获核对，点击前检查前台、[GUI 线程鼠标捕获／菜单／移动状态](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-guithreadinfo)、用户按键及点下根窗口。[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) 一次提交 MOVE／DOWN／UP；插入数异常保留 RESULT_UNKNOWN，仅在自身 DOWN 已插入时释放按键，不重试点击。派发不是业务成功；WindowFromPoint 和实时检查不是操作系统强隔离，仍存在检查到使用的竞态与 UIPI／焦点限制。10 月 25 日已完成自有窗口的原生色块中心单击和防重放验收，不是实际 Main／前端确认后的焦点交接或任意应用兼容证明；仍未支持键盘、拖拽、双击或全桌面。详细验收与剩余边界只维护于统一路线图。

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -60,8 +60,8 @@ struct JsonRpcError {
     message: String,
 }
 
-/// A rejected request is safe to reconsider; a dispatched call without a
-/// trustworthy receipt must not be replayed as an ordinary tool failure.
+/// A protocol-level rejection can be corrected, not treated as business success.
+/// Execution errors or missing completion receipts do not prove effects rolled back.
 #[derive(Debug)]
 pub(crate) enum McpToolCallError {
     Known(String),
@@ -73,7 +73,7 @@ impl std::fmt::Display for McpToolCallError {
         match self {
             Self::Known(message) => formatter.write_str(message),
             Self::ResultUnknown => formatter.write_str(
-                "MCP 工具请求已派发但未收到可靠回执，外部操作结果未知；不要自动重试，请先检查目标应用。",
+                "MCP 工具请求已派发但未取得可核验的完成结果，外部操作可能已部分发生、结果未知；不要自动重试，请先检查目标应用。",
             ),
         }
     }
@@ -103,6 +103,9 @@ struct McpProcessIo {
     next_request_id: u64,
     writes: SyncSender<String>,
     responses: Receiver<Result<String, String>>,
+    /// Host-selected, immutable for this connection. MCP roots are advisory
+    /// metadata, not an OS sandbox or permission inferred from a tool reply.
+    root: Option<serde_json::Value>,
 }
 
 /// A child already admitted under the server policy/lifecycle gate. The
@@ -115,6 +118,8 @@ pub(crate) struct McpPendingStart {
 struct McpServerGate {
     policy: RwLock<()>,
     lifecycle: Mutex<()>,
+    connect: Mutex<()>,
+    stop_generation: AtomicU64,
 }
 
 /// Manages all MCP server processes
@@ -137,6 +142,10 @@ pub struct McpTool {
     pub description: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Untrusted discovery metadata. Used for soft run-budget accounting only,
+    /// never workspace admission, confirmation or recovery authorization.
+    #[serde(default, skip_serializing)]
+    pub annotations: Option<serde_json::Value>,
 }
 
 /// Stable contract captured when a Main-Agent tool is presented for approval.
@@ -149,6 +158,14 @@ pub(crate) struct McpToolSnapshot {
 }
 
 impl McpTool {
+    pub(crate) fn read_only_budget_hint(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("readOnlyHint"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }
+
     pub(crate) fn snapshot_for(&self, server_id: &str) -> McpToolSnapshot {
         let canonical_schema = canonical_json(&self.input_schema);
         let mut hasher = Sha256::new();
@@ -220,6 +237,51 @@ impl McpProcessManager {
         action()
     }
 
+    pub(crate) fn try_with_policy_gate<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = self.policy_gate.try_write().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                "MCP 服务正在执行或变更，请稍后重新查看。".to_owned()
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                "无法核对 MCP 安全状态，请重新启动后再查看；未清理。".to_owned()
+            }
+        })?;
+        action()
+    }
+
+    /// Caller holds the global policy gate. Only already-terminal owned
+    /// process trees are reaped; never stop a live service as a cleanup side effect.
+    pub(crate) fn require_servers_stopped(&self, ids: &[String]) -> Result<(), String> {
+        for id in ids {
+            let entry = self
+                .processes
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(id)
+                .cloned();
+            if let Some(entry) = entry {
+                if entry
+                    .child
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+                {
+                    return Err(
+                        "请先在服务列表停止使用该临时区的浏览器服务，再查看清理预览。".into(),
+                    );
+                }
+                Self::terminate_entry(&entry)?;
+                self.remove_if_current(id, &entry)?;
+            }
+        }
+        Ok(())
+    }
+
     fn server_policy_gate(&self, server_id: &str) -> Result<Arc<McpServerGate>, String> {
         let mut gates = self
             .server_policy_gates
@@ -233,9 +295,41 @@ impl McpProcessManager {
         let gate = Arc::new(McpServerGate {
             policy: RwLock::new(()),
             lifecycle: Mutex::new(()),
+            connect: Mutex::new(()),
+            stop_generation: AtomicU64::new(0),
         });
         gates.insert(server_id.to_string(), Arc::downgrade(&gate));
         Ok(gate)
+    }
+
+    /// Coalesce concurrent on-demand starts without blocking Stop or config
+    /// revocation during the handshake. Waiters retain their own authority.
+    pub(crate) fn with_server_start_gate<T>(
+        &self,
+        server_id: &str,
+        check: impl Fn() -> Result<(), String>,
+        action: impl FnOnce(&dyn Fn() -> Result<(), String>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let gate = self.server_policy_gate(server_id)?;
+        let generation = gate.stop_generation.load(Ordering::Acquire);
+        let current = || {
+            if gate.stop_generation.load(Ordering::Acquire) != generation {
+                return Err("MCP 连接已被停止，未执行工具".into());
+            }
+            check()
+        };
+        let _guard = loop {
+            current()?;
+            match gate.connect.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        current()?;
+        action(&current)
     }
 
     /// A config edit or launch excludes calls to the same service, while calls
@@ -413,6 +507,7 @@ impl McpProcessManager {
                 next_request_id: 1,
                 writes: write_tx,
                 responses: response_rx,
+                root: None,
             }),
         });
         let mut procs = self.processes.lock().map_err(|error| error.to_string())?;
@@ -439,9 +534,19 @@ impl McpProcessManager {
     /// Wait for initialize without the lifecycle gate: Stop, config edits, and
     /// imports can revoke this exact entry while the server is silent.
     pub(crate) fn finish_start(&self, pending: McpPendingStart) -> Result<(), String> {
+        self.finish_start_with_root(pending, None)
+    }
+
+    /// Bind a host-owned root before initialization, never from server requests.
+    /// Failure follows the normal half-started child cleanup path.
+    pub(crate) fn finish_start_with_root(
+        &self,
+        pending: McpPendingStart,
+        root: Option<&std::path::Path>,
+    ) -> Result<(), String> {
         let McpPendingStart { server_id, entry } = pending;
         // Perform MCP initialization handshake
-        match Self::initialize(&entry) {
+        match Self::initialize(&entry, root) {
             Ok(_) => {
                 let procs = self.processes.lock().map_err(|error| error.to_string())?;
                 let current = procs
@@ -477,6 +582,9 @@ impl McpProcessManager {
 
     /// Stop a running MCP server by its config ID.
     pub fn stop(&self, server_id: &str) -> Result<(), String> {
+        self.server_policy_gate(server_id)?
+            .stop_generation
+            .fetch_add(1, Ordering::AcqRel);
         let mut procs = self.processes.lock().map_err(|e| e.to_string())?;
         let entry = procs
             .get(server_id)
@@ -761,7 +869,16 @@ impl McpProcessManager {
             "id": 100
         });
         let response = Self::send_request_to_entry(entry, io, &request)?;
+        if response.error.is_some() && response.result.is_some() {
+            return Err(McpToolCallError::ResultUnknown);
+        }
         if let Some(err) = response.error {
+            // Only correlated parse/request/method rejections remain protocol
+            // failures. Even -32602 can follow an SDK tool's output validation
+            // after its callback has already produced external effects.
+            if !matches!(err.code, -32700 | -32600 | -32601) {
+                return Err(McpToolCallError::ResultUnknown);
+            }
             return Err(McpToolCallError::Known(format!(
                 "MCP tool error {}: {}",
                 err.code, err.message
@@ -772,13 +889,11 @@ impl McpProcessManager {
     }
 
     fn parse_tool_output(result: serde_json::Value) -> Result<McpToolOutput, McpToolCallError> {
-        let tool_failed = result
-            .get("isError")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // MCP execution errors are not a transactional rollback receipt.
+        // Do not expose their payload or let the model replay a partial action.
         if result
             .get("isError")
-            .is_some_and(|value| !value.is_boolean())
+            .is_some_and(|value| value.as_bool() != Some(false))
         {
             return Err(McpToolCallError::ResultUnknown);
         }
@@ -799,7 +914,7 @@ impl McpProcessManager {
                         return Err(McpToolCallError::ResultUnknown);
                     }
                 }
-                Some("image") if !tool_failed && images.len() < MAX_MCP_TOOL_IMAGES => {
+                Some("image") if images.len() < MAX_MCP_TOOL_IMAGES => {
                     let image = item
                         .get("mimeType")
                         .and_then(serde_json::Value::as_str)
@@ -841,18 +956,10 @@ impl McpProcessManager {
             texts.push(format!(
                 "[MCP 返回了 {omitted_content} 项非文本内容；因不支持、未通过图像验证或超过图像预算，已安全省略原始数据。]"
             ));
-            if !tool_failed {
-                texts.push("[工具成功回执已收到，不要为获取已省略的内容而重做已完成操作。]".into());
-            }
+            texts.push("[工具成功回执已收到，不要为获取已省略的内容而重做已完成操作。]".into());
         }
         let text = texts.join("\n");
-        if tool_failed {
-            Err(McpToolCallError::Known(format!(
-                "MCP tool reported an error: {text}"
-            )))
-        } else {
-            Ok(McpToolOutput { text, images })
-        }
+        Ok(McpToolOutput { text, images })
     }
 
     /// Return all server IDs that are currently running.
@@ -919,10 +1026,18 @@ impl McpProcessManager {
 
     /// Get cached tool list for a server.
     pub fn get_cached_tools(&self, server_id: &str) -> Vec<McpTool> {
+        self.cached_discovery(server_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// Missing/failed discovery is distinct from a successful empty catalog.
+    pub(crate) fn cached_discovery(&self, server_id: &str) -> Result<Option<Vec<McpTool>>, String> {
         self.tool_lists
             .lock()
-            .map(|t| t.get(server_id).cloned().unwrap_or_default())
-            .unwrap_or_default()
+            .map(|tools| tools.get(server_id).cloned())
+            .map_err(|_| "MCP 工具目录暂不可用".into())
     }
 
     /// Stop all running MCP servers (called on app shutdown).
@@ -979,15 +1094,32 @@ impl McpProcessManager {
     }
 
     /// Perform MCP initialization handshake.
-    fn initialize(entry: &McpProcessEntry) -> Result<serde_json::Value, String> {
+    fn initialize(
+        entry: &McpProcessEntry,
+        root: Option<&std::path::Path>,
+    ) -> Result<serde_json::Value, String> {
+        let root = root
+            .map(|path| {
+                let path = std::fs::canonicalize(path)
+                    .map_err(|_| "MCP root is not accessible".to_string())?;
+                if !path.is_dir() {
+                    return Err("MCP root must be a directory".to_string());
+                }
+                let uri = reqwest::Url::from_directory_path(path)
+                    .map_err(|_| "MCP root cannot be represented as a file URI".to_string())?;
+                Ok(serde_json::json!({"uri": uri.as_str()}))
+            })
+            .transpose()?;
+        let mut capabilities = serde_json::json!({"tools": {}});
+        if root.is_some() {
+            capabilities["roots"] = serde_json::json!({"listChanged": false});
+        }
         let init_request = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
+                "capabilities": capabilities,
                 "clientInfo": {
                     "name": "AngelBot",
                     "version": "0.1.0"
@@ -997,6 +1129,7 @@ impl McpProcessManager {
         });
 
         let mut io = entry.io.lock().map_err(|error| error.to_string())?;
+        io.root = root;
         let response = Self::send_request_to_entry(entry, &mut io, &init_request)
             .map_err(|error| error.to_string())?;
 
@@ -1044,7 +1177,7 @@ impl McpProcessManager {
         let response = Self::send_message_to_entry(entry, io, &request)
             .map_err(McpToolCallError::Known)
             .and_then(|()| {
-                Self::read_response_from_io(io, id, timeout).map_err(|error| {
+                Self::read_response_from_io(entry, io, id, timeout).map_err(|error| {
                     if method == Some("tools/call") {
                         McpToolCallError::ResultUnknown
                     } else {
@@ -1115,6 +1248,7 @@ impl McpProcessManager {
     /// replies may appear before the response to this request; neither is
     /// authority to approve a tool call.
     fn read_response_from_io(
+        entry: &McpProcessEntry,
         io: &mut McpProcessIo,
         expected_id: u64,
         timeout: Duration,
@@ -1134,7 +1268,42 @@ impl McpProcessManager {
                         "MCP server response stream closed".to_string()
                     }
                 })??;
-            let response: JsonRpcResponse = serde_json::from_str(line.trim())
+            let message: serde_json::Value = serde_json::from_str(line.trim())
+                .map_err(|error| format!("Invalid MCP response: {error}"))?;
+            if message.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0") {
+                return Err("MCP server returned invalid JSON-RPC version".to_string());
+            }
+            if let Some(method) = message.get("method").and_then(|value| value.as_str()) {
+                let Some(id) = message.get("id") else {
+                    continue; // Notification, never an approval or tool response.
+                };
+                if !id.is_string() && !id.is_i64() && !id.is_u64() {
+                    return Err("MCP server request ID must be a string or integer".to_string());
+                }
+                let mut reply = serde_json::json!({"jsonrpc":"2.0", "id":id});
+                if method == "ping" || (method == "roots/list" && io.root.is_some()) {
+                    if message
+                        .get("params")
+                        .is_some_and(|params| !params.is_object())
+                    {
+                        reply["error"] =
+                            serde_json::json!({"code":-32602,"message":"Invalid params"});
+                    } else if method == "ping" {
+                        reply["result"] = serde_json::json!({});
+                    } else {
+                        // Request metadata cannot add or retarget roots.
+                        reply["result"] = serde_json::json!({"roots":[io.root.as_ref().unwrap()]});
+                    }
+                } else {
+                    // Do not implement sampling, elicitation or approval from a
+                    // server request. Keep its ID separate from our request IDs.
+                    reply["error"] =
+                        serde_json::json!({"code":-32601,"message":"Method not found"});
+                }
+                Self::send_message_to_entry(entry, io, &reply)?;
+                continue;
+            }
+            let response: JsonRpcResponse = serde_json::from_value(message)
                 .map_err(|error| format!("Invalid MCP response: {error}"))?;
             if response.jsonrpc.as_deref() != Some("2.0") {
                 return Err("MCP server returned invalid JSON-RPC version".to_string());
@@ -1296,7 +1465,7 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<String>, String
 /// Parse the settings field without invoking a shell. Quoted Windows paths
 /// stay one argument; JSON arrays handle arguments that themselves need quote
 /// characters or other unusual whitespace.
-fn parse_command_args(input: &str) -> Result<Vec<String>, String> {
+pub(crate) fn parse_command_args(input: &str) -> Result<Vec<String>, String> {
     let trimmed = input.trim();
     if trimmed.starts_with('[') {
         return serde_json::from_str(trimmed).map_err(|error| format!("MCP 参数数组无效: {error}"));
@@ -1347,6 +1516,146 @@ mod tests {
     use base64::Engine;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn server_requests_are_not_confused_with_client_responses_or_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("owned results \u{8d44}\u{6599}");
+        fs::create_dir(&root).unwrap();
+        let script = directory.path().join("mcp-roots.cjs");
+        fs::write(
+            &script,
+            r#"
+const readline = require('readline');
+const send = value => process.stdout.write(JSON.stringify({jsonrpc:'2.0', ...value})+'\n');
+let expectedRoot, waiting, responses, commands;
+readline.createInterface({input:process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') {
+    expectedRoot = request.params.capabilities.roots;
+    send({id:request.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},
+      serverInfo:{name:'roots-fixture',version:'1'}}});
+  } else if (request.method === 'tools/list') {
+    waiting = request.id; responses = new Map();
+    send({method:'notifications/message', params:{level:'info',data:'not authority'}});
+    // The numeric server request deliberately collides with the client ID.
+    commands = [
+      {id:waiting,method:'roots/list',params:{_meta:{progressToken:'trace'}}},
+      {id:'root-check',method:'roots/list',params:{path:'C:/not-authorized'}},
+      {id:'bad-params',method:'roots/list',params:['invalid']},
+      {id:'no-authority',method:'sampling/createMessage',params:{messages:[]}},
+      {id:'liveness',method:'ping'}
+    ];
+    send(commands.shift());
+  } else if (!request.method) {
+    responses.set(request.id,request);
+    if (commands.length) {send(commands.shift()); return;}
+    if (responses.size !== 5) return;
+    const first = responses.get(waiting), second = responses.get('root-check');
+    const require = condition => {if (!condition) throw Error('client contract violated');};
+    require(responses.get('no-authority').error.code === -32601);
+    require(JSON.stringify(responses.get('liveness').result) === '{}');
+    if (expectedRoot) {
+      require(expectedRoot.listChanged === false);
+      require(JSON.stringify(first.result) === JSON.stringify(second.result));
+      require(first.result.roots.length === 1);
+      require(responses.get('bad-params').error.code === -32602);
+    } else {
+      for (const id of [waiting,'root-check','bad-params'])
+        require(responses.get(id).error.code === -32601);
+    }
+    send({id:waiting,result:{tools:[{name:'observed-root',
+      description:expectedRoot ? first.result.roots[0].uri : 'none',
+      inputSchema:{type:'object',properties:{}}}]}});
+  }
+});
+"#,
+        )
+        .unwrap();
+        let args = serde_json::to_string(&[script.to_string_lossy()]).unwrap();
+        let manager = McpProcessManager::new();
+        for with_root in [false, true] {
+            let pending = manager
+                .begin_start("fixture", "Fixture", "node", &args, "")
+                .unwrap();
+            manager
+                .finish_start_with_root(pending, with_root.then_some(root.as_path()))
+                .unwrap();
+            let tools = manager.refresh_tools("fixture").unwrap();
+            assert_eq!(tools.len(), 1);
+            if with_root {
+                let uri = reqwest::Url::parse(&tools[0].description).unwrap();
+                assert_eq!(uri.scheme(), "file");
+                assert!(tools[0].description.contains("%20"));
+                assert_eq!(
+                    uri.to_file_path().unwrap().canonicalize().unwrap(),
+                    root.canonicalize().unwrap()
+                );
+            } else {
+                assert_eq!(tools[0].description, "none");
+            }
+            // Root requests during later exchanges see the same root.
+            assert_eq!(
+                manager.refresh_tools("fixture").unwrap()[0].description,
+                tools[0].description
+            );
+            manager.stop("fixture").unwrap();
+        }
+        let pending = manager
+            .begin_start("invalid", "Fixture", "node", &args, "")
+            .unwrap();
+        assert!(manager
+            .finish_start_with_root(pending, Some(&script))
+            .is_err());
+        assert_eq!(manager.get_status("invalid").unwrap().status, "stopped");
+    }
+
+    #[test]
+    fn mcp_connect_waiters_do_not_block_stop_or_restart_after_it() {
+        use std::sync::{mpsc, Arc};
+        let manager = Arc::new(McpProcessManager::new());
+        let (entered, entry) = mpsc::channel();
+        let (release, hold) = mpsc::channel();
+        let first_manager = manager.clone();
+        let first = std::thread::spawn(move || {
+            first_manager.with_server_start_gate(
+                "one",
+                || Ok(()),
+                |check| {
+                    entered.send(()).unwrap();
+                    hold.recv_timeout(Duration::from_secs(5)).unwrap();
+                    check()
+                },
+            )
+        });
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (waiting, waiter) = mpsc::channel();
+        let next_manager = manager.clone();
+        let next: std::thread::JoinHandle<Result<(), String>> = std::thread::spawn(move || {
+            next_manager.with_server_start_gate(
+                "one",
+                || {
+                    let _ = waiting.send(());
+                    Ok(())
+                },
+                |_| panic!("a stopped queued connection must not restart"),
+            )
+        });
+        waiter.recv_timeout(Duration::from_secs(5)).unwrap();
+        manager
+            .with_server_start_gate("unrelated", || Ok(()), |check| check())
+            .unwrap();
+        // Stop also invalidates waiters before a child has been registered.
+        assert!(manager
+            .with_server_lifecycle_gate("one", || manager.stop("one"))
+            .is_err());
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().unwrap_err().contains("停止"));
+        assert!(next.join().unwrap().unwrap_err().contains("停止"));
+        manager
+            .with_server_start_gate("one", || Ok(()), |check| check())
+            .unwrap();
+    }
 
     fn png_image_content() -> serde_json::Value {
         let mut bytes = Vec::new();
@@ -1421,8 +1730,8 @@ mod tests {
             "content": [{"type": "text", "text": "explicit rejection"}, image.clone()],
         }))
         .unwrap_err();
-        assert!(matches!(error, McpToolCallError::Known(_)));
-        assert!(error.to_string().contains("explicit rejection"));
+        assert!(matches!(error, McpToolCallError::ResultUnknown));
+        assert!(!error.to_string().contains("explicit rejection"));
         assert!(!error.to_string().contains(image["data"].as_str().unwrap()));
     }
 
@@ -1568,6 +1877,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         let original = McpTool {
             name: "echo".to_string(),
             description: "Echo a message".to_string(),
+            annotations: None,
             input_schema: serde_json::from_str(
                 r#"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}"#,
             )
@@ -1576,6 +1886,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         let equivalent = McpTool {
             name: "echo".to_string(),
             description: "Updated explanatory copy".to_string(),
+            annotations: Some(serde_json::json!({"readOnlyHint":true,"privateMetadata":"MCP_PRIVATE_HINT_CANARY"})),
             input_schema: serde_json::from_str(
                 r#"{"required":["message"],"properties":{"message":{"type":"string"}},"type":"object"}"#,
             )
@@ -1584,6 +1895,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         let changed = McpTool {
             name: "echo".to_string(),
             description: "Echo a message".to_string(),
+            annotations: None,
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": { "message": { "type": "number" } },
@@ -1603,6 +1915,26 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             original.snapshot_for("mcp-test"),
             original.snapshot_for("another-server")
         );
+        assert!(equivalent.read_only_budget_hint());
+        let exposed = serde_json::to_string(&equivalent).unwrap();
+        assert!(!exposed.contains("annotations"));
+        assert!(!exposed.contains("MCP_PRIVATE_HINT_CANARY"));
+        for annotations in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({"readOnlyHint":false})),
+            Some(serde_json::json!({"readOnlyHint":"true"})),
+        ] {
+            let tool = McpTool {
+                annotations,
+                ..original.clone()
+            };
+            assert!(!tool.read_only_budget_hint());
+            assert_eq!(
+                tool.snapshot_for("mcp-test"),
+                original.snapshot_for("mcp-test")
+            );
+        }
     }
 
     #[test]
@@ -1662,7 +1994,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     result = { tools: [{ name: 'environment', inputSchema: { type: 'object' } }] };
   } else if (request.method === 'tools/call') {
     result = { content: [{ type: 'text', text: JSON.stringify({
-      keys: Object.keys(process.env), explicit: process.env.ANGELBOT_MCP_TEST_EXPLICIT
+      keys: Object.keys(process.env), explicit: process.env.ANGELBOT_MCP_TEST_EXPLICIT,
+      installationRoots: Object.fromEntries(['ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432']
+        .map(key => [key, process.env[key]]))
     }) }] };
   } else { return; }
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
@@ -1703,6 +2037,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             "APPDATA",
             "LOCALAPPDATA",
             "USERPROFILE",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "PROGRAMW6432",
             "ANGELBOT_MCP_TEST_EXPLICIT",
         ];
         #[cfg(not(windows))]
@@ -1721,6 +2058,14 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
                     .iter()
                     .any(|allowed| allowed.eq_ignore_ascii_case(key)),
                 "MCP child inherited unexpected environment key {key}"
+            );
+        }
+        #[cfg(windows)]
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            let expected = std::env::var(key).ok();
+            assert_eq!(
+                environment["installationRoots"][key].as_str(),
+                expected.as_deref()
             );
         }
         manager.stop("env-fixture").unwrap();
@@ -1788,7 +2133,8 @@ lines.on('line', line => {
                 || Ok(()),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("fixture failure"));
+        assert!(matches!(error, McpToolCallError::ResultUnknown));
+        assert!(!error.to_string().contains("fixture failure"));
 
         manager.stop_all();
         assert!(manager.running_servers().is_empty());
@@ -1817,7 +2163,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     lists++;
     const notice = JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
     const response = JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {
-      tools: lists === 3 ? {} : [{ name: 'tool-' + lists, description: 'Fixture', inputSchema: { type: 'object' } }]
+      tools: lists === 3 ? {} : lists === 4 ? [] : [{ name: 'tool-' + lists, description: 'Fixture', inputSchema: { type: 'object' } }]
     } });
     process.stdout.write(notice + '\n' + response + '\n');
   }
@@ -1837,8 +2183,65 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             .unwrap();
         assert_eq!(manager.refresh_tools("fixture").unwrap()[0].name, "tool-1");
         assert_eq!(manager.refresh_tools("fixture").unwrap()[0].name, "tool-2");
+        let mut state = crate::tests::test_app_state();
+        {
+            let conn = state.db.lock().unwrap();
+            crate::db::migrate(&conn).unwrap();
+            conn.execute("INSERT INTO mcp_servers(id,name,command,args,enabled,created_at) VALUES('fixture','Fixture','node',?1,1,1)",[script.display().to_string()]).unwrap();
+            conn.execute("INSERT INTO mcp_workspace_enablements(workspace_id,server_id,enabled_at) VALUES('personal','fixture',1)",[]).unwrap();
+            crate::commands::mcp_catalog::store(
+                &conn,
+                "fixture",
+                "node",
+                &script.display().to_string(),
+                &manager.get_cached_tools("fixture"),
+            )
+            .unwrap();
+        }
         assert!(manager.refresh_tools("fixture").is_err());
         assert!(manager.get_cached_tools("fixture").is_empty());
+        assert!(manager.cached_discovery("fixture").unwrap().is_none());
+        state.mcp_manager = std::sync::Arc::new(manager);
+        let manager = &state.mcp_manager;
+        let mut registry = crate::agent::ToolRegistry::empty();
+        crate::commands::mcp::register_session_tools(&state, None, &mut registry, "personal-main")
+            .unwrap();
+        assert!(
+            registry.contains(&crate::agent::handlers::mcp_registry_tool_name(
+                "fixture", "tool-2"
+            ))
+        );
+        assert!(
+            manager.cached_discovery("fixture").unwrap().is_none(),
+            "assembly must not retry discovery"
+        );
+        assert_eq!(
+            crate::commands::mcp_catalog::load(&state.db.lock().unwrap(), "fixture")
+                .unwrap()
+                .unwrap()[0]
+                .name,
+            "tool-2"
+        );
+        assert!(manager.refresh_tools("fixture").unwrap().is_empty());
+        assert!(manager
+            .cached_discovery("fixture")
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let mut empty = crate::agent::ToolRegistry::empty();
+        crate::commands::mcp::register_session_tools(&state, None, &mut empty, "personal-main")
+            .unwrap();
+        assert!(
+            !empty.contains(&crate::agent::handlers::mcp_registry_tool_name(
+                "fixture", "tool-2"
+            ))
+        );
+        assert!(
+            crate::commands::mcp_catalog::load(&state.db.lock().unwrap(), "fixture")
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
         manager.stop("fixture").unwrap();
     }
 
@@ -1877,9 +2280,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             let mut io = entry.io.lock().unwrap();
             let request = serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
             McpProcessManager::send_message_to_entry(&entry, &mut io, &request).unwrap();
-            let error =
-                McpProcessManager::read_response_from_io(&mut io, 2, Duration::from_millis(100))
-                    .unwrap_err();
+            let error = McpProcessManager::read_response_from_io(
+                &entry,
+                &mut io,
+                2,
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
             assert!(error.contains("timed out"));
         }
         manager.stop("fixture").unwrap();

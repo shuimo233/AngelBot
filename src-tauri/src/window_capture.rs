@@ -57,9 +57,17 @@ pub(crate) fn error(code: &'static str) -> DesktopAdapterError {
         "SCAN_TIMEOUT" => "Single-window observation exceeded its time budget",
         "SCAN_LIMIT" => "Single-window observation exceeded its data budget",
         "TARGET_CHANGED" => "The trusted application window changed",
+        "TARGET_MINIMIZED" => {
+            "The trusted window is minimized; restore it before requesting observation again"
+        }
+        "FRAME_CHANGED" => {
+            "The captured frame dimensions did not match the trusted window; no image was returned"
+        }
         "TARGET_NOT_FOUND" => "The trusted application has no open main window",
         "TARGET_AMBIGUOUS" => "The trusted application has multiple main windows",
         "TARGET_UNAVAILABLE" => "The trusted window or its safety state is unavailable",
+        "CAPTURE_EMPTY" => "The trusted window returned no usable image content",
+        "CAPTURE_FAILED" => "The single-window graphics capture failed; no image was returned",
         "SENSITIVE_SURFACE" => "A password or protected window cannot be observed as an image",
         "UNSUPPORTED_PLATFORM" => "Windows Graphics Capture is unavailable",
         _ => "The single-window capture helper failed; no image was returned",
@@ -105,17 +113,7 @@ pub fn helper_exit_code() -> Option<i32> {
             Ok(Ok(())) => Some(0),
             Ok(Err(failure)) => {
                 // Only fixed allowlisted categories, never OS/UIA errors or pixels.
-                let code = match failure.code.as_str() {
-                    "SCAN_LIMIT"
-                    | "SCAN_TIMEOUT"
-                    | "TARGET_NOT_FOUND"
-                    | "TARGET_AMBIGUOUS"
-                    | "TARGET_CHANGED"
-                    | "TARGET_UNAVAILABLE"
-                    | "SENSITIVE_SURFACE"
-                    | "UNSUPPORTED_PLATFORM" => failure.code.as_str(),
-                    _ => "ADAPTER_FAILED",
-                };
+                let code = helper_failure(failure.code.as_bytes()).code;
                 let _ = writeln!(io::stderr(), "{code}");
                 Some(2)
             }
@@ -146,6 +144,20 @@ pub(crate) fn capture_with_control(
         return Err(error("SCAN_LIMIT"));
     }
     let executable = std::env::current_exe().map_err(|_| error("ADAPTER_FAILED"))?;
+    // Libtest has no production helper entry point. The opt-in native runner
+    // already builds and supplies its isolated binary; honor that path only
+    // in test builds, never as a production environment override.
+    #[cfg(test)]
+    let executable = match std::env::var_os("ANGELBOT_NATIVE_UIA_CAPTURE_EXE") {
+        Some(path) => {
+            let path = std::fs::canonicalize(path).map_err(|_| error("ADAPTER_FAILED"))?;
+            if !path.is_file() || path.file_name() != Some(std::ffi::OsStr::new("angelbot.exe")) {
+                return Err(error("ADAPTER_FAILED"));
+            }
+            path
+        }
+        None => executable,
+    };
     let mut command = Command::new(executable);
     crate::child_process_env::apply_minimal_child_environment(&mut command);
     command
@@ -171,14 +183,19 @@ pub(crate) fn capture_with_control(
 }
 
 #[cfg(windows)]
-fn helper_failure(stderr: &[u8]) -> DesktopAdapterError {
+pub(crate) fn helper_failure(stderr: &[u8]) -> DesktopAdapterError {
     match std::str::from_utf8(stderr).unwrap_or("").trim() {
         "SCAN_LIMIT" => error("SCAN_LIMIT"),
         "SCAN_TIMEOUT" => error("SCAN_TIMEOUT"),
+        "SCAN_CANCELLED" => error("SCAN_CANCELLED"),
         "TARGET_NOT_FOUND" => error("TARGET_NOT_FOUND"),
         "TARGET_AMBIGUOUS" => error("TARGET_AMBIGUOUS"),
         "TARGET_CHANGED" => error("TARGET_CHANGED"),
+        "TARGET_MINIMIZED" => error("TARGET_MINIMIZED"),
+        "FRAME_CHANGED" => error("FRAME_CHANGED"),
         "TARGET_UNAVAILABLE" => error("TARGET_UNAVAILABLE"),
+        "CAPTURE_EMPTY" => error("CAPTURE_EMPTY"),
+        "CAPTURE_FAILED" => error("CAPTURE_FAILED"),
         "SENSITIVE_SURFACE" => error("SENSITIVE_SURFACE"),
         "UNSUPPORTED_PLATFORM" => error("UNSUPPORTED_PLATFORM"),
         _ => error("ADAPTER_FAILED"),
@@ -322,7 +339,7 @@ pub(crate) fn validate_frame_size(
 ) -> Result<usize, DesktopAdapterError> {
     let bytes = validate_source_dimensions(surface.0, surface.1)?;
     if surface != content {
-        return Err(error("TARGET_CHANGED"));
+        return Err(error("FRAME_CHANGED"));
     }
     Ok(bytes)
 }
@@ -333,7 +350,7 @@ pub(crate) fn validate_visible_pixels(pixels: &[u8]) -> Result<(), DesktopAdapte
         || pixels.chunks_exact(4).all(|pixel| pixel[3] == 0)
         || pixels.chunks_exact(4).all(|pixel| pixel[..3] == [0, 0, 0])
     {
-        return Err(error("TARGET_UNAVAILABLE"));
+        return Err(error("CAPTURE_EMPTY"));
     }
     Ok(())
 }
@@ -440,15 +457,65 @@ mod tests {
         )
         .is_err());
         assert!(parse_target(&vec![0; MAX_TARGET_BYTES + 1]).is_err());
+        #[cfg(windows)]
+        {
+            for code in [
+                "TARGET_CHANGED",
+                "TARGET_MINIMIZED",
+                "FRAME_CHANGED",
+                "TARGET_UNAVAILABLE",
+                "TARGET_NOT_FOUND",
+                "CAPTURE_EMPTY",
+                "CAPTURE_FAILED",
+                "SCAN_LIMIT",
+                "SCAN_TIMEOUT",
+                "SCAN_CANCELLED",
+                "SENSITIVE_SURFACE",
+                "UNSUPPORTED_PLATFORM",
+                "TARGET_AMBIGUOUS",
+            ] {
+                assert_eq!(helper_failure(code.as_bytes()).code, code);
+            }
+            for invalid in [
+                "",
+                "CAPTURE_EMPTY|PRIVATE_CANARY",
+                "TARGET_CHANGED\nPRIVATE_CANARY",
+                "TARGET_MINIMIZED\nPRIVATE_CANARY",
+                "FRAME_CHANGED\nPRIVATE_CANARY",
+            ] {
+                let failure = helper_failure(invalid.as_bytes());
+                assert_eq!(failure.code, "ADAPTER_FAILED");
+                assert!(!failure.message.contains("PRIVATE_CANARY"));
+            }
+        }
     }
     #[test]
     fn frame_size_mismatch_and_blank_pixels_are_not_usable_observations() {
         assert_eq!(validate_frame_size((2, 2), (2, 2)).unwrap(), 16);
-        assert!(validate_frame_size((2, 2), (1, 2)).is_err());
-        assert!(validate_frame_size((8192, 8192), (8192, 8192)).is_err());
-        assert!(validate_visible_pixels(&[0; 16]).is_err());
-        assert!(validate_visible_pixels(&[0, 0, 0, 255]).is_err());
-        assert!(validate_visible_pixels(&[1, 2, 3, 0]).is_err());
+        for content in [(1, 2), (2, 1), (1, 1)] {
+            assert_eq!(
+                validate_frame_size((2, 2), content).unwrap_err().code,
+                "FRAME_CHANGED"
+            );
+        }
+        assert_eq!(
+            validate_frame_size((8192, 8192), (8192, 8192))
+                .unwrap_err()
+                .code,
+            "SCAN_LIMIT"
+        );
+        for pixels in [
+            &[][..],
+            &[0][..],
+            &[0; 16][..],
+            &[0, 0, 0, 255][..],
+            &[1, 2, 3, 0][..],
+        ] {
+            assert_eq!(
+                validate_visible_pixels(pixels).unwrap_err().code,
+                "CAPTURE_EMPTY"
+            );
+        }
         validate_visible_pixels(&[1, 2, 3, 255]).unwrap();
     }
     #[test]

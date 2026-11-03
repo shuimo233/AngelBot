@@ -10,6 +10,7 @@ import {
   getWorkDir,
   setSessionReadDirs,
   setWorkDir,
+  saveSessionFile,
 } from './file';
 
 describe('file command IPC contract', () => {
@@ -23,6 +24,8 @@ describe('file command IPC contract', () => {
     await setWorkDir('session-1', 'D:/Projects/test');
     await getSessionFileAccess('session-1');
     await setSessionReadDirs('session-1', ['D:/Projects/read-only']);
+    vi.mocked(invoke).mockResolvedValueOnce({ status: 'cancelled' });
+    await expect(saveSessionFile('session-1', '清单.csv')).resolves.toEqual({ status: 'cancelled' });
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'get_work_dir', { sessionId: 'session-1' });
     expect(invoke).toHaveBeenNthCalledWith(2, 'set_work_dir', {
@@ -34,5 +37,14 @@ describe('file command IPC contract', () => {
       sessionId: 'session-1',
       directories: ['D:/Projects/read-only'],
     });
+    expect(invoke).toHaveBeenNthCalledWith(5, 'save_session_file', { sessionId: 'session-1', path: '清单.csv' });
+  });
+
+  it('rejects invalid save receipts without retrying a possibly completed export', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ status: 'saved', name: '../secret', bytes: 1 });
+    await expect(saveSessionFile('session-1', '清单.csv')).rejects.toThrow('未能确认另存结果');
+    expect(invoke).toHaveBeenCalledTimes(1);
+    vi.mocked(invoke).mockResolvedValueOnce({ status: 'saved', name: 'empty.csv', bytes: 0 });
+    await expect(saveSessionFile('session-1', 'empty.csv')).resolves.toEqual({ status: 'saved', name: 'empty.csv', bytes: 0 });
   });
 });

@@ -140,7 +140,9 @@ describe('DesktopControlSettings', () => {
     await user.click(screen.getByLabelText('操作控件'));
     expect(screen.getByText(/允许后可逐次确认并调用、选中、展开或收起/)).toBeInTheDocument();
     expect(screen.getByText(/可能触发发送、删除或其他不可撤销后果/)).toBeInTheDocument();
-    expect(screen.getByText(/其他回执仅确认控件状态，仍需检查任务结果/)).toBeInTheDocument();
+    expect(screen.getByText(/最多 80 字的短名称，可能含个人内容/)).toBeInTheDocument();
+    expect(screen.getByText(/不读取字段值、密码控件或后台页面/)).toBeInTheDocument();
+    expect(screen.getByText(/仍需检查任务结果，不代表目标已完成/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '保存配置' }));
     await waitFor(() => expect(saveDesktopTrustedApp).toHaveBeenLastCalledWith(expect.objectContaining({
       id: 'chat', capabilities: ['launch', 'interact'],

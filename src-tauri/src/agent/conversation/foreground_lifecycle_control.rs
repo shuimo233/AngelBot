@@ -1,4 +1,4 @@
-//! Foreground terminal lifecycle control.
+//! Foreground dispatch and terminal lifecycle control.
 //!
 //! The runner may stream ordinary progress immediately, but terminal UI facts
 //! are held until the command host has persisted the assistant reply and its
@@ -8,16 +8,20 @@
 use std::sync::{Arc, Mutex};
 
 use super::event::{AgentEvent, AgentEventEmitter, AgentRunJournal};
+use super::lifecycle::{BeforeToolCallResult, ToolCallContext, ToolLifecycleHook};
 
-/// Owns the foreground terminal durability barrier for one run.
+/// Owns external dispatch reservations and terminal durability for one run.
 ///
-/// Its interface intentionally has one commit operation: callers stream into
-/// it through `AgentEventEmitter`, persist the reply/projection, then call
+/// The existing tool hook reserves actual MCP dispatches in the same journal;
+/// ordinary progress remains best-effort. Callers stream through
+/// `AgentEventEmitter`, persist the reply/projection, then call
 /// `commit_terminal`. A failed commit keeps terminal events hidden and leaves
 /// a recoverable, uncommitted terminal state for the caller to report.
 pub struct ForegroundLifecycleControl {
     transport: Arc<dyn AgentEventEmitter>,
     journal: AgentRunJournal,
+    /// Main's admitted reply, not the generic runner's ephemeral message ID.
+    reply_id: String,
     terminal_events: Mutex<Vec<(String, AgentEvent)>>,
 }
 
@@ -25,11 +29,12 @@ impl ForegroundLifecycleControl {
     pub fn new(
         transport: Arc<dyn AgentEventEmitter>,
         db: Arc<Mutex<rusqlite::Connection>>,
-        run_id: String,
+        reply_id: String,
     ) -> Self {
         Self {
             transport,
-            journal: AgentRunJournal::new(db, run_id),
+            journal: AgentRunJournal::new(db, reply_id.clone()),
+            reply_id,
             terminal_events: Mutex::new(Vec::new()),
         }
     }
@@ -76,8 +81,47 @@ impl ForegroundLifecycleControl {
     }
 }
 
+impl ToolLifecycleHook for ForegroundLifecycleControl {
+    fn before_tool_call(&self, ctx: &ToolCallContext) -> BeforeToolCallResult {
+        if !ctx.tool_name.starts_with("mcp_") {
+            return BeforeToolCallResult::default();
+        }
+        let reserved = match (ctx.session_id.as_deref(), ctx.tool_call.id.as_deref()) {
+            (Some(session_id), Some(call_id)) if !session_id.is_empty() && !call_id.is_empty() => {
+                self.journal
+                    .append(
+                        session_id,
+                        &AgentEvent::ExternalToolDispatchReserved {
+                            call_id: call_id.to_string(),
+                            tool_name: ctx.tool_name.clone(),
+                        },
+                    )
+                    .is_ok()
+            }
+            _ => false,
+        };
+        BeforeToolCallResult {
+            block: !reserved,
+            reason: (!reserved).then(|| {
+                "无法安全记录外部工具调用，本次未派发。请检查本地存储后再发起。".to_string()
+            }),
+        }
+    }
+}
+
 impl AgentEventEmitter for ForegroundLifecycleControl {
-    fn emit(&self, session_id: &str, event: AgentEvent) {
+    fn emit(&self, session_id: &str, mut event: AgentEvent) {
+        // UI previews and confirmations address durable replies. Keep runner
+        // turn/call identities intact while binding every message projection
+        // to the same host-admitted parent, including journaled terminal facts.
+        match &mut event {
+            AgentEvent::MessageStart { message_id, .. }
+            | AgentEvent::MessageDelta { message_id, .. }
+            | AgentEvent::ContentBlock { message_id, .. }
+            | AgentEvent::MessageUpdate { message_id, .. }
+            | AgentEvent::MessageEnd { message_id, .. } => message_id.clone_from(&self.reply_id),
+            _ => {}
+        }
         if Self::is_terminal_ui_event(&event) {
             if let Ok(mut terminal_events) = self.terminal_events.lock() {
                 terminal_events.push((session_id.to_string(), event));
@@ -156,6 +200,70 @@ mod tests {
             1
         );
         assert_eq!(transport.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn foreground_message_events_use_the_durable_reply_identity() {
+        let db = database();
+        let transport = Arc::new(RecordingEmitter::default());
+        let control =
+            ForegroundLifecycleControl::new(transport.clone(), db.clone(), "saved-reply".into());
+        let events = vec![
+            AgentEvent::MessageStart {
+                turn_id: "runner-turn".into(),
+                message_id: "ephemeral".into(),
+            },
+            AgentEvent::MessageDelta {
+                turn_id: "runner-turn".into(),
+                message_id: "ephemeral".into(),
+                delta: "内容".into(),
+            },
+            AgentEvent::ContentBlock {
+                turn_id: "runner-turn".into(),
+                message_id: "ephemeral".into(),
+                index: 0,
+                iteration_id: 0,
+                block: crate::agent::event::ContentBlockData::Text {
+                    content: "内容".into(),
+                },
+            },
+            AgentEvent::MessageUpdate {
+                turn_id: "runner-turn".into(),
+                message_id: "ephemeral".into(),
+                content: "内容".into(),
+                is_final: true,
+            },
+            AgentEvent::MessageEnd {
+                turn_id: "runner-turn".into(),
+                message_id: "ephemeral".into(),
+                full_text: "内容".into(),
+            },
+        ];
+        for event in events {
+            control.emit("session-1", event);
+        }
+        assert_eq!(
+            transport.0.lock().unwrap().len(),
+            4,
+            "terminal visibility barrier still applies"
+        );
+        control.commit_terminal().unwrap();
+        for event in transport.0.lock().unwrap().iter() {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["data"]["message_id"], "saved-reply");
+            assert_eq!(value["data"]["turn_id"], "runner-turn");
+        }
+        let conn = db.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT payload FROM agent_run_events ORDER BY sequence")
+            .unwrap();
+        let payloads = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        for payload in payloads {
+            let value: serde_json::Value = serde_json::from_str(&payload.unwrap()).unwrap();
+            assert_eq!(value["data"]["message_id"], "saved-reply");
+        }
     }
 
     #[test]

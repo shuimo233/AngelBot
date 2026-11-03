@@ -113,6 +113,9 @@ pub enum AgentEvent {
         message_id: String,
         full_text: String,
     },
+    /// Journal-only reservation, committed before a runtime-owned external
+    /// tool dispatch. It proves possible execution, never business completion.
+    ExternalToolDispatchReserved { call_id: String, tool_name: String },
     /// Tool execution started
     ToolExecutionStart {
         call_id: String,
@@ -253,6 +256,8 @@ pub enum AgentEvent {
 pub enum ErrorCode {
     /// LLM API call failed
     LlmError,
+    /// Provider identified an exhausted usage quota, not an inferred rate limit.
+    LlmQuotaExceeded,
     /// Tool execution failed
     ToolError,
     /// Context length exceeded
@@ -271,6 +276,7 @@ impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCode::LlmError => "LLM_ERROR",
+            ErrorCode::LlmQuotaExceeded => "LLM_QUOTA_EXCEEDED",
             ErrorCode::ToolError => "TOOL_ERROR",
             ErrorCode::ContextLengthExceeded => "CONTEXT_LENGTH_EXCEEDED",
             ErrorCode::Timeout => "TIMEOUT",
@@ -361,18 +367,29 @@ impl AgentRunJournal {
         let mut conn = self.db.lock().map_err(|error| error.to_string())?;
         let transaction = conn.transaction().map_err(|error| error.to_string())?;
         for (offset, (event_type, payload)) in serialized.iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let created_at = chrono::Utc::now().timestamp();
+            let payload = super::tool_source::seal(&super::tool_source::SourceRecord {
+                id: &id,
+                run_id: &self.run_id,
+                session_id,
+                sequence: *next + offset as i64,
+                event_type,
+                payload,
+                created_at,
+            })?;
             transaction
                 .execute(
                     "INSERT INTO agent_run_events (id, run_id, session_id, sequence, event_type, payload, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
-                        uuid::Uuid::new_v4().to_string(),
+                        id,
                         &self.run_id,
                         session_id,
                         *next + offset as i64,
                         event_type,
                         payload,
-                        chrono::Utc::now().timestamp(),
+                        created_at,
                     ],
                 )
                 .map_err(|error| error.to_string())?;

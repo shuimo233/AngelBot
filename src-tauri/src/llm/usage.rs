@@ -4,11 +4,30 @@
 //!
 //! Tracks token consumption and cost per API call for budget monitoring.
 
+use super::ProviderUsage;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+fn legacy_cost_basis() -> String {
+    "legacy_static_estimate_not_bill".into()
+}
+
+fn read_provider_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ProviderUsage>> {
+    row.get::<_, Option<String>>(10)?
+        .map(|raw| {
+            serde_json::from_str(&raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()
+}
 
 /// Cost per 1M tokens for different providers/models
 /// Based on current pricing (2024-2025)
@@ -73,6 +92,9 @@ pub struct UsageStats {
     pub cost_usd: f64,
     pub latency_ms: Option<u32>,
     pub created_at: i64,
+    pub provider_usage: Option<ProviderUsage>,
+    /// Kept for compatibility; cost_usd is not an observed bill or plan charge.
+    pub cost_basis: String,
 }
 
 /// Aggregated cost summary
@@ -84,6 +106,7 @@ pub struct CostSummary {
     pub total_cost_usd: f64,
     pub by_provider: HashMap<String, ProviderCost>,
     pub by_model: HashMap<String, ModelCost>,
+    pub cost_basis: String,
 }
 
 /// Cost breakdown by provider
@@ -93,6 +116,7 @@ pub struct ProviderCost {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
+    pub cost_basis: String,
 }
 
 /// Cost breakdown by model
@@ -104,6 +128,7 @@ pub struct ModelCost {
     pub total_tokens: u64,
     pub cost_usd: f64,
     pub call_count: u64,
+    pub cost_basis: String,
 }
 
 /// Usage tracker for managing token consumption
@@ -135,7 +160,54 @@ impl UsageTracker {
         completion_tokens: u32,
         latency_ms: Option<u32>,
     ) -> Result<UsageStats, rusqlite::Error> {
-        let total_tokens = prompt_tokens + completion_tokens;
+        self.record_inner(
+            session_id,
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms,
+            None,
+        )
+    }
+
+    pub fn record_provider_usage(
+        &self,
+        session_id: Option<&str>,
+        provider: &str,
+        model: &str,
+        usage: ProviderUsage,
+        latency_ms: Option<u32>,
+    ) -> Result<UsageStats, rusqlite::Error> {
+        self.record_inner(
+            session_id,
+            provider,
+            model,
+            usage.input_tokens,
+            usage.output_tokens,
+            latency_ms,
+            Some(usage),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_inner(
+        &self,
+        session_id: Option<&str>,
+        provider: &str,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        latency_ms: Option<u32>,
+        provider_usage: Option<ProviderUsage>,
+    ) -> Result<UsageStats, rusqlite::Error> {
+        let total_tokens = prompt_tokens
+            .checked_add(completion_tokens)
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        let details = provider_usage
+            .map(|u| serde_json::to_string(&u))
+            .transpose()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         // Calculate cost
         let (input_cost, output_cost) = pricing::get_pricing(provider, model);
@@ -147,8 +219,8 @@ impl UsageTracker {
 
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO usage_stats (id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO usage_stats (id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at, provider_usage_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     id,
                     session_id,
@@ -159,7 +231,8 @@ impl UsageTracker {
                     total_tokens,
                     cost_usd,
                     latency_ms,
-                    now
+                    now,
+                    details
                 ],
             )?;
 
@@ -185,6 +258,8 @@ impl UsageTracker {
                 cost_usd,
                 latency_ms,
                 created_at: now,
+                provider_usage,
+                cost_basis: legacy_cost_basis(),
             })
         })
     }
@@ -193,7 +268,7 @@ impl UsageTracker {
     pub fn get_session_usage(&self, session_id: &str) -> Result<Vec<UsageStats>, rusqlite::Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at
+                "SELECT id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at, provider_usage_json
                  FROM usage_stats WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 100",
             )?;
 
@@ -209,6 +284,8 @@ impl UsageTracker {
                     cost_usd: r.get(7)?,
                     latency_ms: r.get(8)?,
                     created_at: r.get(9)?,
+                    provider_usage: read_provider_usage(r)?,
+                    cost_basis: legacy_cost_basis(),
                 })
             })?;
 
@@ -252,6 +329,7 @@ impl UsageTracker {
                         completion_tokens: row.2,
                         total_tokens: row.3,
                         cost_usd: row.4,
+                        cost_basis: legacy_cost_basis(),
                     },
                 );
             }
@@ -285,6 +363,7 @@ impl UsageTracker {
                         total_tokens: row.4,
                         cost_usd: row.5,
                         call_count: row.6,
+                        cost_basis: legacy_cost_basis(),
                     },
                 );
             }
@@ -296,6 +375,7 @@ impl UsageTracker {
                 total_cost_usd: total_cost,
                 by_provider,
                 by_model,
+                cost_basis: legacy_cost_basis(),
             })
         })
     }
@@ -308,7 +388,7 @@ impl UsageTracker {
     ) -> Result<Vec<UsageStats>, rusqlite::Error> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at
+                "SELECT id, session_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, created_at, provider_usage_json
                  FROM usage_stats WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC LIMIT 1000",
             )?;
 
@@ -324,6 +404,8 @@ impl UsageTracker {
                     cost_usd: r.get(7)?,
                     latency_ms: r.get(8)?,
                     created_at: r.get(9)?,
+                    provider_usage: read_provider_usage(r)?,
+                    cost_basis: legacy_cost_basis(),
                 })
             })?;
 
@@ -379,5 +461,81 @@ mod tests {
             + (completion_tokens as f64 * output_cost / 1_000_000.0);
 
         assert!(cost > 0.0 && cost < 0.1);
+    }
+
+    #[test]
+    fn provider_usage_forward_migration_and_reopen_preserve_unknown_and_reported_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY);")
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/015_usage_tracking.sql"))
+            .unwrap();
+        conn.execute("INSERT INTO usage_stats(id,provider,model,prompt_tokens,completion_tokens,total_tokens,cost_usd,created_at) VALUES('legacy','fixture','fixture',10,2,12,0.7,1)",[]).unwrap();
+        conn.execute_batch(include_str!("../migrations/085_provider_usage_details.sql"))
+            .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE usage_stats SET provider_usage_json='broken' WHERE id='legacy'",
+                []
+            )
+            .is_err());
+        let tracker = UsageTracker::new(Arc::new(Mutex::new(conn)));
+        tracker
+            .record_provider_usage(
+                None,
+                "fixture",
+                "fixture",
+                ProviderUsage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cached_input_tokens: Some(0),
+                    ..ProviderUsage::default()
+                },
+                Some(25),
+            )
+            .unwrap();
+        drop(tracker);
+        let tracker = UsageTracker::new(Arc::new(Mutex::new(Connection::open(&path).unwrap())));
+        let rows = tracker.get_usage_history(0, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|r| r.id == "legacy").unwrap();
+        assert!(old.provider_usage.is_none());
+        assert_eq!(old.cost_usd, 0.7);
+        let new = rows.iter().find(|r| r.id != "legacy").unwrap();
+        assert_eq!(new.provider_usage.unwrap().cached_input_tokens, Some(0));
+        assert!(new.provider_usage.unwrap().cache_write_tokens.is_none());
+        assert_eq!(new.cost_basis, "legacy_static_estimate_not_bill");
+        let full = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        crate::db::migrate(&full.lock().unwrap()).unwrap();
+        let tracker = UsageTracker::new(full.clone());
+        let recorded = tracker
+            .record_provider_usage(
+                None,
+                "fixture",
+                "fixture",
+                new.provider_usage.unwrap(),
+                Some(25),
+            )
+            .unwrap();
+        {
+            let conn = full.lock().unwrap();
+            conn.execute("DELETE FROM migration_log WHERE version=85", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE settings SET value='84' WHERE key='schema_version'",
+                [],
+            )
+            .unwrap();
+            crate::db::migrate(&conn).unwrap();
+        }
+        let recovered = tracker.get_usage_history(0, i64::MAX).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, recorded.id);
+        assert_eq!(
+            recovered[0].provider_usage.unwrap().cached_input_tokens,
+            Some(0)
+        );
     }
 }

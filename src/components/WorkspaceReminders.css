@@ -22,6 +22,20 @@
 }
 
 .workspace-reminders-title { font-weight: 600; }
+.workspace-automation-indicator {
+  padding: 6px 8px; border: 0; border-radius: var(--ui-radius-control);
+  background: transparent; color: var(--color-text-secondary); font: inherit;
+  font-size: 12px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+}
+.workspace-automation-indicator:hover { background: var(--ui-hover); color: var(--color-text); }
+.workspace-automation-indicator:focus-visible { outline: 2px solid var(--color-accent-border); outline-offset: 2px; }
+.right-panel .workspace-reminders { width: auto; margin: 12px 0; }
+.right-panel .workspace-reminders-content { max-height: none; }
+.right-panel .workspace-reminders-counts { display: block; margin-left: 16px; }
+.right-panel .workspace-reminders-results li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; }
+.right-panel .workspace-reminders-results .messages-empty-item-name { grid-column: 1 / -1; max-width: none; }
+.right-panel .workspace-reminders-result-detail { grid-column: 1; }
+.right-panel .workspace-reminders-results li > button { grid-column: 2; grid-row: 2; align-self: start; }
 .workspace-reminders-counts { margin-left: 10px; color: var(--color-muted); }
 .workspace-reminders-content {
   display: grid;
@@ -34,6 +48,23 @@
 .workspace-reminders-section .messages-empty-section-title { margin-top: 0; font-weight: 500; }
 .workspace-reminders-note { margin: 6px 0 0; color: var(--color-muted); font-size: var(--ui-size-caption); line-height: 1.6; }
 .workspace-reminders-list .messages-empty-item-name { min-width: 0; }
+.workspace-reminders-results li { align-items: flex-start; }
+.workspace-reminders-result-detail { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.workspace-reminders-attention { color: var(--color-text); font-size: var(--ui-size-caption); font-weight: 600; }
+.workspace-reminders-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.workspace-reminders-actions button,
+.workspace-reminders-results li > button {
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--ui-radius-control);
+  padding: 4px 8px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--ui-size-caption);
+  cursor: pointer;
+}
+.workspace-reminders-actions button:focus-visible,
+.workspace-reminders-results li > button:focus-visible { outline: 2px solid var(--color-accent-border); outline-offset: 2px; }
+.workspace-reminders-results li > button { flex-shrink: 0; }
 
 @media (max-height: 600px) {
   .workspace-reminders { margin-top: 6px; margin-bottom: 6px; }

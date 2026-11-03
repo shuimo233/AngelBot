@@ -21,6 +21,7 @@ type MemoryDraft = {
 };
 
 const stageOptions = ['all', 'active', 'summarized', 'archived'];
+const stageLabels: Record<string, string> = { all: '全部阶段', active: '活跃', summarized: '已摘要', archived: '已归档' };
 
 function toDraft(memory: RustMemory): MemoryDraft {
   return {
@@ -33,7 +34,7 @@ function toDraft(memory: RustMemory): MemoryDraft {
 }
 
 function formatDate(timestamp: number | null) {
-  if (!timestamp) return 'Never';
+  if (!timestamp) return '暂无';
   return new Date(timestamp * 1000).toLocaleString();
 }
 
@@ -63,7 +64,7 @@ export function MemoryGovernanceSettings() {
         return next;
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load memories');
+      setError(err instanceof Error ? err.message : '无法读取记忆');
     } finally {
       setLoading(false);
     }
@@ -167,7 +168,7 @@ export function MemoryGovernanceSettings() {
         </select>
         <select value={stageFilter} onChange={(e) => setStageFilter(e.target.value)} aria-label="按阶段筛选">
           {stageOptions.map((stage) => (
-            <option key={stage} value={stage}>{stage === 'all' ? '全部阶段' : stage}</option>
+            <option key={stage} value={stage}>{stageLabels[stage]}</option>
           ))}
         </select>
         <button className="btn btn-secondary btn-sm" onClick={loadMemories} disabled={loading}>
@@ -192,12 +193,12 @@ export function MemoryGovernanceSettings() {
               <div className="memory-item-header">
                 <div className="memory-badges">
                   <span className="memory-badge">{memory.category}</span>
-                  <span className="memory-badge muted">{memory.forget_stage}</span>
-                  {memory.is_permanent && <span className="memory-badge permanent">Permanent</span>}
+                  <span className="memory-badge muted">{stageLabels[memory.forget_stage] ?? memory.forget_stage}</span>
+                  {memory.is_permanent && <span className="memory-badge permanent">永久保留</span>}
                 </div>
                 <div className="memory-meta">
-                  <span>Used {memory.frequency}</span>
-                  <span>Updated {formatDate(memory.updated_at)}</span>
+                  <span>已引用 {memory.frequency} 次</span>
+                  <span>更新于 {formatDate(memory.updated_at)}</span>
                 </div>
               </div>
 
@@ -205,21 +206,21 @@ export function MemoryGovernanceSettings() {
                 className="memory-content-input"
                 value={draft.content}
                 onChange={(e) => updateDraft(memory.id, { content: e.target.value })}
-                aria-label={`Memory content ${memory.id}`}
+                aria-label={`记忆内容 ${memory.id}`}
                 rows={3}
               />
 
               <div className="memory-edit-grid">
                 <label>
-                  Scope
+                  适用范围
                   <input value={draft.scope} onChange={(e) => updateDraft(memory.id, { scope: e.target.value })} />
                 </label>
                 <label>
-                  Category
+                  分类
                   <input value={draft.category} onChange={(e) => updateDraft(memory.id, { category: e.target.value })} />
                 </label>
                 <label>
-                  Importance
+                  重要度
                   <input
                     type="number"
                     min={1}
@@ -234,24 +235,24 @@ export function MemoryGovernanceSettings() {
                     checked={draft.isPermanent}
                     onChange={(e) => updateDraft(memory.id, { isPermanent: e.target.checked })}
                   />
-                  Never forget
+                  永久保留
                 </label>
               </div>
 
               <div className="memory-actions">
-                <button className="btn btn-primary btn-sm" onClick={() => saveDraft(memory)}>Save</button>
+                <button className="btn btn-primary btn-sm" onClick={() => saveDraft(memory)}>保存</button>
                 <button className="btn btn-secondary btn-sm" onClick={() => togglePermanent(memory)}>
-                  {memory.is_permanent ? 'Unpin' : 'Pin'}
+                  {memory.is_permanent ? '取消永久保留' : '永久保留'}
                 </button>
-                <button className="btn btn-secondary btn-sm" onClick={() => loadHistory(memory.id)}>History</button>
-                <button className="btn btn-secondary btn-sm" onClick={() => checkConflicts(memory)}>Conflicts</button>
-                <button className="btn btn-danger btn-sm" onClick={() => removeMemory(memory.id)}>Delete</button>
+                <button className="btn btn-secondary btn-sm" onClick={() => loadHistory(memory.id)}>历史记录</button>
+                <button className="btn btn-secondary btn-sm" onClick={() => checkConflicts(memory)}>检查冲突</button>
+                <button className="btn btn-danger btn-sm" onClick={() => removeMemory(memory.id)}>删除</button>
               </div>
 
               {selectedMemoryId === memory.id && (
                 <div className="memory-history">
                   {memoryHistory.length === 0 ? (
-                    <p>No history yet.</p>
+                    <p>暂无历史记录。</p>
                   ) : memoryHistory.map((entry) => (
                     <div className="memory-history-entry" key={entry.id}>
                       <strong>{entry.operation}</strong>
@@ -267,11 +268,11 @@ export function MemoryGovernanceSettings() {
                   {memoryConflicts.map((conflict) => (
                     <div className="memory-conflict" key={conflict.memory_id}>
                       <div>
-                        <strong>{Math.round(conflict.similarity * 100)}% similar</strong>
+                        <strong>相似度 {Math.round(conflict.similarity * 100)}%</strong>
                         <p>{conflict.content}</p>
                       </div>
                       <button className="btn btn-secondary btn-sm" onClick={() => mergeIntoCurrent(conflict.memory_id, memory.id)}>
-                        Merge into this
+                        合并到此条
                       </button>
                     </div>
                   ))}

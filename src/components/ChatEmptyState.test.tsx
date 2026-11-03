@@ -11,31 +11,32 @@ import {
 import { useKnowledgeStore } from '$stores/knowledge';
 import { useNavigationStore } from '$stores/navigation';
 import { useWorkspacesStore } from '$stores/workspaces';
-import type { Automation } from '$lib/commands/automation';
+import type { WorkspaceAutomationStatus } from '$lib/commands/automation';
 
 vi.mock('$lib/commands/automation', () => ({
-  getAutomations: vi.fn(),
+  getWorkspaceAutomationOverview: vi.fn(),
 }));
 vi.mock('$lib/commands/memory', () => ({
   getMemories: vi.fn().mockResolvedValue([]),
 }));
 
-import { getAutomations } from '$lib/commands/automation';
+import { getWorkspaceAutomationOverview } from '$lib/commands/automation';
 
-const getAutomationsMock = getAutomations as ReturnType<typeof vi.fn>;
+const getAutomationsMock = vi.mocked(getWorkspaceAutomationOverview);
 
-const makeAutomation = (overrides: Partial<Automation>): Automation => ({
+const makeAutomation = (overrides: Partial<WorkspaceAutomationStatus>): WorkspaceAutomationStatus => ({
   id: 'a1',
   title: '整理笔记',
-  prompt: '',
   triggerKind: 'schedule',
   triggerValue: '每天 21:00',
   enabled: true,
-  permissionSummary: '每次运行前询问',
   executorKind: 'agent',
   workspaceId: 'personal',
-  scriptArgs: [],
-  timeoutSeconds: 300,
+  nextRunAt: null,
+  lastRunAt: null,
+  latestRun: null,
+  lastSkippedAt: null,
+  maaConfig: null,
   ...overrides,
 });
 
@@ -55,12 +56,12 @@ describe('greetingForHour', () => {
 
 describe('pickTodayAutomations', () => {
   it('只保留启用且下次运行在今天的任务，最多 3 条并按时间排序', () => {
-    const items: Automation[] = [
+    const items: WorkspaceAutomationStatus[] = [
       makeAutomation({ id: 'late', title: '晚间任务', nextRunAt: todayAt(21) }),
       makeAutomation({ id: 'early', title: '早间任务', nextRunAt: todayAt(8) }),
       makeAutomation({ id: 'disabled', title: '已暂停', enabled: false, nextRunAt: todayAt(9) }),
       makeAutomation({ id: 'tomorrow', title: '明天任务', nextRunAt: todayAt(9) + 86400 }),
-      makeAutomation({ id: 'no-run', title: '未排期', nextRunAt: undefined }),
+      makeAutomation({ id: 'no-run', title: '未排期', nextRunAt: null }),
       makeAutomation({ id: 'mid', title: '午间任务', nextRunAt: todayAt(12) }),
       makeAutomation({ id: 'extra', title: '第四条', nextRunAt: todayAt(23) }),
     ];
@@ -104,13 +105,13 @@ describe('ChatEmptyState', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
-    getAutomationsMock.mockResolvedValue([]);
+    getAutomationsMock.mockResolvedValue({ items: [], truncated: false });
     useWorkspacesStore.setState({
       workspaces: [{ id: 'personal', kind: 'personal', name: 'Personal', activeSessionId: 's1', createdAt: 1, updatedAt: 1 }],
       activeWorkspaceId: 'personal',
     });
     useKnowledgeStore.setState({ entries: [{
-      id: 'k1', content: '偏好浓缩咖啡', category: 'knowledge', importance: 5, source: 'knowledge', createdAt: 1, updatedAt: 1,
+      id: 'k1', content: '偏好浓缩咖啡', category: 'knowledge', importance: 5, source: 'knowledge', createdAt: 1, updatedAt: 1, scope: 'global', isPermanent: false, forgetStage: 'active',
     }], isLoading: false, error: null });
     useNavigationStore.setState({ currentPage: 'chat' });
   });
@@ -118,7 +119,7 @@ describe('ChatEmptyState', () => {
   it('显示时间问候和发消息引导', () => {
     render(<ChatEmptyState />);
     expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/直接说出想处理的事/)).toBeInTheDocument();
+    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
   });
 
   it('个人空间任务起点只写入草稿，不直接发送', async () => {
@@ -143,7 +144,7 @@ describe('ChatEmptyState', () => {
     render(<ChatEmptyState />);
 
     expect(screen.getByText('项目 · AngelBot')).toBeInTheDocument();
-    expect(screen.getByText(/这个项目的文件、历史与受控委派范围/)).toBeInTheDocument();
+    expect(screen.getByText(/文件和任务进展都在右侧工作台/)).toBeInTheDocument();
   });
 
   it('项目任务起点优先读取和诊断，不默认修改', () => {
@@ -158,31 +159,20 @@ describe('ChatEmptyState', () => {
     expect(screen.queryByRole('button', { name: /整理今天的安排/ })).not.toBeInTheDocument();
   });
 
-  it('使用共享事项回看展示当前空间的待执行事项', async () => {
-    const user = userEvent.setup();
-    getAutomationsMock.mockResolvedValue([
+  it('空白对话保留引导，不重复加载和展示自动化历史', () => {
+    getAutomationsMock.mockResolvedValue({ items: [
       makeAutomation({ id: 'a1', title: '整理笔记', triggerValue: '每天 21:00', workspaceId: 'personal', nextRunAt: todayAt(21) }),
       makeAutomation({ id: 'a2', title: '已暂停任务', enabled: false, nextRunAt: todayAt(9) }),
       makeAutomation({ id: 'a3', title: '明天的任务', nextRunAt: todayAt(9) + 86400 }),
-    ]);
+    ], truncated: false });
     render(<ChatEmptyState />);
 
-    await user.click(await screen.findByText('事项回看'));
-    expect(screen.getByText('整理笔记')).toBeInTheDocument();
-    expect(screen.getByText(/自动任务 · 今天/)).toBeInTheDocument();
-    expect(screen.queryByText('已暂停任务')).not.toBeInTheDocument();
-    expect(screen.getByText('明天的任务')).toBeInTheDocument();
-  });
-
-  it('自动化加载失败时静默降级为问候和引导', async () => {
-    getAutomationsMock.mockRejectedValue(new Error('ipc down'));
-    render(<ChatEmptyState />);
-
-    await waitFor(() => expect(getAutomationsMock).toHaveBeenCalled());
-    expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/直接说出想处理的事/)).toBeInTheDocument();
+    expect(getAutomationsMock).not.toHaveBeenCalled();
     expect(screen.queryByText('事项回看')).not.toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
+    expect(screen.queryByText('整理笔记')).not.toBeInTheDocument();
+    expect(screen.queryByText('已暂停任务')).not.toBeInTheDocument();
+    expect(screen.queryByText('明天的任务')).not.toBeInTheDocument();
   });
 
   it('尚未解析到真实空间时不会加载或展示其他空间提醒', () => {
@@ -214,7 +204,7 @@ describe('ChatEmptyState', () => {
 
     unmount();
     render(<ChatEmptyState />);
-    await waitFor(() => expect(getAutomationsMock).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText('添加你的第一条资料，让 AngelBot 能引用它')).not.toBeInTheDocument());
     expect(screen.queryByText('添加你的第一条资料，让 AngelBot 能引用它')).not.toBeInTheDocument();
   });
 });

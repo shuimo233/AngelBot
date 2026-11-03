@@ -10,7 +10,7 @@ interface Command {
   label: string;
   description: string;
   category: CommandCategory;
-  action: () => void | Promise<void>;
+  action: () => void | boolean | Promise<void | boolean>;
 }
 
 interface CommandPaletteProps {
@@ -43,6 +43,7 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
   const [runningCommandId, setRunningCommandId] = useState<string | null>(null);
   const [actionError, setActionError] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const generationRef = useRef(0);
   const workspaces = useWorkspacesStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
   const openWorkspace = useWorkspacesStore((state) => state.openWorkspace);
@@ -57,8 +58,13 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
         : workspace.rootPath ?? '项目主对话',
       category: 'workspace' as const,
       action: async () => {
-        if (workspace.id !== activeWorkspaceId) await openWorkspace(workspace.id);
+        const navigation = useNavigationStore.getState();
+        const generation = generationRef.current;
+        // Selecting the current workspace must also supersede an older opening.
+        const accepted = await openWorkspace(workspace.id);
+        if (!accepted || navigation !== useNavigationStore.getState() || generation !== generationRef.current) return false;
         setPage('chat');
+        return true;
       },
     })),
     {
@@ -103,7 +109,7 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
       category: 'settings',
       action: () => { window.dispatchEvent(new CustomEvent('open-settings', { detail: 'mcp' })); },
     },
-  ], [activeWorkspaceId, openWorkspace, setPage, workspaces]);
+  ], [openWorkspace, setPage, workspaces]);
 
   const filteredCommands = useMemo(() => {
     const search = normalized(query);
@@ -118,12 +124,15 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
 
   useEffect(() => {
     if (!isOpen) return undefined;
+    ++generationRef.current;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setQuery('');
     setSelectedIndex(0);
     setActionError('');
+    setRunningCommandId(null);
     const timer = window.setTimeout(() => inputRef.current?.focus(), 0);
     return () => {
+      ++generationRef.current;
       window.clearTimeout(timer);
       previousFocus?.focus();
     };
@@ -137,13 +146,14 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
     if (runningCommandId) return;
     setRunningCommandId(command.id);
     setActionError('');
+    const generation = generationRef.current;
     try {
-      await command.action();
-      onClose();
+      const accepted = await command.action();
+      if (generation === generationRef.current && accepted !== false) onClose();
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : `无法执行“${command.label}”`);
+      if (generation === generationRef.current) setActionError(reason instanceof Error ? reason.message : `无法执行“${command.label}”`);
     } finally {
-      setRunningCommandId(null);
+      if (generation === generationRef.current) setRunningCommandId(null);
     }
   };
 

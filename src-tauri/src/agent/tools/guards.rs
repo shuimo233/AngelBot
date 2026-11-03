@@ -10,10 +10,10 @@
 //!
 //! - Guards never mutate state directly; the runner owns state mutation.
 //! - `WallClockGuard` is the only hard terminator in this set.
-//! - `NetProgressGuard` and `SideEffectAutoPauseGuard` are *soft* pauses
-//!   that preserve user sovereignty (philosophy §2.3).
-//! - Side-effect counting uses the centralised `is_side_effect_tool` from
-//!   the registry so the two lists cannot drift.
+//! - NetProgressGuard is a soft pause. SideEffectAutoPauseGuard adds a
+//!   count-based pause only outside the user's full-access task authorization.
+//! - Side-effect counting uses the registry's conservative predicate. Explicit
+//!   MCP read-only hints affect this soft budget, not execution authorization.
 //!
 //! Pi-inspired naming: `shouldStopAfterTurn` is a hook today; these guards
 //! are an extension layer that catches the cases Pi leaves to user abort.
@@ -31,6 +31,9 @@ pub struct GuardContext {
     pub turn_wall_clock_elapsed: Duration,
     /// Count of side-effect tool calls executed in the current turn.
     pub side_effect_count: usize,
+    /// Selected by the runtime, never supplied by model/tool arguments. This
+    /// changes the count fuse only, not scope, approval or unknown-result rules.
+    pub full_access: bool,
     /// Number of consecutive iterations without new evidence.
     pub no_progress_streak: usize,
     /// Whether the latest assistant response added new facts or tool results.
@@ -126,8 +129,8 @@ impl LoopGuard for NetProgressGuard {
 // ── SideEffectAutoPauseGuard ──────────────────────────────────────────────────
 
 /// Pauses (never terminates) after the configured number of side-effect
-/// tool calls. Per design philosophy §2.3, side-effect auto-pause must be
-/// soft — only the user may authorise further side effects.
+/// tool calls outside full access. Full access already authorizes continuing
+/// the task; time, progress, cancellation and tool-specific controls still apply.
 pub struct SideEffectAutoPauseGuard {
     threshold: usize,
 }
@@ -144,7 +147,7 @@ impl LoopGuard for SideEffectAutoPauseGuard {
     }
 
     fn evaluate(&self, ctx: &GuardContext) -> GuardVerdict {
-        if ctx.side_effect_count >= self.threshold {
+        if !ctx.full_access && ctx.side_effect_count >= self.threshold {
             GuardVerdict::PauseForUser {
                 reason: format!(
                     "side effect limit reached ({}); user confirmation needed before more",
@@ -158,10 +161,15 @@ impl LoopGuard for SideEffectAutoPauseGuard {
 }
 
 /// Helper used by the runner to know whether a tool name counts as a
-/// side effect for guard accounting. Re-exports the registry-level predicate
-/// to keep the single source of truth.
-pub fn is_side_effect(name: &str) -> bool {
+/// side effect for the soft budget. Unknown MCP tools remain conservative;
+/// names are never used to infer read-only behavior. Hints do not affect the
+/// registry's independent confirmation policy or durable dispatch reservations.
+pub fn is_side_effect(registry: &crate::agent::registry::ToolRegistry, name: &str) -> bool {
     is_side_effect_tool(name)
+        && !(name.starts_with("mcp_")
+            && registry
+                .get(name)
+                .is_some_and(|tool| tool.read_only_budget_hint))
 }
 
 #[cfg(test)]
@@ -170,10 +178,11 @@ mod tests {
 
     #[test]
     fn is_side_effect_delegates_to_registry() {
-        assert!(is_side_effect("write_file"));
-        assert!(is_side_effect("create_directory"));
-        assert!(is_side_effect("mcp_anything"));
-        assert!(!is_side_effect("read_file"));
-        assert!(!is_side_effect("search_files"));
+        let registry = crate::agent::registry::ToolRegistry::empty();
+        assert!(is_side_effect(&registry, "write_file"));
+        assert!(is_side_effect(&registry, "create_directory"));
+        assert!(is_side_effect(&registry, "mcp_anything"));
+        assert!(!is_side_effect(&registry, "read_file"));
+        assert!(!is_side_effect(&registry, "search_files"));
     }
 }
