@@ -111,9 +111,34 @@ pub(crate) fn operation_repair_matches(
     succeeded_name: &str,
     succeeded_args: &Value,
 ) -> bool {
+    // Compaction metrics describe the current context, not an operation target.
+    // A later host-proven reduction repairs an earlier preparation failure even
+    // when the context grew meanwhile. Keep the failed receipt, and do not apply
+    // this exception to model calls, malformed metrics, or unknown outcomes.
+    let recovered_compaction = failed_name == "context_compaction"
+        && failed_id
+            .strip_prefix("context-compaction-")
+            .is_some_and(|suffix| {
+                suffix
+                    .parse::<usize>()
+                    .is_ok_and(|value| value.to_string() == suffix)
+            })
+        && failed_output.starts_with("Context compaction failed: ")
+        && failed_args.as_object().is_some_and(|args| {
+            args.len() == 1 && args.get("before_tokens").and_then(Value::as_u64).is_some()
+        })
+        && succeeded_args.as_object().is_some_and(|args| {
+            args.len() == 2
+                && args
+                    .get("before_tokens")
+                    .and_then(Value::as_u64)
+                    .zip(args.get("after_tokens").and_then(Value::as_u64))
+                    .is_some_and(|(before, after)| after < before)
+        });
     failed_name == succeeded_name
         && !ToolResult::is_result_unknown(false, failed_output)
-        && (failed_args == succeeded_args
+        && (recovered_compaction
+            || failed_args == succeeded_args
             || repairs_argument_rejection(
                 failed_id,
                 failed_name,

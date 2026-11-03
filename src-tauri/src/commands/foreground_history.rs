@@ -997,6 +997,139 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovered_compaction_allows_approved_continuation_without_rewriting_receipts() {
+        for scenario in [
+            "recovered",
+            "first-iteration",
+            "earlier-success",
+            "unknown",
+            "wrong-id",
+            "wrong-output",
+            "invalid-metrics",
+            "ordinary-tool",
+        ] {
+            let mut failed = crate::agent::AgentStep {
+                call_id: "context-compaction-1".into(),
+                tool_name: "context_compaction".into(),
+                arguments: serde_json::json!({"before_tokens": 4681}),
+                success: false,
+                output: "Context compaction failed: summary did not reduce context".into(),
+                confirmation_required: false,
+                confirmation_status: None,
+                verification: None,
+            };
+            let mut recovered = crate::agent::AgentStep {
+                call_id: "context-compaction-2".into(),
+                tool_name: "context_compaction".into(),
+                arguments: serde_json::json!({"before_tokens": 5971, "after_tokens": 4379}),
+                success: true,
+                output: "Context compacted before LLM call".into(),
+                confirmation_required: false,
+                confirmation_status: None,
+                verification: None,
+            };
+            match scenario {
+                "first-iteration" => failed.call_id = "context-compaction-0".into(),
+                "unknown" => failed.output = r#"Error: {"code":"RESULT_UNKNOWN"}"#.into(),
+                "wrong-id" => failed.call_id = "model-call".into(),
+                "wrong-output" => failed.output = "Unknown tool".into(),
+                "invalid-metrics" => {
+                    recovered.arguments = serde_json::json!({"before_tokens": 4, "after_tokens": 5})
+                }
+                "ordinary-tool" => {
+                    failed.tool_name = "write_file".into();
+                    recovered.tool_name = "write_file".into();
+                }
+                _ => {}
+            }
+            let mut steps = vec![failed, recovered];
+            if scenario == "earlier-success" {
+                steps.swap(0, 1);
+            }
+            steps.push(crate::agent::AgentStep {
+                call_id: "cu-uncheck".into(),
+                tool_name: "operate_trusted_app_control".into(),
+                arguments: serde_json::json!({"action":"uncheck"}),
+                success: true,
+                output: "Confirmation approved: verified uncheck".into(),
+                confirmation_required: false,
+                confirmation_status: Some("approved".into()),
+                verification: None,
+            });
+            let facts = crate::agent::foreground_conversation_state::task_facts_from_steps(
+                "verify checkbox",
+                &steps,
+            );
+            let calls: Vec<_> = steps
+                .iter()
+                .map(|step| ToolCallInfo {
+                    id: step.call_id.clone(),
+                    name: step.tool_name.clone(),
+                    arguments: step.arguments.to_string(),
+                })
+                .collect();
+            let results: Vec<_> = steps
+                .iter()
+                .map(|step| ToolResultInfo {
+                    call_id: step.call_id.clone(),
+                    tool_name: step.tool_name.clone(),
+                    success: step.success,
+                    output: step.output.clone(),
+                    error: None,
+                    confirmation_required: false,
+                    confirmation_status: step.confirmation_status.clone(),
+                })
+                .collect();
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::migrate(&conn).unwrap();
+            conn.execute_batch("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','test',1,1);
+                INSERT INTO messages(id,session_id,role,content,created_at) VALUES('a','s','assistant','',2);
+                INSERT INTO task_runs(id,session_id,message_id,goal,status,plan,confirmation_state,resumable,step_count,completed_step_count,continuation_context,created_at,updated_at)
+                VALUES('r','s','a','verify checkbox','awaiting_confirmation','[]','pending',1,3,1,'',2,2);").unwrap();
+            persist_tool_results(&conn, "s", 2, Some(&calls), &results).unwrap();
+            refresh_persisted_task_run_from_steps(&conn, "s", "a", 2).unwrap();
+            let (status, resumable): (String, bool) = conn
+                .query_row(
+                    "SELECT status,resumable FROM task_runs WHERE id='r'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let is_recovered = matches!(scenario, "recovered" | "first-iteration");
+            let expected = if is_recovered {
+                "continue_suggested"
+            } else {
+                "needs_attention"
+            };
+            assert_eq!(
+                status, expected,
+                "{scenario}: confirmation must derive the same repaired state"
+            );
+            assert_eq!(
+                facts.has_unhandled_failures(),
+                !is_recovered,
+                "{scenario}: live facts must agree"
+            );
+            assert_eq!(
+                resumable,
+                scenario != "unknown",
+                "unknown results must never become resumable"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT success FROM agent_steps WHERE call_id=?1",
+                    [&steps.iter().find(|step| !step.success).unwrap().call_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0,
+                "the original failed receipt must remain failed"
+            );
+            assert_eq!(results.iter().filter(|result| result.success).count(), 2);
+        }
+    }
+
+    #[test]
     fn corrected_rejection_stays_completed_after_refresh_and_reopen() {
         let rejection = serde_json::json!({"code":"HOST_ARGUMENTS_REJECTED","dispatched":false,
             "call_id":"bad","tool_name":"snapshot","null_corrections":["depth"],"message":"not executed"}).to_string();
