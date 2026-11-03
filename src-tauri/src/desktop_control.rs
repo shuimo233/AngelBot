@@ -4733,6 +4733,68 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn run_provider_fixture_commands(
+        mut commands: Vec<std::process::Command>,
+        script: Option<&str>,
+    ) -> Vec<crate::window_capture::BoundedChildOutput> {
+        // Compile the synthetic provider once per batch, not once per case.
+        // Keep every case in its own bounded PowerShell process; only immutable
+        // assembly bytes are shared. The owned directory outlives all children.
+        let directory = tempfile::tempdir().unwrap();
+        let assembly = directory.path().join("observation-provider.dll");
+        let mut compiler =
+            desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap());
+        compiler.env("ANGELBOT_TEST_PROVIDER_ASSEMBLY", &assembly);
+        let compile_script = format!(
+            "Add-Type -TypeDefinition @'\n{OBSERVATION_TEST_PROVIDER_TYPES}\n'@ -OutputAssembly $env:ANGELBOT_TEST_PROVIDER_ASSEMBLY"
+        );
+        let compiled = run_fixture_commands(vec![compiler], Some(&compile_script))
+            .pop()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "synthetic provider compilation: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(assembly.is_file());
+        for command in &mut commands {
+            command.env("ANGELBOT_TEST_PROVIDER_ASSEMBLY", &assembly);
+        }
+        run_fixture_commands(commands, script)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_fixture_shares_only_assembly_and_cleans_it_after_children_exit() {
+        assert!(!OBSERVATION_TEST_PROVIDER_FIXTURE.contains("-TypeDefinition"));
+        let script = format!(
+            "{OBSERVATION_TEST_PROVIDER_FIXTURE}\n$before = $firstControl.Written; $firstControl.Written = $true; @{{ before = $before; after = $firstControl.Written; assembly = [ObservationTestElement].Assembly.Location }} | ConvertTo-Json -Compress"
+        );
+        let commands = (0..2)
+            .map(|_| desktop_child_command(WindowsDesktopAdapter::system_powershell().unwrap()))
+            .collect();
+        let outputs = run_provider_fixture_commands(commands, Some(&script));
+        let mut assembly = None;
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["before"], false);
+            assert_eq!(result["after"], true);
+            let path = result["assembly"].as_str().unwrap().to_owned();
+            assert!(!std::path::Path::new(&path).exists());
+            assert!(!std::path::Path::new(&path).parent().unwrap().exists());
+            if let Some(previous) = &assembly {
+                assert_eq!(previous, &path);
+            }
+            assembly = Some(path);
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn uia_helpers_use_a_windowless_mta_thread() {
         let mut command = WindowsDesktopAdapter::uia_command().unwrap();
@@ -6425,8 +6487,9 @@ if ($mode -eq 'unsafe') { $root.Failure = 'password' }
                 command
             })
             .collect();
-        for ((mode, scoped, code, reads, sleeps, elapsed), output) in
-            cases.into_iter().zip(run_fixture_commands(commands, None))
+        for ((mode, scoped, code, reads, sleeps, elapsed), output) in cases
+            .into_iter()
+            .zip(run_provider_fixture_commands(commands, None))
         {
             assert!(
                 output.status.success(),
@@ -6447,10 +6510,7 @@ if ($mode -eq 'unsafe') { $root.Failure = 'password' }
     }
 
     #[cfg(windows)]
-    const OBSERVATION_TEST_PROVIDER_FIXTURE: &str = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -TypeDefinition @'
+    const OBSERVATION_TEST_PROVIDER_TYPES: &str = r#"
 public class ObservationTestControlType {
   public string ProgrammaticName = "ControlType.Button";
 }
@@ -6707,7 +6767,13 @@ public class ObservationTestWalker {
     return element.NextSibling;
   }
 }
-'@
+"#;
+
+    #[cfg(windows)]
+    const OBSERVATION_TEST_PROVIDER_FIXTURE: &str = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -Path $env:ANGELBOT_TEST_PROVIDER_ASSEMBLY
 $root = New-Object ObservationTestElement
 $firstControl = New-Object ObservationTestElement
 $firstControl.Identifier = 'first'
@@ -6785,7 +6851,7 @@ function Get-UiaWindowProcessId([IntPtr]$handle) {
             .collect();
         for ((failure, expected_controls), output) in cases
             .into_iter()
-            .zip(run_fixture_commands(commands, Some(&script)))
+            .zip(run_provider_fixture_commands(commands, Some(&script)))
         {
             if matches!(failure, "rootCurrent" | "rootVisibility" | "rootPassword") {
                 assert!(!output.status.success(), "fixture {failure}");
@@ -6937,7 +7003,7 @@ function Get-Process { param([int]$Id) return [pscustomobject]@{ Path = 'C:\trus
             .collect();
         for (failure, output) in cases
             .into_iter()
-            .zip(run_fixture_commands(commands, Some(&script)))
+            .zip(run_provider_fixture_commands(commands, Some(&script)))
         {
             assert!(
                 output.status.success(),
@@ -7066,7 +7132,7 @@ if ($env:ANGELBOT_TEST_ROLE -ceq 'ControlType.ListItem' -and $failure -eq 'label
             .collect();
         for ((role, operation, failure, partial), output) in cases
             .into_iter()
-            .zip(run_fixture_commands(commands, Some(&script)))
+            .zip(run_provider_fixture_commands(commands, Some(&script)))
         {
             assert!(
                 output.status.success(),
@@ -7265,7 +7331,7 @@ function Get-Process {
             .collect();
         for ((failure, text), output) in cases
             .into_iter()
-            .zip(run_fixture_commands(commands, Some(&script)))
+            .zip(run_provider_fixture_commands(commands, Some(&script)))
         {
             assert!(
                 output.status.success(),
@@ -7377,7 +7443,7 @@ else { $firstControl.Failure = $failure }
             .collect();
         for (failure, output) in failures
             .into_iter()
-            .zip(run_fixture_commands(commands, Some(&script)))
+            .zip(run_provider_fixture_commands(commands, Some(&script)))
         {
             assert!(
                 output.status.success(),
@@ -7640,7 +7706,7 @@ if ($failure -ceq 'noop') {
         }
         for ((operation, failure), output) in cases
             .into_iter()
-            .zip(run_fixture_commands(commands, Some(&script)))
+            .zip(run_provider_fixture_commands(commands, Some(&script)))
         {
             assert!(
                 output.status.success(),

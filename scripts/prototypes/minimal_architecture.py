@@ -391,7 +391,9 @@ def local_clock(clock):
     if instant.utcoffset() is None:
         raise ValueError('Clock view requires an offset-aware instant')
     offset = instant.strftime('%z')
-    return instant.strftime('%Y年%m月%d日%H时%M分%S秒') + f'（UTC{offset[:3]}:{offset[3:]}）'
+    return (f'{instant.year:04d}年{instant.month:02d}月{instant.day:02d}日'
+            f'{instant.hour:02d}时{instant.minute:02d}分{instant.second:02d}秒'
+            f'（UTC{offset[:3]}:{offset[3:]}）')
 
 
 def normalized_clock_frame(frame, rendered):

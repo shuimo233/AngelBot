@@ -304,17 +304,20 @@ fn invalid_script_definition_is_rejected_before_persistence() {
 #[test]
 fn arbitrary_source_is_copied_transactionally_executed_and_cleaned_without_touching_source() {
     let profile = tempfile::tempdir().unwrap();
+    let alias = profile.path().join("alias");
+    fs::create_dir(&alias).unwrap();
+    let profile_root = alias.join("..");
     let external = tempfile::tempdir().unwrap();
     let source = external.path().join("独立 routine.cjs");
     fs::write(&source, "console.log('imported-copy-canary')").unwrap();
     let state = crate::tests::test_app_state();
     {
         let mut conn = state.db.lock().unwrap();
-        *conn = rusqlite::Connection::open(profile.path().join("data.db")).unwrap();
+        *conn = rusqlite::Connection::open(profile_root.join("data.db")).unwrap();
         crate::db::migrate(&conn).unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('work_directory',?1,1)",
-            [profile.path().to_string_lossy().as_ref()],
+            [profile_root.to_string_lossy().as_ref()],
         )
         .unwrap();
         conn.execute_batch("CREATE TRIGGER reject_import BEFORE INSERT ON automations BEGIN SELECT RAISE(FAIL,'fixture rejected insert'); END;").unwrap();
@@ -336,7 +339,10 @@ fn arbitrary_source_is_copied_transactionally_executed_and_cleaned_without_touch
         )
     };
     assert!(create().is_err());
-    let owned_root = profile.path().join("automation-scripts");
+    // Stored script paths use canonical, display-form paths, not TEMP aliases.
+    let owned_root = std::path::PathBuf::from(crate::commands::file::display_work_dir(
+        &fs::canonicalize(profile_root.join("automation-scripts")).unwrap(),
+    ));
     assert_eq!(
         fs::read_dir(&owned_root).unwrap().count(),
         0,

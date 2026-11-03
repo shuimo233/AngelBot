@@ -214,8 +214,12 @@ class DesktopE2eArtifactTests(unittest.TestCase):
             self.assertTrue(report['usageIncomplete'])
             self.assertNotIn('results', report)
             self.assertFalse((owned / 'acceptance.tmp').exists())
-            failed_owned = root / 'failed-preservation'
-            failed_owned.mkdir()
+            alias = root / 'alias'
+            alias.mkdir()
+            raw_failed_owned = alias / '..' / 'failed-preservation'
+            raw_failed_owned.mkdir()
+            # The worker canonicalizes mkdtemp, including Windows short aliases.
+            failed_owned = raw_failed_owned.resolve()
             preservation['inject'] = True
             write_text = Path.write_text
 
@@ -225,7 +229,7 @@ class DesktopE2eArtifactTests(unittest.TestCase):
                 return write_text(path, *args, **kwargs)
 
             with patch.object(minimal_architecture, 'saved_prefix_source', return_value=(source, hashes, 'fixture-luna', prefixes)), \
-                 patch.object(minimal_architecture.tempfile, 'mkdtemp', return_value=str(failed_owned)), \
+                 patch.object(minimal_architecture.tempfile, 'mkdtemp', return_value=str(raw_failed_owned)), \
                  patch.object(minimal_architecture, 'run_context_worker', side_effect=interrupted_worker), \
                  patch.object(Path, 'write_text', new=fail_manifest_write), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(subprocess.TimeoutExpired) as interrupted:
@@ -419,8 +423,15 @@ class DesktopE2eArtifactTests(unittest.TestCase):
         self.assertEqual(result['scores'], {arm:dict(answerMatches=2, strictSuccess=2) for arm in ('iso', 'local')})
         self.assertEqual(result['learningUsage']['requestCount'], 0)
         self.assertFalse(result['candidateQualifiesForValidation'])
-        self.assertEqual(minimal_architecture.local_clock('2026-11-05T03:59:00-06:30'),
-                         '2026年11月05日03时59分00秒（UTC-06:30）')
+        class AsciiStrftimeDatetime(minimal_architecture.datetime):
+            def strftime(self, fmt):
+                # Python 3.11's Windows strftime uses the active ANSI locale.
+                fmt.encode('ascii')
+                return super().strftime(fmt)
+
+        with patch.object(minimal_architecture, 'datetime', AsciiStrftimeDatetime):
+            self.assertEqual(minimal_architecture.local_clock('2026-11-05T03:59:00-06:30'),
+                             '2026年11月05日03时59分00秒（UTC-06:30）')
         for fault in ('partner', 'effort', 'usage', 'prefix', 'instant', 'hint', 'learning', 'readback'):
             broken = copy.deepcopy(rows)
             if fault == 'partner': broken.pop()
