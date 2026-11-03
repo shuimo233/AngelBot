@@ -1728,6 +1728,55 @@ class DesktopE2eArtifactTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(verify.run_check(verify.Check('required contracts', ('cargo',), minimum_rust_tests=1), True), expected)
 
+    def test_owned_control_journey_distinguishes_checkbox_from_its_caption(self):
+        script = r'''
+import assert from 'node:assert/strict';
+const { assertOwnedDesktopControlJourney } = await import(process.argv[1]);
+const task = 'check and restore the owned checkbox';
+const appId = 'desktop-e2e-window';
+const messages = [{ id: 'u', role: 'user', content: task }];
+for (const [index, phase] of ['before', 'after-check', 'after-uncheck'].entries()) {
+  const regionRef = `region-${index}`, controlRef = `control-${index}`;
+  const message = { id: `a${index}`, parentId: messages.at(-1).id, role: 'assistant',
+    taskRun: { goal: task }, taskFacts: { goal: task }, toolCalls: [], toolResults: [] };
+  const add = (id, name, args, output, approved = false) => {
+    message.toolCalls.push({ id, name, arguments: JSON.stringify(args) });
+    message.toolResults.push({ callId: id, toolName: name, success: true,
+      output: (approved ? 'Confirmation approved: ' : '') + JSON.stringify(output),
+      confirmationStatus: approved ? 'approved' : undefined });
+  };
+  add(`cu-root-${phase}`, 'observe_trusted_app_window', { app_id: appId, mode: 'controls' },
+    { appId, regions: [{ name: 'Fixture region A', role: 'group', regionRef }] });
+  add(`cu-region-${phase}`, 'observe_trusted_app_window',
+    { app_id: appId, mode: 'controls', region_ref: regionRef },
+    { appId, regionRef, truncated: false, diagnostics: [], controls: [
+      { role: 'text', name: 'Region checkbox', enabled: true },
+      { role: 'checkBox', name: 'Region checkbox', enabled: true, capabilities: ['toggle'],
+        state: { toggle: index === 1 ? 'on' : 'off' }, controlRef },
+    ] });
+  if (index < 2) {
+    const action = index === 0 ? 'check' : 'uncheck';
+    add(`cu-${action}`, 'operate_trusted_app_control',
+      { app_id: appId, control_ref: controlRef, action },
+      { adapter: 'windows-native-uia', status: 'verified', target: appId, action, detail: 'verified' }, true);
+  }
+  messages.push(message);
+}
+assertOwnedDesktopControlJourney(messages, task);
+const ambiguous = structuredClone(messages);
+const result = ambiguous[1].toolResults.find(item => item.callId === 'cu-region-before');
+const output = JSON.parse(result.output);
+output.controls.push({ ...output.controls[1], controlRef: 'ambiguous-control' });
+result.output = JSON.stringify(output);
+assert.throws(() => assertOwnedDesktopControlJourney(ambiguous, task), /scope must identify one exact checkbox/);
+console.log('caption accepted; duplicate checkbox rejected');
+'''
+        result = subprocess.run(['node', '--input-type=module', '-e', script,
+                                 (REPO_ROOT/'e2e/helpers/owned-control-journey.mjs').as_uri()],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn('caption accepted; duplicate checkbox rejected', result.stdout)
+
     def test_ci_failure_evidence_is_bounded_best_effort_and_synthetic_only(self):
         script = r'''
 import assert from 'node:assert/strict';
