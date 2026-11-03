@@ -1,0 +1,72 @@
+name: Profile Windows helper startup
+
+on:
+  push:
+    branches: [codex/ci-helper-profile]
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    name: Measure isolated Windows PowerShell phases
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Measure only (not an acceptance gate)
+        shell: python
+        run: |
+          import json, os, subprocess, tempfile, time
+          from pathlib import Path
+          keys = ['PATH', 'PATHEXT', 'SystemRoot', 'WINDIR', 'ComSpec', 'TEMP', 'TMP',
+                  'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'ProgramFiles',
+                  'ProgramFiles(x86)', 'ProgramW6432']
+          env = {key: os.environ[key] for key in keys if key in os.environ}
+          shell = Path(env['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          identity = Path('src-tauri/src/desktop_control/window_identity.ps1').read_text(encoding='utf-8')
+          stamp = "[Console]::Out.WriteLine('{stage}|' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); "
+          builtin = ("$PSModuleAutoLoadingPreference='None'; "
+                     "Import-Module ($PSHOME + '/Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop; "
+                     "Import-Module ($PSHOME + '/Modules/Microsoft.PowerShell.Management/Microsoft.PowerShell.Management.psd1') -ErrorAction Stop; ")
+          for index, (arm, prelude) in enumerate([('minimal', ''), ('builtin_modules', builtin),
+                                                ('builtin_modules', builtin), ('minimal', '')]):
+              script = (stamp.format(stage='engine') + prelude + stamp.format(stage='imports') +
+                        "[Console]::InputEncoding = New-Object Text.UTF8Encoding($false); "
+                        "$ErrorActionPreference='Stop'; " + stamp.format(stage='utility') +
+                        ". ([scriptblock]::Create([Console]::In.ReadToEnd())); " + stamp.format(stage='identity'))
+              start = time.time() * 1000
+              with tempfile.TemporaryDirectory(prefix='angelbot-helper-profile-') as directory:
+                  root = Path(directory)
+                  (root/'input.ps1').write_text(identity, encoding='utf-8')
+                  timed_out = False
+                  # Files keep inherited compiler output from turning pipe draining
+                  # into an unbounded wait. No user or application data is used.
+                  with (root/'input.ps1').open('rb') as source, (root/'stdout').open('wb') as out, (root/'stderr').open('wb') as err:
+                      process = subprocess.Popen([str(shell), '-Mta', '-NoProfile', '-NonInteractive', '-Command', script],
+                                                 stdin=source, stdout=out, stderr=err, env=env,
+                                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                      try:
+                          process.wait(timeout=90)
+                      except subprocess.TimeoutExpired:
+                          timed_out = True
+                      finally:
+                          if process.poll() is None:
+                              cleanup = subprocess.run([str(Path(env['SystemRoot'])/'System32/taskkill.exe'),
+                                                        '/PID', str(process.pid), '/T', '/F'], env=env,
+                                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                       timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+                              if cleanup.returncode and process.poll() is None:
+                                  raise RuntimeError('Owned diagnostic process tree cleanup failed; stop measurement')
+                          process.wait(timeout=10)
+                  output = (root/'stdout').read_text(encoding='utf-8-sig', errors='replace')
+                  stages = {line.split('|')[0]: round(int(line.split('|')[1])-start)
+                            for line in output.splitlines() if '|' in line and line.split('|')[1].isdigit()}
+                  print(json.dumps(dict(index=index, arm=arm, exit=process.returncode, timeout=timed_out,
+                                        elapsedMs=round(time.time()*1000-start), stagesMs=stages,
+                                        stderr=(root/'stderr').read_text(errors='replace')[:1200])), flush=True)
