@@ -494,8 +494,32 @@ describe('first-run desktop experience', () => {
     const redirectSendButton = await browser.$('button[title="发送"]');
     await redirectSendButton.waitForEnabled({ timeout: 5_000 });
     await redirectSendButton.click();
-    const redirectReply = await browser.$('//*[contains(text(), "已取消打开 Windows 声音设置，并先说明如何调整声音")]');
-    await redirectReply.waitForDisplayed({ timeout: 20_000 });
+    try {
+      // The streaming row can be replaced when the durable reply is promoted.
+      // Reacquire its current node rather than waiting on a detached element.
+      await waitForVisible(browser, '//*[contains(text(), "已取消打开 Windows 声音设置，并先说明如何调整声音")]', { timeout: 20_000 });
+    } catch (error) {
+      let state;
+      try {
+        state = await browser.tauri.execute(async ({ core }) => {
+          const messages = await core.invoke('get_messages', { sessionId: window.__angelbotE2ePersonalSessionId });
+          return {
+            messages: messages.slice(-5).map(({ role, content, taskRun, toolResults }) => ({
+              role, content: content?.slice(0, 1000),
+              run: taskRun && { status: taskRun.status, resumable: taskRun.resumable, confirmation: taskRun.confirmationState },
+              results: toolResults?.slice(-3).map(({ callId, success, confirmationStatus, output }) => ({
+                callId: callId?.slice(0, 128), success, confirmationStatus,
+                output: typeof output === 'string' ? output.slice(0, 500) : undefined,
+              })),
+            })),
+            visibleConversation: document.querySelector('.messages')?.textContent?.slice(-4000),
+          };
+        });
+      } catch (diagnosticError) {
+        state = { diagnosticError: String(diagnosticError).slice(0, 500) };
+      }
+      throw new Error(`redirected reply was not visible: ${JSON.stringify(state)}`, { cause: error });
+    }
 
     let redirectedTimeline;
     await browser.waitUntil(async () => {
