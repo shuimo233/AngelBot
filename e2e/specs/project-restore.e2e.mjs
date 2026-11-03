@@ -122,14 +122,27 @@ async function assertPending(item) {
   }
 }
 
-async function chooseWorkspace(item) {
+async function navigatePrimary(label) {
   if (await browser.execute(() => document.querySelector('.sidebar')?.getBoundingClientRect().right <= 0)) {
     await browser.$('[aria-label="打开菜单"]').click();
   }
-  await browser.$(`//button[contains(@class,"session-item-select")][.//span[text()="${item.name}"]]`).click();
-  await browser.waitUntil(async () =>
-    await browser.$('.session-item-select.active .session-item-title').getText() === item.name,
-  { timeout: 10_000, timeoutMsg: 'restored workspace did not become active' });
+  await browser.$('.sidebar-primary-nav').$(`button=${label}`).click();
+}
+
+async function chooseWorkspace(item) {
+  const daily = item.id === DAILY.id;
+  await navigatePrimary(daily ? '日常' : '项目');
+  if (daily) {
+    await browser.waitUntil(async () =>
+      await browser.$('.chat-header-workspace-kind').getText() === '个人空间',
+    { timeout: 10_000, timeoutMsg: 'restored personal workspace did not become active' });
+    assert.equal(await browser.$('.sidebar-primary-nav').$('button=日常').getAttribute('aria-current'), 'page');
+  } else {
+    await browser.$(`//button[contains(@class,"session-item-select")][.//span[text()="${item.name}"]]`).click();
+    await browser.waitUntil(async () =>
+      await browser.$('.session-item-select.active .session-item-title').getText() === item.name,
+    { timeout: 10_000, timeoutMsg: 'restored project workspace did not become active' });
+  }
   await browser.waitUntil(async () => (await browser.$('.messages').getText()).includes(
     item.id === PROJECT_A.id ? 'restore-a-history-visible' : item.id === PROJECT_B.id ? 'restore-b-history-visible' : 'restore-daily-history-visible'),
   { timeout: 10_000, timeoutMsg: 'restored Main history did not appear' });
@@ -245,6 +258,8 @@ describe('native project backup restore', () => {
         await section.$('input[type="password"]').setValue(PASSWORD);
         checkpoint('awaiting-backup-picker', { backupPath, instructions: 'Select this synthetic encrypted backup in the native file picker; do not open any ordinary profile files.' });
         await section.$('button*=导入数据').click();
+        await dialog.waitForDisplayed({ reverse: true, timeout: 180_000 });
+        await navigatePrimary('项目');
         await browser.$('.sidebar-restore-directories').waitForDisplayed({ timeout: 180_000 });
         const pending = await verifyHistory(manifest);
         assert.equal(pending.find((row) => row.id === PROJECT_A.id).directoryConfirmed, false);

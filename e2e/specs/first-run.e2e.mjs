@@ -11,7 +11,7 @@ writeFileSync(join(projectRoot, 'README.md'), '# Desktop E2E Project\n\nThis fil
 const ownedStopScript = join(projectRoot, 'owned-stop.cjs');
 const ownedStopStarted = join(projectRoot, 'owned-stop-started.txt');
 const mainStopEvidenceDir = mkdtempSync(join(tmpdir(), 'angelbot-main-stop-evidence-'));
-writeFileSync(ownedStopScript, "require('node:fs').writeFileSync(require('node:path').join(__dirname, 'owned-stop-started.txt'), String(process.pid));\nsetInterval(() => {}, 1000);\n");
+writeFileSync(ownedStopScript, "require('node:fs').writeFileSync(process.argv[2], String(process.pid));\nsetInterval(() => {}, 1000);\n");
 const notepadPath = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'notepad.exe');
 const mcpFixturePath = fileURLToPath(new URL('../fixtures/mcp-stdio.cjs', import.meta.url));
 
@@ -1352,14 +1352,14 @@ describe('first-run desktop experience', () => {
 
     // Exercise the real signal/cleanup path on one owned temporary process,
     // not a user's game helper or a stale persisted running receipt.
-    const ownedStopDefinition = await browser.tauri.execute(async ({ core }, { scriptPath, rootPath }) => {
+    const ownedStopDefinition = await browser.tauri.execute(async ({ core }, { scriptPath, rootPath, markerPath }) => {
       window.__angelbotE2ePreviousScriptRoot = await core.invoke('get_work_directory');
       await core.invoke('set_work_directory', { path: rootPath });
       const item = await core.invoke('create_automation', {
         title: '停止本次执行检查', prompt: 'Only an isolated owned process fixture.',
         triggerKind: 'once', triggerValue: new Date(Date.now() + 86_400_000).toISOString(),
         permissionSummary: 'Local fixture', executorKind: 'script', scriptPath,
-        scriptArgs: [], timeoutSeconds: 60, workspaceId: window.__angelbotE2eWorkspaceId,
+        scriptArgs: [markerPath], timeoutSeconds: 60, workspaceId: window.__angelbotE2eWorkspaceId,
       });
       window.__angelbotE2eOwnedStopId = item.id;
       window.__angelbotE2eOwnedStopResult = 'pending';
@@ -1368,7 +1368,7 @@ describe('first-run desktop experience', () => {
         () => { window.__angelbotE2eOwnedStopResult = 'failed'; },
       );
       return item;
-    }, { scriptPath: ownedStopScript, rootPath: projectRoot });
+    }, { scriptPath: ownedStopScript, rootPath: projectRoot, markerPath: ownedStopStarted });
     await browser.waitUntil(() => existsSync(ownedStopStarted), {
       timeout: 10_000, interval: 100, timeoutMsg: 'owned stop fixture did not actually start',
     });
