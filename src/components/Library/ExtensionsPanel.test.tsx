@@ -20,9 +20,9 @@ it('shows actual metadata and compatibility limits without starting services or 
   const frame = render(<ExtensionsPanel kind="skills" />);
   expect(await screen.findByText('写作规范')).toBeInTheDocument();
   expect(getMcpServers).not.toHaveBeenCalled();
-  await user.click(screen.getByText('查看详情'));
+  await user.click(screen.getByText('写作规范'));
   expect(screen.getByText('external-tool')).toBeInTheDocument();
-  expect(screen.getByText(/声明不是授权/)).toBeInTheDocument();
+  expect(screen.getByText(/技能声明不授予权限/)).toBeInTheDocument();
   await user.click(screen.getByText('模板：检查'));
   expect(screen.getByText('<script>不执行</script>')).toBeInTheDocument();
   expect(frame.container.querySelector('script')).toBeNull();
@@ -40,7 +40,7 @@ it('keeps a skill read failure distinct without loading connections', async () =
   const user = userEvent.setup();
     render(<ExtensionsPanel kind="skills" />);
     expect(await screen.findByRole('alert')).toHaveTextContent('无法加载已添加的技能');
-    expect(screen.queryByText('还没有已添加的技能')).not.toBeInTheDocument();
+    expect(screen.queryByText('暂无技能')).not.toBeInTheDocument();
     expect(getMcpServers).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: '重新加载' }));
     await waitFor(() => expect(screen.getByText('写作规范')).toBeInTheDocument());

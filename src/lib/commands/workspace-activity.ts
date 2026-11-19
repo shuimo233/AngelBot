@@ -27,6 +27,7 @@ interface WirePendingDecisionProjection {
 interface WireAttentionSummary {
   open_count: number;
   message: string;
+  retry_reminder_ids?: string[];
 }
 
 interface WireWorkspaceActivityProjection {
@@ -78,6 +79,7 @@ export interface MainAgentDecision {
 export interface WorkspaceAttentionSummary {
   openCount: number;
   message: string;
+  retryReminderIds?: string[];
 }
 
 export interface WorkspaceActivityProjection {
@@ -132,7 +134,11 @@ export function mapWorkspaceActivityProjection(wire: WireWorkspaceActivityProjec
       updatedAt: item.updated_at,
     })),
     attention: wire.attention
-      ? { openCount: wire.attention.open_count, message: wire.attention.message }
+      ? {
+        openCount: wire.attention.open_count,
+        message: wire.attention.message,
+        retryReminderIds: wire.attention.retry_reminder_ids,
+      }
       : null,
   };
 }
@@ -141,4 +147,8 @@ export function mapWorkspaceActivityProjection(wire: WireWorkspaceActivityProjec
 export async function getWorkspaceActivity(workspaceId: string): Promise<WorkspaceActivityProjection> {
   const wire = await invoke<WireWorkspaceActivityProjection>('get_workspace_activity_projection', { workspaceId });
   return mapWorkspaceActivityProjection(wire);
+}
+
+export function dismissWorkspaceTaskReminders(workspaceId: string, sessionId: string, reminderIds: string[]): Promise<void> {
+  return invoke('dismiss_workspace_task_reminders', { workspaceId, sessionId, reminderIds });
 }

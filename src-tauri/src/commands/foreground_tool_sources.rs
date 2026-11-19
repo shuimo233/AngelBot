@@ -6,8 +6,9 @@ use crate::agent::{
 };
 use crate::agent::{
     tool_context::{self, ToolContextProjector},
-    tool_source::{self, SourceRecord},
+    tool_source::{self, SourceRecord, ToolSource},
 };
+use crate::llm::{Message, ModelProtocol};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -304,12 +305,16 @@ impl ToolContextProjector for ForegroundToolSources {
         call_id: &str,
         tool_name: &str,
         result: &ToolResult,
+        visible_history: &[Message],
     ) -> Result<Option<String>, String> {
+        let contextual = self.allow_history
+            && (tool_name == "recall_conversation"
+                || (tool_name == "read_file" && result.content.len() >= 512))
+            && has_native_history(visible_history);
         if !result.success
             || result.terminate_batch
             || !result.images.is_empty()
-            || tool_name == "read_tool_result"
-            || result.content.len() <= 6000
+            || !(projectable_output(tool_name, &result.content) || contextual)
         {
             return Ok(None);
         }
@@ -317,23 +322,282 @@ impl ToolContextProjector for ForegroundToolSources {
         else {
             return Ok(None);
         };
-        let visible = tool_context::view(
-            &reference,
-            &source.tool_name,
-            source.reported_success,
-            &source.output,
-            "",
-            0,
-            1200,
-            false,
-            false,
-        )?;
-        if visible.len() + 256 >= result.content.len() {
-            return Ok(None);
+        if contextual {
+            if let Some(projected) =
+                contextual_model_view(&reference, &source, visible_history, None)
+            {
+                return Ok(Some(projected));
+            }
         }
-        Ok(Some(visible))
+        bounded_model_view(&reference, &source)
     }
 }
+
+fn projectable_output(tool_name: &str, output: &str) -> bool {
+    tool_name != "read_tool_result" && output.len() > 6000
+}
+
+fn bounded_model_view(reference: &str, source: &ToolSource) -> Result<Option<String>, String> {
+    if !source.reported_success || !projectable_output(&source.tool_name, &source.output) {
+        return Ok(None);
+    }
+    let mut visible = tool_context::view(
+        reference,
+        &source.tool_name,
+        source.reported_success,
+        &source.output,
+        "",
+        0,
+        1200,
+        false,
+        false,
+    )?;
+    if source.tool_name == "run_project_command" {
+        if let Some(with_previews) = command_projection_with_previews(&visible, &source.output) {
+            visible = with_previews;
+        }
+    }
+    Ok((visible.len() + 256 < source.output.len()).then_some(visible))
+}
+
+/// Verify the exact model-visible text against an already opened, sealed source.
+pub(crate) fn matches_sealed_model_output(
+    reference: &str,
+    source: &ToolSource,
+    text: &str,
+) -> bool {
+    if !source.reported_success {
+        return false;
+    }
+    if text == source.output {
+        return true;
+    }
+    text.strip_prefix("Result: ").is_some_and(|result| {
+        if result == source.output {
+            return text.chars().count() <= tool_context::MAX_TOOL_RESULT_CONTEXT_CHARS;
+        }
+        bounded_model_view(reference, source).is_ok_and(|view| view.as_deref() == Some(result))
+    })
+}
+
+pub(crate) fn matches_sealed_model_output_with_history(
+    reference: &str,
+    source: &ToolSource,
+    text: &str,
+    visible_history: &[Message],
+) -> bool {
+    source.reported_success
+        && text.strip_prefix("Result: ").is_some_and(|projected| {
+            contextual_model_view(reference, source, visible_history, Some(projected)).as_deref()
+                == Some(projected)
+        })
+}
+
+fn contextual_model_view(
+    reference: &str,
+    source: &ToolSource,
+    history: &[Message],
+    emitted: Option<&str>,
+) -> Option<String> {
+    let history = active_native_history(history)?;
+    match source.tool_name.as_str() {
+        "recall_conversation" => recall_projection(&source.output, history, emitted),
+        "read_file" => repeated_read_projection(reference, source, history, emitted),
+        _ => None,
+    }
+}
+
+fn has_native_history(history: &[Message]) -> bool {
+    history.iter().any(|message| {
+        message
+            .protocol_state
+            .as_ref()
+            .is_some_and(|protocol| protocol.protocol == ModelProtocol::OpenaiResponses)
+    })
+}
+
+fn active_native_history(history: &[Message]) -> Option<&[Message]> {
+    if !has_native_history(history) {
+        return None;
+    }
+    // The Responses adapter discards old input before its latest matching
+    // native checkpoint. Cut at any Responses checkpoint conservatively.
+    let active_start = history
+        .iter()
+        .rposition(|message| {
+            message.protocol_state.as_ref().is_some_and(|protocol| {
+                protocol.protocol == ModelProtocol::OpenaiResponses
+                    && protocol
+                        .output_items
+                        .iter()
+                        .any(|item| item["type"] == "compaction")
+            })
+        })
+        .unwrap_or(0);
+    Some(&history[active_start..])
+}
+
+fn recall_projection(output: &str, history: &[Message], emitted: Option<&str>) -> Option<String> {
+    const TEXT_IN_PRIOR_USER: &str = "text_in_prior_user";
+    let emitted: Option<Value> = match emitted {
+        Some(value) => Some(serde_json::from_str(value).ok()?),
+        None => None,
+    };
+    let mut value: Value = serde_json::from_str(output).ok()?;
+    let rows = value.get_mut("sources")?.as_array_mut()?;
+    let mut omitted = false;
+    for (index, row) in rows.iter_mut().enumerate() {
+        // Replay may now contain additional eligible copies. Verify only the
+        // exact subset that was omitted in the saved model-visible receipt.
+        if emitted
+            .as_ref()
+            .is_some_and(|saved| !saved["sources"][index][TEXT_IN_PRIOR_USER].is_string())
+        {
+            continue;
+        }
+        if row["role"] != "user" || row["complete"] != true {
+            continue;
+        }
+        let Some(prefix) = row["text"]
+            .as_str()
+            .and_then(|text| prior_user_prefix(text, history))
+        else {
+            continue;
+        };
+        let fields = row.as_object_mut()?;
+        fields.remove("text");
+        fields.remove("complete");
+        fields.insert(TEXT_IN_PRIOR_USER.into(), json!(prefix));
+        omitted = true;
+    }
+    if !omitted {
+        return None;
+    }
+    let projected = value.to_string();
+    (projected.len() < output.len()).then_some(projected)
+}
+
+fn repeated_read_projection(
+    reference: &str,
+    source: &ToolSource,
+    history: &[Message],
+    emitted: Option<&str>,
+) -> Option<String> {
+    const PREVIOUS_READ: &str = "same_content_as_read_call";
+    const MIN_SAVINGS_BYTES: usize = 128;
+    let mut value: Value = serde_json::from_str(&source.output).ok()?;
+    if value["content"].as_str()?.len() < MIN_SAVINGS_BYTES
+        || value["resolvedPath"].as_str()?.is_empty()
+        || value.get(PREVIOUS_READ).is_some()
+        || value.get("source_ref").is_some()
+    {
+        return None;
+    }
+    let requested_call = match emitted {
+        Some(text) => Some(
+            serde_json::from_str::<Value>(text).ok()?[PREVIOUS_READ]
+                .as_str()?
+                .to_owned(),
+        ),
+        None => None,
+    };
+    let prior_call = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            let call_id = message.tool_call_id.as_deref()?;
+            if message.role != "tool"
+                || call_id.is_empty()
+                || call_id == source.call_id.as_str()
+                || requested_call
+                    .as_deref()
+                    .is_some_and(|requested| requested != call_id)
+                || message.content.strip_prefix("Result: ") != Some(source.output.as_str())
+                || !unique_read_call_before_result(history, call_id, index)
+            {
+                return None;
+            }
+            Some(call_id)
+        })?;
+    let fields = value.as_object_mut()?;
+    fields.remove("content");
+    fields.insert(PREVIOUS_READ.into(), json!(prior_call));
+    fields.insert("source_ref".into(), json!(reference));
+    let projected = value.to_string();
+    (projected.len() + MIN_SAVINGS_BYTES <= source.output.len()).then_some(projected)
+}
+
+fn unique_read_call_before_result(history: &[Message], call_id: &str, result_index: usize) -> bool {
+    let mut calls = history
+        .iter()
+        .enumerate()
+        .flat_map(|(index, message)| {
+            message
+                .tool_calls
+                .iter()
+                .flatten()
+                .map(move |call| (index, message.role.as_str(), call))
+        })
+        .filter(|(_, _, call)| call.id == call_id);
+    calls.next().is_some_and(|(index, role, call)| {
+        role == "assistant" && index < result_index && call.name == "read_file"
+    }) && calls.next().is_none()
+        && history
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some(call_id))
+            .count()
+            == 1
+}
+
+fn prior_user_prefix(text: &str, history: &[Message]) -> Option<String> {
+    let prefix: String = text.chars().take(24).collect();
+    if prefix == text {
+        return None;
+    }
+    let mut matches = history
+        .iter()
+        .filter(|message| message.role == "user" && message.content.starts_with(&prefix));
+    (matches.next()?.content == text && matches.all(|message| message.content == text))
+        .then_some(prefix)
+}
+
+fn command_projection_with_previews(view: &str, output: &str) -> Option<String> {
+    const PREVIEW_CHARS: usize = 192;
+
+    let mut view: Value = serde_json::from_str(view).ok()?;
+    if view["values"]["code"] != "COMMAND_EXITED" {
+        return None;
+    }
+    let omitted_paths = view["omitted_paths"].as_array()?;
+    let output: Value = serde_json::from_str(output).ok()?;
+    let mut previews = serde_json::Map::new();
+    for path in ["/stdout", "/stderr"] {
+        if !omitted_paths
+            .iter()
+            .any(|omitted| omitted.as_str() == Some(path))
+        {
+            continue;
+        }
+        if let Some(captured) = output.pointer(path).and_then(Value::as_str) {
+            let start = captured
+                .char_indices()
+                .rev()
+                .nth(PREVIEW_CHARS - 1)
+                .map_or(0, |(index, _)| index);
+            previews.insert(path.into(), json!(&captured[start..]));
+        }
+    }
+    if previews.is_empty() {
+        return None;
+    }
+    // Each preview ends at the capture boundary. The receipt's truncation
+    // flags describe whether that boundary is also the end of the stream.
+    view["captured_tail_previews"] = Value::Object(previews);
+    let view = view.to_string();
+    (view.len() <= tool_context::MAX_VIEW_BYTES).then_some(view)
+}
+
 impl ToolHandler for ForegroundToolSources {
     fn name(&self) -> &str {
         "read_tool_result"
@@ -375,18 +639,344 @@ mod tests {
     }
 
     fn append(db: Arc<Mutex<Connection>>, call: &str, output: &str) {
+        append_tool(db, call, "inspect", output);
+    }
+
+    fn append_tool(db: Arc<Mutex<Connection>>, call: &str, tool_name: &str, output: &str) {
         AgentRunJournal::new(db, "r".into())
             .append(
                 "s",
                 &AgentEvent::ToolExecutionEnd {
                     call_id: call.into(),
-                    tool_name: "inspect".into(),
+                    tool_name: tool_name.into(),
                     success: true,
                     output: output.into(),
                     error: None,
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn recall_projection_requires_visible_whole_user_originals_and_verifies_sealed_subset() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        seed(&db.lock().unwrap());
+        let original = format!(
+            "One visible user requirement. {}",
+            "保存原始要求。".repeat(32)
+        );
+        let additional = format!(
+            "Another original user message. {}",
+            "另外的偏好。".repeat(32)
+        );
+        let older = format!(
+            "Old user message before the checkpoint. {}",
+            "之前的约定。".repeat(32)
+        );
+        let assistant = format!(
+            "Assistant suggestion, not a user source. {}",
+            "建议。".repeat(32)
+        );
+        let partial = format!(
+            "Partial body with unknown remainder. {}",
+            "片段。".repeat(32)
+        );
+        let revision = "a".repeat(64);
+        let row = |id: &str, role: &str, text: &str| {
+            json!({
+                "message_id":id,"revision":revision,"role":role,"created_at":1,
+                "matched":true,"complete":true,"text":text
+            })
+        };
+        let mut fragment = row("partial", "user", &partial);
+        fragment.as_object_mut().unwrap().remove("complete");
+        fragment["has_more"] = json!(true);
+        let mut exact = row("visible", "user", &original);
+        exact["attachments"] = json!([{"attachment_index":0,"name":"notes.txt","total_chars":2}]);
+        let raw = json!({"historical_data":true,"sources":[
+            row("older", "user", &older), exact,
+            row("another", "user", &additional), row("assistant", "assistant", &assistant), fragment
+        ]});
+        let output = raw.to_string();
+        let tool = "recall_conversation";
+        let result = ToolResult::success(tool, &output);
+        append_tool(db.clone(), "recall", tool, &output);
+        let sources = ForegroundToolSources::new(db, "s".into(), Some("r".into()), true);
+        let message = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_images: vec![],
+            protocol_state: None,
+        };
+        let mut checkpoint = message("assistant", "");
+        checkpoint.protocol_state = Some(crate::llm::ProtocolContinuation {
+            protocol: ModelProtocol::OpenaiResponses,
+            model: "fixture".into(),
+            credential_ref: "fixture".into(),
+            output_items: vec![json!({"type":"compaction"})],
+        });
+        let history = vec![
+            message("user", &older),
+            checkpoint,
+            message("user", &original),
+            message("assistant", &additional),
+            message("user", &assistant),
+            message("user", &partial),
+        ];
+        let projected = sources
+            .project("recall", tool, &result, &history)
+            .unwrap()
+            .unwrap();
+        assert!(projected.len() < output.len());
+        let mut compact: Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(
+            compact["sources"][1]["text_in_prior_user"],
+            original.chars().take(24).collect::<String>()
+        );
+        assert!(compact["sources"][1].get("text").is_none());
+        assert!(compact["sources"][1].get("complete").is_none());
+        for field in [
+            "message_id",
+            "revision",
+            "role",
+            "created_at",
+            "matched",
+            "attachments",
+        ] {
+            assert_eq!(compact["sources"][1][field], raw["sources"][1][field]);
+        }
+        for index in [0, 2, 3, 4] {
+            assert_eq!(compact["sources"][index], raw["sources"][index]);
+        }
+        assert!(sources
+            .project("missing", tool, &result, &history)
+            .unwrap()
+            .is_none());
+        assert!(sources
+            .project("recall", tool, &result, &[message("user", &original)])
+            .unwrap()
+            .is_none());
+
+        let (reference, sealed) = sources
+            .current_source("recall", tool, &output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed.output, output);
+        let model_result = format!("Result: {projected}");
+        assert!(!matches_sealed_model_output(
+            &reference,
+            &sealed,
+            &model_result
+        ));
+        assert!(matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &model_result,
+            &history
+        ));
+        let mut replay = history.clone();
+        replay.push(message("user", &additional));
+        assert!(matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &model_result,
+            &replay
+        ));
+        replay[2].role = "assistant".into();
+        assert!(!matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &model_result,
+            &replay
+        ));
+        let mut ambiguous = history.clone();
+        ambiguous.push(message(
+            "user",
+            "One visible user requirement. But different.",
+        ));
+        assert!(sources
+            .project("recall", tool, &result, &ambiguous)
+            .unwrap()
+            .is_none());
+        compact["sources"][1]["revision"] = json!("forged");
+        assert!(!matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &format!("Result: {compact}"),
+            &history
+        ));
+    }
+
+    #[test]
+    fn repeated_file_projection_keeps_fresh_sealed_read_and_requires_exact_prior_raw() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        seed(&db.lock().unwrap());
+        let text = "same file contents 🪶\n".repeat(36);
+        let raw = json!({"resolvedPath":"/project/file.txt","content":text,"offset":20,
+            "total_chars":1000,"has_more":true,"next_offset":20+text.chars().count()});
+        let output = raw.to_string();
+        let tool = "read_file";
+        let result = ToolResult::success(tool, &output);
+        append_tool(db.clone(), "second-read", tool, &output);
+        let sources = ForegroundToolSources::new(db, "s".into(), Some("r".into()), true);
+        let request = Message {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![crate::llm::ToolCall {
+                id: "first-read".into(),
+                name: tool.into(),
+                arguments: json!({"path":"file.txt","offset":20,"limit":text.chars().count()}),
+            }]),
+            tool_call_id: None,
+            tool_images: vec![],
+            protocol_state: Some(crate::llm::ProtocolContinuation {
+                protocol: ModelProtocol::OpenaiResponses,
+                model: "fixture".into(),
+                credential_ref: "fixture".into(),
+                output_items: vec![],
+            }),
+        };
+        let previous = Message {
+            role: "tool".into(),
+            content: format!("Result: {output}"),
+            tool_calls: None,
+            tool_call_id: Some("first-read".into()),
+            tool_images: vec![],
+            protocol_state: None,
+        };
+        let history = vec![request.clone(), previous.clone()];
+        let project = |history: &[Message]| {
+            sources
+                .project("second-read", tool, &result, history)
+                .unwrap()
+        };
+        let projected = project(&history).unwrap();
+        assert!(projected.len() + 128 <= output.len());
+        let compact: Value = serde_json::from_str(&projected).unwrap();
+        let (reference, sealed) = sources
+            .current_source("second-read", tool, &output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed.output, output);
+        let mut expected = raw.clone();
+        expected.as_object_mut().unwrap().remove("content");
+        expected["same_content_as_read_call"] = json!("first-read");
+        expected["source_ref"] = json!(reference);
+        assert_eq!(compact, expected);
+        let reread: Value = serde_json::from_str(
+            &sources
+                .read(&json!({
+                    "source_ref":reference,"path":"/content"
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reread["text"], text);
+        let model_result = format!("Result: {projected}");
+        assert!(!matches_sealed_model_output(
+            &reference,
+            &sealed,
+            &model_result
+        ));
+        assert!(matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &model_result,
+            &history
+        ));
+
+        let mut changed_range = raw.clone();
+        changed_range["offset"] = json!(21);
+        let mut changed_content = raw.clone();
+        changed_content["content"] = json!("file changed");
+        for changed in [changed_range, changed_content, compact.clone()] {
+            let mut replay = history.clone();
+            replay[1].content = format!("Result: {changed}");
+            assert!(project(&replay).is_none());
+            assert!(!matches_sealed_model_output_with_history(
+                &reference,
+                &sealed,
+                &model_result,
+                &replay
+            ));
+        }
+        let mut ambiguous = history.clone();
+        ambiguous.push(previous);
+        assert!(project(&ambiguous).is_none());
+        let mut wrong_tool = history.clone();
+        wrong_tool[0].tool_calls.as_mut().unwrap()[0].name = "other_tool".into();
+        assert!(project(&wrong_tool).is_none());
+        let mut checkpoint = request;
+        checkpoint.tool_calls = None;
+        checkpoint.protocol_state.as_mut().unwrap().output_items =
+            vec![json!({"type":"compaction"})];
+        let mut truncated = history.clone();
+        truncated.push(checkpoint);
+        assert!(project(&truncated).is_none());
+        assert!(!matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &model_result,
+            &truncated
+        ));
+
+        let mut forged = compact;
+        forged["source_ref"] = json!("forged");
+        assert!(!matches_sealed_model_output_with_history(
+            &reference,
+            &sealed,
+            &format!("Result: {forged}"),
+            &history
+        ));
+    }
+
+    #[test]
+    fn command_projection_keeps_captured_tails_and_exact_source() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        seed(&db.lock().unwrap());
+        let tool = "run_project_command";
+        let stdout = format!("build-start\n{}\nbuild-complete", "编译🪶\n".repeat(900));
+        let stderr = format!("{}\nwarning-capture-boundary", "\0\"\\".repeat(600));
+        let output = json!({
+            "code": "COMMAND_EXITED",
+            "exit_code": 0,
+            "message": "Command completed",
+            "stdout": stdout,
+            "stdout_truncated": false,
+            "stderr": stderr,
+            "stderr_truncated": true,
+        })
+        .to_string();
+        append_tool(db.clone(), "cmd-1", tool, &output);
+        let sources = ForegroundToolSources::new(db, "s".into(), Some("r".into()), false);
+        let result = sources
+            .project("cmd-1", tool, &ToolResult::success(tool, &output), &[])
+            .unwrap()
+            .unwrap();
+        assert!(result.len() <= tool_context::MAX_VIEW_BYTES);
+        assert!(result.len() + 256 < output.len());
+        let view: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(view["values"]["exit_code"], 0);
+        assert_eq!(view["values"]["stderr_truncated"], true);
+        assert_eq!(view["complete"], false);
+        for (path, original) in [("/stdout", stdout), ("/stderr", stderr)] {
+            assert!(view["omitted_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(path)));
+            let preview = view["captured_tail_previews"][path].as_str().unwrap();
+            assert_eq!(preview.chars().count(), 192);
+            assert!(original.ends_with(preview));
+            let reread: Value = serde_json::from_str(
+                &sources
+                    .read(&json!({"source_ref":view["source_ref"],"path":path,"tail":true,"limit":192}))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reread["text"], preview);
+        }
     }
 
     #[test]
@@ -428,7 +1018,7 @@ mod tests {
         let reference = tool_source::reference(&id).unwrap();
         let sources = ForegroundToolSources::new(db.clone(), "s".into(), Some("r".into()), false);
         assert!(sources
-            .project("window", "read_file", &result)
+            .project("window", "read_file", &result, &[])
             .unwrap()
             .is_none());
         std::fs::write(&file, "newer disk content").unwrap();
@@ -487,6 +1077,7 @@ mod tests {
                 "inspect-1",
                 "inspect",
                 &ToolResult::success("inspect", &output),
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -549,7 +1140,8 @@ mod tests {
                 .project(
                     "absent",
                     "inspect",
-                    &ToolResult::success("inspect", &output)
+                    &ToolResult::success("inspect", &output),
+                    &[],
                 )
                 .unwrap()
                 .is_none(),
@@ -818,20 +1410,26 @@ mod tests {
             );
         }
         assert!(current
-            .project("same", "inspect", &ToolResult::error("inspect", &output))
+            .project(
+                "same",
+                "inspect",
+                &ToolResult::error("inspect", &output),
+                &[]
+            )
             .unwrap()
             .is_none());
         let mut result = ToolResult::success("inspect", &output);
         result.terminate_batch = true;
         assert!(current
-            .project("same", "inspect", &result)
+            .project("same", "inspect", &result, &[])
             .unwrap()
             .is_none());
         assert!(current
             .project(
                 "same",
                 "wrong-tool",
-                &ToolResult::success("wrong-tool", &output)
+                &ToolResult::success("wrong-tool", &output),
+                &[],
             )
             .unwrap()
             .is_none());
@@ -851,7 +1449,12 @@ mod tests {
             "limit is an actual index bound, not a silently ignored option"
         );
         assert!(current
-            .project("same", "inspect", &ToolResult::success("inspect", &output))
+            .project(
+                "same",
+                "inspect",
+                &ToolResult::success("inspect", &output),
+                &[]
+            )
             .unwrap()
             .is_none());
         db.lock().unwrap().execute_batch("UPDATE sessions SET leaf_message_id=NULL WHERE id='s'; UPDATE messages SET parent_id=NULL WHERE id='r';").unwrap();

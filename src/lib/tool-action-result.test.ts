@@ -9,6 +9,9 @@ describe('tool action result semantics', () => {
     expect(toolActionReceipt('mcp_browser__browser_click_a1b2c3d4', {
       success: false, output: 'Error: {"code":"RESULT_UNKNOWN","message":"untrusted details"}',
     })).toMatchObject({ status: 'result_unknown', label: '结果未知' });
+    expect(toolActionReceipt('run_project_command', {
+      success: false, output: '{"code":"RESULT_UNKNOWN","message":"interrupted"}',
+    })).toMatchObject({ status: 'result_unknown', explanation: expect.stringContaining('核对文件和运行结果') });
     expect(toolActionReceipt('mcp_browser__browser_click_a1b2c3d4', {
       success: true, output: '{"status":"verified"}',
     })).toBeNull();

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigationStore } from '$stores/navigation';
 import { useWorkspacesStore } from '$stores/workspaces';
+import { normalizeProjectSearch, projectsByRecentUse } from '$lib/project-search';
 import './CommandPalette.css';
 
 type CommandCategory = 'workspace' | 'navigate' | 'action' | 'settings';
@@ -19,6 +20,7 @@ interface CommandPaletteProps {
 }
 
 const CATEGORY_ORDER: CommandCategory[] = ['workspace', 'navigate', 'action', 'settings'];
+const PROJECT_RESULT_LIMIT = 20;
 const CATEGORY_LABEL: Record<CommandCategory, string> = {
   workspace: '工作区',
   navigate: '功能',
@@ -33,24 +35,22 @@ const SearchIcon = () => (
   </svg>
 );
 
-function normalized(value: string): string {
-  return value.trim().toLocaleLowerCase();
-}
-
 export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [runningCommandId, setRunningCommandId] = useState<string | null>(null);
   const [actionError, setActionError] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
   const generationRef = useRef(0);
   const workspaces = useWorkspacesStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
+  const recentProjectIds = useWorkspacesStore((state) => state.recentProjectIds);
   const openWorkspace = useWorkspacesStore((state) => state.openWorkspace);
   const setPage = useNavigationStore((state) => state.setPage);
 
   const commands: Command[] = useMemo(() => [
-    ...workspaces.map((workspace) => ({
+    ...[...workspaces.filter(({ kind }) => kind === 'personal'), ...projectsByRecentUse(workspaces, recentProjectIds)].map((workspace) => ({
       id: `workspace-${workspace.id}`,
       label: workspace.kind === 'personal' ? 'AngelBot 日常' : workspace.name,
       description: workspace.kind === 'personal'
@@ -67,6 +67,13 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
         return true;
       },
     })),
+    {
+      id: 'navigate-projects',
+      label: '全部项目',
+      description: '按名称或路径筛选',
+      category: 'navigate',
+      action: () => setPage('projects'),
+    },
     {
       id: 'navigate-automations',
       label: '自动化',
@@ -109,18 +116,31 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
       category: 'settings',
       action: () => { window.dispatchEvent(new CustomEvent('open-settings', { detail: 'mcp' })); },
     },
-  ], [openWorkspace, setPage, workspaces]);
+  ], [openWorkspace, recentProjectIds, setPage, workspaces]);
 
   const filteredCommands = useMemo(() => {
-    const search = normalized(query);
+    const search = normalizeProjectSearch(query);
     if (!search) return commands;
-    return commands.filter((command) => normalized(`${command.label} ${command.description}`).includes(search));
+    return commands.filter((command) => normalizeProjectSearch(`${command.label} ${command.description}`).includes(search));
   }, [commands, query]);
 
-  const groupedCommands = useMemo(() => CATEGORY_ORDER.map((category) => ({
-    category,
-    commands: filteredCommands.filter((command) => command.category === category),
-  })).filter((group) => group.commands.length > 0), [filteredCommands]);
+  const { groupedCommands, visibleCommands, truncatedWorkspaces } = useMemo(() => {
+    let workspaceCount = 0;
+    const byCategory = new Map<CommandCategory, Command[]>();
+    for (const command of filteredCommands) {
+      if (command.category === 'workspace' && ++workspaceCount > PROJECT_RESULT_LIMIT) continue;
+      const group = byCategory.get(command.category);
+      if (group) group.push(command);
+      else byCategory.set(command.category, [command]);
+    }
+    const groupedCommands = CATEGORY_ORDER.flatMap((category) => {
+      const commands = byCategory.get(category);
+      return commands ? [{ category, commands }] : [];
+    });
+    return { groupedCommands, visibleCommands: groupedCommands.flatMap(({ commands }) => commands),
+      truncatedWorkspaces: workspaceCount > PROJECT_RESULT_LIMIT };
+  }, [filteredCommands]);
+  const selectedCommand = visibleCommands[selectedIndex];
 
   useEffect(() => {
     if (!isOpen) return undefined;
@@ -139,8 +159,14 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
   }, [isOpen]);
 
   useEffect(() => {
-    if (selectedIndex >= filteredCommands.length) setSelectedIndex(Math.max(filteredCommands.length - 1, 0));
-  }, [filteredCommands.length, selectedIndex]);
+    if (selectedIndex >= visibleCommands.length) setSelectedIndex(Math.max(visibleCommands.length - 1, 0));
+  }, [visibleCommands.length, selectedIndex]);
+
+  const selectedId = selectedCommand?.id;
+  useEffect(() => {
+    if (!isOpen || !selectedId) return;
+    resultsRef.current?.querySelector('[aria-selected="true"]')?.scrollIntoView?.({ block: 'nearest' });
+  }, [isOpen, selectedId]);
 
   const execute = async (command: Command) => {
     if (runningCommandId) return;
@@ -158,21 +184,22 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       onClose();
       return;
     }
-    if (filteredCommands.length === 0) return;
+    if (visibleCommands.length === 0) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      setSelectedIndex((index) => (index + 1) % filteredCommands.length);
+      setSelectedIndex((index) => (index + 1) % visibleCommands.length);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      setSelectedIndex((index) => (index - 1 + filteredCommands.length) % filteredCommands.length);
-    } else if (event.key === 'Enter') {
+      setSelectedIndex((index) => (index - 1 + visibleCommands.length) % visibleCommands.length);
+    } else if (event.key === 'Enter' && selectedCommand) {
       event.preventDefault();
-      void execute(filteredCommands[selectedIndex]);
+      void execute(selectedCommand);
     }
   };
 
@@ -195,7 +222,7 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
             placeholder="搜索项目、功能或设置"
             autoComplete="off"
             aria-controls="command-palette-results"
-            aria-activedescendant={filteredCommands[selectedIndex] ? `command-${filteredCommands[selectedIndex].id}` : undefined}
+            aria-activedescendant={selectedId ? `command-${selectedId}` : undefined}
             value={query}
             onChange={(event) => { setQuery(event.target.value); setSelectedIndex(0); setActionError(''); }}
             onKeyDown={handleKeyDown}
@@ -205,7 +232,7 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
 
         {actionError && <div className="command-palette-error" role="alert">{actionError}<span>请重试，或从左侧工作区列表打开。</span></div>}
 
-        <div id="command-palette-results" className="command-palette-results" role="listbox" aria-label="快速切换结果">
+        <div id="command-palette-results" ref={resultsRef} className="command-palette-results" role="listbox" aria-label="快速切换结果">
           {filteredCommands.length === 0 ? (
             <div className="command-palette-empty">
               <strong>没有找到“{query.trim()}”</strong>
@@ -243,7 +270,9 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
         <footer className="command-palette-footer">
           <span><kbd>↑↓</kbd> 选择</span>
           <span><kbd>Enter</kbd> 打开</span>
-          <span className="command-palette-footer-note">Ctrl+K 随时呼出</span>
+          {truncatedWorkspaces
+            ? <span className="command-palette-footer-note command-palette-limit">前 {PROJECT_RESULT_LIMIT} 个工作区，可继续筛选</span>
+            : <span className="command-palette-footer-note">Ctrl+K 随时呼出</span>}
         </footer>
       </section>
     </div>

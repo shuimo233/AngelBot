@@ -7,12 +7,18 @@ import {
   type Workspace,
 } from '$lib/commands/workspace';
 import { useSessionsStore } from './sessions';
+import { saveComposerDraft, type ComposerDraft } from '$lib/commands/composer-draft';
+import { useMessagesStore } from './messages';
 import { projectCandidatesForMessage, useWorkspacesStore } from './workspaces';
 
 vi.mock('$lib/commands/workspace', () => ({
   createProjectWorkspace: vi.fn(),
   getWorkspaces: vi.fn(),
   openWorkspace: vi.fn(),
+}));
+
+vi.mock('$lib/commands/composer-draft', () => ({
+  saveComposerDraft: vi.fn(),
 }));
 
 const project: Workspace = {
@@ -59,9 +65,11 @@ function deferred<T>() {
 describe('workspace store', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     useWorkspacesStore.setState({
       workspaces: [],
       activeWorkspaceId: null,
+      recentProjectIds: [],
       loading: false,
       lastError: null,
     });
@@ -72,6 +80,63 @@ describe('workspace store', () => {
       isLoading: false,
       lastError: null,
     });
+  });
+
+  it('restores only its own ordinary text after reopening the renderer', async () => {
+    const saved = new Map<string, ComposerDraft>();
+    const save = vi.mocked(saveComposerDraft);
+    save.mockImplementation(async (sessionId, revision, text) => {
+      saved.set(sessionId, { revision, text });
+      return true;
+    });
+    openWorkspaceMock.mockImplementation(async (id) => {
+      const workspace = id === personal.id ? personal : project;
+      return { ...opened(workspace), composerDraft: saved.get(workspace.activeSessionId) ?? { text: '', revision: 0 } };
+    });
+    const open = async (id: string) => {
+      await useWorkspacesStore.getState().openWorkspace(id);
+      useMessagesStore.getState().activateInput(useSessionsStore.getState().activeSessionId);
+    };
+    const clearMemory = () => {
+      for (const sessionId of [personal.activeSessionId, project.activeSessionId]) {
+        useMessagesStore.getState().forgetInput(sessionId);
+      }
+    };
+    clearMemory();
+    try {
+      await open(personal.id);
+      useMessagesStore.getState().setInput('  日常原稿\n第二行');
+      await open(project.id);
+      expect(useMessagesStore.getState().input).toBe('');
+      useMessagesStore.getState().setInput('项目原稿');
+
+      clearMemory();
+      await open(personal.id);
+      expect(useMessagesStore.getState().input).toBe('  日常原稿\n第二行');
+      await open(project.id);
+      const oldToken = useMessagesStore.getState().inputToken;
+      useMessagesStore.getState().setInput('');
+      useMessagesStore.getState().setInput('项目原稿');
+      useMessagesStore.getState().clearSubmittedInput(project.activeSessionId, '项目原稿', oldToken);
+      expect(saved.get(project.activeSessionId)?.text).toBe('项目原稿');
+      useMessagesStore.getState().clearSubmittedInput(project.activeSessionId, '项目原稿', useMessagesStore.getState().inputToken);
+      expect(saved.get(project.activeSessionId)?.text).toBe('');
+
+      useMessagesStore.getState().setInput('设置联网搜索 tavily fake-secret');
+      useMessagesStore.getState().setInput('fake-secret');
+      expect(useMessagesStore.getState().input).toBe('fake-secret');
+      expect(saved.get(project.activeSessionId)?.text).toBe('');
+      useMessagesStore.getState().setInput('');
+      useMessagesStore.getState().setInput('排队中的文字', true);
+      expect(saved.get(project.activeSessionId)?.text).toBe('');
+
+      clearMemory();
+      await open(project.id);
+      expect(useMessagesStore.getState().input).toBe('');
+      expect(save.mock.calls.flat().join()).not.toMatch(/fake-secret|排队中的文字/);
+    } finally {
+      clearMemory();
+    }
   });
 
   it('projects exactly one main session when switching workspaces', async () => {
@@ -104,6 +169,20 @@ describe('workspace store', () => {
     expect(openWorkspaceMock).toHaveBeenCalledTimes(1);
     expect(openWorkspaceMock).toHaveBeenCalledWith(project.id);
     expect(useSessionsStore.getState().sessions).toEqual([opened(project).session]);
+  });
+
+  it('remembers successful project openings separately from catalogue dates', async () => {
+    const older = { ...project, id: 'older', updatedAt: 0 };
+    const recent = { ...project, id: 'recent', updatedAt: 10 };
+    useWorkspacesStore.setState({ workspaces: [personal, recent, older], recentProjectIds: [recent.id] });
+    openWorkspaceMock.mockResolvedValueOnce(opened(older)).mockResolvedValueOnce(opened(personal));
+
+    await useWorkspacesStore.getState().openWorkspace(older.id);
+    await useWorkspacesStore.getState().openWorkspace(personal.id);
+
+    expect(useWorkspacesStore.getState().recentProjectIds).toEqual([older.id, recent.id]);
+    expect(JSON.parse(localStorage.getItem('recent-project-ids')!)).toEqual([older.id, recent.id]);
+    expect(useWorkspacesStore.getState().workspaces).toEqual([personal, recent, older]);
   });
 
   it('creates a project and replaces the personal main-session projection', async () => {

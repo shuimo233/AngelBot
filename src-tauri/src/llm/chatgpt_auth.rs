@@ -1681,6 +1681,13 @@ pub fn credential_source(
     app: &tauri::AppHandle,
     opaque_ref: &str,
 ) -> Result<Arc<dyn ModelCredentialSource>, String> {
+    credential_source_with_epoch(app, opaque_ref).map(|(source, _)| source)
+}
+
+pub(super) fn credential_source_with_epoch(
+    app: &tauri::AppHandle,
+    opaque_ref: &str,
+) -> Result<(Arc<dyn ModelCredentialSource>, u64), String> {
     validate_reference(opaque_ref)?;
     let session = Session::production(app)?;
     let record = session.store.load()?.ok_or(SIGN_IN_REQUIRED)?;
@@ -1692,11 +1699,14 @@ pub fn credential_source(
         return Err(SIGN_IN_REQUIRED.into());
     }
     session.validate_source(opaque_ref, record.authorization_epoch)?;
-    Ok(Arc::new(PlanCredentialSource {
-        session,
-        credential_ref: opaque_ref.to_string(),
-        authorization_epoch: record.authorization_epoch,
-    }))
+    Ok((
+        Arc::new(PlanCredentialSource {
+            session,
+            credential_ref: opaque_ref.to_string(),
+            authorization_epoch: record.authorization_epoch,
+        }),
+        record.authorization_epoch,
+    ))
 }
 
 #[cfg(test)]

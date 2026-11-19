@@ -1,0 +1,9 @@
+.desktop-pet-settings-preview {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--ui-space-3);
+  padding-block: var(--ui-space-2);
+}
+
+.desktop-pet-settings-preview > img { display: block; object-fit: contain; justify-self: center; }

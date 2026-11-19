@@ -9,6 +9,7 @@ pub enum RuntimeIssueCode {
     DelegationDisabled,
     DelegationUnavailable,
     StorageMigration,
+    AutomationSchedulerUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,12 +38,24 @@ pub struct RuntimeIssue {
 }
 
 impl RuntimeIssue {
+    pub fn automation_scheduler_unavailable() -> Self {
+        Self {
+            code: RuntimeIssueCode::AutomationSchedulerUnavailable,
+            severity: RuntimeIssueSeverity::Warning,
+            title: "定时调度未启动".into(),
+            detail: "已启用的定时和登录触发本次不会运行。请保存内容，从托盘退出 AngelBot，再从开始菜单手动打开。本次登录触发不会补跑；结果未知的旧任务请先核对，不要直接重试。".into(),
+            // Tauri's in-app relaunch preserves --angelbot-autostart, which is
+            // for a Windows login, not for recovering this session.
+            recovery_action: RuntimeRecoveryAction::None,
+        }
+    }
+
     pub fn storage_migration(recovery: bool) -> Self {
         Self {
             code: RuntimeIssueCode::StorageMigration,
-            severity: if recovery { RuntimeIssueSeverity::Warning } else { RuntimeIssueSeverity::Notice },
-            title: if recovery { "正在使用迁移前的资料目录" } else { "本地资料目录已统一" }.into(),
-            detail: if recovery { "迁移已回滚，旧资料保留。请先备份，再使用 --migrate-storage 明确重试；未自动合并两个目录。" } else { "迁移前资料已保留。浏览器工具需在设置中重新连接；检测到旧目录参数的自定义服务已停用。请另行核对自定义命令、环境变量及脚本中的路径。没有自动启动服务。" }.into(),
+            severity: RuntimeIssueSeverity::Notice,
+            title: if recovery { "资料目录迁移待处理" } else { "本地资料目录已统一" }.into(),
+            detail: if recovery { "当前继续使用原目录保存资料。请先备份、整理遗留任务现场，再重试迁移；没有自动合并新旧目录。" } else { "迁移前资料已保留。浏览器工具需在设置中重新连接；检测到旧目录参数的自定义服务已停用。请另行核对自定义命令、环境变量及脚本中的路径。没有自动启动服务。" }.into(),
             recovery_action: RuntimeRecoveryAction::None,
         }
     }
@@ -162,6 +175,28 @@ mod tests {
         assert_eq!(snapshot.status, RuntimeHealthStatus::Ready);
         assert_eq!(snapshot.issues.len(), 1);
         assert_eq!(snapshot.issues[0].severity, RuntimeIssueSeverity::Notice);
+    }
+
+    #[test]
+    fn storage_recovery_is_informational_without_hiding_real_storage_failure() {
+        let mut state = RuntimeHealthState::default();
+        state.add(RuntimeIssue::storage_migration(true));
+        let snapshot = state.snapshot(true);
+        assert_eq!(snapshot.status, RuntimeHealthStatus::Ready);
+        assert_eq!(snapshot.issues[0].severity, RuntimeIssueSeverity::Notice);
+        assert_eq!(snapshot.issues[0].title, "资料目录迁移待处理");
+        assert_eq!(
+            snapshot.issues[0].recovery_action,
+            RuntimeRecoveryAction::None
+        );
+
+        state.add(RuntimeIssue::ephemeral_storage());
+        let failed = state.snapshot(true);
+        assert_eq!(failed.status, RuntimeHealthStatus::Degraded);
+        assert!(failed
+            .issues
+            .iter()
+            .any(|issue| issue.severity == RuntimeIssueSeverity::Critical));
     }
 
     #[test]

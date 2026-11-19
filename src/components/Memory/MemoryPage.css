@@ -1,16 +1,12 @@
 .memory-page { display: flex; flex-direction: column; gap: 24px; min-width: 0; min-height: 100%; color: var(--color-text); font-size: 14px; line-height: 1.6; }
-.memory-hero { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: start; gap: 16px; }
-.memory-hero > div:first-child { flex: 1 1 320px; min-width: 0; }
-.memory-hero h2 { margin: 0 0 7px; font-size: 20px; font-weight: 600; }
-.memory-hero p { max-width: 520px; margin: 0; color: var(--color-text-secondary); font-size: 13px; line-height: 1.7; }
+.memory-hero { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: var(--ui-space-3); }
+.memory-hero h2 { margin: 0; font-size: 20px; font-weight: 600; }
 .memory-hero-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
 .memory-hero-actions button, .memory-back-button { min-height: 38px; padding: 6px 14px; border: 1px solid var(--color-border); border-radius: var(--radius-control); color: var(--color-text); background: transparent; cursor: pointer; font: inherit; }
 .memory-hero-actions button:hover, .memory-back-button:hover { border-color: var(--color-text-secondary); background: var(--color-surface); }
 .memory-hero-actions button { background: var(--color-accent-fill); border-color: var(--color-accent-fill); color: var(--color-accent-contrast); }
 .memory-hero-actions button:hover { background: var(--color-accent-fill); border-color: var(--color-accent); }
-.memory-empty-state { padding: 24px 0; border-bottom: 1px solid var(--color-border-muted); text-align: left; }
-.memory-empty-state strong { font-size: 16px; font-weight: 600; }
-.memory-empty-state p { margin: 8px 0 0; color: var(--color-text-secondary); font-size: 13px; }
+.memory-empty-state { padding: 24px 0; border-bottom: 1px solid var(--color-border-muted); color: var(--color-muted); }
 .memory-archived-note { margin: 0; color: var(--color-text-secondary); font-size: 13px; }
 .memory-page-error { margin: 0; padding: 12px 16px; border-left: 2px solid var(--color-danger); color: var(--color-danger); background: var(--color-surface); }
 .memory-overview-stats { display: flex; flex-wrap: wrap; gap: 12px 24px; color: var(--color-muted); font-size: 13px; }
@@ -21,6 +17,7 @@
 .memory-category, .memory-permanent { padding: 2px 6px; border-radius: 3px; color: var(--color-accent); background: var(--color-accent-subtle); font-size: 12px; }
 .memory-permanent { color: var(--color-text-secondary); background: var(--color-surface); }
 .memory-preview-card p { flex: 1; margin: 12px 0 16px; font-size: 14px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-preview-card > button { align-self: flex-start; }
 .memory-governance-page { overflow: visible; }
 .memory-back-button { align-self: flex-start; }
 .memory-page .memory-governance { padding: 0; }

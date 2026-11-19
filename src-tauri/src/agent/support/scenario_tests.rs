@@ -564,96 +564,71 @@ mod scenario_tests {
 
     // -------------------------------------------------------------------------
     // Scenario 5: Multi-Turn Conversation Memory
-    // User: "记住我喜欢蓝色" → agent confirms
-    // User: "我有什么喜好?" → agent recalls
-    // Expected: remember_fact stores → recall shows it
+    // Save only after the owner approves, then recall on a later turn.
     // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn scenario_conversation_memory_across_turns() {
-        // Simulate 2 turns: remember → recall
-        let history = vec![("user".to_string(), "记住我喜欢蓝色".to_string())];
-
+        let content = "用户喜欢蓝色";
         let provider = ScenarioProvider::with_tools_and_text(vec![
-            // Turn 1 (with history): remember_fact
             (
                 Some(vec![crate::llm::ToolCall {
                     id: "call-remember".into(),
                     name: "remember_fact".into(),
-                    arguments: serde_json::json!({
-                        "fact": "user prefers blue color",
-                        "importance": 0.8
-                    }),
+                    arguments: serde_json::json!({"content": content, "category": "preference"}),
                 }]),
-                Some("好的，我记住了你更喜欢蓝色！".to_string()),
+                None,
             ),
-            // Turn 2 (simulated next turn): recall
             (
                 Some(vec![crate::llm::ToolCall {
-                    id: "call-recall2".into(),
+                    id: "call-recall".into(),
                     name: "recall_memories".into(),
-                    arguments: serde_json::json!({"query": "color preference"}),
+                    arguments: serde_json::json!({"query": "蓝色"}),
                 }]),
-                Some("让我查一下...".to_string()),
+                None,
             ),
             (None, Some("你更喜欢蓝色！".to_string())),
         ]);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let mut runner = AgentRunner::new(Box::new(provider), default_config())
+            .with_execution_permission("full_access".into());
+        crate::agent::extensions::memory::register(runner.tool_registry_mut(), db.clone());
 
-        let tools = vec![
-            (
-                Tool::new(
-                    "remember_fact",
-                    "Remember a fact about the user",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "fact": { "type": "string" },
-                            "importance": { "type": "number" }
-                        },
-                        "required": ["fact"]
-                    }),
-                ),
-                Arc::new(ScenarioToolHandler::new(
-                    "remember_fact",
-                    vec![ToolResult::success(
-                        "remember_fact",
-                        "Fact remembered successfully",
-                    )],
-                )) as Arc<dyn ToolHandler>,
-            ),
-            (
-                Tool::new(
-                    "recall_memories",
-                    "Recall memories",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": { "query": { "type": "string" } },
-                        "required": ["query"]
-                    }),
-                ),
-                Arc::new(ScenarioToolHandler::new(
-                    "recall_memories",
-                    vec![ToolResult::success(
-                        "recall_memories",
-                        r#"{"memories":[{"content":"user prefers blue color","importance":0.8}]}"#,
-                    )],
-                )) as Arc<dyn ToolHandler>,
-            ),
-        ];
-
-        let runner = build_runner_with_tools(provider, tools);
-
-        // Simulate the full conversation
-        let result = runner.run("What are my preferences?", &history).await;
-
-        match result {
-            AgentResponse::TextWithToolCalls { text, steps } => {
-                assert_eq!(steps.len(), 2, "Should call both remember and recall");
-                assert_eq!(steps[0].tool_name, "remember_fact");
-                assert_eq!(steps[1].tool_name, "recall_memories");
-                assert!(text.contains("蓝色"), "Should recall blue preference");
+        let step = match runner.run("记住我喜欢蓝色", &[]).await {
+            AgentResponse::TextWithToolCalls { mut steps, .. } => {
+                assert_eq!(steps.len(), 1);
+                steps.remove(0)
             }
-            other => panic!("Expected TextWithToolCalls, got {:?}", other),
+            other => panic!("Expected a pending memory write, got {other:?}"),
+        };
+        assert_eq!(step.tool_name, "remember_fact");
+        assert_eq!(step.confirmation_status.as_deref(), Some("pending"));
+        assert!(!step.success);
+        let count: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Replay the pending payload through the same handler as an approved call.
+        let approved = runner.tool_registry_mut().execute(
+            &crate::agent::ToolCall::new(step.tool_name, step.arguments),
+            &step.call_id,
+            std::path::Path::new("."),
+        );
+        assert!(approved.result.success, "{}", approved.result.content);
+
+        match runner.run("我有什么喜好？", &[]).await {
+            AgentResponse::TextWithToolCalls { text, steps } => {
+                assert_eq!(steps.len(), 1);
+                assert_eq!(steps[0].tool_name, "recall_memories");
+                assert!(steps[0].success && steps[0].output.contains(content));
+                assert!(text.contains("蓝色"));
+            }
+            other => panic!("Expected memory recall, got {other:?}"),
         }
     }
 

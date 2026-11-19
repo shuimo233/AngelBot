@@ -7,9 +7,11 @@
 //! never cross this seam.
 
 use crate::keychain::ApiCredentials;
+use crate::llm::tracked::TrackedProvider;
 use crate::llm::{
-    create_provider_for_app, resolve_thinking_settings, LlmProvider, ModelAuthMode, ProviderConfig,
-    ThinkingSettings,
+    create_foreground_provider_for_app, create_session_foreground_provider_for_app,
+    invalidate_foreground_websocket_for_app, resolve_thinking_settings, LlmProvider, ModelAuthMode,
+    ProviderConfig, ThinkingSettings, UsageTracker,
 };
 use crate::AppState;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -51,6 +53,17 @@ pub(crate) struct ResolvedForegroundModel {
 }
 
 impl ResolvedForegroundModel {
+    /// Keep the usage meter on the same binding used for preparation and execution.
+    pub(crate) fn with_usage_tracking(mut self, tracker: UsageTracker, session_id: &str) -> Self {
+        self.provider = Box::new(TrackedProvider::new(
+            self.provider,
+            tracker,
+            session_id.to_owned(),
+            self.identity.model.clone(),
+        ));
+        self
+    }
+
     /// Optional learning borrows this turn's model identity and resolved effort.
     /// Recheck current configuration before opening credentials; changes defer
     /// learning rather than silently switching providers or reasoning defaults.
@@ -133,9 +146,29 @@ impl<'a> ForegroundModelFactory<'a> {
         &self,
         request: ForegroundModelRequest<'_>,
     ) -> Result<ResolvedForegroundModel, ModelResolutionError> {
+        self.resolve_for_turn(request, false)
+            .map(|(model, _)| model)
+    }
+
+    pub(crate) fn resolve_for_turn(
+        &self,
+        request: ForegroundModelRequest<'_>,
+        append: bool,
+    ) -> Result<(ResolvedForegroundModel, bool), ModelResolutionError> {
+        if !append {
+            invalidate_foreground_websocket_for_app(self.app, request.session_id);
+        }
         #[cfg(feature = "desktop-e2e")]
-        if let Some(model) = desktop_e2e::resolve(&self.db, request)? {
-            return Ok(model);
+        if let Some(model) = desktop_e2e::prepare()? {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| ModelResolutionError::SessionBindingFailed)?;
+            bind_model_identity_in_conn(&conn, request.session_id, &model.identity, request.now)?;
+            return Ok((
+                model.with_usage_tracking(UsageTracker::new(self.db.clone()), request.session_id),
+                false,
+            ));
         }
 
         let config = self.resolve_config()?;
@@ -150,25 +183,85 @@ impl<'a> ForegroundModelFactory<'a> {
             resolve_thinking_settings(&config, request.requested_thinking_effort)
                 .map_err(|_| ModelResolutionError::InvalidThinkingSettings)?;
 
-        let provider = create_provider_for_app(&config, self.app)
-            .map_err(|_| classify_provider_configuration(&config))?;
+        let plan_append =
+            append && self.app.is_some() && config.auth_mode == ModelAuthMode::ChatgptPlan;
+        let provider = if plan_append {
+            let execution_permission = {
+                let db = self
+                    .db
+                    .lock()
+                    .map_err(|_| ModelResolutionError::SessionBindingFailed)?;
+                crate::commands::foreground_tool_surface::agent_execution_permission_from_conn(&db)
+                    .map_err(|_| ModelResolutionError::SessionBindingFailed)?
+            };
+            create_session_foreground_provider_for_app(
+                &config,
+                self.app,
+                request.session_id,
+                &execution_permission,
+            )
+        } else {
+            if append {
+                invalidate_foreground_websocket_for_app(self.app, request.session_id);
+            }
+            create_foreground_provider_for_app(&config, self.app)
+        }
+        .map_err(|_| classify_provider_configuration(&config))?;
 
-        Ok(ResolvedForegroundModel {
-            provider,
-            thinking_settings,
-            context_window_tokens: crate::llm::context_window_tokens(&config),
-            max_output_tokens: config.max_tokens as usize,
-            identity: ForegroundModelIdentity {
-                provider_profile_ref: config.profile_identity(),
-                credential_handle_ref: config.credential_identity(),
-                provider: config.provider,
-                model: config.model,
-            },
-        })
+        let model = resolved_model(config, provider, thinking_settings);
+        Ok((
+            model.with_usage_tracking(UsageTracker::new(self.db.clone()), request.session_id),
+            plan_append,
+        ))
+    }
+
+    /// Prepare the one-turn provider without advancing or rebinding a task
+    /// whose explicit continuation has not yet been admitted.
+    pub(crate) fn prepare_explicit_continuation(
+        &self,
+        request: ForegroundModelRequest<'_>,
+    ) -> Result<ResolvedForegroundModel, ModelResolutionError> {
+        let tracker = UsageTracker::new(self.db.clone());
+        #[cfg(feature = "desktop-e2e")]
+        if let Some(model) = desktop_e2e::prepare()? {
+            return Ok(model.with_usage_tracking(tracker, request.session_id));
+        }
+        let config = self.resolve_config()?;
+        validate_provider_identity(&config)?;
+        let thinking_settings =
+            resolve_thinking_settings(&config, request.requested_thinking_effort)
+                .map_err(|_| ModelResolutionError::InvalidThinkingSettings)?;
+        let provider = create_foreground_provider_for_app(&config, self.app)
+            .map_err(|_| classify_provider_configuration(&config))?;
+        Ok(resolved_model(config, provider, thinking_settings)
+            .with_usage_tracking(tracker, request.session_id))
     }
 
     fn resolve_config(&self) -> Result<ProviderConfig, ModelResolutionError> {
         resolve_model_config(self.app)
+    }
+}
+
+fn resolved_model(
+    config: ProviderConfig,
+    provider: Box<dyn LlmProvider>,
+    thinking_settings: Option<ThinkingSettings>,
+) -> ResolvedForegroundModel {
+    ResolvedForegroundModel {
+        provider,
+        thinking_settings,
+        context_window_tokens: crate::llm::context_window_tokens(&config),
+        max_output_tokens: config.max_tokens as usize,
+        identity: model_identity(&config),
+    }
+}
+
+fn model_identity(config: &ProviderConfig) -> ForegroundModelIdentity {
+    ForegroundModelIdentity {
+        provider_profile_ref: config.profile_identity(),
+        credential_handle_ref: config.credential_identity(),
+        provider: config.provider.clone(),
+        model: config.model.clone(),
     }
 }
 
@@ -296,6 +389,15 @@ pub(crate) fn bind_session_provider_in_conn(
     now: i64,
 ) -> Result<(), ModelResolutionError> {
     validate_provider_identity(config)?;
+    bind_model_identity_in_conn(conn, session_id, &model_identity(config), now)
+}
+
+pub(crate) fn bind_model_identity_in_conn(
+    conn: &Connection,
+    session_id: &str,
+    identity: &ForegroundModelIdentity,
+    now: i64,
+) -> Result<(), ModelResolutionError> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT metadata FROM sessions WHERE id=?1",
@@ -314,12 +416,12 @@ pub(crate) fn bind_session_provider_in_conn(
             None => serde_json::json!({}),
         });
     metadata["modelConnectionBinding"] = serde_json::json!({
-        "version":1, "profileRef":config.profile_identity(), "credentialRef":config.credential_identity(),
-        "modelRef":format!("model:{}",config.model),
+        "version":1, "profileRef":identity.provider_profile_ref, "credentialRef":identity.credential_handle_ref,
+        "modelRef":format!("model:{}",identity.model),
     });
     conn.execute(
         "UPDATE sessions SET agent_provider = ?1, agent_model = ?2, updated_at = ?3, metadata=?5 WHERE id = ?4",
-        params![config.provider, config.model, now, session_id, metadata.to_string()],
+        params![identity.provider, identity.model, now, session_id, metadata.to_string()],
     )
     .map_err(|_| ModelResolutionError::SessionBindingFailed)?;
     Ok(())

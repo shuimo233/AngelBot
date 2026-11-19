@@ -12,7 +12,12 @@ use crate::agent::config::AgentConfig;
 use crate::agent::delegation_contract::ContractLimits;
 use crate::agent::delivery_inbox::{DeliveryInbox, InboxDelivery};
 use crate::agent::task_understanding::TaskUnderstanding;
+#[cfg(test)]
 use crate::commands::foreground_history::hydrate_llm_history;
+use crate::commands::foreground_history::{
+    hydrate_history_from_window_with_clocks, main_plan_history_from_window,
+    main_working_history_from_window, ConversationWindow,
+};
 use crate::commands::foreground_message_contracts::SendMessageRequest;
 use crate::commands::foreground_text_attachments;
 use crate::commands::message::{
@@ -46,6 +51,7 @@ pub struct ForegroundContextRequest<'a> {
     pub state: &'a AppState,
     pub app: Option<&'a AppHandle>,
     pub request: &'a SendMessageRequest,
+    pub admitted_user_message_id: Option<&'a str>,
     pub history_before_created_at: i64,
     pub agent_config: AgentConfig,
     pub budget: ForegroundContextBudget,
@@ -63,7 +69,16 @@ pub struct PreparedForegroundContext {
     pub history: Vec<LlmMessage>,
     pub agent_input: String,
     pub attention_context: Option<String>,
+    pub(crate) append_turn_clock: bool,
     pub sources: ForegroundContextSources,
+}
+
+#[derive(Clone, Copy)]
+enum HistoryMode {
+    Working,
+    PlanAppend,
+    #[cfg(test)]
+    NativeControl,
 }
 
 /// Deep foreground context module: local config, then bound-model preparation.
@@ -91,7 +106,13 @@ impl ForegroundContextAssembler {
     pub async fn prepare(
         request: ForegroundContextRequest<'_>,
     ) -> Result<PreparedForegroundContext, String> {
-        Self::prepare_history(request, false).await
+        Self::prepare_history(request, HistoryMode::Working).await
+    }
+
+    pub(crate) async fn prepare_plan_append(
+        request: ForegroundContextRequest<'_>,
+    ) -> Result<PreparedForegroundContext, String> {
+        Self::prepare_history(request, HistoryMode::PlanAppend).await
     }
 
     /// Explicit native-replay control for protocol acceptance, never a runtime
@@ -100,14 +121,20 @@ impl ForegroundContextAssembler {
     pub(crate) async fn prepare_native(
         request: ForegroundContextRequest<'_>,
     ) -> Result<PreparedForegroundContext, String> {
-        Self::prepare_history(request, true).await
+        Self::prepare_history(request, HistoryMode::NativeControl).await
     }
 
     async fn prepare_history(
         request: ForegroundContextRequest<'_>,
-        native_control: bool,
+        mode: HistoryMode,
     ) -> Result<PreparedForegroundContext, String> {
         let mut agent_config = request.agent_config;
+        let native_control = match mode {
+            #[cfg(test)]
+            HistoryMode::NativeControl => true,
+            _ => false,
+        };
+        let append_turn_clock = matches!(mode, HistoryMode::PlanAppend);
 
         // Preserve the existing best-effort compaction failure mapping.
         let fresh_summary = best_effort_summary(
@@ -123,12 +150,9 @@ impl ForegroundContextAssembler {
             )
             .await,
         );
-        if let Some(summary) = fresh_summary.as_ref() {
-            agent_config.context_summary = Some(summary.clone());
-        }
-
         let (
             history,
+            attachment_metadata,
             attention_card_ids,
             pending_delivery_ids,
             task_understanding_record_ids,
@@ -138,29 +162,72 @@ impl ForegroundContextAssembler {
             let conn = db
                 .unchecked_transaction()
                 .map_err(|error| error.to_string())?;
-            agent_config.context_summary = super::foreground_history::ConversationWindow::load(
-                &conn,
-                &request.request.session_id,
-                request.history_before_created_at,
-            )?
-            .summary;
-            let history = hydrate_llm_history(
+            let window = ConversationWindow::load(
                 &conn,
                 &request.request.session_id,
                 request.history_before_created_at,
             )?;
-            let history = if native_control {
-                history
-            } else {
-                super::foreground_history::main_working_history(
-                    &conn,
-                    &request.request.session_id,
-                    request.history_before_created_at,
-                    history,
-                    agent_config.preferences.use_long_term_memory,
-                )?
-                .messages
+            let history = hydrate_history_from_window_with_clocks(
+                &conn,
+                &request.request.session_id,
+                request.history_before_created_at,
+                &window,
+                append_turn_clock,
+            )?;
+            let history = match mode {
+                #[cfg(test)]
+                HistoryMode::NativeControl => history,
+                HistoryMode::PlanAppend => {
+                    main_plan_history_from_window(
+                        &conn,
+                        &request.request.session_id,
+                        request.history_before_created_at,
+                        &window,
+                        history,
+                        agent_config.preferences.use_long_term_memory,
+                    )?
+                    .messages
+                }
+                HistoryMode::Working => {
+                    main_working_history_from_window(
+                        &conn,
+                        &request.request.session_id,
+                        request.history_before_created_at,
+                        &window,
+                        history,
+                        agent_config.preferences.use_long_term_memory,
+                    )?
+                    .messages
+                }
             };
+            let attachment_metadata = if request
+                .request
+                .text_attachments
+                .iter()
+                .any(|file| file.reference_only)
+            {
+                let id = request
+                    .admitted_user_message_id
+                    .ok_or("文本附件引用缺少本轮消息。")?;
+                let metadata: String = conn
+                    .query_row(
+                        "SELECT m.metadata FROM messages m JOIN sessions s
+                           ON s.id=m.session_id AND s.leaf_message_id=m.id
+                         WHERE m.id=?1 AND m.session_id=?2 AND m.role='user' AND m.is_provisional=0",
+                        rusqlite::params![id, request.request.session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| "无法读取本轮的文本附件引用。")?;
+                if foreground_text_attachments::from_metadata(Some(&metadata))?
+                    != request.request.text_attachments
+                {
+                    return Err("本轮的文本附件引用已改变。".into());
+                }
+                Some(metadata)
+            } else {
+                None
+            };
+            agent_config.context_summary = window.summary;
             let cards = load_context_cards(&conn, &request.request.session_id)?;
             let (attention_card_ids, attention_context) = bounded_attention_context(&cards)?;
             let pending = DeliveryInbox::pending_for_session_from_connection(
@@ -185,6 +252,7 @@ impl ForegroundContextAssembler {
                 merge_context_sections(attention_context, task_understanding_context);
             (
                 history,
+                attachment_metadata,
                 attention_card_ids,
                 pending_delivery_ids,
                 task_understanding_record_ids,
@@ -199,15 +267,23 @@ impl ForegroundContextAssembler {
         );
         // Explicit snapshots are data, not workspace paths. Never pass their
         // contents through the file-reference scanner.
-        let agent_input = foreground_text_attachments::render(
-            &expanded_prompt,
-            &request.request.text_attachments,
-        );
+        let agent_input = match attachment_metadata {
+            Some(metadata) => foreground_text_attachments::render_stored(
+                &expanded_prompt,
+                "user",
+                Some(&metadata),
+            )?,
+            None => foreground_text_attachments::render(
+                &expanded_prompt,
+                &request.request.text_attachments,
+            ),
+        };
         Ok(PreparedForegroundContext {
             agent_config,
             history,
             agent_input,
             attention_context,
+            append_turn_clock,
             sources: ForegroundContextSources {
                 session_id: request.request.session_id.clone(),
                 history_before_created_at: request.history_before_created_at,
@@ -382,7 +458,10 @@ fn workspace_write_projection(handoff: Option<&str>) -> &'static str {
     }
 }
 
-fn merge_context_sections(attention: Option<String>, delegation: Option<String>) -> Option<String> {
+pub(super) fn merge_context_sections(
+    attention: Option<String>,
+    delegation: Option<String>,
+) -> Option<String> {
     match (attention, delegation) {
         (Some(attention), Some(delegation)) => Some(format!("{attention}\n{delegation}")),
         (Some(attention), None) => Some(attention),

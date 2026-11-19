@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { desktopActionOperation, desktopConfirmationOperation, fileWriteContentForPreview, getToolConfirmationSummary, mcpArgumentsForPreview, requiresDesktopActionPreview, requiresDesktopConfirmationPreview } from './tool-confirmation';
+
+it('discloses both Codex execution and independent review before approving the task', () => {
+  const summary = getToolConfirmationSummary('delegate_codex_change', { goal: '修复本地示例' });
+  expect(summary).toContain('本机 Codex 登录');
+  expect(summary).toContain('候选差异会发送给 AngelBot 配置的审校模型');
+  expect(summary).toContain('不会直接应用到项目');
+  expect(summary).toContain('修复本地示例');
+});
 import { getToolDisplayName } from './tool-display';
 
 describe('tool confirmation summaries', () => {

@@ -25,6 +25,7 @@ const VISIBLE_ATTENTION_MESSAGE: &str =
 pub struct VisibleAttentionSummary {
     pub open_count: usize,
     pub message: String,
+    pub retry_reminder_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,27 +188,65 @@ pub fn load_visible_summary(
     session_id: &str,
 ) -> Result<Option<VisibleAttentionSummary>, String> {
     let scope = cross_session_scope_for_session(conn, session_id)?;
-    let open_count: i64 = conn
+    let (open_count, retry_reminder_ids): (i64, String) = conn
         .query_row(
-            "SELECT COUNT(*)
-             FROM attention_states
+            "SELECT COUNT(*), json_group_array(id) FILTER (
+                 WHERE category = 'runtime_failure' AND next_action = 'retry')
+             FROM attention_states AS notice
              WHERE status = 'open'
                AND ((?1 IS NOT NULL AND scope_owner_profile_id = ?1 AND scope_workspace_key = ?2)
-                 OR (?1 IS NULL AND session_id = ?3))",
+                 OR (?1 IS NULL AND session_id = ?3))
+               AND NOT (
+                 category = 'runtime_failure' AND next_action = 'retry'
+                 AND goal_ref LIKE 'message:%' AND COALESCE(recovery_ref, '') LIKE 'run:%'
+                 AND NOT EXISTS (SELECT 1 FROM messages m
+                   WHERE m.session_id = notice.session_id AND m.id = substr(notice.goal_ref, 9))
+                 AND NOT EXISTS (SELECT 1 FROM task_runs r
+                   WHERE r.session_id = notice.session_id AND r.id = substr(notice.recovery_ref, 5))
+               )",
             params![
                 scope.as_ref().map(|scope| scope.owner_profile_id),
                 scope.as_ref().map(|scope| scope.workspace_key.as_str()),
                 session_id,
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| error.to_string())?;
     let open_count = usize::try_from(open_count)
         .map_err(|_| "attention state count is outside the supported range".to_string())?;
+    let retry_reminder_ids =
+        serde_json::from_str(&retry_reminder_ids).map_err(|error| error.to_string())?;
     Ok((open_count > 0).then(|| VisibleAttentionSummary {
         open_count,
         message: VISIBLE_ATTENTION_MESSAGE.to_string(),
+        retry_reminder_ids,
     }))
+}
+
+/// Expire the failure reminders explicitly selected from a workbench snapshot.
+pub(crate) fn dismiss_retry_reminders(
+    conn: &Connection,
+    session_id: &str,
+    ids: &[String],
+) -> Result<(), String> {
+    let scope = cross_session_scope_for_session(conn, session_id)?;
+    let ids = serde_json::to_string(ids).map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE attention_states SET status = 'expired', updated_at = ?5
+         WHERE status = 'open' AND category = 'runtime_failure' AND next_action = 'retry'
+           AND id IN (SELECT value FROM json_each(?4))
+           AND ((?1 IS NOT NULL AND scope_owner_profile_id = ?1 AND scope_workspace_key = ?2)
+             OR (?1 IS NULL AND session_id = ?3))",
+        params![
+            scope.as_ref().map(|scope| scope.owner_profile_id),
+            scope.as_ref().map(|scope| scope.workspace_key.as_str()),
+            session_id,
+            ids,
+            Utc::now().timestamp(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub fn record_recoverable_runtime_failure(
@@ -482,11 +521,61 @@ mod tests {
             .expect("open cards should be visible to the workbench");
 
         assert_eq!(summary.open_count, 4);
+        assert_eq!(summary.retry_reminder_ids.len(), 4);
         assert_eq!(summary.message, VISIBLE_ATTENTION_MESSAGE);
         let encoded = serde_json::to_string(&summary).unwrap();
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("message-"));
         assert!(!encoded.contains("run-"));
+    }
+
+    #[test]
+    fn dismissing_displayed_retry_reminders_keeps_new_and_out_of_scope_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        seed_session(&conn, "current", None);
+        seed_session(&conn, "other", None);
+        let shown =
+            record_recoverable_runtime_failure(&conn, "current", "goal-1", "run-1", "old").unwrap();
+        let confirmation =
+            record_recoverable_runtime_failure(&conn, "current", "goal-2", "run-2", "confirmation")
+                .unwrap();
+        conn.execute(
+            "UPDATE attention_states SET next_action='ask_user' WHERE id=?1",
+            [&confirmation.id],
+        )
+        .unwrap();
+        record_recoverable_runtime_failure(&conn, "current", "message:removed", "removed", "stale")
+            .unwrap();
+        let snapshot = load_visible_summary(&conn, "current").unwrap().unwrap();
+        assert_eq!(snapshot.open_count, 2);
+        assert_eq!(snapshot.retry_reminder_ids, vec![shown.id]);
+        let new =
+            record_recoverable_runtime_failure(&conn, "current", "goal-3", "run-3", "new").unwrap();
+        let other =
+            record_recoverable_runtime_failure(&conn, "other", "goal-4", "run-4", "other").unwrap();
+
+        let mut ids = snapshot.retry_reminder_ids;
+        ids.extend([confirmation.id, other.id]);
+        dismiss_retry_reminders(&conn, "current", &ids).unwrap();
+        let remaining = load_visible_summary(&conn, "current").unwrap().unwrap();
+        assert_eq!(remaining.open_count, 2);
+        assert_eq!(remaining.retry_reminder_ids, vec![new.id]);
+        assert_eq!(
+            load_visible_summary(&conn, "other")
+                .unwrap()
+                .unwrap()
+                .open_count,
+            1
+        );
+        let evidence: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM attention_diagnostic_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence, 5);
     }
 
     #[test]

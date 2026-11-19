@@ -155,17 +155,29 @@ async fn check_model_connection(
     };
     let response = tokio::time::timeout_at(
         deadline,
-        provider.chat(
+        provider.chat_stream_classified(
             &[message(
                 "user",
                 "Reply with OK only. Do not call tools.".into(),
             )],
             None,
             None,
+            None,
         ),
     )
     .await
-    .map_err(|_| "Model connection test timed out")??;
+    .map_err(|_| {
+        crate::llm::LlmFailureKind::TimedOut
+            .visible_notice()
+            .unwrap_or_default()
+    })?
+    .map_err(|failure| {
+        failure
+            .kind
+            .visible_notice()
+            .unwrap_or("未能完成模型连接测试。请检查所选模型和连接设置。")
+            .to_owned()
+    })?;
     if !matches!(response.into_parts().0,
         LlmResponse::Text { stop_reason: StopReason::EndTurn, text } if !text.trim().is_empty())
     {
@@ -187,7 +199,7 @@ async fn check_model_connection(
     let mut messages = vec![message("user", "Connection check: call angelbot_connection_probe exactly once with echo set to ping. After its result, reply only with the receipt value it returns. Do not invent a receipt or call any other tool.".into())];
     let check_tools = async {
         let response = provider
-            .chat(&messages, Some(&tools), None)
+            .chat_stream_classified(&messages, Some(&tools), None, None)
             .await
             .map_err(|_| ToolRoundTrip::RequestFailed)?;
         let (response, protocol_state) = response.into_parts();
@@ -232,7 +244,7 @@ async fn check_model_connection(
             ..message("tool", serde_json::json!({"receipt": receipt}).to_string())
         });
         let response = provider
-            .chat(&messages, Some(&tools), None)
+            .chat_stream_classified(&messages, Some(&tools), None, None)
             .await
             .map_err(|_| ToolRoundTrip::RequestFailed)?;
         let (response, protocol_state) = response.into_parts();
@@ -285,7 +297,7 @@ pub async fn test_model_connection(
             })
             .unwrap_or_default();
     }
-    let provider = crate::llm::create_provider_for_app(&profile, Some(&app))?;
+    let provider = crate::llm::create_foreground_provider_for_app(&profile, Some(&app))?;
     check_model_connection(provider.as_ref(), Duration::from_secs(60)).await
 }
 

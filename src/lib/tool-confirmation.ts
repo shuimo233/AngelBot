@@ -76,6 +76,29 @@ export function fileWriteContentForPreview(rawArguments: unknown): string | null
   return typeof content === 'string' ? content : null;
 }
 
+export function projectCommandForPreview(rawArguments: unknown): string | null {
+  const input = parseArgumentObject(rawArguments);
+  if (typeof input?.command !== 'string' || !input.command.trim()) return null;
+  const args = input.args === undefined ? [] : input.args;
+  const timeout = input.timeout_seconds ?? 90;
+  if (!Array.isArray(args) || args.length > 32
+    || args.some((arg) => typeof arg !== 'string')
+    || typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 5 || timeout > 180) return null;
+  return JSON.stringify({ command: input.command, args, timeout_seconds: timeout }, null, 2);
+}
+
+const MEMORY_CATEGORIES = new Map([
+  ['fact', '事实'], ['preference', '偏好'], ['event', '事项'], ['knowledge', '参考资料'],
+]);
+
+export function memoryContentForPreview(rawArguments: unknown): string | null {
+  const args = parseArgumentObject(rawArguments);
+  if (typeof args?.content !== 'string' || !args.content.trim()) return null;
+  const category = args.category ?? 'fact';
+  if (typeof category !== 'string' || !MEMORY_CATEGORIES.has(category)) return null;
+  return args.content;
+}
+
 /** Optional review aid, not an attestation of a third-party tool's effects. */
 export function mcpArgumentsForPreview(rawArguments: unknown): string | null {
   const args = parseArgumentObject(rawArguments);
@@ -194,6 +217,10 @@ export function getToolConfirmationSummary(toolName: string, rawArguments: strin
   const appId = textArgument(args, 'app_id');
 
   switch (toolName) {
+    case 'remember_fact': {
+      const category = MEMORY_CATEGORIES.get(String(args.category ?? 'fact'));
+      return category ? `保存长期记忆 · ${category} · 所有对话` : '保存长期记忆';
+    }
     case 'write_file':
       return path ? `写入项目文件：${shortened(path)}` : '写入当前项目中的文件';
     case 'edit_file':
@@ -276,6 +303,8 @@ export function getToolConfirmationSummary(toolName: string, rawArguments: strin
       return '向已配置的搜索服务发送一次公开网页查询';
     case 'delegate_network_exploration':
       return networkExplorationSummary(args);
+    case 'delegate_codex_change':
+      return `使用本机 Codex 登录委派当前项目的候选修改。执行所需项目内容会发送给 Codex，候选差异会发送给 AngelBot 配置的审校模型。不会直接应用到项目。任务：${textArgument(args, 'goal') ?? '未提供目标'}`;
     case 'materialize_delegated_change':
       return '将已审校的候选修改写入当前项目';
     default:

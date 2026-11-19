@@ -14,6 +14,8 @@ target/
 # Local diagnostics and their recovery manifests are never published.
 /logs/
 /.playwright-mcp/
+# Private design drafts and Codex pet production assets.
+/artwork/local/
 .env
 .env.*
 !.env.example
@@ -67,6 +69,7 @@ docs/research/*
 !docs/research/single-window-observation-2026-10-07.md
 !docs/research/maa-local-routines-2026-10-08.md
 !docs/research/hermes-long-term-learning-2026-10-15.md
+!docs/research/billion-context-cache-2026-11-13.md
 /issues/
 /tools/
 # Keep the repository's verification guidance available to every coding agent.

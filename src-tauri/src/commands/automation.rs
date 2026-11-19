@@ -1,6 +1,6 @@
 use crate::{
     agent::supervision::{SupervisorInputKind, WorkspaceSupervisor},
-    child_process_tree::ProcessTree,
+    child_process_tree::{capture_stream, join_capture, CapturedStream, ProcessTree},
     AppState,
 };
 use chrono::{TimeZone, Utc};
@@ -8,7 +8,6 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
-    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -42,8 +41,8 @@ mod maa;
 mod overview;
 pub(crate) use overview::{maa_config_for_automation, workspace_automation_overview};
 pub use overview::{
-    AutomationDashboard, WorkspaceAutomationOverview, WorkspaceAutomationRunStatus,
-    WorkspaceAutomationStatus, WorkspaceMaaAutomationConfig,
+    AutomationDashboard, AutomationRunRequest, WorkspaceAutomationOverview,
+    WorkspaceAutomationRunStatus, WorkspaceAutomationStatus, WorkspaceMaaAutomationConfig,
 };
 #[path = "automation_script_admission.rs"]
 mod script_admission;
@@ -422,16 +421,11 @@ fn script_command(script: &Path, args: &[String], working_dir: &Path) -> Result<
             // protect batch arguments from operators, expansion, or quoting.
             // Keep batch support for literal arguments and reject ambiguous
             // inputs explicitly rather than silently changing their meaning.
-            let is_shell_text = |value: &str| {
-                value.chars().any(|character| {
-                    character.is_control()
-                        || matches!(
-                            character,
-                            '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!' | '"'
-                        )
-                })
-            };
-            if is_shell_text(&script.to_string_lossy()) || args.iter().any(|arg| is_shell_text(arg))
+            use crate::child_process_env::windows_batch_argument_is_literal;
+            if !windows_batch_argument_is_literal(&script.to_string_lossy())
+                || args
+                    .iter()
+                    .any(|arg| !windows_batch_argument_is_literal(arg))
             {
                 return Err(
                     "批处理脚本路径和参数不能包含 shell 元字符、引号或控制字符；请使用 Python、Node.js 或 PowerShell 包装脚本"
@@ -480,45 +474,6 @@ fn script_command(script: &Path, args: &[String], working_dir: &Path) -> Result<
     Ok(command)
 }
 
-#[derive(Default)]
-struct CapturedStream {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-fn capture_stream<R: Read + Send + 'static>(
-    mut stream: R,
-) -> thread::JoinHandle<Result<CapturedStream, String>> {
-    thread::spawn(move || {
-        let mut captured = CapturedStream::default();
-        let mut chunk = [0_u8; 8192];
-        loop {
-            let count = match stream.read(&mut chunk) {
-                Ok(0) => return Ok(captured),
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(format!("无法读取脚本输出：{error}")),
-            };
-            let retained = count.min(MAX_CAPTURED_OUTPUT_BYTES - captured.bytes.len());
-            captured.bytes.extend_from_slice(&chunk[..retained]);
-            captured.truncated |= retained < count;
-            // Always drain the pipe, including after the capture limit. A noisy
-            // child must not block on a full pipe or consume unbounded memory.
-        }
-    })
-}
-
-fn join_capture(
-    reader: Option<thread::JoinHandle<Result<CapturedStream, String>>>,
-) -> Result<CapturedStream, String> {
-    match reader {
-        Some(reader) => reader
-            .join()
-            .map_err(|_| "脚本输出读取线程异常退出".to_string())?,
-        None => Ok(CapturedStream::default()),
-    }
-}
-
 fn truncate_output(stdout: CapturedStream, stderr: CapturedStream) -> String {
     let mut text = String::from_utf8_lossy(&stdout.bytes).into_owned();
     if stdout.truncated {
@@ -558,8 +513,12 @@ fn execute_script_command(
     let mut child =
         ProcessTree::spawn(&mut command).map_err(|error| format!("无法启动脚本：{error}"))?;
     // Dedicated handles retain stream identity even if stderr reaches EOF first.
-    let stdout_reader = child.take_stdout().map(capture_stream);
-    let stderr_reader = child.take_stderr().map(capture_stream);
+    let stdout_reader = child
+        .take_stdout()
+        .map(|pipe| capture_stream(pipe, MAX_CAPTURED_OUTPUT_BYTES));
+    let stderr_reader = child
+        .take_stderr()
+        .map(|pipe| capture_stream(pipe, MAX_CAPTURED_OUTPUT_BYTES));
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds);
     let outcome = loop {
@@ -690,12 +649,33 @@ pub fn get_automations_impl(state: &AppState) -> Result<Vec<Automation>, String>
 
 /// Global settings UI projection; Main tools retain their workspace-scoped API.
 #[tauri::command]
-pub fn get_automation_dashboard(state: State<AppState>) -> Result<AutomationDashboard, String> {
-    get_automation_dashboard_impl(&state)
+pub fn get_automation_dashboard(
+    state: State<AppState>,
+    pending_requests: Option<Vec<AutomationRunRequest>>,
+) -> Result<AutomationDashboard, String> {
+    get_automation_dashboard_with_requests(&state, pending_requests.as_deref().unwrap_or_default())
 }
 
+#[cfg(test)]
 pub fn get_automation_dashboard_impl(state: &AppState) -> Result<AutomationDashboard, String> {
-    overview::automation_dashboard(state)
+    get_automation_dashboard_with_requests(state, &[])
+}
+
+pub fn get_automation_dashboard_with_requests(
+    state: &AppState,
+    pending_requests: &[AutomationRunRequest],
+) -> Result<AutomationDashboard, String> {
+    if pending_requests.len() > 100 {
+        return Err("待核对的自动化运行过多".to_string());
+    }
+    if pending_requests.iter().any(|request| {
+        request.automation_id.is_empty()
+            || request.automation_id.len() > 128
+            || !is_manual_run_id(&request.run_id)
+    }) {
+        return Err("无效的待核对自动化运行".to_string());
+    }
+    overview::automation_dashboard(state, pending_requests)
 }
 
 fn automation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
@@ -1215,13 +1195,24 @@ fn cancel_all_agent_automation_inputs_in_tx(
 }
 
 #[tauri::command]
-pub async fn run_automation_now(app_handle: AppHandle, id: String) -> Result<(), String> {
+pub async fn run_automation_now(
+    app_handle: AppHandle,
+    id: String,
+    run_id: Option<String>,
+) -> Result<ManualAutomationStart, String> {
+    if run_id.as_deref().is_some_and(|id| !is_manual_run_id(id)) {
+        return Ok(ManualAutomationStart::Rejected {
+            error: "无效的自动化运行编号".into(),
+        });
+    }
+    let has_request_id = run_id.is_some();
     let blocking_app = app_handle.clone();
     let notification = tauri::async_runtime::spawn_blocking(move || {
         let state = blocking_app.state::<AppState>();
         run_automation_now_with_events_impl(
             &state,
             &id,
+            run_id.as_deref(),
             &|| {
                 let _ = blocking_app.emit("angelbot:automations-updated", ());
             },
@@ -1231,7 +1222,15 @@ pub async fn run_automation_now(app_handle: AppHandle, id: String) -> Result<(),
         )
     })
     .await
-    .map_err(|error| format!("自动化执行线程异常：{error}"))??;
+    .map_err(|error| format!("自动化执行线程异常：{error}"))?;
+    let notification = match notification {
+        Ok(notification) => notification,
+        Err(ManualRunError::NotStarted(error)) if !has_request_id => return Err(error),
+        Err(ManualRunError::NotStarted(error)) => {
+            return Ok(ManualAutomationStart::Rejected { error })
+        }
+        Err(ManualRunError::Unconfirmed(error)) => return Err(error),
+    };
     let _ = app_handle.emit("angelbot:automations-updated", ());
     let state = app_handle.state::<AppState>();
     finish_automation_batch(
@@ -1255,7 +1254,7 @@ pub async fn run_automation_now(app_handle: AppHandle, id: String) -> Result<(),
         },
         &|| state.foreground_automation_pump.wake(app_handle.clone()),
     )
-    .map(|_| ())
+    .map(|_| ManualAutomationStart::Accepted)
 }
 #[cfg(test)]
 pub fn run_automation_now_impl(state: &AppState, id: &str) -> Result<(), String> {
@@ -1312,22 +1311,72 @@ fn run_automation_now_with_notification_impl(
     id: &str,
 ) -> Result<Option<ReminderNotification>, String> {
     // Development/test-only execution has no native notification handle.
-    run_automation_now_with_events_impl(state, id, &|| {}, &|_| {})
+    run_automation_now_with_events_impl(state, id, None, &|| {}, &|_| {}).map_err(|error| {
+        match error {
+            ManualRunError::NotStarted(message) | ManualRunError::Unconfirmed(message) => message,
+        }
+    })
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ManualAutomationStart {
+    Accepted,
+    Rejected { error: String },
+}
+
+#[derive(Debug)]
+enum ManualRunError {
+    NotStarted(String),
+    Unconfirmed(String),
+}
+
+impl From<String> for ManualRunError {
+    fn from(error: String) -> Self {
+        Self::Unconfirmed(error)
+    }
+}
+
+fn is_manual_run_id(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok_and(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == id)
+}
+
+fn manual_run_exists(conn: &Connection, id: &str, run_id: &str) -> Result<bool, String> {
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT automation_id FROM automation_runs WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match owner {
+        Some(owner) if owner == id => Ok(true),
+        Some(_) => Err("自动化运行编号已属于另一个任务".to_string()),
+        None => Ok(false),
+    }
 }
 
 fn run_automation_now_with_events_impl(
     state: &AppState,
     id: &str,
+    manual_run_id: Option<&str>,
     on_update: &dyn Fn(),
     on_complete: &dyn Fn(script_admission::OwnedRunOutcome),
-) -> Result<Option<ReminderNotification>, String> {
+) -> Result<Option<ReminderNotification>, ManualRunError> {
     let automation = get_automations_impl(state)?
         .into_iter()
         .find(|item| item.id == id)
-        .ok_or_else(|| "未找到自动化任务".to_string())?;
+        .ok_or_else(|| ManualRunError::NotStarted("未找到自动化任务".into()))?;
     let now = Utc::now().timestamp();
     if is_owned_executor(&automation.executor_kind) {
-        match script_admission::admit(state, id, script_admission::Origin::Manual, now, on_update)?
+        let origin = manual_run_id.map_or(
+            script_admission::Origin::Manual,
+            script_admission::Origin::ManualRequest,
+        );
+        // Admission only creates a durable ticket. No process has started if it fails.
+        match script_admission::admit(state, id, origin, now, on_update)
+            .map_err(ManualRunError::NotStarted)?
         {
             script_admission::Admission::Started(ticket) => {
                 let outcome = script_admission::execute_ticket(
@@ -1347,15 +1396,26 @@ fn run_automation_now_with_events_impl(
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if let Some(run_id) = manual_run_id {
+            if manual_run_exists(&transaction, id, run_id)? {
+                return Ok(None);
+            }
+        }
         if pause_unsupported_schedule_in_tx(&transaction, &automation, now, None)? {
             transaction.commit().map_err(|error| error.to_string())?;
-            return Err(
+            return Err(ManualRunError::NotStarted(
                 "自动化使用了不支持的定时频率，已暂停；请重新配置为每日定时或一次性提醒"
                     .to_string(),
-            );
+            ));
         }
         if automation.executor_kind == "agent" {
-            persist_agent_automation_run_in_tx(&transaction, &automation, now, None)?;
+            persist_agent_automation_run_in_tx(
+                &transaction,
+                &automation,
+                now,
+                None,
+                manual_run_id,
+            )?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -1366,11 +1426,14 @@ fn run_automation_now_with_events_impl(
                 notification_run_result(),
                 now,
                 None,
+                manual_run_id,
             )?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(notification_for_automation(&automation, run_id));
         }
-        Err("该执行方式必须通过受控的自动化派发路径运行".to_string())
+        Err(ManualRunError::NotStarted(
+            "该执行方式必须通过受控的自动化派发路径运行".into(),
+        ))
     }
 }
 
@@ -1392,6 +1455,7 @@ fn persist_agent_automation_run_in_tx(
     automation: &Automation,
     now: i64,
     claim_token: Option<&str>,
+    manual_run_id: Option<&str>,
 ) -> Result<(), String> {
     let input = enqueue_agent_automation_in_tx(transaction, automation, now)?;
     persist_automation_run_in_conn(
@@ -1406,6 +1470,7 @@ fn persist_agent_automation_run_in_tx(
         },
         now,
         claim_token,
+        manual_run_id,
     )
     .map(|_| ())
 }
@@ -1439,6 +1504,7 @@ fn pause_unsupported_schedule_in_tx(
         },
         now,
         claim_token,
+        None,
     )?;
     transaction
         .execute(
@@ -1477,8 +1543,11 @@ fn persist_automation_run_in_conn(
     result: ScriptRunResult,
     now: i64,
     claim_token: Option<&str>,
+    manual_run_id: Option<&str>,
 ) -> Result<String, String> {
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = manual_run_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     conn.execute(
         "INSERT INTO automation_runs (
             id, automation_id, status, summary, exit_code, output, started_at,
@@ -1968,7 +2037,13 @@ fn dispatch_claimed_automation(
         if automation.executor_kind == "agent" {
             // The queue input, its owner receipt, and scheduling advance become
             // visible together; a failure cannot leave an unowned follow-up.
-            persist_agent_automation_run_in_tx(&transaction, &automation, now, Some(&claim.token))?;
+            persist_agent_automation_run_in_tx(
+                &transaction,
+                &automation,
+                now,
+                Some(&claim.token),
+                None,
+            )?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(Some(ScheduledAutomationExecution { notification: None }));
         }
@@ -1982,6 +2057,7 @@ fn dispatch_claimed_automation(
                 notification_run_result(),
                 now,
                 Some(&claim.token),
+                None,
             )?;
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(Some(ScheduledAutomationExecution {

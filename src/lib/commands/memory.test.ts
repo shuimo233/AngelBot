@@ -19,9 +19,9 @@ import {
   decayMemories,
   setMemoryPermanent,
   updateMemory,
-  detectMemoryConflicts,
+  findRelatedMemories,
   getMemoryHistory,
-  mergeMemories,
+  replaceMemory,
   findRelevantMemories,
   findRelevantMemoriesByTime,
   runBatchForgetting,
@@ -144,15 +144,12 @@ describe('Memory Commands', () => {
       expect(invoke).toHaveBeenCalledWith('update_memory', { req });
     });
 
-    it('should expose memory history and conflict commands', async () => {
+    it('uses typed memory review and history commands', async () => {
       (invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
-        { memory_id: 'mem-2', content: 'Similar', category: 'fact', similarity: 0.91 },
+        { memory_id: 'mem-2', content: 'Similar', source: 'user', updated_at: 1 },
       ]);
-      await detectMemoryConflicts('Similar memory', 0.8);
-      expect(invoke).toHaveBeenCalledWith('detect_memory_conflicts', {
-        content: 'Similar memory',
-        threshold: 0.8,
-      });
+      await findRelatedMemories('mem-1');
+      expect(invoke).toHaveBeenCalledWith('find_related_memories', { memory_id: 'mem-1' });
 
       (invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
         { id: 'h1', memoryId: 'mem-1', operation: 'update', previousContent: 'a', newContent: 'b', details: null, createdAt: 1 },
@@ -161,8 +158,9 @@ describe('Memory Commands', () => {
       expect(invoke).toHaveBeenCalledWith('get_memory_history', { memory_id: 'mem-1' });
 
       (invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
-      await mergeMemories('mem-2', 'mem-1');
-      expect(invoke).toHaveBeenCalledWith('merge_memories', { source_id: 'mem-2', target_id: 'mem-1' });
+      const req = { sourceId: 'mem-2', sourceContent: 'old', targetId: 'mem-1', targetContent: 'current' };
+      await replaceMemory(req);
+      expect(invoke).toHaveBeenCalledWith('replace_memory', { req });
     });
   });
 

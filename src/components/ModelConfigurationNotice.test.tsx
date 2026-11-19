@@ -24,8 +24,9 @@ describe('ModelConfigurationNotice', () => {
     const listener = vi.fn();
     window.addEventListener('open-settings', listener);
     render(<ModelConfigurationNotice />);
-    expect(screen.getByText('连接模型后即可开始对话')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '模型设置' }));
+    expect(screen.getByText('尚未连接模型')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('可以先写草稿');
+    fireEvent.click(screen.getByRole('button', { name: '连接模型' }));
     expect(listener).toHaveBeenCalledTimes(1);
     window.removeEventListener('open-settings', listener);
   });
@@ -46,7 +47,7 @@ describe('ModelConfigurationNotice', () => {
       for (const loaded of [false, true]) {
         useSettingsStore.setState({ activeApiConfig: unconfigured, apiConfigLoaded: loaded });
         const { container, unmount } = render(<ModelConfigurationNotice />);
-        if (loaded) expect(screen.getByText('连接模型后即可开始对话')).toBeInTheDocument();
+        if (loaded) expect(screen.getByText('尚未连接模型')).toBeInTheDocument();
         else expect(container).toBeEmptyDOMElement();
         await act(() => useSettingsStore.getState().loadApiConfig());
         expect(useSettingsStore.getState().activeApiConfig.model).toBe(config.model);
@@ -60,6 +61,22 @@ describe('ModelConfigurationNotice', () => {
   it('does not declare chat ready because an unsaved plan draft is authorized', () => {
     useSettingsStore.getState().updateApiConfig({ provider: 'openai', model: 'draft-model', baseUrl: 'https://api.openai.com/v1', protocol: 'openai_responses', authMode: 'chatgpt_plan', credentialRef: 'draft-ref', planEnabled: true });
     render(<ModelConfigurationNotice />);
-    expect(screen.getByText('连接模型后即可开始对话')).toBeInTheDocument();
+    expect(screen.getByText('尚未连接模型')).toBeInTheDocument();
+  });
+
+  it('offers a status retry when a saved plan cannot be read', async () => {
+    const plan: ApiProviderConfig = {
+      provider: 'openai', model: 'gpt-6-luna', base_url: 'https://api.openai.com/v1',
+      api_key: '', protocol: 'openai_responses', auth_mode: 'chatgpt_plan',
+      credential_ref: 'fixture-account', max_tokens: 4096, temperature: 0.7,
+    };
+    vi.mocked(loadApiConfig).mockResolvedValueOnce({ ...plan, plan_status_error: '资料正在迁移或需要恢复。' })
+      .mockResolvedValueOnce({ ...plan, plan_connected: true, plan_enabled: true });
+    await act(() => useSettingsStore.getState().loadApiConfig());
+    const { container } = render(<ModelConfigurationNotice />);
+    expect(screen.getByRole('alert')).toHaveTextContent('无法读取 ChatGPT 连接状态');
+    expect(screen.getByRole('alert')).toHaveTextContent('资料正在迁移或需要恢复。');
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '重新检查' })));
+    expect(container).toBeEmptyDOMElement();
   });
 });

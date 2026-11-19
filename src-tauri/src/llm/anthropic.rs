@@ -7,8 +7,8 @@
 //! - Uses `x-api-key` header and `anthropic-version` header
 
 use super::{
-    LlmProvider, LlmResponse, Message, ProviderUsage, StopReason, ThinkingEffort, ThinkingProtocol,
-    ThinkingSettings, ToolCall, ToolSchema,
+    transport, LlmFailure, LlmProvider, LlmResponse, Message, ProviderUsage, StopReason,
+    ThinkingEffort, ThinkingProtocol, ThinkingSettings, ToolCall, ToolSchema,
 };
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -74,8 +74,92 @@ impl LlmProvider for AnthropicProvider {
         tools: Option<&[ToolSchema]>,
         thinking: Option<&ThinkingSettings>,
     ) -> Result<LlmResponse, String> {
+        self.chat_classified(messages, tools, thinking)
+            .await
+            .map_err(|failure| failure.diagnostic)
+    }
+
+    async fn chat_stream_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        _delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<LlmResponse, LlmFailure> {
+        self.chat_classified(messages, tools, thinking).await
+    }
+
+    async fn chat_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+    ) -> Result<LlmResponse, LlmFailure> {
         *self.last_usage.lock().unwrap() = None;
-        let (system_prompt, user_messages) = self.split_system_message(messages);
+        let body = self.build_request_body(messages, tools, thinking);
+
+        let api_key = self.api_key.lock().unwrap().clone();
+        let mut request = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .map_err(|_| "Cannot initialize Anthropic-compatible connection")?
+            .post(&self.endpoint)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&body);
+        if !api_key.is_empty() {
+            request = request.header("x-api-key", &api_key);
+        }
+        let resp = transport::send_model_request(request)
+            .await
+            .map_err(|error| transport::request_failure(error, "Anthropic Messages"))?;
+
+        if !resp.status().is_success() {
+            return Err(transport::api_response_failure(resp, "Anthropic Messages").await);
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|error| transport::response_read_failure(error, "Anthropic Messages"))?;
+        let resp_json: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Anthropic Messages 响应 JSON 格式无效。")?;
+        if let Some(failure) = transport::json_response_failure(&resp_json, "Anthropic Messages") {
+            return Err(failure);
+        }
+        self.parse_response(resp_json).map_err(Into::into)
+    }
+}
+
+impl AnthropicProvider {
+    fn split_system_messages(messages: &[Message]) -> (Option<String>, Vec<&Message>) {
+        let mut system = String::new();
+        let mut remaining = Vec::new();
+        for message in messages {
+            if message.role != "system" {
+                remaining.push(message);
+            } else if !message.content.trim().is_empty() {
+                if !system.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&message.content);
+            }
+        }
+        ((!system.is_empty()).then_some(system), remaining)
+    }
+
+    /// The exact body sent to Messages. Keep the system segments outside the
+    /// conversation, without changing user, assistant or tool order.
+    fn build_request_body(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+    ) -> Value {
+        let (system_prompt, user_messages) = Self::split_system_messages(messages);
         let anthropic_messages = self.build_anthropic_messages(&user_messages);
 
         let mut body = serde_json::json!({
@@ -85,7 +169,7 @@ impl LlmProvider for AnthropicProvider {
             "temperature": self.temperature,
         });
 
-        // Anthropic uses top-level `system` field (string, not array)
+        // This adapter represents ordered system segments as one top-level string.
         if let Some(sys) = system_prompt {
             body["system"] = serde_json::json!(sys);
         }
@@ -140,54 +224,7 @@ impl LlmProvider for AnthropicProvider {
                 );
             }
         }
-
-        let api_key = self.api_key.lock().unwrap().clone();
-        let mut request = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| "Cannot initialize Anthropic-compatible connection")?
-            .post(&self.endpoint)
-            .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if !api_key.is_empty() {
-            request = request.header("x-api-key", &api_key);
-        }
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| format!("[Anthropic] HTTP request failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("[Anthropic] API error {}: {}", status, text));
-        }
-
-        let resp_json: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("[Anthropic] JSON parse error: {}", e))?;
-
-        self.parse_response(resp_json)
-    }
-}
-
-impl AnthropicProvider {
-    /// Extract the first system message from the message list (Anthropic uses top-level `system`)
-    /// Returns (system_text, remaining_messages)
-    fn split_system_message<'a>(
-        &self,
-        messages: &'a [Message],
-    ) -> (Option<String>, Vec<&'a Message>) {
-        let system_text = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.clone());
-
-        let remaining: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
-
-        (system_text, remaining)
+        body
     }
 
     /// Convert unified messages to Anthropic format
@@ -332,5 +369,75 @@ impl AnthropicProvider {
         let mut m = self.model.lock().unwrap();
         *m = model.to_string();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_wire_prompt_contract_preserves_system_order_and_tool_transcript() {
+        let provider = AnthropicProvider::new("fixture".into(), "fixture-model".into(), 64, 0.3);
+        let message = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            protocol_state: None,
+            tool_images: Vec::new(),
+        };
+        let mut call = message("assistant", "Checking");
+        call.tool_calls = Some(vec![crate::llm::ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "fixture.txt"}),
+        }]);
+        let mut result = message("tool", "fixture contents");
+        result.tool_call_id = Some("call-1".into());
+        let body = provider.build_request_body(
+            &[
+                message("system", "Main identity"),
+                message("user", "Read the fixture"),
+                message("system", " \t\n"),
+                call,
+                message("system", "Pending attention"),
+                result,
+                message("system", "Ordered tail"),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            body["system"],
+            "Main identity\n\nPending attention\n\nOrdered tail"
+        );
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "Read the fixture"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Checking"},
+                    {"type": "tool_use", "id": "call-1", "name": "read_file",
+                        "input": {"path": "fixture.txt"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-1",
+                        "content": "fixture contents"}
+                ]}
+            ])
+        );
+        let blank_only = provider.build_request_body(
+            &[message("system", " \n "), message("user", "Hello")],
+            None,
+            None,
+        );
+        assert!(blank_only.get("system").is_none());
+        assert_eq!(
+            blank_only["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "Hello"}
+            ])
+        );
     }
 }

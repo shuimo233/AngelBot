@@ -487,16 +487,62 @@ fn local_clock(clock: &str) -> String {
         .to_string()
 }
 
+fn move_clock_after_history(messages: &mut Vec<Message>) {
+    const HEADING: &str = "\n\n## 当前时间\n本机当前时间为 ";
+    let Some(user_index) = messages.iter().rposition(|message| message.role == "user") else {
+        return;
+    };
+    let Some(system) = messages[..user_index]
+        .iter_mut()
+        .find(|message| message.role == "system" && message.content.contains(HEADING))
+    else {
+        return;
+    };
+    let (before, rest) = system
+        .content
+        .rsplit_once(HEADING)
+        .expect("known clock layer");
+    let (clock, policy) = rest
+        .split_once("\n\n## 每轮决策")
+        .expect("known turn policy");
+    let content = format!("{}{clock}", HEADING.trim_start());
+    system.content = format!("{before}\n\n## 每轮决策{policy}");
+    messages.insert(
+        user_index,
+        Message {
+            role: "developer".into(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            protocol_state: None,
+            tool_images: Vec::new(),
+        },
+    );
+}
+
+enum ProbeClock {
+    Fixed(String),
+    AfterHistory,
+}
+
 struct PairedClock {
     inner: Box<dyn LlmProvider>,
-    clock: String,
+    clock: ProbeClock,
     lookup_aware: bool,
 }
 
 pub(super) fn with_frozen_clock(inner: Box<dyn LlmProvider>, clock: &str) -> Box<dyn LlmProvider> {
     Box::new(PairedClock {
         inner,
-        clock: clock.into(),
+        clock: ProbeClock::Fixed(clock.into()),
+        lookup_aware: false,
+    })
+}
+
+pub(super) fn with_clock_after_history(inner: Box<dyn LlmProvider>) -> Box<dyn LlmProvider> {
+    Box::new(PairedClock {
+        inner,
+        clock: ProbeClock::AfterHistory,
         lookup_aware: false,
     })
 }
@@ -526,15 +572,18 @@ impl LlmProvider for PairedClock {
         thinking: Option<&ThinkingSettings>,
     ) -> Result<LlmResponse, LlmFailure> {
         let mut messages = messages.to_vec();
-        for m in &mut messages {
-            if m.role == "system" {
-                m.content = frozen_clock(&m.content, &self.clock);
-                if self.lookup_aware {
-                    m.content = completed_lookup_contract(&m.content);
+        match &self.clock {
+            ProbeClock::AfterHistory => move_clock_after_history(&mut messages),
+            ProbeClock::Fixed(clock) => {
+                for m in messages.iter_mut().filter(|m| m.role == "system") {
+                    m.content = frozen_clock(&m.content, clock);
+                    if self.lookup_aware {
+                        m.content = completed_lookup_contract(&m.content);
+                    }
                 }
             }
         }
-        // Freeze before instrumentation, so receipts are the actual sent input.
+        // Transform before instrumentation so receipts describe the actual sent input.
         self.inner.chat_classified(&messages, tools, thinking).await
     }
 }
@@ -635,7 +684,7 @@ impl Reader<'_> {
         let runner = AgentRunner::with_registry(
             Box::new(PairedClock {
                 inner: provider,
-                clock: case.clock.as_deref().unwrap_or(self.clock).into(),
+                clock: ProbeClock::Fixed(case.clock.as_deref().unwrap_or(self.clock).into()),
                 lookup_aware,
             }),
             config,
@@ -679,6 +728,27 @@ impl Reader<'_> {
         row_metrics(&mut row, &metrics, started);
         row
     }
+}
+
+#[test]
+fn cache_probe_moves_only_the_fresh_clock_before_the_current_user() {
+    let clock = "## 当前时间\n本机当前时间为 2026-11-11T00:00:01+08:00。解释relative";
+    let policy = "## 每轮决策\nCurrent turn policy";
+    let mut messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"system","content":format!("Stable rules\n\n{clock}\n\n{policy}")},
+        {"role":"user","content":"previous user"},
+        {"role":"assistant","content":"previous reply"},
+        {"role":"user","content":"current user"},
+        {"role":"tool","content":"recorded result","tool_call_id":"same-call"}
+    ]))
+    .unwrap();
+    let original = serde_json::to_value(&messages[1..]).unwrap();
+    move_clock_after_history(&mut messages);
+    assert_eq!(messages[0].content, format!("Stable rules\n\n{policy}"));
+    assert_eq!(messages[3].role, "developer");
+    assert_eq!(messages[3].content, clock);
+    messages.remove(3);
+    assert_eq!(serde_json::to_value(&messages[1..]).unwrap(), original);
 }
 
 #[test]

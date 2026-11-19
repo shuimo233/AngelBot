@@ -29,6 +29,8 @@ pub mod change_pipeline;
 pub mod change_worker_runtime;
 #[path = "support/circuit_breaker.rs"]
 pub mod circuit_breaker;
+#[path = "workers/codex_cli.rs"]
+mod codex_cli;
 #[path = "conversation/compaction.rs"]
 pub mod compaction;
 #[path = "isolation/concrete_sandbox.rs"]
@@ -256,6 +258,7 @@ pub use router::{SharedToolRouter, ToolRouter};
 pub use run_state::{derive_run_state, AgentRunStatus, ConfirmationState, RunStateInput};
 #[cfg(test)]
 pub(crate) use runner::AgentStep;
+pub(crate) use runner::DEFAULT_WALL_CLOCK_BUDGET;
 pub(crate) use runner::STOPPED_RUN_NOTICE;
 pub use runner::{AgentResponse, AgentRunner, AgentSliceOutcome, NativeAgentSliceResult};
 #[allow(unused_imports)]

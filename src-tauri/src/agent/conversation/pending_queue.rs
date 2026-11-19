@@ -24,6 +24,7 @@ pub const PENDING_QUEUE_CAP: usize = 16;
 
 use crate::llm::Message as LlmMessage;
 use std::sync::Mutex;
+use tokio::sync::oneshot;
 
 /// FIFO queue of user messages waiting to be consumed by the next
 /// runner iteration. Designed to be wrapped in `Arc<Mutex<...>>` and
@@ -34,8 +35,9 @@ pub struct PendingMessageQueue {
 }
 
 struct Inner {
-    queue: VecDeque<LlmMessage>,
+    queue: VecDeque<(LlmMessage, Option<oneshot::Sender<()>>)>,
     dropped: usize,
+    closed: bool,
 }
 
 impl PendingMessageQueue {
@@ -44,6 +46,7 @@ impl PendingMessageQueue {
             inner: Mutex::new(Inner {
                 queue: VecDeque::with_capacity(PENDING_QUEUE_CAP),
                 dropped: 0,
+                closed: false,
             }),
         }
     }
@@ -58,7 +61,39 @@ impl PendingMessageQueue {
             inner.dropped += 1;
             return;
         }
-        inner.queue.push_back(message);
+        if !inner.closed {
+            inner.queue.push_back((message, None));
+        }
+    }
+
+    pub fn submit(&self, message: LlmMessage) -> Result<oneshot::Receiver<()>, String> {
+        let mut inner = self.inner.lock().expect("pending queue poisoned");
+        if inner.closed {
+            return Err("当前轮已结束。".into());
+        }
+        if inner.queue.len() >= PENDING_QUEUE_CAP {
+            return Err("当前轮的引导队列已满。".into());
+        }
+        let (ack, received) = oneshot::channel();
+        inner.queue.push_back((message, Some(ack)));
+        Ok(received)
+    }
+
+    /// Seal a successful turn, or let the runner take another step if a
+    /// message arrived while the model was producing its final response.
+    pub fn close_if_empty(&self) -> bool {
+        let mut inner = self.inner.lock().expect("pending queue poisoned");
+        if !inner.queue.is_empty() {
+            return false;
+        }
+        inner.closed = true;
+        true
+    }
+
+    pub fn close(&self) {
+        let mut inner = self.inner.lock().expect("pending queue poisoned");
+        inner.closed = true;
+        inner.queue.clear();
     }
 
     /// Remove and return all queued messages, in FIFO order.
@@ -66,7 +101,16 @@ impl PendingMessageQueue {
     /// callers can see the cumulative damage over the run's lifetime.
     pub fn drain(&self) -> Vec<LlmMessage> {
         let mut inner = self.inner.lock().expect("pending queue poisoned");
-        std::mem::take(&mut inner.queue).into_iter().collect()
+        inner
+            .queue
+            .drain(..)
+            .map(|(message, ack)| {
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+                message
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {

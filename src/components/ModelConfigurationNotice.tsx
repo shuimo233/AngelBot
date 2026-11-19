@@ -1,5 +1,5 @@
 import { useSettingsStore } from '$stores/settings';
-import { getModelConfigReadiness } from '$lib/model-config';
+import { getModelConfigReadiness, openModelSettings } from '$lib/model-config';
 
 export function ModelConfigurationNotice() {
   const config = useSettingsStore((state) => state.activeApiConfig);
@@ -10,17 +10,17 @@ export function ModelConfigurationNotice() {
 
   if (readiness.kind === 'loading' || readiness.kind === 'ready') return null;
 
-  const openSettings = () => window.dispatchEvent(new CustomEvent('open-settings', { detail: 'api' }));
   return (
-    <aside className="model-config-notice" role={readiness.kind === 'invalid' ? 'alert' : 'status'}>
-      <span className="model-config-notice__marker" aria-hidden="true" />
+    <aside className="model-config-notice" role={readiness.kind === 'needs-credentials' ? 'status' : 'alert'}>
       <div className="model-config-notice__copy">
         <strong>{readiness.title}</strong>
         <span>{readiness.detail}</span>
       </div>
       <div className="model-config-notice__actions">
-        {loadError && <button type="button" onClick={() => { void load(); }}>重新检查</button>}
-        <button type="button" className="is-primary" onClick={openSettings}>模型设置</button>
+        {(loadError || config.planStatusError) && <button type="button" onClick={() => { void load(); }}>重新检查</button>}
+        <button type="button" className="is-primary" onClick={openModelSettings}>
+          {readiness.kind === 'needs-credentials' ? '连接模型' : '模型设置'}
+        </button>
       </div>
     </aside>
   );

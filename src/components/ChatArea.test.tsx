@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ChatArea, restoreRetryableLiveConfirmation, workspaceFilePathFromHref } from '$components/ChatArea';
+import { ChatArea, restoreRetryableLiveConfirmation } from '$components/ChatArea';
+import { workspaceFilePathFromHref } from '$components/MessageMarkdown';
 import { ContentBlockRenderer } from '$components/ContentBlockRenderer';
 import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { useSessionsStore } from '$stores/sessions';
@@ -15,6 +16,7 @@ import type { Message } from '$types';
 import type { WorkspaceAutomationStatus } from '$lib/commands/automation';
 import type { ApiProviderConfig } from '$lib/commands/settings';
 import * as messageCommands from '$lib/commands/message';
+import * as agentEvents from '$lib/commands/agent-event';
 import * as workspaceCommands from '$lib/commands/workspace';
 
 const automationFixture = vi.hoisted(() => ({ items: [] as WorkspaceAutomationStatus[] }));
@@ -56,6 +58,22 @@ const makeSession = (id: string, title: string) => ({
   id, title, createdAt: Date.now(), updatedAt: Date.now(), contextVersion: 0,
 });
 
+// Keep the transcript fixtures shared with the existing send/approval tests.
+// The long-history regression below tests the actual typed IPC path separately.
+function fixturePage(rows: Message[], cursor?: messageCommands.MessagePageCursor): messageCommands.MessagePage {
+  const target = cursor?.beforeId ?? cursor?.afterId ?? cursor?.aroundId ?? cursor?.newerId;
+  const at = rows.findIndex(row => row.id === target);
+  const reset = Boolean(cursor && (at < 0 || (cursor.afterId && rows.length - at > 81)));
+  const tail = Math.max(0, rows.length - 80);
+  let start = tail;
+  let end = rows.length;
+  if (!reset && cursor?.beforeId) { start = Math.max(0, at - 80); end = at; }
+  if (!reset && cursor?.afterId) start = at + 1;
+  if (!reset && cursor?.newerId) { start = at + 1; end = Math.min(rows.length, start + 80); }
+  if (!reset && cursor?.aroundId) { start = Math.max(0, Math.min(at - 40, tail)); end = Math.min(rows.length, start + 80); }
+  return { messages: rows.slice(start, end), hasOlder: start > 0, hasNewer: end < rows.length, reset };
+}
+
 function desktopApprovalFixture() {
   const pending: Message = {
     id: 'desktop-turn', sessionId: 'session-1', role: 'assistant', content: '请核对输入框。', createdAt: Date.now(),
@@ -92,6 +110,8 @@ describe('Main Agent file citations', () => {
 describe('ChatArea', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(messageCommands, 'getMessagePage').mockImplementation(async (sessionId, cursor) =>
+      fixturePage(await messageCommands.getMessages(sessionId), cursor));
     automationFixture.items = [];
     useMessagesStore.setState((state) => ({
       ...state,
@@ -100,6 +120,8 @@ describe('ChatArea', () => {
       inputSessionId: null,
       inputToken: {},
       draftInputs: {},
+      queuedFollowUps: {},
+      stoppingSessions: new Set(),
       toolExecuting: false,
       executingTool: null,
       streamingText: '',
@@ -110,10 +132,13 @@ describe('ChatArea', () => {
     }));
     useSessionsStore.setState({ sessions: [], activeSessionId: null, activeSession: null });
     useWorkspacesStore.setState({ workspaces: [], activeWorkspaceId: null });
+    const profile = { ...useSettingsStore.getInitialState().profile, name: 'Test', tone: 'friendly', greeting: '' } as const;
     useSettingsStore.setState({
-      profile: { name: 'Test', avatar: '', bio: '', languageStyle: 'casual', tone: 'friendly', responseFormats: ['text'], keywords: [], greeting: '', personality: 'balanced', speechBubble: 'default' },
-      activeApiConfig: { provider: 'anthropic', model: 'claude-sonnet-4-20250514', baseUrl: '', apiKey: '', maxTokens: 4096, temperature: 0.7 },
+      profile,
+      activeProfile: profile,
+      activeApiConfig: { provider: 'anthropic', model: 'claude-sonnet-4-20250514', baseUrl: '', apiKey: '', hasApiKey: true, maxTokens: 4096, temperature: 0.7 },
       apiConfigLoaded: true,
+      apiConfigLoadError: null,
     });
     useThinkingEffortStore.setState({ effort: 'medium' });
     usePreferencesStore.setState({
@@ -150,7 +175,6 @@ describe('ChatArea', () => {
     render(<ChatArea />);
 
     expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
     expect(screen.getByPlaceholderText('给 AngelBot 发消息…')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
   });
@@ -164,6 +188,46 @@ describe('ChatArea', () => {
     render(<ChatArea />);
     expect(screen.getByRole('heading', { name: 'Demo' })).toBeInTheDocument();
     expect(screen.queryByText(/0 条消息/)).not.toBeInTheDocument();
+  });
+
+  it('uses saved persona notes and stops carrying them after a saved clear', async () => {
+    const user = userEvent.setup();
+    const session = makeSession('persona-session', '日常');
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session, sessions: [session] });
+    useSettingsStore.getState().updateProfile({ personaNotes: 'SELECTED_PERSONA_NOTES', characterCard: {
+      specVersion: '2.0', personality: '', scenario: '', mesExample: '', systemPrompt: 'RAW_SYSTEM_DO_NOT_SEND',
+      postHistoryInstructions: '', alternateGreetings: [], creatorNotes: '', creator: '', tags: [],
+      rawData: { character_book: { entries: [{ content: 'RAW_BOOK_DO_NOT_SEND' }] } },
+    } });
+    useSettingsStore.getState().persistProfile();
+    useSettingsStore.getState().updateProfile({ personaNotes: 'UNSAVED_PERSONA_NOTES' });
+    const submitted: Record<string, unknown>[] = [];
+    let durable: Message[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body ?? '{}'));
+      if (cmd === 'get_messages') return new Response(JSON.stringify({ ok: true, data: durable }));
+      if (cmd === 'send_message') {
+        submitted.push(args.req);
+        const reply: Message = { id: `reply-${submitted.length}`, sessionId: session.id, role: 'assistant', content: `回复 ${submitted.length}`, createdAt: submitted.length };
+        durable = [...durable, { id: args.req.clientMessageId, sessionId: session.id, role: 'user', content: args.req.content, createdAt: submitted.length }, reply];
+        return new Response(JSON.stringify({ ok: true, data: reply }));
+      }
+      return new Response(JSON.stringify({ ok: true, data: [] }));
+    });
+    render(<ChatArea />);
+    await user.type(screen.getByRole('textbox'), '工作问题');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByText('回复 1');
+    expect(submitted[0]).toMatchObject({ personality: { supplement: 'SELECTED_PERSONA_NOTES' } });
+    act(() => {
+      useSettingsStore.getState().updateProfile({ personaNotes: '' });
+      useSettingsStore.getState().persistProfile();
+    });
+    await user.type(screen.getByRole('textbox'), '另一个问题');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByText('回复 2');
+    expect(submitted[1]).toMatchObject({ personality: { supplement: '' } });
+    expect(JSON.stringify(submitted)).not.toMatch(/RAW_BOOK_DO_NOT_SEND|RAW_SYSTEM_DO_NOT_SEND/);
   });
 
   it('sends file-only snapshots from Personal space without routing from file contents, and reloads compact history', async () => {
@@ -220,6 +284,62 @@ describe('ChatArea', () => {
     expect(await screen.findByText('daily.csv')).toBeInTheDocument();
   });
 
+  it('retains the first question and attachment until the model connection is saved', async () => {
+    const user = userEvent.setup();
+    const session = makeSession('first-model', '日常');
+    const saved: ApiProviderConfig = {
+      provider: 'anthropic', model: 'claude-sonnet-4-20250514', base_url: 'https://api.anthropic.com',
+      api_key: '', has_api_key: true, max_tokens: 4096, temperature: 0.7,
+    };
+    const unconfigured = fromRustConfig({ ...saved, has_api_key: false });
+    useSettingsStore.setState({ apiConfig: unconfigured, activeApiConfig: unconfigured });
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session, sessions: [session] });
+    const openSettings = vi.spyOn(window, 'dispatchEvent');
+    const submitted = vi.fn();
+    let durable: Message[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body ?? '{}'));
+      if (cmd === 'load_api_config') return new Response(JSON.stringify({ ok: true, data: saved }));
+      if (cmd === 'get_messages') return new Response(JSON.stringify({ ok: true, data: durable }));
+      if (cmd === 'send_message') {
+        submitted(args.req);
+        const reply: Message = {
+          id: 'first-reply', sessionId: session.id, role: 'assistant', content: '读到了第一份附件。', createdAt: 1,
+        };
+        durable = [{ id: args.req.clientMessageId, sessionId: session.id, role: 'user', content: args.req.content,
+          textAttachments: args.req.textAttachments, createdAt: 1 }, reply];
+        return new Response(JSON.stringify({ ok: true, data: reply }));
+      }
+      return new Response(JSON.stringify({ ok: true, data: [] }));
+    });
+    render(<ChatArea />);
+    const composer = screen.getByRole('textbox');
+    await user.upload(screen.getByLabelText('选择文本附件'), new File(['first snapshot'], 'first.txt'));
+    await screen.findByText('first.txt');
+    await user.type(composer, '概括这份资料。{Enter}');
+    expect(openSettings).toHaveBeenCalledWith(expect.objectContaining({ type: 'open-settings', detail: 'api' }));
+
+    act(() => useSettingsStore.getState().updateApiConfig({ apiKey: 'synthetic-fixture-key' }));
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    expect(openSettings.mock.calls.filter(([event]) => event.type === 'open-settings')).toHaveLength(2);
+    expect(submitted).not.toHaveBeenCalled();
+    expect(useMessagesStore.getState().messages).toEqual([]);
+    expect(composer).toHaveValue('概括这份资料。');
+    expect(within(screen.getByLabelText('待发送文本附件')).getByText('first.txt')).toBeVisible();
+
+    await act(() => useSettingsStore.getState().persistApiConfig());
+    expect(submitted).not.toHaveBeenCalled();
+    await user.click(composer);
+    await user.keyboard('{Enter}');
+    await screen.findByText('读到了第一份附件。');
+    expect(submitted).toHaveBeenCalledTimes(1);
+    expect(submitted).toHaveBeenCalledWith(expect.objectContaining({
+      content: '概括这份资料。', textAttachments: [{ name: 'first.txt', text: 'first snapshot' }],
+    }));
+    expect(composer).toHaveValue('');
+    expect(screen.queryByLabelText('待发送文本附件')).not.toBeInTheDocument();
+  });
+
   it.each([false, true])('rechecks saved model readiness after provider failure without touching the draft or retrying (%s)', async (connected) => {
     const user = userEvent.setup();
     const session = makeSession('model-failure', 'Model failure');
@@ -272,6 +392,102 @@ describe('ChatArea', () => {
     expect(commands.filter((cmd) => cmd === 'load_api_config')).toHaveLength(1);
     expect(commands.filter((cmd) => cmd === 'send_message')).toHaveLength(1);
     expect(commands.some((cmd) => cmd === 'save_api_config' || cmd.startsWith('chatgpt_plan_'))).toBe(false);
+  });
+
+  it.each(['read_file', 'web_search'] as const)('answers from a saved %s receipt and allows retry without changing the draft or queued work', async (source) => {
+    const session = makeSession('receipt-only', 'Recovery');
+    const isSearch = source === 'web_search';
+    const searchOutput = JSON.stringify({ kind: 'web_search_evidence', trust: 'untrusted_external', provider: 'tavily',
+      results: [{ title: '展馆公告', url: 'https://example.test/notice', snippet: 'PRIVATE_SEARCH_SNIPPET' }], truncated: false });
+    const request: Message = { id: 'receipt-user', sessionId: session.id, role: 'user', content: isSearch ? '查找本周展馆公告' : '阅读周末清单并概括', createdAt: 1 };
+    const failed: Message = {
+      id: 'receipt-provider-failure', parentId: request.id, sessionId: session.id, role: 'assistant', content: '模型连接中断。', createdAt: 2,
+      taskRun: { id: 'receipt-provider-failure', goal: request.content, status: 'provider_unavailable',
+        plan: [source], confirmationState: 'none', resumable: false, stepCount: 1, completedStepCount: 1 },
+      toolCalls: [{ id: 'read-receipt', name: source, arguments: isSearch ? '{"query":"展馆公告"}' : '{"path":"docs/周末清单.md"}' }],
+      toolResults: [{ callId: 'read-receipt', toolName: source, success: true, output: isSearch ? searchOutput : 'PRIVATE_FILE_CONTENT' }],
+    };
+    const answered: Message = { id: 'answered-from-receipt', parentId: failed.id, sessionId: session.id, role: 'assistant', content: isSearch ? '依据已保存的展馆公告，没有重新核对最新情况。' : '周六出门，周日休息。', createdAt: 3 };
+    const activeConfig: ApiProviderConfig = { provider: 'anthropic', model: 'test-model', api_key: '', has_api_key: true, base_url: '', max_tokens: 4096, temperature: 0.7 };
+    const config = fromRustConfig(activeConfig);
+    useSettingsStore.setState({ apiConfig: config, activeApiConfig: config, apiConfigLoaded: true, apiConfigLoadError: null });
+    const queued = [{ id: 'unrelated-follow-up', text: '不要因整理回执而自动发送' }];
+    useMessagesStore.setState({ queuedFollowUps: { [session.id]: queued } });
+
+    const calls: Array<{ cmd: string; args: { req?: Record<string, unknown> } }> = [];
+    let history = [request, failed];
+    let complete!: (response: Response) => void;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body));
+      calls.push({ cmd, args });
+      if (cmd === 'continue_agent_task') return new Promise<Response>(resolve => { complete = resolve; });
+      return new Response(JSON.stringify({ ok: true, data: cmd === 'load_api_config' ? activeConfig : cmd === 'get_messages' ? history : [] }));
+    });
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session, sessions: [session] });
+    const user = userEvent.setup();
+    const locator = vi.fn();
+    window.addEventListener('angelbot:locate-file', locator);
+    try {
+      render(<ChatArea onOpenWorkbenchView={vi.fn()} />);
+      const recovery = await screen.findByRole('region', { name: '任务恢复' });
+      expect(within(recovery).queryByRole('button', { name: '继续任务' })).not.toBeInTheDocument();
+      expect(recovery).not.toHaveTextContent('PRIVATE_FILE_CONTENT');
+      expect(recovery).not.toHaveTextContent('PRIVATE_SEARCH_SNIPPET');
+      if (!isSearch) {
+        await user.click(within(recovery).getByRole('button', { name: '在工作台中定位 docs/周末清单.md' }));
+        expect(locator).toHaveBeenCalledWith(expect.objectContaining({ detail: { path: 'docs/周末清单.md' } }));
+      }
+      const input = screen.getByRole('textbox', { name: '消息输入' });
+      await user.type(input, '这条草稿还没写完');
+      const continueCalls = () => calls.filter(call => call.cmd === 'continue_agent_task');
+      const action = () => screen.getByRole('button', { name: '用已有结果回答' });
+      await user.click(action());
+      await screen.findByRole('group', { name: '运行控制' });
+      await waitFor(() => expect(continueCalls()).toHaveLength(1));
+      expect(continueCalls()[0].args.req).toMatchObject({ sessionId: session.id, messageId: failed.id, resultsOnly: true });
+      await act(async () => complete(new Response(JSON.stringify({ ok: false, error: '模型仍无法连接' }))));
+      expect(within(await screen.findByRole('region', { name: '任务恢复' })).getByRole('alert')).toHaveTextContent('模型仍无法连接');
+      expect(input).toHaveValue('这条草稿还没写完');
+      expect(action()).toBeEnabled();
+
+      await user.click(action());
+      await waitFor(() => expect(continueCalls()).toHaveLength(2));
+      expect(continueCalls()[1].args.req).toMatchObject({ sessionId: session.id, messageId: failed.id, resultsOnly: true });
+      history = [request, failed, answered];
+      await act(async () => complete(new Response(JSON.stringify({ ok: true, data: answered }))));
+      expect(await screen.findByText(answered.content)).toBeInTheDocument();
+      expect(screen.getByText(failed.content)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '用已有结果回答' })).not.toBeInTheDocument();
+      expect(input).toHaveValue('这条草稿还没写完');
+      expect(useMessagesStore.getState().queuedFollowUps[session.id]).toEqual(queued);
+      expect(calls.some(call => ['send_message', 'resolve_agent_confirmation'].includes(call.cmd))).toBe(false);
+    } finally {
+      window.removeEventListener('angelbot:locate-file', locator);
+    }
+  });
+
+  it.each(['agent_loop', 'write_file', 'list_automations', 'unknown outcome', 'pending approval', 'empty search', 'failed search'] as const)('does not offer a receipt-only answer with %s', async (reason) => {
+    const session = makeSession('blocked-receipt-only', 'Recovery');
+    const known = { callId: 'known', toolName: 'read_file', success: true, output: 'existing result' };
+    const results: Message['toolResults'] = reason === 'unknown outcome'
+      ? [known, { callId: 'unknown', toolName: 'run_project_command', success: false, output: 'Error: {"code":"RESULT_UNKNOWN"}' }]
+      : reason === 'pending approval'
+        ? [known, { callId: 'pending', toolName: 'write_file', success: false, output: 'Confirmation required', confirmationStatus: 'pending' }]
+        : reason === 'empty search' || reason === 'failed search'
+          ? [{ ...known, toolName: 'web_search', success: reason === 'empty search', output: JSON.stringify({ kind: 'web_search_evidence',
+            trust: 'untrusted_external', provider: 'tavily', results: reason === 'empty search' ? []
+              : [{ title: '不应引用', url: 'https://example.test', snippet: '' }], truncated: false }) }]
+          : [{ ...known, toolName: reason }];
+    const reply: Message = { id: 'blocked-answer', sessionId: session.id, role: 'assistant', content: '模型无法连接。', createdAt: 1,
+      taskRun: { id: 'blocked-answer', goal: '整理现有结果', status: 'provider_unavailable', plan: [],
+        confirmationState: 'none', resumable: false, stepCount: results.length, completedStepCount: 1 }, toolResults: results };
+    vi.spyOn(messageCommands, 'getMessages').mockResolvedValue([reply]);
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session, sessions: [session] });
+    render(<ChatArea />);
+    const recovery = await screen.findByRole('region', { name: '任务恢复' });
+    if (reason === 'write_file') expect(recovery).toHaveTextContent('最近成功 · 写入文件');
+    expect(screen.queryByRole('button', { name: '用已有结果回答' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '继续任务' })).not.toBeInTheDocument();
   });
 
   it.each([
@@ -339,6 +555,8 @@ describe('ChatArea', () => {
         expect(screen.getByRole('textbox')).toHaveValue('');
       } else {
         expect(await screen.findByRole('alert')).toHaveTextContent('附件仍保留');
+        expect(screen.getByRole('alert')).toHaveTextContent('未确认送达');
+        expect(screen.getByRole('alert')).not.toHaveTextContent('尚未发送');
         expect(screen.getByLabelText('待发送文本附件')).toHaveTextContent('keep.txt');
         if (failure === 'reload-failed') expect(screen.getByLabelText('已发送文本附件')).toHaveTextContent('keep.txt');
         else expect(screen.queryByLabelText('已发送文本附件')).not.toBeInTheDocument();
@@ -386,6 +604,29 @@ describe('ChatArea', () => {
     } finally { useMessagesStore.setState({ subscribeToAgentEvents: originalSubscribe }); }
   });
 
+  it('does not dispatch when event subscription fails or imply an unknown delivery', async () => {
+    const user = userEvent.setup();
+    const session = makeSession('subscribe-failure', 'Unsent draft');
+    const originalSubscribe = useMessagesStore.getState().subscribeToAgentEvents;
+    const send = vi.spyOn(messageCommands, 'sendMessage');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true, data: [] })));
+    useMessagesStore.setState({ subscribeToAgentEvents: vi.fn().mockRejectedValue(new Error('Events unavailable')) });
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session, sessions: [session] });
+    try {
+      render(<ChatArea />);
+      await user.upload(screen.getByLabelText('选择文本附件'), new File(['keep this snapshot'], 'unsent.txt'));
+      await screen.findByText('unsent.txt');
+      await user.type(screen.getByRole('textbox'), '请保留未发送的内容');
+      await user.click(screen.getByRole('button', { name: '发送' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('尚未发送');
+      expect(screen.getByRole('alert')).not.toHaveTextContent('未确认送达');
+      expect(screen.getByRole('textbox')).toHaveValue('请保留未发送的内容');
+      expect(screen.getByLabelText('待发送文本附件')).toHaveTextContent('unsent.txt');
+      expect(send).not.toHaveBeenCalled();
+    } finally { useMessagesStore.setState({ subscribeToAgentEvents: originalSubscribe }); }
+  });
+
   it.each(['daily', 'clarify', 'error'] as const)('keeps a project mention in daily or asks without dispatching (%s)', async (decision) => {
     const user = userEvent.setup();
     const session = makeSession('daily-main', '日常');
@@ -415,6 +656,8 @@ describe('ChatArea', () => {
       await screen.findByRole('button', { name: '留在日常' });
       expect(sent).toHaveLength(0);
       expect(screen.getByRole('textbox')).toHaveValue(text);
+      expect(await screen.findByRole('alert')).toHaveTextContent('尚未发送');
+      expect(screen.getByRole('alert')).not.toHaveTextContent('未确认送达');
       await user.click(screen.getByRole('button', { name: '留在日常' }));
       await user.click(screen.getByRole('button', { name: '发送' }));
     }
@@ -692,6 +935,179 @@ describe('ChatArea', () => {
     window.removeEventListener('angelbot:locate-file', located);
   });
 
+  it('shows one open action per delivered file and distinguishes saved files from readback', async () => {
+    const session = makeSession('session-delivery', 'Demo');
+    const write = (id: string, path: string) => ({ id, name: 'write_file', arguments: JSON.stringify({ path }) });
+    const written = write('write-report', 'docs\\周末清单.md');
+    const plain = write('write-index', 'index.txt');
+    const outside = write('write-outside', '../outside.txt');
+    const read = { id: 'read-report', name: 'read_file', arguments: written.arguments };
+    const receipt = (call: typeof written) => ({ callId: call.id, toolName: call.name, output: 'PRIVATE_RECEIPT', success: true });
+    const pending: Message = { id: 'awaiting-write', sessionId: session.id, role: 'assistant', content: '', createdAt: 1, toolCalls: [written], toolResults: [{ ...receipt(written), success: false, confirmationStatus: 'pending' }] };
+    const completed: Message = {
+      id: 'answer-delivery', parentId: pending.id, sessionId: session.id, role: 'assistant', createdAt: 2,
+      content: '交给你这份[清单](angelbot-file:docs%2F%E5%91%A8%E6%9C%AB%E6%B8%85%E5%8D%95.md)。',
+      taskRun: { id: 'delivery-task', goal: '整理报告', status: 'completed', plan: [], confirmationState: 'approved', resumable: false, stepCount: 4, completedStepCount: 4 },
+      toolCalls: [read, plain, outside], toolResults: [{ ...receipt(written), confirmationStatus: 'approved' }, receipt(read), receipt(plain), receipt(outside)],
+    };
+    const chat: Message = { id: 'ordinary-chat', sessionId: session.id, role: 'assistant', content: '随便聊聊。', createdAt: 3 };
+    vi.spyOn(messageCommands, 'getMessages').mockResolvedValue([pending, completed, chat]);
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session });
+    const located = vi.fn();
+    window.addEventListener('angelbot:locate-file', located);
+    render(<ChatArea onOpenWorkbenchView={vi.fn()} />);
+    try {
+      const delivery = await screen.findByRole('list', { name: '本次交付文件' });
+      expect(within(delivery).getByText('已写入并读回')).toBeVisible();
+      expect(within(delivery).getByText('已写入')).toBeVisible();
+      expect(screen.queryByText(/outside.txt|PRIVATE_RECEIPT/)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: '在工作台中定位 docs/周末清单.md' }));
+      expect(located).toHaveBeenCalledTimes(1);
+      expect((located.mock.calls[0][0] as CustomEvent).detail).toEqual({ path: 'docs/周末清单.md' });
+      expect(screen.getAllByRole('list', { name: '本次交付文件' })).toHaveLength(1);
+    } finally {
+      window.removeEventListener('angelbot:locate-file', located);
+    }
+  });
+
+  it('indexes a visible short turn across its hidden successful write without searching the hidden tool message', async () => {
+    const session = makeSession('session-hidden-file-index', 'Demo');
+    const common = { sessionId: session.id, createdAt: 2 };
+    const taskRun = { id: 'indexed-delivery', goal: '继续', status: 'completed', plan: [], confirmationState: 'none', resumable: false, stepCount: 1, completedStepCount: 1 };
+    const rows: Message[] = [
+      { ...common, id: 'short-question', role: 'user', content: '继续' },
+      { ...common, id: 'hidden-write', parentId: 'short-question', role: 'assistant', content: '',
+        toolCalls: [{ id: 'write', name: 'write_file', arguments: '{"path":"docs/清单.md"}' }],
+        toolResults: [{ callId: 'write', toolName: 'write_file', success: true, output: '仅回执内容' }],
+        taskFacts: { goal: '继续', modifiedFiles: ['隐藏回执.txt'] } },
+      { ...common, id: 'visible-result', parentId: 'hidden-write', role: 'assistant', content: '整理好了。', taskRun },
+    ];
+    vi.spyOn(messageCommands, 'getMessages').mockResolvedValue(rows);
+    useSessionsStore.setState({ activeSessionId: session.id, activeSession: session });
+    const { container } = render(<ChatArea onOpenWorkbenchView={vi.fn()} />);
+    const index = await screen.findByRole('button', { name: '定位第 1 条：继续 · 清单.md' });
+    expect(container.querySelector('[data-conversation-message-id="hidden-write"]')).not.toBeInTheDocument();
+    fireEvent.mouseEnter(index);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('继续 · 清单.md');
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '搜索当前对话' }));
+    const dialog = screen.getByRole('dialog');
+    await waitFor(() => expect(within(dialog).getByRole('searchbox')).toHaveFocus());
+    await user.paste('隐藏回执.txt');
+    expect(within(dialog).getByRole('status')).toHaveTextContent('当前对话没有匹配的消息');
+  });
+
+  it('reconciles a background reply that commits while reopening its conversation', async () => {
+    const project = makeSession('project-main', 'Project');
+    const daily = makeSession('daily-main', 'Daily');
+    const select = (session: typeof project) => useSessionsStore.setState({
+      sessions: [project, daily], activeSessionId: session.id, activeSession: session,
+    });
+    const callbacks = new Map<string, (event: agentEvents.AgentEvent) => void>();
+    vi.spyOn(agentEvents, 'subscribeAgentSessionEvents').mockImplementation((sessionId, callback) => {
+      callbacks.set(sessionId, callback);
+      return { ready: Promise.resolve(), unsubscribe: () => callbacks.delete(sessionId) };
+    });
+    let finishReopen!: (messages: Message[]) => void;
+    const reopening = new Promise<Message[]>((resolve) => { finishReopen = resolve; });
+    let projectReads = 0;
+    const message = (sessionId: string, content: string): Message => ({
+      id: sessionId, sessionId, role: 'assistant', content, createdAt: Date.now(),
+    });
+    vi.spyOn(messageCommands, 'getMessages').mockImplementation(async (sessionId) => {
+      if (sessionId === daily.id) return [message(daily.id, 'Daily only')];
+      if (++projectReads === 2) return reopening;
+      return [message(project.id, projectReads === 1 ? 'Previous project reply' : 'New durable project reply')];
+    });
+
+    select(project);
+    render(<ChatArea />);
+    expect(await screen.findByText('Previous project reply')).toBeInTheDocument();
+    act(() => select(daily));
+    expect(await screen.findByText('Daily only')).toBeInTheDocument();
+    expect(callbacks.has(project.id)).toBe(false);
+
+    act(() => select(project));
+    await waitFor(() => expect(projectReads).toBe(2));
+    const projectObserver = callbacks.get(project.id)!;
+    const finished = { type: 'MessageEnd', data: { message_id: project.id, full_text: 'Not the durable transcript' } };
+    await act(async () => {
+      projectObserver?.(finished);
+      projectObserver?.(finished);
+    });
+    expect(projectReads).toBe(2);
+    finishReopen([message(project.id, 'Previous project reply')]);
+    expect(await screen.findByText('New durable project reply')).toBeInTheDocument();
+    expect(screen.queryByText('Not the durable transcript')).not.toBeInTheDocument();
+    expect(projectReads).toBe(3);
+
+    act(() => select(daily));
+    expect(await screen.findByText('Daily only')).toBeInTheDocument();
+    await act(async () => projectObserver?.(finished));
+    expect(projectReads).toBe(3);
+    expect(screen.queryByText('New durable project reply')).not.toBeInTheDocument();
+  });
+
+  it('bounds durable timeline reads and stops scheduling them after leaving a conversation', async () => {
+    const project = makeSession('project-main', 'Project');
+    const daily = makeSession('daily-main', 'Daily');
+    const select = (session: typeof project) => useSessionsStore.setState({
+      sessions: [project, daily], activeSessionId: session.id, activeSession: session,
+    });
+    const pendingReads: Array<() => void> = [];
+    const events = vi.spyOn(agentEvents, 'getDurableAgentRunEvents').mockImplementation(() =>
+      new Promise((resolve) => pendingReads.push(() => resolve([]))));
+    vi.spyOn(messageCommands, 'getMessages').mockImplementation(async (sessionId) =>
+      sessionId === project.id ? Array.from({ length: 8 }, (_, index): Message => ({
+        id: `tool-reply-${index}`, sessionId, role: 'assistant', content: `Project reply ${index}`, createdAt: Date.now(),
+        toolCalls: [{ id: `read-${index}`, name: 'read_file', arguments: '{}' }],
+      })) : [{ id: 'daily-reply', sessionId, role: 'assistant', content: 'Daily reply', createdAt: Date.now() }]);
+
+    select(project);
+    render(<ChatArea />);
+    await waitFor(() => expect(events).toHaveBeenCalledTimes(4));
+    expect(await screen.findByText('Project reply 7')).toBeVisible();
+    expect(screen.getByRole('textbox', { name: '消息输入' })).toBeEnabled();
+    act(() => select(daily));
+    expect(await screen.findByText('Daily reply')).toBeInTheDocument();
+    await act(async () => { pendingReads.forEach((resolve) => resolve()); });
+    expect(events).toHaveBeenCalledTimes(4);
+    expect(screen.queryByText('Project reply 0')).not.toBeInTheDocument();
+  });
+
+  it('loads an older run only when opened, keeping its saved reply and private details separate', async () => {
+    const session = makeSession('session-1', 'Daily');
+    const saved = Array.from({ length: 9 }, (_, index): Message => ({
+      id: 'run-' + index, sessionId: session.id, role: 'assistant', content: 'Saved reply ' + index, createdAt: index + 1,
+      toolCalls: [{ id: 'read-' + index, name: 'read_file', arguments: '{}' }],
+      toolResults: [{ callId: 'read-' + index, toolName: 'read_file', success: true, output: 'receipt' }],
+    }));
+    const events = vi.spyOn(agentEvents, 'getDurableAgentRunEvents').mockImplementation(async (sessionId, runId) => {
+      if (runId !== 'run-0') return [];
+      return ['ToolCallStart', 'ToolCallResult'].map((kind, index) => ({
+        id: kind, run_id: runId, session_id: sessionId, sequence: index + 1, event_type: 'ContentBlock', created_at: 1,
+        payload: { type: 'ContentBlock', data: {
+          index, iteration_id: 0, block: { kind, data: { call_id: 'read-0', tool_name: 'read_file',
+            arguments: { path: 'private-argument.txt' }, success: true, output: 'private-output' } },
+        } },
+      }));
+    });
+    vi.spyOn(messageCommands, 'getMessages').mockResolvedValue(saved);
+    useSessionsStore.setState({ sessions: [session], activeSession: session, activeSessionId: session.id });
+    render(<ChatArea />);
+
+    const olderReply = (await screen.findByText('Saved reply 0')).closest('.message-row') as HTMLElement;
+    const disclosure = within(olderReply).getByText('查看运行过程').parentElement as HTMLDetailsElement;
+    await waitFor(() => expect(events.mock.calls.map(([, runId]) => runId))
+      .toEqual(['run-8', 'run-7', 'run-6', 'run-5', 'run-4', 'run-3']));
+    disclosure.open = true;
+    fireEvent(disclosure, new Event('toggle', { bubbles: true }));
+    expect(await within(olderReply).findByText('读取文件 · 完成')).toBeVisible();
+    expect(events).toHaveBeenLastCalledWith(session.id, 'run-0');
+    expect(within(olderReply).getByText('Saved reply 0')).toBeVisible();
+    expect(olderReply).not.toHaveTextContent(/private-argument|private-output/);
+  });
+
   it('does not render a stale message load after switching sessions', async () => {
     const firstSession = makeSession('session-1', 'First');
     const secondSession = makeSession('session-2', 'Second');
@@ -786,6 +1202,149 @@ describe('ChatArea', () => {
     await screen.findByText('Saved reply for session-2');
     await waitFor(() => expect(transcript.scrollTop).toBe(transcript.scrollHeight));
   });
+
+  it('paginates a 2,000-message transcript through the typed IPC and preserves old jumps and the live leaf', async () => {
+    const firstSession = makeSession('session-1', 'First');
+    const secondSession = makeSession('session-2', 'Second');
+    const transcriptFor = (sessionId: string) => Array.from({ length: 2_000 }, (_, index): Message => ({
+      id: `${sessionId}-${index}`, sessionId, role: index % 2 === 0 ? 'user' : 'assistant',
+      content: index === 1 ? `归档编号 ${sessionId}：[归档材料](angelbot-file:docs%2Farchive.md)` : `消息 ${index} ${sessionId}`, createdAt: index + 1,
+      ...(index === 1 ? { toolCalls: [{ id: 'old-file-read', name: 'read_file', arguments: '{"path":"docs/archive.md"}' }],
+        toolResults: [{ callId: 'old-file-read', toolName: 'read_file', success: true, output: '旧文件内容' }] } : {}),
+    }));
+    const durable = transcriptFor(firstSession.id);
+    let finishSecondLoad!: (messages: Message[]) => void;
+    const secondLoad = new Promise<Message[]>((resolve) => { finishSecondLoad = resolve; });
+    vi.mocked(messageCommands.getMessagePage).mockRestore();
+    const reads: { command: string; args: Record<string, unknown>; count?: number }[] = [];
+    const journalReads: string[] = [];
+    const subscriptions = new Map<string, (event: agentEvents.AgentEvent) => void>();
+    vi.spyOn(agentEvents, 'subscribeAgentSessionEvents').mockImplementation((sessionId, observer) => {
+      subscriptions.set(sessionId, observer);
+      return { ready: Promise.resolve(), unsubscribe: () => subscriptions.delete(sessionId) };
+    });
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body ?? '{}'));
+      let data: unknown = [];
+      if (cmd === 'get_message_page') {
+        const read = { command: cmd, args, count: undefined as number | undefined };
+        reads.push(read);
+        const rows = args.sessionId === secondSession.id ? await secondLoad : durable;
+        const page = fixturePage(rows, args);
+        read.count = page.messages.length;
+        data = page;
+      } else if (cmd === 'search_conversation_page') {
+        const results = args.sessionId === firstSession.id && args.query === 'docs/archive.md'
+          ? [{ id: 'session-1-1', role: 'assistant', text: 'docs/archive.md', createdAt: 2 }] : [];
+        reads.push({ command: cmd, args, count: results.length });
+        data = { results, nextBeforeId: null };
+      } else if (cmd === 'get_messages') {
+        reads.push({ command: cmd, args });
+        throw new Error('Search must never fetch the full transcript');
+      } else if (cmd === 'get_agent_run_events') {
+        journalReads.push(args.runId);
+        data = ['ToolCallStart', 'ToolCallResult'].map((kind, index) => ({
+          id: kind, run_id: args.runId, session_id: args.sessionId, sequence: index + 1, event_type: 'ContentBlock', created_at: 1,
+          payload: { type: 'ContentBlock', data: { index, iteration_id: 0,
+            block: { kind, data: { call_id: 'old-file-read', tool_name: 'read_file', arguments: { path: 'docs/archive.md' }, success: true, output: 'receipt' } } } },
+        }));
+      } else if (cmd === 'send_message') {
+        const { sessionId, clientMessageId, content } = args.req ?? args;
+        data = { id: 'durable-reply', sessionId, role: 'assistant', content: '新回复已保存', createdAt: 2_003 };
+        durable.push({ id: clientMessageId, sessionId, role: 'user', content, createdAt: 2_002 }, data as Message);
+      }
+      return new Response(JSON.stringify({ ok: true, data }));
+    });
+    useSessionsStore.setState({ sessions: [firstSession, secondSession], activeSessionId: firstSession.id, activeSession: firstSession });
+    const { container } = render(<ChatArea onOpenWorkbenchView={vi.fn()} />);
+    const rows = () => container.querySelectorAll('[data-conversation-message-id]');
+    const row = (id: string) => container.querySelector(`[data-conversation-message-id="${id}"]`);
+    await waitFor(() => expect(row('session-1-1999')).toBeInTheDocument());
+    expect(rows()).toHaveLength(80);
+    expect(row('session-1-1')).toBeNull();
+    expect(reads).toEqual([{ command: 'get_message_page', args: { sessionId: firstSession.id }, count: 80 }]);
+
+    const findArchive = async () => {
+      fireEvent.click(screen.getByRole('button', { name: '搜索当前对话' }));
+      fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'docs/archive.md' } });
+      fireEvent.click(await screen.findByRole('button', { name: /docs\/archive\.md/ }));
+      await waitFor(() => expect(row('session-1-1')).toHaveFocus());
+      expect(reads.at(-2)).toEqual({ command: 'search_conversation_page', args: { sessionId: firstSession.id, query: 'docs/archive.md' }, count: 1 });
+      expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, aroundId: 'session-1-1' }, count: 80 });
+    };
+    await findArchive();
+    expect(rows()).toHaveLength(80);
+    expect(row('session-1-1999')).toBeNull();
+    expect(row('session-1-1')).toHaveTextContent('归档材料');
+    expect(journalReads).toHaveLength(0);
+    const oldRow = within(row('session-1-1') as HTMLElement);
+    const journal = oldRow.getByText('查看运行过程').parentElement as HTMLDetailsElement;
+    fireEvent(journal, new Event('toggle'));
+    journal.open = true;
+    fireEvent(journal, new Event('toggle'));
+    expect(await oldRow.findByRole('list', { name: '已记录的运行步骤' })).toHaveTextContent('读取文件 · 完成');
+    expect(journalReads).toEqual(['session-1-1']);
+    expect(oldRow.getByRole('button', { name: '在工作台中定位 docs/archive.md' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '加载较新消息' }));
+    await waitFor(() => expect(rows()).toHaveLength(160));
+    expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, newerId: 'session-1-79' }, count: 80 });
+
+    const latest = screen.getByRole('button', { name: '回到最底部' });
+    expect(latest).toBeVisible();
+    durable.push(desktopApprovalFixture().pending);
+    act(() => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'desktop-turn' } }));
+    const pendingApproval = await screen.findByRole('button', { name: '查看待确认操作' });
+    expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, afterId: 'session-1-1999' }, count: 1 });
+    expect(row('desktop-turn')).toBeNull();
+    fireEvent.click(pendingApproval);
+    expect(row('desktop-turn')).toHaveTextContent('请核对输入框。');
+    await waitFor(() => expect(row('desktop-turn')).toHaveFocus());
+    expect(row('session-1-1999')).toBeInTheDocument();
+    expect(rows()).toHaveLength(80);
+    expect(reads.filter(read => read.command === 'search_conversation_page')).toHaveLength(1);
+
+    await findArchive();
+    act(() => useSessionsStore.setState({ activeSessionId: secondSession.id, activeSession: secondSession }));
+    await waitFor(() => expect(reads.at(-1)?.args).toEqual({ sessionId: secondSession.id }));
+    act(() => useSessionsStore.setState({ activeSessionId: firstSession.id, activeSession: firstSession }));
+    await waitFor(() => expect(row('session-1-1999')).toBeInTheDocument());
+    await act(async () => finishSecondLoad(transcriptFor(secondSession.id)));
+    expect(row('session-1-1')).toBeNull();
+    expect(row('session-2-1999')).toBeNull();
+    expect(rows()).toHaveLength(80);
+
+    const scroller = container.querySelector<HTMLDivElement>('.messages')!;
+    scroller.scrollTop = 400;
+    const anchor = row('session-1-1921')!;
+    vi.spyOn(anchor, 'getBoundingClientRect').mockImplementation(() =>
+      new DOMRect(0, [...rows()].indexOf(anchor) * 20 - scroller.scrollTop, 0, 20));
+    const originalTop = anchor.getBoundingClientRect().top;
+    fireEvent.click(screen.getByRole('button', { name: '加载更早消息' }));
+    await waitFor(() => expect(rows()).toHaveLength(160));
+    expect(anchor.getBoundingClientRect().top).toBe(originalTop);
+    expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, beforeId: 'session-1-1921' }, count: 80 });
+    expect(reads.filter(read => read.command === 'search_conversation_page')).toHaveLength(2);
+
+    durable.push({ id: 'new-during-browse', sessionId: firstSession.id, role: 'assistant', content: '阅读时的新消息', createdAt: 2_002 });
+    act(() => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'new-during-browse' } }));
+    await waitFor(() => expect(useMessagesStore.getState().messages.at(-1)?.id).toBe('new-during-browse'));
+    expect(rows()).toHaveLength(160);
+    expect(anchor.getBoundingClientRect().top).toBe(originalTop);
+    expect(row('new-during-browse')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '回到最底部' }));
+    expect(row('new-during-browse')).toBeInTheDocument();
+    expect(rows()).toHaveLength(80);
+
+    durable[durable.length - 2] = { ...durable.at(-2)!, content: '确认已结束', taskRun: undefined, toolCalls: undefined, toolResults: undefined };
+    act(() => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'desktop-turn' } }));
+    await screen.findByText('确认已结束');
+    await userEvent.setup().type(screen.getByRole('textbox', { name: '消息输入' }), '正常发送{Enter}');
+    await screen.findByText('新回复已保存');
+    expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, afterId: 'new-during-browse' }, count: 2 });
+    expect(rows()).toHaveLength(80);
+    expect(screen.getAllByText('正常发送')).toHaveLength(1);
+    expect(reads.filter(read => read.command === 'get_messages')).toHaveLength(0);
+  }, 15_000);
 
   it('keeps text and file-reference drafts in their original session across switches and remounts', async () => {
     const firstSession = makeSession('session-1', 'First');
@@ -1263,8 +1822,16 @@ describe('ChatArea', () => {
 
     act(() => useMessagesStore.getState().setLiveStatus('正在规划下一步'));
 
-    expect(screen.getAllByText('正在执行')).toHaveLength(1);
-    expect(screen.queryByText('正在规划下一步')).not.toBeInTheDocument();
+    expect(screen.getAllByText('正在规划下一步')).toHaveLength(1);
+    const controls = within(screen.getByRole('group', { name: '运行控制' }));
+    expect(controls.getByRole('status')).toHaveTextContent('正在规划下一步');
+    expect(screen.getAllByRole('button', { name: '停止运行' })).toEqual([controls.getByTitle('停止运行')]);
+    act(() => useMessagesStore.setState({
+      liveStatus: '正在调用 read_file',
+      liveToolSteps: { read: { callId: 'read', toolName: 'read_file', arguments: {}, status: 'running' } },
+    }));
+    expect(controls.getByRole('status')).toHaveTextContent('正在读取文件');
+    expect(screen.queryByText('正在调用 read_file')).not.toBeInTheDocument();
     expect(screen.queryByTitle('停止生成 (Esc)')).not.toBeInTheDocument();
 
     resolveReply(new Response(JSON.stringify({
@@ -1272,6 +1839,362 @@ describe('ChatArea', () => {
       data: { id: 'assistant-1', sessionId: session.id, role: 'assistant', content: 'Done', createdAt: Date.now() },
     })));
     expect(await screen.findByText('Done')).toBeInTheDocument();
+  });
+
+  it.each(['needs_attention', 'provider_unavailable'])('continues the last interrupted task from its durable reply and preserves the composer draft (%s)', async (status) => {
+    const session = makeSession('continue-task-session', 'Recovery');
+    const request: Message = {
+      id: 'original-task', sessionId: session.id, role: 'user', content: '生成并核对清单', createdAt: 1,
+    };
+    const interrupted: Message = {
+      id: 'interrupted-task', sessionId: session.id, parentId: request.id, role: 'assistant',
+      content: '连接中断。', createdAt: 2,
+      toolCalls: [
+        { id: 'read', name: 'read_file', arguments: '{"path":"reports/source.csv"}' },
+        { id: 'write', name: 'write_file', arguments: '{"path":"reports/summary.csv","content":"private draft"}' },
+        { id: 'unverified', name: 'edit_file', arguments: '{"path":"reports/unverified.csv"}' },
+      ],
+      toolResults: [
+        { callId: 'read', toolName: 'read_file', success: true, output: 'source file contents' },
+        { callId: 'write', toolName: 'write_file', success: true, output: '文件已写入', confirmationStatus: 'approved' },
+        { callId: 'unverified', toolName: 'edit_file', success: true, output: '文件已修改',
+          verification: { kind: 'file_exists', target: 'reports/unverified.csv', declaredExistence: true,
+            actualExistence: false, source: 'work_dir', matched: false } },
+      ],
+      taskRun: { id: 'interrupted-task', goal: request.content, status, plan: ['read_file', 'write_file', 'edit_file'],
+        confirmationState: 'none', resumable: true, stepCount: 3, completedStepCount: 2 },
+      taskFacts: { goal: request.content, modifiedFiles: ['reports/summary.csv'] },
+    };
+    const completed: Message = {
+      id: 'continued-task', sessionId: session.id, parentId: interrupted.id, role: 'assistant',
+      content: '已读回核对清单。', createdAt: 3,
+    };
+    let history = [request, interrupted];
+    const invocations: { cmd: string; args: any }[] = [];
+    let complete!: (response: Response) => void;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body));
+      invocations.push({ cmd, args });
+      if (cmd === 'continue_agent_task') return new Promise<Response>((resolve) => { complete = resolve; });
+      if (cmd === 'get_agent_run_events' && args.runId === interrupted.id) {
+        return new Response(JSON.stringify({ ok: true, data: [{
+          id: 'interruption', run_id: interrupted.id, session_id: session.id, sequence: 1,
+          event_type: 'Error', payload: { type: 'Error', data: { code: 'LlmResponseInterrupted' } }, created_at: 2,
+        }] }));
+      }
+      return new Response(JSON.stringify({ ok: true, data: cmd === 'get_messages' ? history : [] }));
+    });
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    const user = userEvent.setup();
+    const located = vi.fn();
+    const openSettings = vi.fn();
+    window.addEventListener('angelbot:locate-file', located);
+    window.addEventListener('open-settings', openSettings);
+    try {
+      render(<ChatArea onToggleWorkbench={vi.fn()} />);
+      const recovery = await screen.findByRole('region', { name: '任务恢复' });
+      expect(within(recovery).getByText(/最近成功/)).toHaveTextContent('写入文件 · reports/summary.csv');
+      expect(recovery).not.toHaveTextContent(/private draft|source file contents|reports\/unverified\.csv/);
+      await user.click(within(recovery).getByRole('button', { name: '检查模型连接' }));
+      expect(openSettings).toHaveBeenCalledWith(expect.objectContaining({ detail: 'api' }));
+      expect(invocations.some(({ cmd }) => cmd === 'send_message' || cmd === 'continue_agent_task')).toBe(false);
+      await user.click(within(recovery).getByRole('button', { name: 'reports/summary.csv' }));
+      expect(located).toHaveBeenCalledWith(expect.objectContaining({ detail: { path: 'reports/summary.csv' } }));
+      const input = screen.getByRole('textbox', { name: '消息输入' });
+      await user.type(input, '保留这条草稿');
+      expect(within(recovery).queryByRole('button', { name: '用已有结果回答' })).not.toBeInTheDocument();
+      await user.click(within(recovery).getByRole('button', { name: '继续任务' }));
+      await screen.findByRole('group', { name: '运行控制' });
+      await waitFor(() => expect(invocations.filter(({ cmd }) => cmd === 'continue_agent_task')).toHaveLength(1));
+      expect(invocations.find(({ cmd }) => cmd === 'continue_agent_task')?.args.req).toMatchObject({
+        sessionId: session.id, messageId: interrupted.id,
+      });
+      expect(invocations.find(({ cmd }) => cmd === 'continue_agent_task')?.args.req).not.toHaveProperty('resultsOnly');
+      history = [request, interrupted, completed];
+      await act(async () => complete(new Response(JSON.stringify({ ok: true, data: completed }))));
+      expect(await screen.findByText(completed.content)).toBeInTheDocument();
+      expect(screen.getByText(interrupted.content)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '继续任务' })).not.toBeInTheDocument();
+      expect(invocations.some(({ cmd }) => cmd === 'send_message')).toBe(false);
+      expect(input).toHaveValue('保留这条草稿');
+    } finally {
+      window.removeEventListener('angelbot:locate-file', located);
+      window.removeEventListener('open-settings', openSettings);
+    }
+  });
+
+  it('shows the model connection action after approval without delaying the saved recovery receipt', async () => {
+    const session = makeSession('approval-model-recovery', 'Recovery');
+    const tool = { id: 'write', name: 'write_file', arguments: '{"path":"report.csv","content":"draft"}' };
+    const pending: Message = {
+      id: 'pending-write', sessionId: session.id, role: 'assistant', content: '确认写入', createdAt: 1,
+      toolCalls: [tool],
+      toolResults: [{ callId: tool.id, toolName: tool.name, success: false, output: 'Confirmation required',
+        confirmationRequired: true, confirmationStatus: 'pending' }],
+    };
+    const receipt = { callId: tool.id, toolName: tool.name, success: true, output: '文件已写入', confirmationStatus: 'approved' };
+    const interrupted: Message = {
+      id: 'failed-followup', parentId: pending.id, sessionId: session.id, role: 'assistant', content: '模型连接中断。', createdAt: 2,
+      toolCalls: [tool], toolResults: [receipt],
+      taskRun: { id: 'failed-followup', goal: '生成报告', status: 'needs_attention', plan: [tool.name],
+        confirmationState: 'none', resumable: true, stepCount: 2, completedStepCount: 1 },
+    };
+    let history = [pending];
+    let finishJournal!: (response: Response) => void;
+    const calls: string[] = [];
+    const ok = (data: unknown) => new Response(JSON.stringify({ ok: true, data }));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body));
+      calls.push(cmd);
+      if (cmd === 'get_messages') return ok(history);
+      if (cmd === 'resolve_agent_confirmation') {
+        history = [{ ...pending, toolResults: [receipt] }, interrupted];
+        return ok(receipt);
+      }
+      if (cmd === 'get_agent_run_events' && args.runId === interrupted.id) {
+        return new Promise<Response>((resolve) => { finishJournal = resolve; });
+      }
+      return ok([]);
+    });
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    render(<ChatArea />);
+    await userEvent.click(await screen.findByRole('button', { name: /^允许(?:一次)?$/ }));
+    const recovery = await screen.findByRole('region', { name: '任务恢复' });
+    expect(within(recovery).getByText(/最近成功/)).toHaveTextContent('写入文件 · report.csv');
+    expect(within(recovery).getByRole('button', { name: '继续任务' })).toBeEnabled();
+    expect(within(recovery).queryByRole('button', { name: '检查模型连接' })).not.toBeInTheDocument();
+    await act(async () => finishJournal(ok([{
+      id: 'model-error', run_id: interrupted.id, session_id: session.id, sequence: 1,
+      event_type: 'Error', payload: { type: 'Error', data: { code: 'LlmTransportError' } }, created_at: 2,
+    }])));
+    expect(await within(recovery).findByRole('button', { name: '检查模型连接' })).toBeEnabled();
+    expect(calls.filter((cmd) => cmd === 'resolve_agent_confirmation')).toHaveLength(1);
+    expect(calls).not.toContain('continue_agent_task');
+  });
+
+  it.each([
+    ['Error: {"code":"RESULT_UNKNOWN","message":"Inspect the target"}', true],
+    ['The command printed the literal RESULT_UNKNOWN and exited with an error', false],
+  ])('offers continuation only for known results (%s)', async (output, unknown) => {
+    const session = makeSession('unknown-task-session', 'Recovery');
+    const reply: Message = {
+      id: 'unknown-task', sessionId: session.id, role: 'assistant', content: '连接在操作后中断。', createdAt: 1,
+      toolCalls: [{ id: 'action', name: 'write_file', arguments: '{"path":"report.csv"}' }],
+      toolResults: [
+        { callId: 'read', toolName: 'read_file', success: true, output: 'source file contents' },
+        { callId: 'action', toolName: 'write_file', success: false, output },
+      ],
+      taskRun: { id: 'unknown-task', goal: '生成报表', status: 'needs_attention', plan: ['write_file'],
+        confirmationState: 'none', resumable: true, stepCount: 1, completedStepCount: 0 },
+    };
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd } = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ ok: true, data: cmd === 'get_messages' ? [reply] : [] }));
+    });
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    const openWorkbenchView = vi.fn();
+    const located = vi.fn();
+    window.addEventListener('angelbot:locate-file', located, { once: true });
+    render(<ChatArea onOpenWorkbenchView={openWorkbenchView} />);
+    const recovery = await screen.findByRole('region', { name: unknown ? '核对操作结果' : '任务恢复' });
+    expect(within(recovery).getByText(unknown ? '结果待核对' : '任务未完成')).toBeInTheDocument();
+    if (unknown) {
+      expect(recovery).toHaveTextContent('report.csv');
+      expect(within(recovery).queryByText(/最近成功/)).not.toBeInTheDocument();
+      await userEvent.click(within(recovery).getByRole('button', { name: '核对目标文件' }));
+      expect(located).toHaveBeenCalledWith(expect.objectContaining({ detail: { path: 'report.csv' } }));
+      expect(openWorkbenchView).not.toHaveBeenCalled();
+    } else {
+      expect(within(recovery).getByText(/最近成功/)).toHaveTextContent('读取文件');
+    }
+    window.removeEventListener('angelbot:locate-file', located);
+    expect(within(recovery).queryByRole('button', { name: '检查模型连接' })).not.toBeInTheDocument();
+    const button = within(recovery).queryByRole('button', { name: '继续任务' });
+    if (unknown) expect(button).not.toBeInTheDocument();
+    else expect(button).toBeEnabled();
+  });
+
+  it('returns to an earlier result and opens workspace files without running the command again', async () => {
+    const session = makeSession('return-review-session', 'Review');
+    const reply: Message = {
+      id: 'return-review-message', sessionId: session.id, role: 'assistant', content: '归档操作已发出。', createdAt: 2,
+      toolCalls: [{ id: 'archive-command', name: 'run_project_command', arguments: '{"command":"python","args":["archive.py"]}' }],
+      toolResults: [{ callId: 'archive-command', toolName: 'run_project_command', success: false, output: 'Error: {"code":"RESULT_UNKNOWN"}' }],
+      taskRun: { id: 'return-review-message', goal: '归档资料', status: 'needs_attention', plan: [],
+        confirmationState: 'none', resumable: false, stepCount: 1, completedStepCount: 0 },
+    };
+    const otherReply: Message = { id: 'other-reply', sessionId: session.id, role: 'assistant', content: '日程已整理。', createdAt: 3,
+      taskRun: { ...reply.taskRun!, id: 'other-reply', status: 'completed', goal: '整理日程' } };
+    const commands: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd } = JSON.parse(String(init?.body));
+      commands.push(cmd);
+      return new Response(JSON.stringify({ ok: true, data: cmd === 'get_messages' ? [reply, otherReply] : [] }));
+    });
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    const open = vi.fn();
+    render(<ChatArea onOpenWorkbenchView={open} />);
+    await userEvent.click(await screen.findByRole('button', { name: '查看待核对结果' }));
+    const review = screen.getByRole('region', { name: '核对操作结果' });
+    expect(review).toHaveTextContent('工作区文件可能已改动');
+    await userEvent.click(within(review).getByRole('button', { name: '查看工作区文件' }));
+    expect(open).toHaveBeenCalledWith('files');
+    expect(screen.queryByText('run_project_command')).not.toBeInTheDocument();
+    expect(commands).not.toContain('continue_agent_task');
+    expect(commands).not.toContain('resolve_agent_confirmation');
+  });
+
+  it('dispatches one queued follow-up per successful turn and preserves the rest after stopping', async () => {
+    const session = makeSession('queue-session', 'Queue');
+    const sends: { text: string; complete: (response: Response) => void }[] = [];
+    let finishInterrupt!: (response: Response) => void;
+    const stopping = new Promise<Response>((resolve) => { finishInterrupt = resolve; });
+    const interruptRequested = vi.fn();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body));
+      if (cmd === 'send_message') {
+        expect(args.req.sessionId).toBe(session.id);
+        return new Promise<Response>((complete) => sends.push({ text: args.req.content, complete }));
+      }
+      if (cmd === 'interrupt_agent') {
+        interruptRequested(args.sessionId);
+        return stopping;
+      }
+      return new Response(JSON.stringify({ ok: true, data: [] }));
+    });
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    const user = userEvent.setup();
+    const view = render(<ChatArea />);
+    const input = await screen.findByRole('textbox', { name: '消息输入' });
+    await user.type(input, 'initial{Enter}');
+    await screen.findByRole('group', { name: '运行控制' });
+    await user.type(input, 'first queued{Enter}second queued{Enter}retained draft');
+    const queue = screen.getByRole('region', { name: '待发送队列' });
+    expect(within(queue).getByText('first queued')).toBeInTheDocument();
+    expect(within(queue).getByText('second queued')).toBeInTheDocument();
+    expect(sends.map((item) => item.text)).toEqual(['initial']);
+
+    const reply = (id: string) => new Response(JSON.stringify({
+      ok: true, data: { id, sessionId: session.id, role: 'assistant', content: 'Done', createdAt: Date.now() },
+    }));
+    await act(async () => sends[0].complete(reply('initial-reply')));
+    await waitFor(() => expect(sends.map((item) => item.text)).toEqual(['initial', 'first queued']));
+    await user.click(screen.getByRole('button', { name: '停止运行' }));
+    expect(await screen.findByText('正在停止…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '停止运行' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: '停止运行' }));
+    expect(interruptRequested).toHaveBeenCalledTimes(1);
+    expect(interruptRequested).toHaveBeenCalledWith(session.id);
+    await act(async () => sends[1].complete(reply('follow-up-reply')));
+    expect(screen.getByText('正在停止…')).toBeInTheDocument();
+    expect(within(queue).getByRole('button', { name: '发送下一条' })).toBeDisabled();
+    await user.type(input, '{Enter}');
+    expect(sends).toHaveLength(2);
+    expect(within(queue).queryByText('first queued')).not.toBeInTheDocument();
+    expect(within(queue).getByText('second queued')).toBeInTheDocument();
+    expect(input).toHaveValue('retained draft');
+    view.unmount();
+    render(<ChatArea />);
+    expect(await screen.findByText('正在停止…')).toBeInTheDocument();
+    const restoredQueue = screen.getByRole('region', { name: '待发送队列' });
+    expect(within(restoredQueue).getByRole('button', { name: '发送下一条' })).toBeDisabled();
+    await act(async () => finishInterrupt(new Response(JSON.stringify({ ok: true, data: null }))));
+    expect(screen.queryByText('正在停止…')).not.toBeInTheDocument();
+    expect(within(restoredQueue).getByRole('button', { name: '发送下一条' })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: '消息输入' })).toHaveValue('retained draft');
+  });
+
+  it('fences late pause responses across sessions and stopped foreground runs', async () => {
+    const first = makeSession('pause-A', 'First');
+    const second = makeSession('pause-B', 'Second');
+    const running: { sessionId: string; complete: (response: Response) => void }[] = [];
+    let finishFirst!: (response: Response) => void;
+    let finishSecond!: (response: Response) => void;
+    const firstPause = new Promise<Response>((resolve) => { finishFirst = resolve; });
+    const secondPause = new Promise<Response>((resolve) => { finishSecond = resolve; });
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd, args } = JSON.parse(String(init?.body));
+      if (cmd === 'send_message') return new Promise<Response>((complete) => { running.push({ sessionId: args.req.sessionId, complete }); });
+      if (cmd === 'pause_agent') return args.sessionId === first.id ? firstPause : secondPause;
+      return new Response(JSON.stringify({ ok: true, data: [] }));
+    });
+    useSessionsStore.setState({ sessions: [first, second], activeSessionId: first.id, activeSession: first });
+    render(<ChatArea />);
+    const send = async (text: string) => {
+      await waitFor(() => expect(screen.getByPlaceholderText('给 AngelBot 发消息…')).toBeEnabled());
+      await userEvent.type(screen.getByPlaceholderText('给 AngelBot 发消息…'), text);
+      await waitFor(() => expect(screen.getByRole('button', { name: '发送' })).toBeEnabled());
+      await userEvent.click(screen.getByRole('button', { name: '发送' }));
+      await screen.findByLabelText('运行控制');
+    };
+    try {
+      await send('Task A');
+      await userEvent.click(screen.getByRole('button', { name: '暂停' }));
+      act(() => useSessionsStore.setState({ activeSessionId: second.id, activeSession: second }));
+      await send('Task B');
+      await userEvent.click(screen.getByRole('button', { name: '暂停' }));
+      await act(async () => finishFirst(new Response(JSON.stringify({ ok: true, data: null }))));
+      expect(screen.getByRole('button', { name: '暂停' })).toBeDisabled();
+      expect(screen.queryByText('已暂停')).not.toBeInTheDocument();
+      await userEvent.click(within(screen.getByLabelText('运行控制')).getByRole('button', { name: '停止运行' }));
+      // Main's stopped request settles before the composer admits a new run;
+      // the independently delayed pause acknowledgement remains in flight.
+      await act(async () => running[1].complete(new Response(JSON.stringify({ ok: true, data: {
+        id: 'stopped-B', sessionId: second.id, role: 'assistant', content: 'Stopped', createdAt: 1,
+      } }))));
+      await send('New B run');
+      await act(async () => finishSecond(new Response(JSON.stringify({ ok: true, data: null }))));
+      expect(screen.getByRole('button', { name: '暂停' })).toBeEnabled();
+      expect(screen.queryByText('已暂停')).not.toBeInTheDocument();
+      expect(fetch.mock.calls.filter(([, init]) => JSON.parse(String(init?.body)).cmd === 'pause_agent')).toHaveLength(2);
+    } finally {
+      finishFirst(new Response(JSON.stringify({ ok: true, data: null })));
+      finishSecond(new Response(JSON.stringify({ ok: true, data: null })));
+      for (const [index, run] of running.entries()) await act(async () => run.complete(new Response(JSON.stringify({
+        ok: true, data: { id: `pause-reply-${index}`, sessionId: run.sessionId, role: 'assistant', content: 'Done', createdAt: 1 },
+      }))));
+    }
+  });
+
+  it('guards in-flight pause controls and shows safe pause or resume failures', async () => {
+    const session = makeSession('pause-failure', 'Demo');
+    let finishReply!: (response: Response) => void;
+    let finishPause!: (response: Response) => void;
+    const pendingReply = new Promise<Response>((resolve) => { finishReply = resolve; });
+    const pendingPause = new Promise<Response>((resolve) => { finishPause = resolve; });
+    let pauses = 0;
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const { cmd } = JSON.parse(String(init?.body));
+      if (cmd === 'send_message') return pendingReply;
+      if (cmd === 'pause_agent') return ++pauses === 1 ? pendingPause : new Response(JSON.stringify({ ok: true, data: null }));
+      if (cmd === 'resume_agent') return new Response(JSON.stringify({ ok: false, error: 'PRIVATE_RESUME_DIAGNOSTIC' }));
+      return new Response(JSON.stringify({ ok: true, data: [] }));
+    });
+    useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+    render(<ChatArea />);
+    await userEvent.type(screen.getByPlaceholderText('给 AngelBot 发消息…'), 'Run a task');
+    await userEvent.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByLabelText('运行控制');
+    try {
+      const button = screen.getByRole('button', { name: '暂停' });
+      act(() => { fireEvent.click(button); fireEvent.click(button); });
+      expect(pauses).toBe(1);
+      expect(button).toBeDisabled();
+      expect(within(screen.getByLabelText('运行控制')).getByRole('button', { name: '停止运行' })).toBeEnabled();
+      await act(async () => finishPause(new Response(JSON.stringify({ ok: false, error: 'PRIVATE_PAUSE_DIAGNOSTIC' }))));
+      expect(await screen.findByRole('alert')).toHaveTextContent('未能确认暂停');
+      expect(screen.queryByText(/PRIVATE_/)).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: '暂停' }));
+      await userEvent.click(await screen.findByRole('button', { name: '继续运行' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('未能确认继续运行');
+      expect(screen.queryByText(/PRIVATE_/)).not.toBeInTheDocument();
+      expect(fetch.mock.calls.filter(([, init]) => JSON.parse(String(init?.body)).cmd === 'resume_agent')).toHaveLength(1);
+    } finally {
+      finishPause(new Response(JSON.stringify({ ok: true, data: null })));
+      await act(async () => finishReply(new Response(JSON.stringify({ ok: true, data: {
+        id: 'pause-finished', sessionId: session.id, role: 'assistant', content: 'Done', createdAt: 1,
+      } }))));
+    }
   });
 
   it.each(['field', 'image'])('renders one $0 approval and preflight when persisted and live views share a pending call', async (operation) => {
@@ -1379,6 +2302,8 @@ describe('ChatArea', () => {
     await userEvent.click(screen.getByRole('button', { name: '发送' }));
 
     await waitFor(() => expect(useMessagesStore.getState().messages).toHaveLength(2));
+    expect(screen.queryByRole('button', { name: '复制' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '保存回复…' })).not.toBeInTheDocument();
     act(() => useMessagesStore.getState().updateStreamingText('# Streaming title'));
 
     expect(await screen.findByRole('heading', { name: 'Streaming title' })).toBeInTheDocument();
@@ -1386,15 +2311,21 @@ describe('ChatArea', () => {
     act(() => useMessagesStore.getState().updateStreamingText('# Streaming title\n\n**Second delta**'));
     expect(await screen.findByText('Second delta')).toHaveProperty('tagName', 'STRONG');
     expect(screen.getByLabelText('运行控制')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '复制' })).not.toBeInTheDocument();
 
     resolveReply(new Response(JSON.stringify({
       ok: true,
       data: { id: 'assistant-1', sessionId: session.id, role: 'assistant', content: 'Done', createdAt: Date.now() },
     })));
     expect(await screen.findByText('Done')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '复制' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '保存回复…' })).toBeVisible();
   });
 
-  it('keeps failed-run details folded until requested, then shows memory evidence and error output', async () => {
+  it.each([
+    ['needs_attention', '有步骤失败'],
+    ['completed', '任务已完成 · 查看执行记录'],
+  ] as const)('keeps the failed receipt available without misreporting task status: %s', async (status, summary) => {
     const user = userEvent.setup();
     const messages: Message[] = [{
       id: 'msg-steps',
@@ -1402,6 +2333,8 @@ describe('ChatArea', () => {
       role: 'assistant',
       content: 'I checked the context.',
       createdAt: Date.now(),
+      taskRun: { id: 'msg-steps', goal: 'Check the context', status, plan: [],
+        confirmationState: 'none', resumable: status === 'needs_attention', stepCount: 2, completedStepCount: 1 },
       timelineBlocks: [{
         kind: 'tool_call', index: 0, iterationId: 0,
         callId: 'call-2', toolName: 'write_file', arguments: {}, status: 'failed',
@@ -1447,8 +2380,9 @@ describe('ChatArea', () => {
 
     render(<ChatArea />);
 
-    const disclosure = await screen.findByRole('button', { name: /有步骤失败/ });
+    const disclosure = await screen.findByRole('button', { name: new RegExp(summary) });
     expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+    if (status === 'completed') expect(screen.queryByRole('button', { name: /有步骤失败/ })).not.toBeInTheDocument();
     expect(screen.queryByText('查询记忆')).not.toBeInTheDocument();
     expect(screen.queryByText('[preference] User likes Rust (importance 8)')).not.toBeInTheDocument();
 
@@ -1457,8 +2391,13 @@ describe('ChatArea', () => {
     expect(disclosure).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByText('查询记忆')).toBeInTheDocument();
     expect(screen.getByText('写入文件')).toBeInTheDocument();
+    expect(Boolean(screen.queryByText(/此操作未完成：检查工作目录/))).toBe(status === 'needs_attention');
     expect(screen.getByText('已检索的记忆')).toBeInTheDocument();
     expect(screen.getByText('[preference] User likes Rust (importance 8)')).toBeInTheDocument();
+    const openSettings = vi.fn();
+    window.addEventListener('open-settings', openSettings, { once: true });
+    await user.click(screen.getByRole('button', { name: '查看与更正已保存的记忆' }));
+    expect(openSettings).toHaveBeenCalledWith(expect.objectContaining({ detail: 'memory' }));
     expect(screen.queryByText('Path escapes sandbox', { selector: 'pre' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '查看工具输出' }));
     expect(screen.getByText('Path escapes sandbox', { selector: 'pre' })).toBeInTheDocument();
@@ -1601,12 +2540,12 @@ describe('ChatArea', () => {
     expect(loadedRuns).toEqual(['tool-owner']);
   });
 
-  it('renders side-effect confirmation steps as approval state', async () => {
+  it('preserves streamed plan paragraphs when a file action waits for approval', async () => {
     const messages: Message[] = [{
       id: 'msg-approval',
       sessionId: 'session-1',
       role: 'assistant',
-      content: 'This action needs approval.',
+      content: '',
       createdAt: Date.now(),
       toolCalls: [{
         id: 'call-approval',
@@ -1622,11 +2561,16 @@ describe('ChatArea', () => {
         confirmationRequired: true,
         confirmationStatus: 'pending',
       }],
-      timelineBlocks: [{ kind: 'text', index: 0, iterationId: 0, content: 'This action needs approval.' }],
     }];
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, data: messages }))
-    );
+    const fragments = ['### 执', '行', '计划', '\n\n1', '. ', '读取', ' rules.md', '。\n2. ', '写入汇总。'];
+    const events = fragments.map((content, index) => ({
+      run_id: 'msg-approval', session_id: 'session-1',
+      payload: { type: 'ContentBlock', data: { index, iteration_id: 0, block: { kind: 'Text', data: { content } } } },
+    }));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const { cmd } = JSON.parse(String(init?.body ?? '{}'));
+      return new Response(JSON.stringify({ ok: true, data: cmd === 'get_messages' ? messages : cmd === 'get_agent_run_events' ? events : [] }));
+    });
     useSessionsStore.setState({
       sessions: [],
       activeSessionId: 'session-1',
@@ -1643,6 +2587,9 @@ describe('ChatArea', () => {
     expect(screen.getByRole('region', { name: '拟写入的正文' })).toHaveTextContent('hello');
     expect(screen.getByRole('button', { name: '允许一次' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '拒绝' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '执行计划' })).toBeInTheDocument();
+    expect(screen.getByText('读取 rules.md。')).toBeInTheDocument();
+    expect(screen.getByText('写入汇总。')).toBeInTheDocument();
     // No verbose "audit trail" intro text
     expect(screen.queryByText(/以下是 AngelBot/)).not.toBeInTheDocument();
   });
@@ -1757,8 +2704,10 @@ describe('ChatArea', () => {
 
     render(<ChatArea />);
 
-    expect(await screen.findByRole('button', { name: /有操作结果待核对/ })).toBeInTheDocument();
-    expect(screen.getByText('操作停止后草稿可能已写入；请先去目标应用核对，勿自动重试。')).toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: '核对操作结果' })).toHaveTextContent('草稿可能已写入。请先到目标应用核对。');
+    expect(screen.queryByRole('button', { name: /有操作结果待核对/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('list', { name: '操作结果' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /查看执行记录/ })).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByText('private draft')).not.toBeInTheDocument();
     act(() => useMessagesStore.getState().addToolResult(messages[0].id, messages[0].toolResults![0]));
     expect(useMessagesStore.getState().messages[0].taskRun?.resumable).toBe(false);
@@ -2264,6 +3213,8 @@ describe('ChatArea', () => {
         expect(await screen.findByText('未能确认停止请求，Agent 可能仍在执行。请先核对运行状态与操作结果，不要重复提交原任务。')).toBeInTheDocument();
       }
       if (newRun) {
+        expect(await screen.findByText('正在停止…')).toBeInTheDocument();
+        await act(async () => finishInterrupt(new Response(JSON.stringify({ ok: true, data: null }))));
         await userEvent.type(screen.getByPlaceholderText('给 AngelBot 发消息…'), '处理新的事项');
         await userEvent.click(screen.getByRole('button', { name: '发送' }));
         await waitFor(() => expect(newStarted).toBe(true));
@@ -2536,6 +3487,9 @@ describe('ChatArea', () => {
   });
 
   it('does not continue the agent after an approved draft has an unknown result', async () => {
+    useSettingsStore.setState((state) => ({ activeProfile: { ...state.activeProfile, name: 'Mira', personaNotes: '热茶' } }));
+    usePreferencesStore.setState((state) => ({ preferences: { ...state.preferences, evolutionEnabled: false,
+      habits: { ...state.preferences.habits, responseLanguage: 'en-US', useLongTermMemory: false } } }));
     const pending: Message = {
       id: 'msg-draft-confirmation',
       sessionId: 'session-1',
@@ -2563,10 +3517,11 @@ describe('ChatArea', () => {
     };
     let resolved = false;
     let resolvedPreviewId: string | undefined;
+    let interaction: unknown;
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
       const { cmd: command, args } = JSON.parse(init?.body as string) as {
         cmd: string;
-        args?: { req?: { previewId?: string } };
+        args?: { req?: { previewId?: string; interaction?: unknown } };
       };
       if (command === 'preflight_pending_desktop_action') {
         return new Response(JSON.stringify({ ok: true, data: {
@@ -2578,6 +3533,7 @@ describe('ChatArea', () => {
       if (command === 'resolve_agent_confirmation') {
         resolved = true;
         resolvedPreviewId = args?.req?.previewId;
+        interaction = args?.req?.interaction;
         return new Response(JSON.stringify({ ok: true, data: settled.toolResults![0] }));
       }
       if (command === 'get_messages') {
@@ -2598,6 +3554,8 @@ describe('ChatArea', () => {
     await userEvent.click(await screen.findByRole('button', { name: '允许一次' }));
     expect(await screen.findByRole('button', { name: /有操作结果待核对/ })).toBeInTheDocument();
     expect(resolvedPreviewId).toBe('attested-preview-1');
+    expect(interaction).toMatchObject({ personality: { name: 'Mira', supplement: '热茶' },
+      preferences: { responseLanguage: 'en-US', useLongTermMemory: false, evolutionEnabled: false }, thinkingEffort: 'medium' });
     const commands = vi.mocked(globalThis.fetch).mock.calls.map(([, init]) =>
       (JSON.parse(init?.body as string) as { cmd: string }).cmd,
     );
@@ -2840,6 +3798,8 @@ describe('ChatArea', () => {
       explanation: '操作停止后控件可能已被触发；请重新观察目标确认结果，勿自动重试。' },
     { toolName: 'mcp_browser__browser_click_a1b2c3d4', operation: 'mcp', text: null, button: '允许一次',
       explanation: '外部操作可能已部分生效；请先检查目标应用或服务，再决定是否发起新操作。不要重复批准或自动重试。' },
+    { toolName: 'run_project_command', operation: 'command', text: null, button: '允许一次',
+      explanation: '命令可能已经改变工作区。请先核对文件和运行结果，再决定是否发起新的命令。' },
   ])('does not repeat $operation approval when both confirmation and refresh fail', async ({ toolName, operation, text, button, explanation }) => {
     const pending: Message = {
       id: 'msg-field-uncertain', sessionId: 'session-1', role: 'assistant',
@@ -2849,7 +3809,9 @@ describe('ChatArea', () => {
         plan: [], confirmationState: 'pending', resumable: true,
         stepCount: 1, completedStepCount: 0,
       },
-      toolCalls: [{ id: 'field-call', name: toolName, arguments: JSON.stringify({ action: operation, text: 'model text' }) }],
+      toolCalls: [{ id: 'field-call', name: toolName, arguments: JSON.stringify(
+        operation === 'command' ? { command: 'python', args: ['verify.py'] } : { action: operation, text: 'model text' },
+      ) }],
       toolResults: [{
         callId: 'field-call', toolName, success: false,
         output: 'Confirmation required', confirmationRequired: true, confirmationStatus: 'pending',
@@ -2882,10 +3844,14 @@ describe('ChatArea', () => {
     useMessagesStore.setState({ messages: [pending] });
 
     render(<ChatArea />);
-    if (operation !== 'mcp') await screen.findByText(/已核对目标：记事本/);
+    if (operation !== 'mcp' && operation !== 'command') await screen.findByText(/已核对目标：记事本/);
     await userEvent.click(await screen.findByRole('button', { name: button }));
 
-    expect(await screen.findByText(explanation)).toBeInTheDocument();
+    const review = await screen.findByRole('region', { name: '核对操作结果' });
+    expect(review).toHaveTextContent(operation === 'command' ? '工作区文件可能已改动'
+      : operation === 'field' ? '输入框可能已改动'
+      : '操作可能已经生效');
+    expect(screen.queryByText(explanation)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: button })).not.toBeInTheDocument();
     const local = useMessagesStore.getState().messages.find((message) => message.id === pending.id);
     expect(local?.toolResults?.find((result) => result.callId === 'field-call')?.error).toContain('RESULT_UNKNOWN');

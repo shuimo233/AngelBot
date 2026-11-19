@@ -8,6 +8,49 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn project_verification_invocation(arguments: &Value) -> Option<String> {
+    let program = arguments.get("command")?.as_str()?;
+    let args = arguments
+        .get("args")?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    if args.iter().any(|arg| {
+        matches!(
+            arg.split_once('=').map_or(*arg, |(name, _)| name),
+            "-h" | "-V"
+                | "--help"
+                | "--version"
+                | "--dry-run"
+                | "--no-run"
+                | "-list"
+                | "--list"
+                | "--list-tests"
+                | "--listTests"
+                | "--collect-only"
+                | "--co"
+                | "--showConfig"
+        )
+    }) {
+        return None;
+    }
+    let check_script =
+        |name: &str| matches!(name, "test" | "check" | "typecheck" | "lint" | "build");
+    let recognized = match (program, args.as_slice()) {
+        ("cargo", ["test" | "check" | "build" | "clippy", ..])
+        | ("go", ["test" | "build" | "vet", ..])
+        | ("dotnet", ["test" | "build", ..])
+        | ("deno", ["test" | "check" | "lint", ..])
+        | ("node", ["--test", ..])
+        | ("uv", ["run", "pytest", ..]) => true,
+        ("npm" | "pnpm" | "yarn" | "bun", ["run", script, ..]) => check_script(script),
+        ("npm" | "pnpm" | "yarn" | "bun", ["test", ..]) => true,
+        _ => false,
+    };
+    recognized.then(|| format!("{program} {}", args.join(" ")))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStepStatus {
@@ -124,12 +167,6 @@ impl TaskFacts {
                 .any(|step| step.status == PlanStepStatus::Failed)
     }
 
-    pub fn has_successful_verification(&self) -> bool {
-        self.verification_evidence
-            .iter()
-            .any(|evidence| evidence.exit_code == 0)
-    }
-
     /// Project mutations invalidate all prior verification evidence.
     pub fn record_project_mutation(&mut self, path: impl Into<String>) {
         let path = path.into();
@@ -137,6 +174,35 @@ impl TaskFacts {
             self.modified_files.push(path);
         }
         self.verification_evidence.clear();
+    }
+
+    pub(crate) fn record_successful_project_step(
+        &mut self,
+        tool_name: &str,
+        arguments: &Value,
+        output: &str,
+    ) {
+        let path_key = match tool_name {
+            "write_file" | "edit_file" | "create_directory" => "path",
+            "organize_workspace_item" => "destination",
+            "run_project_command" => {
+                if let Some(command) = project_verification_invocation(arguments) {
+                    self.verification_evidence.push(VerificationEvidence {
+                        command,
+                        exit_code: 0,
+                        summary: output.to_owned(),
+                        verified_at: chrono::Utc::now().timestamp(),
+                    });
+                }
+                return;
+            }
+            _ => return,
+        };
+        let path = arguments
+            .get(path_key)
+            .and_then(Value::as_str)
+            .unwrap_or(tool_name);
+        self.record_project_mutation(path);
     }
 }
 
@@ -151,7 +217,7 @@ pub enum DerivedTaskPhase {
 }
 
 /// Derive a user-visible phase without creating an executable state machine.
-pub fn derive_task_phase(facts: &TaskFacts, verification_required: bool) -> DerivedTaskPhase {
+pub fn derive_task_phase(facts: &TaskFacts) -> DerivedTaskPhase {
     match facts.terminal_reason {
         Some(TaskTerminalReason::Stopped) => return DerivedTaskPhase::Stopped,
         Some(TaskTerminalReason::NeedsAttention) => return DerivedTaskPhase::NeedsAttention,
@@ -170,12 +236,6 @@ pub fn derive_task_phase(facts: &TaskFacts, verification_required: bool) -> Deri
     }
     if facts.has_unfinished_plan_steps() {
         return DerivedTaskPhase::Running;
-    }
-    if verification_required
-        && !facts.modified_files.is_empty()
-        && !facts.has_successful_verification()
-    {
-        return DerivedTaskPhase::NeedsAttention;
     }
     DerivedTaskPhase::Completed
 }
@@ -252,21 +312,27 @@ mod tests {
     #[test]
     fn project_mutation_invalidates_prior_verification() {
         let mut facts = TaskFacts::new("update project");
-        facts.verification_evidence.push(VerificationEvidence {
-            command: "cargo test --lib".to_string(),
-            exit_code: 0,
-            summary: "passed".to_string(),
-            verified_at: 1,
-        });
+        facts.record_successful_project_step(
+            "run_project_command",
+            &serde_json::json!({"command":"cargo","args":["test","--lib"]}),
+            "passed",
+        );
+        assert_eq!(facts.verification_evidence[0].command, "cargo test --lib");
 
         facts.record_project_mutation("src/main.rs");
 
         assert_eq!(facts.modified_files, vec!["src/main.rs"]);
         assert!(facts.verification_evidence.is_empty());
-        assert_eq!(
-            derive_task_phase(&facts, true),
-            DerivedTaskPhase::NeedsAttention
-        );
+
+        for args in [
+            serde_json::json!({"command":"git","args":["status"]}),
+            serde_json::json!({"command":"cargo","args":["test","--","--list"]}),
+            serde_json::json!({"command":"npm","args":["test","--help"]}),
+            serde_json::json!({"command":"uv","args":["run","pytest","--collect-only"]}),
+        ] {
+            facts.record_successful_project_step("run_project_command", &args, "ok");
+            assert!(facts.verification_evidence.is_empty(), "{args}");
+        }
     }
 
     #[test]
@@ -279,16 +345,13 @@ mod tests {
             requested_at: 1,
         });
         assert_eq!(
-            derive_task_phase(&facts, false),
+            derive_task_phase(&facts),
             DerivedTaskPhase::AwaitingConfirmation
         );
 
         facts.pending_confirmation = None;
         facts.failed_steps.push("call-1".to_string());
-        assert_eq!(
-            derive_task_phase(&facts, false),
-            DerivedTaskPhase::NeedsAttention
-        );
+        assert_eq!(derive_task_phase(&facts), DerivedTaskPhase::NeedsAttention);
     }
 
     #[test]

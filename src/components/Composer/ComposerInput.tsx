@@ -2,21 +2,25 @@
  * ComposerInput — Three-section input bar inspired by pi-web ChatInput.
  *
  * Layout:
- *   [attachment]  |  [textarea]  |  [Send/Stop]
- *   [运行环境 ▾] [Sound]
+ *   [attachment]  |  [textarea]  |  [Send]
+ *   [对话选项 ▾] [Sound]
  *
- * 运行环境弹层内包含：模型、思考强度、工具预设、权限确认方式。
+ * 运行环境弹层内包含模型、思考强度和权限确认方式。
  *
  * Streaming state:
- *   [attachment]  |  [textarea]  |  [Stop]
- *   [引导] [排队]
+ *   [status]                       [Pause] [Stop]
+ *   [attachment]                  [排队 / 引导] [Send]
  */
 "use client";
 
-import { useRef, useState, useCallback, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useRef, useState, useCallback, useEffect, forwardRef, useImperativeHandle, type ReactNode } from 'react';
 import { useThinkingEffortStore, type ThinkingEffort } from '$stores/thinkingEffort';
 import { useSettingsStore } from '$stores/settings';
+import { useAppearanceStore } from '$stores/appearance';
+import { usePreferencesStore } from '$stores/preferences';
+import { getModelConfigReadiness, openModelSettings } from '$lib/model-config';
 import type { AgentExecutionPermission } from '$lib/commands/settings';
+import { EXECUTION_PERMISSION_OPTIONS } from '$lib/execution-permission-copy';
 import { useExecutionPermissionStore } from '$stores/executionPermission';
 import type { TextAttachment } from '$types';
 import { loadTextAttachments, TEXT_ATTACHMENT_ACCEPT, validateTextAttachments } from '$lib/text-attachments';
@@ -34,15 +38,8 @@ const AttachIcon = () => (
 
 
 const SendIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-    <line x1="22" y1="2" x2="11" y2="13"/>
-    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-  </svg>
-);
-
-const StopIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-    <rect x="3" y="3" width="18" height="18" rx="2"/>
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M12 19V5m-6 6 6-6 6 6" />
   </svg>
 );
 
@@ -63,9 +60,9 @@ const SoundOffIcon = () => (
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
-export type ToolPreset = 'none' | 'default' | 'full';
 
 export interface ComposerInputHandle {
+  focus: () => void;
   insertText: (text: string) => void;
   insertIfEmpty: (text: string) => void;
   prependText: (text: string) => void;
@@ -73,21 +70,22 @@ export interface ComposerInputHandle {
   restoreFiles: (files: TextAttachment[]) => boolean;
 }
 
+/** Message admission only; acceptance does not imply task completion. */
+export type ComposerSendResult = 'accepted' | 'not_sent' | 'unknown';
+
 export interface ComposerInputProps {
   /** Text input value */
   value: string;
   onChange: (value: string) => void;
-  onSend: (message: string, files?: TextAttachment[]) => boolean | void | Promise<boolean | void>;
-  onAbort: () => void;
-  onSteer?: (message: string) => void;
-  onFollowUp?: (message: string) => void;
+  onSend: (message: string, files?: TextAttachment[]) => ComposerSendResult | Promise<ComposerSendResult>;
+  runControls?: ReactNode;
+  stopPending?: boolean;
+  onSteer?: (message: string) => void | Promise<void>;
+  onFollowUp?: (message: string) => void | Promise<void>;
   /** Attachments never cross a session or workspace switch except explicit routing. */
   scopeKey?: string;
   /** Agent is currently running */
   isStreaming: boolean;
-  /** Tool preset (none / default / full) */
-  toolPreset: ToolPreset;
-  onToolPresetChange: (preset: ToolPreset) => void;
   soundEnabled: boolean;
   onSoundToggle: () => void;
   disabled?: boolean;
@@ -95,123 +93,15 @@ export interface ComposerInputProps {
   sendDisabled?: boolean;
 }
 
-// ── Tool Preset config ──────────────────────────────────────────────────────────
-
-const TOOL_PRESET_OPTIONS: Array<{ value: ToolPreset; label: string; desc: string }> = [
-  { value: 'none',    label: '关闭工具', desc: '只读对话，不调用工具' },
-  { value: 'default', label: '默认工具', desc: '内置工具' },
-  { value: 'full',   label: '全部工具', desc: '所有内置工具' },
-];
-
-
-const PERMISSION_OPTIONS: Array<{ value: AgentExecutionPermission; label: string; desc: string }> = [
-  { value: 'ask', label: '请求批准', desc: '按工具规则逐次确认需要批准的操作' },
-  { value: 'workspace_auto', label: '工作区自动', desc: '新建或覆盖项目文件、已启用的 MCP 工具可自动执行；其他文件操作仍按规则确认' },
-  { value: 'full_access', label: '完全访问', desc: '已准入的工具按任务授权连续执行，不按调用次数暂停；已有保护操作仍会询问，范围与停止规则不变' },
-];
-
 // ── Thinking Effort config ──────────────────────────────────────────────────────
 
-const THINKING_OPTIONS: Array<{ value: ThinkingEffort; label: string; desc: string }> = [
-  { value: 'low',    label: '低', desc: '快速回复，适合简单任务' },
-  { value: 'medium', label: '中', desc: '速度与质量平衡' },
-  { value: 'high',   label: '高', desc: '深度推理，适合复杂任务' },
+const THINKING_OPTIONS: readonly { value: ThinkingEffort; label: string }[] = [
+  { value: 'low', label: '快速' },
+  { value: 'medium', label: '平衡' },
+  { value: 'high', label: '深入' },
 ];
 
 // ── Sub-components ──────────────────────────────────────────────────────────────
-
-function PButton({
-  children,
-  onClick,
-  disabled,
-  title,
-  className,
-  style,
-}: {
-  children: React.ReactNode;
-  onClick?: () => void;
-  disabled?: boolean;
-  title?: string;
-  className?: string;
-  style?: React.CSSProperties;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className={className}
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 5,
-        padding: '7px 12px',
-        height: 36,
-        background: 'none',
-        border: '1px solid var(--color-border-muted)',
-        borderRadius: 'var(--radius-control)',
-        color: 'var(--color-muted)',
-        cursor: disabled ? 'not-allowed' : 'pointer',
-        fontSize: 12,
-        fontWeight: 500,
-        letterSpacing: '-0.01em',
-        opacity: disabled ? 0.45 : 1,
-        transition: 'background-color 120ms ease, color 120ms ease, border-color 120ms ease',
-        whiteSpace: 'nowrap',
-        userSelect: 'none',
-        flexShrink: 0,
-        ...style,
-      }}
-      onMouseEnter={(e) => {
-        if (disabled) return;
-        const el = e.currentTarget;
-        el.style.background = 'var(--color-surface)';
-        el.style.color = 'var(--color-text)';
-        el.style.borderColor = 'var(--color-border)';
-      }}
-      onMouseLeave={(e) => {
-        if (disabled) return;
-        const el = e.currentTarget;
-        el.style.background = 'none';
-        el.style.color = 'var(--color-muted)';
-        el.style.borderColor = 'var(--color-border-muted)';
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-function TooltipPButton({
-  children,
-  onClick,
-  disabled,
-  title,
-  active,
-  activeStyle,
-}: {
-  children: React.ReactNode;
-  onClick?: () => void;
-  disabled?: boolean;
-  title?: string;
-  active?: boolean;
-  activeStyle?: React.CSSProperties;
-}) {
-  return (
-    <PButton
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      style={active ? activeStyle : undefined}
-      className={active ? 'p-btn-active' : undefined}
-    >
-      {children}
-    </PButton>
-  );
-}
-
 
 /** 运行环境弹层里的选项分组：标题 + 单选选项列表 */
 
@@ -228,100 +118,35 @@ function EnvironmentChoiceGroup<T extends string>({
   options,
   onSelect,
   disabled,
+  describeOptions = false,
 }: {
   label: string;
-  value: T;
-  options: EnvDropdownOption<T>[];
+  value: T | null;
+  options: readonly EnvDropdownOption<T>[];
   onSelect: (value: T) => void;
   disabled?: boolean;
+  describeOptions?: boolean;
 }) {
   return (
-    <div className="environment-panel-group">
+    <div className="environment-panel-group" role="group" aria-label={label}>
       <div className="environment-panel-label">{label}</div>
-      <div className="environment-panel-choices">
+      <div className={`environment-panel-choices${describeOptions ? ' environment-panel-choices--described' : ''}`}>
         {options.map((option) => (
           <button
             key={option.value}
             type="button"
             className="environment-panel-choice"
             aria-pressed={option.value === value}
+            aria-label={describeOptions ? option.label : undefined}
+            aria-description={describeOptions ? option.desc : undefined}
             disabled={disabled}
-            title={option.desc}
             onClick={() => onSelect(option.value)}
           >
-            {option.label}
+            <span>{option.label}</span>
+            {describeOptions && option.desc && <small>{option.desc}</small>}
           </button>
         ))}
       </div>
-      {options.find((option) => option.value === value)?.desc && (
-        <div className="environment-panel-description">
-          {options.find((option) => option.value === value)?.desc}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function EnvDropdown<T extends string>({
-  label,
-  value,
-  options,
-  onSelect,
-  disabled,
-  renderValue,
-  loadingLabel,
-}: {
-  label: string;
-  value: T;
-  options: EnvDropdownOption<T>[];
-  onSelect: (value: T) => void;
-  disabled?: boolean;
-  renderValue: (v: T) => string;
-  loadingLabel?: string;
-}) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const activeOption = options.find((option) => option.value === value);
-
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('click', handler);
-    return () => document.removeEventListener('click', handler);
-  }, [open]);
-
-  return (
-    <div ref={ref} style={{ position: 'relative' }}>
-      <button
-        type="button"
-        onClick={() => !disabled && setOpen((v) => !v)}
-        disabled={disabled}
-        className="env-dropdown-btn"
-        title={loadingLabel ?? activeOption?.desc}
-      >
-        <span className="env-dropdown-btn-label">{label}</span>
-        <span className="env-dropdown-btn-value">{loadingLabel ?? renderValue(value)}</span>
-      </button>
-      {open && (
-        <div className="env-dropdown-panel">
-          {options.map((opt) => {
-            const isActive = opt.value === value;
-            return (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => { onSelect(opt.value); setOpen(false); }}
-                className={`env-dropdown-item ${isActive ? 'active' : ''}`}
-              >
-                <span className="env-dropdown-item-label">{opt.label}</span>
-                {opt.desc && <span className="env-dropdown-item-desc">{opt.desc}</span>}
-              </button>
-            );
-          })}
-        </div>
-      )}
     </div>
   );
 }
@@ -334,12 +159,11 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
     value,
     onChange,
     onSend,
-    onAbort,
+    runControls,
+    stopPending = false,
     onSteer,
     onFollowUp,
     isStreaming,
-    toolPreset,
-    onToolPresetChange,
     soundEnabled,
     onSoundToggle,
     disabled,
@@ -349,6 +173,9 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
 
     const { effort, setEffort } = useThinkingEffortStore();
     const apiConfig = useSettingsStore((state) => state.activeApiConfig);
+    const chatFontSize = useAppearanceStore((state) => state.chatFontSize);
+    const chatFontFamily = useAppearanceStore((state) => state.chatFontFamily);
+    const attachmentReaderEnabled = usePreferencesStore((state) => state.preferences.habits.useLongTermMemory ?? true);
 
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -356,6 +183,9 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
     const filesRef = useRef<TextAttachment[]>([]);
     const readsRef = useRef(0);
     const sendingRef = useRef(false);
+    const runSubmission = useRef<object | null>(null);
+    const [preferredRunMode, setPreferredRunMode] = useState<'queue' | 'steer'>('queue');
+    const [runFeedback, setRunFeedback] = useState({ generation: 0, pending: false, error: '' });
     const mountedRef = useRef(true);
     const valueRef = useRef(value);
     const valueRevisionRef = useRef(0);
@@ -366,20 +196,32 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
       filesRef.current = [];
       readsRef.current = 0;
       sendingRef.current = false;
+      runSubmission.current = null;
     }
     const generation = scopeRef.current.generation;
     const [fileDraft, setFileDraft] = useState({ generation, files: [] as TextAttachment[] });
     const [fileStatus, setFileStatus] = useState({ generation, reading: false, sending: false, error: '' });
     const attachedFiles = fileDraft.generation === generation ? fileDraft.files : [];
+    const hasReferenceAttachments = attachedFiles.some((file) => file.referenceOnly);
+    const hasInlineAttachments = attachedFiles.some((file) => !file.referenceOnly);
     const status = fileStatus.generation === generation ? fileStatus : { reading: false, sending: false, error: '' };
     const executionPermission = useExecutionPermissionStore((state) => state.permission);
     const permissionLoading = useExecutionPermissionStore((state) => state.loading);
     const permissionSaving = useExecutionPermissionStore((state) => state.saving);
+    const permissionError = useExecutionPermissionStore((state) => state.error);
     const loadExecutionPermission = useExecutionPermissionStore((state) => state.load);
     const changeExecutionPermission = useExecutionPermissionStore((state) => state.save);
     const permissionLoaded = executionPermission !== null;
+    const permissionLabel = executionPermission !== 'ask'
+      ? EXECUTION_PERMISSION_OPTIONS.find((option) => option.value === executionPermission)?.label
+      : undefined;
     const [environmentOpen, setEnvironmentOpen] = useState(false);
     const environmentRef = useRef<HTMLDivElement>(null);
+    const environmentTriggerRef = useRef<HTMLButtonElement>(null);
+
+    useEffect(() => {
+      setEnvironmentOpen(false);
+    }, [scopeKey, isStreaming]);
 
     useEffect(() => {
       if (!environmentOpen) return;
@@ -388,15 +230,8 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
           setEnvironmentOpen(false);
         }
       };
-      const closeOnEscape = (event: KeyboardEvent) => {
-        if (event.key === 'Escape') setEnvironmentOpen(false);
-      };
       document.addEventListener('click', closeOnOutsideClick);
-      document.addEventListener('keydown', closeOnEscape);
-      return () => {
-        document.removeEventListener('click', closeOnOutsideClick);
-        document.removeEventListener('keydown', closeOnEscape);
-      };
+      return () => document.removeEventListener('click', closeOnOutsideClick);
     }, [environmentOpen]);
 
     useEffect(() => {
@@ -467,9 +302,22 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
       setFileDraft({ generation, files: filesRef.current });
     };
 
+    const setAttachmentReferenceOnly = (file: TextAttachment, referenceOnly: boolean) => {
+      if (referenceOnly && !attachmentReaderEnabled) return;
+      filesRef.current = filesRef.current.map((candidate) => {
+        if (candidate !== file) return candidate;
+        const next = { ...candidate };
+        if (referenceOnly) next.referenceOnly = true;
+        else delete next.referenceOnly;
+        return next;
+      });
+      setFileDraft({ generation, files: filesRef.current });
+    };
+
     // ── Imperative handle ───────────────────────────────────────────────────
 
     useImperativeHandle(ref, () => ({
+      focus() { textareaRef.current?.focus({ preventScroll: true }); },
       insertIfEmpty(text: string) {
         if (value.trim()) return;
         onChange(text);
@@ -502,13 +350,28 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
 
     // ── Send ────────────────────────────────────────────────────────────────
 
-    const canSend = Boolean(value.trim() || attachedFiles.length > 0) && !isStreaming && !disabled && !sendDisabled && !status.reading && !status.sending;
-    const canQueue = Boolean(value.trim()) && attachedFiles.length === 0 && !status.reading && !disabled && !sendDisabled;
+    const runPending = runFeedback.generation === generation && runFeedback.pending;
+    const canSend = Boolean(value.trim() || attachedFiles.length > 0) && !isStreaming && !disabled && !sendDisabled && !status.reading && !status.sending && !runPending;
+    const hasRunMessageActions = Boolean(onSteer || onFollowUp);
+    const runMode = onSteer && onFollowUp ? preferredRunMode : onFollowUp ? 'queue' : 'steer';
+    const runActionLabel = runMode === 'queue' ? '加入队列' : '引导本轮';
+    const runPlaceholder = runMode === 'queue' ? '排到下一轮…' : '补充本轮指令…';
+    const canSubmitRunText = Boolean(value.trim()) && attachedFiles.length === 0 && !status.reading && !disabled && !sendDisabled && !runPending;
 
     const handleSend = useCallback(async () => {
       const msg = value.trim();
       const submittedFiles = filesRef.current;
-      if ((!msg && submittedFiles.length === 0) || isStreaming || disabled || sendDisabled || readsRef.current || sendingRef.current) return;
+      if ((!msg && submittedFiles.length === 0) || isStreaming || disabled || sendDisabled || readsRef.current || sendingRef.current || runSubmission.current) return;
+      const { activeApiConfig, apiConfigLoaded, apiConfigLoadError } = useSettingsStore.getState();
+      const readiness = getModelConfigReadiness(activeApiConfig, apiConfigLoaded, apiConfigLoadError);
+      // Scripted desktop tests provide their own model without saving credentials.
+      if (import.meta.env.VITE_ANGELBOT_DESKTOP_E2E !== '1'
+        && (readiness.kind === 'needs-credentials' || readiness.kind === 'invalid')) {
+        openModelSettings();
+        return;
+      }
+      const retainedDraftNotice = submittedFiles.length ? '草稿和附件仍保留。' : '草稿仍保留。';
+      const unconfirmedSendNotice = `消息未确认送达，${retainedDraftNotice}请先核对会话记录。`;
       const sendGeneration = scopeRef.current.generation;
       const submittedRevision = valueRevisionRef.current;
       sendingRef.current = true;
@@ -518,12 +381,12 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
       setFileDraft({ generation: sendGeneration, files: filesRef.current });
       setFileStatus({ generation: sendGeneration, reading: false, sending: true, error: '' });
       try {
-        const accepted = await onSend(msg, submittedFiles.length ? submittedFiles : undefined);
+        const result = await onSend(msg, submittedFiles.length ? submittedFiles : undefined);
         if (!mountedRef.current || scopeRef.current.generation !== sendGeneration) return;
-        if (accepted === false) {
+        if (result !== 'accepted') {
           const restored = restoreFiles(submittedFiles);
           if (restored) setFileStatus({ generation: sendGeneration, reading: readsRef.current > 0, sending: false,
-            error: '消息未确认送达，附件仍保留。请检查会话记录后再重试。' });
+            error: result === 'not_sent' ? `消息尚未发送，${retainedDraftNotice}` : unconfirmedSendNotice });
         } else {
           if (valueRevisionRef.current === submittedRevision && valueRef.current.trim() === msg) onChange('');
         }
@@ -531,7 +394,7 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
         if (mountedRef.current && scopeRef.current.generation === sendGeneration) {
           const restored = restoreFiles(submittedFiles);
           if (restored) setFileStatus({ generation: sendGeneration, reading: readsRef.current > 0, sending: false,
-            error: '发送失败，文本和附件仍保留。请检查会话记录后再重试。' });
+            error: unconfirmedSendNotice });
         }
       } finally {
         if (mountedRef.current && scopeRef.current.generation === sendGeneration) {
@@ -547,19 +410,35 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
       });
     }, [value, isStreaming, disabled, sendDisabled, onSend, onChange, restoreFiles]);
 
-    const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        if (isStreaming && (onSteer || onFollowUp)) {
-          if (onSteer && canQueue) {
-            const msg = value.trim();
-            if (msg) { onSteer(msg); onChange(''); }
-          }
-        } else {
-          void handleSend();
+    const submitRunText = async (mode: 'queue' | 'steer') => {
+      const submit = mode === 'queue' ? onFollowUp : onSteer;
+      if (!submit || !canSubmitRunText || runSubmission.current) return;
+      const request = {};
+      const revision = valueRevisionRef.current;
+      runSubmission.current = request;
+      setRunFeedback({ generation, pending: true, error: '' });
+      let error = '';
+      try {
+        const result = submit(value.trim());
+        if (result) await result;
+        if (mountedRef.current && runSubmission.current === request && valueRevisionRef.current === revision) onChange('');
+      } catch (cause) {
+        error = `${cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : '未能送达引导。'} 草稿已保留。`;
+      } finally {
+        if (mountedRef.current && runSubmission.current === request) {
+          runSubmission.current = null;
+          setRunFeedback({ generation, pending: false, error });
         }
       }
-    }, [isStreaming, onSteer, onFollowUp, value, onChange, handleSend, canQueue]);
+    };
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      const alternateMode = isStreaming && Boolean(onSteer && onFollowUp) && e.shiftKey && (e.ctrlKey || e.metaKey);
+      if (e.key !== 'Enter' || (e.shiftKey && !alternateMode) || e.nativeEvent.isComposing) return;
+      e.preventDefault();
+      if (isStreaming) void submitRunText(alternateMode ? (runMode === 'queue' ? 'steer' : 'queue') : runMode);
+      else void handleSend();
+    };
 
     const handleInput = useCallback(() => {
       const ta = textareaRef.current;
@@ -577,18 +456,20 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
       void processFiles(files);
     }, [processFiles]);
 
-    // Auto-resize textarea on external value changes
+    // Reflow the draft when input wraps differently after a window resize.
     useEffect(() => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      ta.style.height = 'auto';
-      ta.style.height = `${Math.min(ta.scrollHeight, 220)}px`;
-    }, [value]);
+      window.addEventListener('resize', handleInput);
+      return () => window.removeEventListener('resize', handleInput);
+    }, [handleInput]);
+
+    useEffect(() => {
+      handleInput();
+    }, [value, chatFontSize, chatFontFamily, handleInput]);
 
     // ── Render ──────────────────────────────────────────────────────────────
 
     return (
-      <div className="composer-input-root"
+      <div className={`composer-input-root${isStreaming ? ' composer-input-root--running' : ''}`}
         onDragOver={(event) => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }}
         onDrop={(event) => {
           if (!event.dataTransfer.files.length) return;
@@ -610,52 +491,57 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
           }}
         />
 
-        {attachedFiles.length > 0 && (
-          <div className="composer-files-strip" aria-label="待发送文本附件">
-            {attachedFiles.map((file, index) => (
-              <div key={index} className="composer-file-chip">
-                <TextAttachmentDetails file={file} />
-                <button type="button" onClick={() => removeFile(file)} aria-label={`移除附件 ${file.name}`} title="移除附件">×</button>
-              </div>
-            ))}
-          </div>
-        )}
-        {(attachedFiles.length > 0 || status.reading) && <div className="composer-attachment-note">
-          {status.reading ? '正在读取文件文字… ' : ''}点击文件名可核对文字；发送后内容将交给当前配置的模型。附件是只读快照，不授予原文件访问或修改权限。
-          {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.docx')) && ' DOCX 只读取正文和表格文字，不含图片、页眉页脚或版式；复杂域与修订暂不支持。'}
-          {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.xlsx')) && ' XLSX 读取保存的原始单元格值，不按日期、百分比或货币格式换算，不含图表或样式；公式及隐藏内容暂不支持。'}
-        </div>}
-        {isStreaming && (attachedFiles.length > 0 || status.reading) && <div className="composer-attachment-note">附件已暂存，请等待当前任务结束后发送；引导和排队暂不支持附件。</div>}
-        {status.error && <div role="alert" className="composer-attachment-error">{status.error}</div>}
-
-        {/* Main input row */}
-        <div className="composer-bar">
-
-          {/* ── LEFT: attachment only; model selection lives in the toolbar ── */}
-          <div className="composer-bar-left">
-            {/* Explicit text snapshots, not a general file permission. */}
-            <TooltipPButton
-              onClick={() => fileInputRef.current?.click()}
-              disabled={disabled}
-              title="添加文本、DOCX 或 XLSX（文档原文件最多 4 MiB；文字每个 16 KiB、合计 32 KiB，最多 4 个）"
-            >
-              <AttachIcon />
-            </TooltipPButton>
-
-          </div>
-
-          {/* ── CENTER: textarea ── */}
+        <div className="composer-bar" role={isStreaming ? 'group' : undefined} aria-label={isStreaming ? '运行控制' : undefined}>
+          {isStreaming && runControls}
+          {attachedFiles.length > 0 && (
+            <div className="composer-files-strip" aria-label="待发送文本附件">
+              {attachedFiles.map((file, index) => (
+                <div key={index} className="composer-file-chip">
+                  <TextAttachmentDetails file={file} />
+                  <label className="composer-file-mode" title={attachmentReaderEnabled
+                    ? '模型需要时再读取附件正文'
+                    : '读取附件正文需要开启长期记忆'}>
+                    <input type="checkbox" checked={file.referenceOnly === true}
+                      aria-label={`按需读取 ${file.name}`}
+                      disabled={disabled || status.sending || (!attachmentReaderEnabled && !file.referenceOnly)}
+                      onChange={(event) => setAttachmentReferenceOnly(file, event.currentTarget.checked)} />
+                    按需读取
+                  </label>
+                  <button type="button" onClick={() => removeFile(file)} aria-label={`移除附件 ${file.name}`} title="移除附件">×</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {(attachedFiles.length > 0 || status.reading) && <div className="composer-attachment-note">
+            {status.reading ? '正在读取文件文字… ' : ''}点击文件名可核对文字。
+            {hasInlineAttachments && '普通附件发送后内容将交给当前配置的模型。'}
+            {hasReferenceAttachments && (attachmentReaderEnabled
+              ? '按需附件的正文会在模型读取时发送。'
+              : '长期记忆已关闭。按需附件只提供引用，模型无法读取正文。')}
+            附件是只读快照，不授予原文件访问或修改权限。
+            {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.docx')) && ' DOCX 只读取正文和表格文字，不含图片、页眉页脚或版式；复杂域与修订暂不支持。'}
+            {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.xlsx')) && ' XLSX 读取保存的原始单元格值，不按日期、百分比或货币格式换算，不含图表或样式；公式及隐藏内容暂不支持。'}
+            {attachedFiles.some((file) => file.name.toLowerCase().endsWith('.pdf')) && ' PDF 按页提取文字，扫描件需先 OCR。'}
+          </div>}
+          {isStreaming && (attachedFiles.length > 0 || status.reading) && <div className="composer-attachment-note">附件已暂存，可在本轮结束后发送。</div>}
+          {status.error && <div role="alert" className="composer-attachment-error">{status.error}</div>}
+          {runFeedback.generation === generation && runFeedback.error && <div role="alert" className="composer-attachment-error">{runFeedback.error}</div>}
           <textarea
             className="composer-textarea"
+            aria-label="消息输入"
             ref={textareaRef}
             value={value}
-            onChange={(e) => onChange(e.target.value)}
+            onChange={(e) => {
+              if (!runPending && runFeedback.error) setRunFeedback({ generation, pending: false, error: '' });
+              onChange(e.target.value);
+            }}
             onKeyDown={handleKeyDown}
             onInput={handleInput}
             onPaste={handlePaste}
             placeholder={
-              isStreaming && (onSteer || onFollowUp)
-                ? '输入引导，将在当前步骤结束后交给 AngelBot…'
+              stopPending ? '准备下一条消息…'
+                : isStreaming && hasRunMessageActions
+                ? runPlaceholder
                 : isStreaming
                 ? 'AngelBot 正在运行…'
                 : '给 AngelBot 发消息…'
@@ -664,152 +550,127 @@ export const ComposerInput = forwardRef<ComposerInputHandle, ComposerInputProps>
             disabled={disabled}
           />
 
-          {/* ── RIGHT: send / stop ── */}
-          <div className="composer-bar-right">
-            {isStreaming ? (
-              <TooltipPButton
-                onClick={onAbort}
-                title="停止运行"
-                active
-                activeStyle={{
-                  background: 'color-mix(in srgb, var(--color-danger) 10%, var(--color-surface))',
-                  border: '1px solid color-mix(in srgb, var(--color-danger) 34%, var(--color-border))',
-                  color: 'var(--color-danger)',
-                }}
-              >
-                <StopIcon />
-              </TooltipPButton>
-            ) : (
+          <div className="composer-toolbar-row">
+            <div className="env-options-row">
               <button
                 type="button"
-                className="composer-submit"
-                disabled={!canSend}
-                onClick={handleSend}
-                title="发送"
+                className="composer-icon-button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={disabled}
+                aria-label="添加文本附件"
+                title="添加文本、DOCX 或 XLSX（文档原文件最多 4 MiB；文字每个 16 KiB、合计 32 KiB，最多 4 个）"
               >
-                <SendIcon />
+                <AttachIcon />
               </button>
-            )}
-          </div>
-        </div>
+              {!isStreaming && <>
+                <div className="environment-disclosure" ref={environmentRef}
+                  onBlur={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget)) setEnvironmentOpen(false);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && environmentOpen) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setEnvironmentOpen(false);
+                      environmentTriggerRef.current?.focus();
+                    }
+                  }}>
+                  <button
+                    type="button"
+                    ref={environmentTriggerRef}
+                    className="env-dropdown-btn environment-disclosure-trigger"
+                    aria-expanded={environmentOpen}
+                    aria-controls="composer-environment-panel"
+                    onClick={() => setEnvironmentOpen((open) => !open)}
+                  >
+                    <span>对话选项</span>
+                    {permissionLabel && <span className="composer-permission-mode">{permissionLabel}</span>}
+                  </button>
 
-        {/* ── TOOLBAR ROW: environment options split into separate sections below input ── */}
-        <div className="composer-toolbar-row">
-          {isStreaming ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              {onSteer && (
-                <TooltipPButton
-                  onClick={() => {
-                    const msg = value.trim();
-                    if (msg) { onSteer(msg); onChange(''); }
-                  }}
-                  disabled={!canQueue}
-                  title={attachedFiles.length ? '附件暂存，任务结束后再发送' : '立即注入消息'}
-                  active
-                  activeStyle={{
-                    background: 'var(--color-warning-surface)',
-                    border: '1px solid var(--color-warning-border)',
-                    color: 'var(--color-warning)',
-                  }}
-                >
-                  <span style={{ fontWeight: 600, fontSize: 12 }}>引导</span>
-                </TooltipPButton>
-              )}
-              {onFollowUp && (
-                <TooltipPButton
-                  onClick={() => {
-                    const msg = value.trim();
-                    if (msg) { onFollowUp(msg); onChange(''); }
-                  }}
-                  disabled={!canQueue}
-                  title={attachedFiles.length ? '附件暂存，任务结束后再发送' : '排队此消息'}
-                  active
-                  activeStyle={{
-                    background: 'color-mix(in srgb, var(--color-cool-accent) 10%, var(--color-surface))',
-                    border: '1px solid color-mix(in srgb, var(--color-cool-accent) 34%, var(--color-border))',
-                    color: 'var(--color-cool-accent)',
-                  }}
-                >
-                  <span style={{ fontWeight: 600, fontSize: 12 }}>排队</span>
-                </TooltipPButton>
-              )}
-            </div>
-          ) : (
-            <div className="env-options-row">
-              <div className="environment-disclosure" ref={environmentRef}>
+                  {environmentOpen && (
+                    <div id="composer-environment-panel" className="environment-panel">
+                      <button
+                        type="button"
+                        className="environment-panel-model"
+                        onClick={() => {
+                          setEnvironmentOpen(false);
+                          openModelSettings();
+                        }}
+                      >
+                        <span>
+                          <span className="environment-panel-label">模型</span>
+                          <strong>{apiConfig.model || '尚未配置'}</strong>
+                        </span>
+                        <span className="environment-panel-link">更改</span>
+                      </button>
+                      <EnvironmentChoiceGroup<ThinkingEffort>
+                        label="思考强度"
+                        value={effort}
+                        options={THINKING_OPTIONS}
+                        onSelect={setEffort}
+                        disabled={disabled}
+                      />
+                      <EnvironmentChoiceGroup<AgentExecutionPermission>
+                        label="执行权限"
+                        value={executionPermission}
+                        options={EXECUTION_PERMISSION_OPTIONS}
+                        onSelect={(next) => void changeExecutionPermission(next)}
+                        disabled={disabled || permissionLoading || !permissionLoaded || permissionSaving}
+                        describeOptions
+                      />
+                      {permissionLoading && <div className="environment-panel-status" role="status">正在读取执行权限…</div>}
+                      {permissionSaving && <div className="environment-panel-status" role="status">正在保存执行权限…</div>}
+                      {permissionError && !permissionLoading && !permissionSaving && (
+                        <div className="environment-panel-status" role="alert">
+                          {permissionLoaded ? '执行权限未能保存，请重试。' : '无法读取执行权限。'}
+                          {!permissionLoaded && <button type="button" onClick={() => void loadExecutionPermission()}>重新读取</button>}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <button
                   type="button"
-                  className="env-dropdown-btn environment-disclosure-trigger"
-                  aria-expanded={environmentOpen}
-                  aria-controls="composer-environment-panel"
-                  onClick={() => setEnvironmentOpen((open) => !open)}
+                  className="composer-icon-button"
+                  onClick={onSoundToggle}
+                  aria-label="完成音效"
+                  aria-pressed={soundEnabled}
+                  title={soundEnabled ? '关闭完成音效' : '开启完成音效'}
                 >
-                  <span className="env-dropdown-btn-label">运行配置</span>
-                  <span className="env-dropdown-btn-value">
-                    {THINKING_OPTIONS.find((option) => option.value === effort)?.label ?? effort}
-                    {' · '}
-                    {TOOL_PRESET_OPTIONS.find((option) => option.value === toolPreset)?.label ?? toolPreset}
-                  </span>
+                  {soundEnabled ? <SoundOnIcon /> : <SoundOffIcon />}
                 </button>
-
-                {environmentOpen && (
-                  <div id="composer-environment-panel" className="environment-panel">
-                    <button
-                      type="button"
-                      className="environment-panel-model"
-                      onClick={() => {
-                        setEnvironmentOpen(false);
-                        window.dispatchEvent(new CustomEvent('open-settings', { detail: 'api' }));
-                      }}
-                    >
-                      <span>
-                        <span className="environment-panel-label">模型</span>
-                        <strong>{apiConfig.model || '尚未配置'}</strong>
-                      </span>
-                      <span className="environment-panel-link">更改</span>
-                    </button>
-                    <EnvironmentChoiceGroup<ThinkingEffort>
-                      label="思考强度"
-                      value={effort}
-                      options={THINKING_OPTIONS}
-                      onSelect={setEffort}
-                      disabled={disabled}
-                    />
-                    <EnvironmentChoiceGroup<ToolPreset>
-                      label="可用工具"
-                      value={toolPreset}
-                      options={TOOL_PRESET_OPTIONS}
-                      onSelect={onToolPresetChange}
-                      disabled={disabled}
-                    />
-                  </div>
-                )}
-              </div>
-
-              {/* 权限 - 下拉选择 */}
-              <EnvDropdown<AgentExecutionPermission>
-                label="执行权限"
-                value={executionPermission ?? 'ask'}
-                options={PERMISSION_OPTIONS}
-                onSelect={(v) => void changeExecutionPermission(v)}
-                disabled={disabled || permissionLoading || !permissionLoaded || permissionSaving}
-                loadingLabel={!permissionLoaded ? (permissionLoading ? '读取中…' : '不可用，请到设置中重试') : undefined}
-                renderValue={(v) => PERMISSION_OPTIONS.find((o) => o.value === v)?.label ?? v}
-              />
-
-              {/* Sound toggle */}
-              <TooltipPButton
-                onClick={onSoundToggle}
-                title={soundEnabled ? '关闭完成音效' : '开启完成音效'}
-                active={soundEnabled}
-                activeStyle={{ color: 'var(--color-text)' }}
-              >
-                {soundEnabled ? <SoundOnIcon /> : <SoundOffIcon />}
-              </TooltipPButton>
+              </>}
             </div>
-          )}
+            <div className="composer-bar-right">
+              {isStreaming ? (
+                <>
+                  {onSteer && onFollowUp && <select className="composer-run-mode" aria-label="指令发送方式"
+                    disabled={stopPending}
+                    value={runMode} onChange={(event) => setPreferredRunMode(event.target.value === 'steer' ? 'steer' : 'queue')}>
+                    <option value="queue">排到下一轮</option>
+                    <option value="steer">引导本轮</option>
+                  </select>}
+                  {hasRunMessageActions && <button type="button" className="composer-submit" disabled={!canSubmitRunText}
+                    onClick={() => { void submitRunText(runMode); }} aria-label={runActionLabel}
+                    aria-busy={runPending || undefined} title={runPending ? `正在提交 · ${runActionLabel}` : runActionLabel}>
+                    <SendIcon />
+                  </button>}
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="composer-submit"
+                  disabled={!canSend}
+                  onClick={handleSend}
+                  title="发送"
+                >
+                  <SendIcon />
+                </button>
+              )}
+            </div>
+          </div>
         </div>
-
       </div>
     );
   }

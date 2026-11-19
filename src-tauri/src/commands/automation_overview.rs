@@ -9,6 +9,15 @@ const MAX_TEXT_CHARS: usize = 120;
 #[derive(Debug, Serialize)]
 pub struct AutomationDashboard {
     pub items: Vec<AutomationDashboardItem>,
+    #[serde(rename = "acceptedRequests")]
+    pub accepted_requests: Vec<AutomationRunRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationRunRequest {
+    pub automation_id: String,
+    pub run_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -21,7 +30,10 @@ pub struct AutomationDashboardItem {
 }
 
 /// One snapshot and one joined receipt read, not a history/output fetch per card.
-pub(super) fn automation_dashboard(state: &AppState) -> Result<AutomationDashboard, String> {
+pub(super) fn automation_dashboard(
+    state: &AppState,
+    pending_requests: &[AutomationRunRequest],
+) -> Result<AutomationDashboard, String> {
     let mut conn = state.db.lock().map_err(|error| error.to_string())?;
     let tx = conn.transaction().map_err(|error| error.to_string())?;
     let sql = format!(
@@ -89,8 +101,30 @@ pub(super) fn automation_dashboard(state: &AppState) -> Result<AutomationDashboa
             });
         }
     }
+    let accepted_requests = {
+        let mut query = tx
+            .prepare(
+                "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE id=?1 AND automation_id=?2)",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut accepted = Vec::new();
+        for request in pending_requests {
+            let exists: bool = query
+                .query_row(params![request.run_id, request.automation_id], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if exists {
+                accepted.push(request.clone());
+            }
+        }
+        accepted
+    };
     tx.commit().map_err(|error| error.to_string())?;
-    Ok(AutomationDashboard { items })
+    Ok(AutomationDashboard {
+        items,
+        accepted_requests,
+    })
 }
 
 #[derive(Debug, Serialize)]

@@ -38,7 +38,7 @@ describe('ProjectNetworkApprovalsSettings', () => {
 
     render(<ProjectNetworkApprovalsSettings />);
 
-    expect(screen.getByText('个人空间没有项目联网授权')).toBeInTheDocument();
+    expect(screen.getByText('打开项目即可查看和撤销联网授权。')).toBeInTheDocument();
     expect(getProjectNetworkApprovals).not.toHaveBeenCalled();
   });
 
@@ -101,12 +101,14 @@ describe('ProjectNetworkApprovalsSettings', () => {
 
     render(<ProjectNetworkApprovalsSettings />);
 
-    await user.click(await screen.findByRole('button', { name: '撤销 docs.example.test 的联网授权' }));
+    const revoke = await screen.findByRole('button', { name: '撤销 docs.example.test 的联网授权' });
+    expect(revoke).toHaveAccessibleDescription('撤销后会阻止新请求，并丢弃传输中的结果。');
+    await user.click(revoke);
 
     await waitFor(() => expect(revokeProjectNetworkApproval).toHaveBeenCalledWith(
       'project-1',
       approval.approvalRef,
     ));
-    expect(screen.getByText('尚无联网授权。需要联网探索时，AngelBot 会先向你说明要访问的范围。')).toBeInTheDocument();
+    expect(screen.getByText(/尚无联网授权/)).toHaveTextContent('先确认访问范围');
   });
 });

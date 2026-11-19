@@ -172,6 +172,7 @@ pub(super) async fn verify(
         provider: provider.as_ref(),
         agent_config,
         request: &input,
+        admitted_user_message_id: None,
         history_before_created_at: i64::MAX,
         budget: ForegroundContextBudget {
             estimated_tool_count: crate::commands::foreground_tool_surface::ESTIMATED_TOOL_COUNT,
@@ -187,18 +188,7 @@ pub(super) async fn verify(
             .with_memory_reading(false)
             .build_for_session(session.clone())
             .unwrap();
-    let schemas = registry
-        .get_schemas_with_enhanced(prepared.agent_config.enhanced_tool_descriptions)
-        .into_iter()
-        .map(|v| {
-            let v = v.get("function").unwrap_or(&v);
-            crate::llm::ToolSchema {
-                name: v["name"].as_str().unwrap().into(),
-                description: v["description"].as_str().unwrap().into(),
-                parameters: v["parameters"].clone(),
-            }
-        })
-        .collect::<Vec<_>>();
+    let schemas = registry.get_provider_schemas(prepared.agent_config.enhanced_tool_descriptions);
     let mut messages =
         crate::agent::foreground_conversation_state::ForegroundConversationState::initial_context(
             &prepared.agent_config,

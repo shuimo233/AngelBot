@@ -13,7 +13,7 @@ export {
   resolveAgentConfirmation,
   preflightPendingDesktopAction,
 } from './commands/message';
-export { pauseAgent, resumeAgent, interruptAgent, submitInProgressCommand } from './commands/steering';
+export { pauseAgent, resumeAgent, interruptAgent, submitSteeringMessage } from './commands/steering';
 export {
   getMcpServers,
   saveMcpServer,

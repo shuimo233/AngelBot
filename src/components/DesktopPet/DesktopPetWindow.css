@@ -1,0 +1,141 @@
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+
+.desktop-pet-window {
+  position: relative;
+  display: grid;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+
+.desktop-pet-character {
+  box-sizing: border-box;
+  display: block;
+  width: calc(100% - 12px);
+  height: calc(100% - 12px);
+  min-width: 0;
+  min-height: 0;
+  padding: 4px;
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+}
+
+.desktop-pet-character:active { cursor: grabbing; }
+.desktop-pet-character:focus-visible, .desktop-pet-actions button:focus-visible { outline: 2px solid #7153a2; outline-offset: 2px; }
+.desktop-pet-pose {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform: rotate(var(--pet-tilt, 0deg));
+  transform-origin: center 86%;
+  transition: transform 240ms ease-out;
+  pointer-events: none;
+}
+.desktop-pet-character img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform-origin: center bottom;
+  animation: desktop-pet-idle 24s ease-in-out infinite;
+}
+
+.desktop-pet-window[data-reaction='hop'] img { animation: desktop-pet-hop 660ms ease-in-out; }
+.desktop-pet-window[data-reaction='wiggle'] img { animation: desktop-pet-wiggle 710ms ease-out; }
+.desktop-pet-character:active:not(:focus-visible) img { animation-play-state: paused; }
+
+@keyframes desktop-pet-idle {
+  0%, 17%, 34%, 49%, 72%, 87%, 100% { transform: none; }
+  8%, 26%, 42%, 79%, 94% { transform: scale(1.014, 1.009) translateY(-1px); }
+  58% { transform: rotate(-2deg) translateY(-1px); }
+  65% { transform: rotate(1.5deg); }
+}
+@keyframes desktop-pet-hop {
+  0%, 100% { transform: none; }
+  18%, 68% { transform: scale(1.05, .965); }
+  43% { transform: translateY(-8px) scale(.985, 1.012); }
+  85% { transform: scale(.99, 1.012); }
+}
+@keyframes desktop-pet-wiggle {
+  0%, 100% { transform: none; }
+  22% { transform: rotate(-4deg) translateY(-2px); }
+  45% { transform: rotate(3.5deg); }
+  68% { transform: rotate(-1.5deg); }
+}
+
+.desktop-pet-actions {
+  position: absolute;
+  inset: 8px 8px auto auto;
+  display: grid;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+  pointer-events: none;
+}
+.desktop-pet-actions button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 5px;
+  border: 1px solid #ede6ff;
+  border-radius: 50%;
+  background: #342a45;
+  color: #fff;
+  cursor: pointer;
+}
+.desktop-pet-actions button:hover { background: #5d4776; }
+.desktop-pet-actions svg { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.desktop-pet-window:hover .desktop-pet-actions, .desktop-pet-actions:focus-within { opacity: 1; pointer-events: auto; }
+@media (hover: none) { .desktop-pet-actions { opacity: 1; pointer-events: auto; } }
+
+.desktop-pet-hearts {
+  position: absolute;
+  inset: 22px 49px auto auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  color: #d84e87;
+  font: 22px/1 "Segoe UI Symbol", sans-serif;
+  text-shadow: 0 1px 2px #fff, 0 0 5px #fff;
+  pointer-events: none;
+}
+.desktop-pet-hearts span { animation: desktop-pet-heart-rise 840ms ease-out both; }
+.desktop-pet-hearts span + span { margin-top: 13px; font-size: 15px; animation-delay: 180ms; }
+@keyframes desktop-pet-heart-rise {
+  0% { opacity: 0; transform: translateY(12px) scale(.7); }
+  24% { opacity: 1; transform: translateY(2px) scale(1.08); }
+  67% { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-16px); }
+}
+
+.desktop-pet-window[data-reduced-motion] :is(.desktop-pet-pose, img, .desktop-pet-hearts span, .desktop-pet-actions) {
+  animation: none;
+  transition: none;
+  transform: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .desktop-pet-window :is(.desktop-pet-pose, img, .desktop-pet-hearts span, .desktop-pet-actions) {
+    animation: none;
+    transition: none;
+    transform: none;
+  }
+}
+
+.desktop-pet-error {
+  position: absolute;
+  inset: auto 8px 8px;
+  margin: 0;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: #292535;
+  color: #fff;
+  text-align: center;
+  font: 12px/1.4 "Segoe UI", "Microsoft YaHei", sans-serif;
+  pointer-events: none;
+}

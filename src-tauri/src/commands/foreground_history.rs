@@ -22,8 +22,9 @@ use uuid::Uuid;
 const PRIVATE_TRANSCRIPT_KEY: &str = "privateProtocolTranscript";
 
 mod working_view;
-pub(crate) use working_view::main_working_history;
-pub(crate) use working_view::working_history;
+pub(crate) use working_view::{main_plan_history_from_window, main_working_history_from_window};
+#[cfg(test)]
+pub(crate) use working_view::{main_working_history, working_history};
 
 pub(crate) struct ConversationAnchor {
     pub id: String,
@@ -240,8 +241,10 @@ impl CheckpointHistory {
             return Ok(None);
         }
         if allow_working {
-            let raw = hydrate_llm_history(conn, session, before)?;
-            let view = working_history(conn, session, before, raw, true)?;
+            let raw = hydrate_history_from_window(conn, session, before, &window)?;
+            let view = working_view::checkpoint_working_history_from_window(
+                conn, session, before, &window, raw,
+            )?;
             if view.applied {
                 let mut messages: Vec<_> = view
                     .message_ids
@@ -431,10 +434,24 @@ fn parse_inline_llm_tool_calls(json: Option<&str>) -> Option<Vec<LlmToolCall>> {
     let calls: Vec<LlmToolCall> = parse_inline_tool_calls(json)?
         .into_iter()
         .filter_map(|call| {
+            let arguments: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+            // Old rows project host termination into the UI's tool audit. It
+            // is not a dispatched provider call. Leave the audit and private
+            // native ledger intact; the paired result is removed below when
+            // it has no corresponding replay call.
+            if call.name == "agent_loop"
+                && arguments.is_null()
+                && call
+                    .id
+                    .strip_prefix("agent-loop-")
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            {
+                return None;
+            }
             Some(LlmToolCall {
                 id: call.id,
                 name: call.name,
-                arguments: serde_json::from_str(&call.arguments).ok()?,
+                arguments,
             })
         })
         .collect();
@@ -452,6 +469,21 @@ pub(crate) fn hydrate_agent_steps(
     conn: &Connection,
     messages: &mut [Message],
 ) -> Result<(), String> {
+    hydrate_agent_steps_with_scope(conn, messages, false)
+}
+
+pub(crate) fn hydrate_paged_agent_steps(
+    conn: &Connection,
+    messages: &mut [Message],
+) -> Result<(), String> {
+    hydrate_agent_steps_with_scope(conn, messages, true)
+}
+
+fn hydrate_agent_steps_with_scope(
+    conn: &Connection,
+    messages: &mut [Message],
+    paged: bool,
+) -> Result<(), String> {
     if !messages.iter().any(|message| {
         message.role == "assistant"
             && (message.tool_calls.is_none() || message.tool_results.is_none())
@@ -459,37 +491,57 @@ pub(crate) fn hydrate_agent_steps(
         return Ok(());
     }
 
+    // Inline call identities disambiguate replies that share a timestamp.
+    // For older rows without identities, only use the timestamp when it points
+    // to a single assistant reply and a durable run has not recorded zero steps.
+    let scope = if paged {
+        "AND CASE WHEN ?3 IS NOT NULL THEN EXISTS (
+            SELECT 1 FROM json_each(?3) call
+            WHERE json_extract(call.value, '$.id') = COALESCE(agent_steps.call_id, agent_steps.id)
+              AND json_extract(call.value, '$.name') = agent_steps.tool_name
+        ) ELSE NOT EXISTS (
+            SELECT 1 FROM messages other
+            WHERE other.session_id = ?1 AND other.created_at = ?2
+              AND other.role = 'assistant' AND other.id != ?4
+        ) AND NOT EXISTS (
+            SELECT 1 FROM task_runs WHERE message_id = ?4 AND step_count = 0
+        ) END"
+    } else {
+        ""
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT COALESCE(call_id, id), tool_name, tool_input, tool_output, success
+             FROM agent_steps WHERE session_id = ?1 AND created_at = ?2
+             {scope} ORDER BY seq ASC"
+        ))
+        .map_err(|e| e.to_string())?;
     for message in messages.iter_mut().filter(|message| {
         message.role == "assistant"
             && (message.tool_calls.is_none() || message.tool_results.is_none())
     }) {
-        let mut stmt = conn
-            .prepare(
-                "SELECT COALESCE(call_id, id), tool_name, tool_input, tool_output, success
-                 FROM agent_steps
-                 WHERE session_id = ?1 AND created_at = ?2
-                 ORDER BY seq ASC",
-            )
-            .map_err(|e| e.to_string())?;
+        let legacy_params = params![&message.session_id, message.created_at];
+        let calls = if paged {
+            message
+                .tool_calls
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let page_params = params![&message.session_id, message.created_at, calls, &message.id];
         let rows = stmt
-            .query_map(params![&message.session_id, message.created_at], |row| {
+            .query_map(if paged { page_params } else { legacy_params }, |row| {
                 let id: String = row.get(0)?;
                 let tool_name: String = row.get(1)?;
                 let output = row.get::<_, Option<String>>(3)?.unwrap_or_default();
                 let success: i32 = row.get(4)?;
-                let confirmation_required =
-                    success != 1 && output.contains("Confirmation required");
-                let confirmation_status = if confirmation_required {
-                    Some("pending".to_string())
-                } else if output.contains("Confirmation rejected") {
-                    Some("rejected".to_string())
-                } else if output.contains("Confirmation cancelled") {
-                    Some("cancelled".to_string())
-                } else if output.contains("Confirmation approved") {
-                    Some("approved".to_string())
-                } else {
-                    None
-                };
+                let confirmation_status = crate::agent::ToolResult::confirmation_status_from_output(
+                    success == 1,
+                    &output,
+                );
                 Ok((
                     ToolCallInfo {
                         id: id.clone(),
@@ -502,8 +554,8 @@ pub(crate) fn hydrate_agent_steps(
                         success: success == 1,
                         output: output.clone(),
                         error: (success != 1).then_some(output),
-                        confirmation_required,
-                        confirmation_status,
+                        confirmation_required: confirmation_status == Some("pending"),
+                        confirmation_status: confirmation_status.map(str::to_owned),
                     },
                 ))
             })
@@ -525,12 +577,33 @@ pub(crate) fn hydrate_agent_steps(
 }
 
 /// Recreate provider-native assistant/tool pairs from the inline transcript.
+#[cfg(test)]
 pub(crate) fn hydrate_llm_history(
     conn: &Connection,
     session_id: &str,
     before_created_at: i64,
 ) -> Result<Vec<LlmMessage>, String> {
     let window = ConversationWindow::load(conn, session_id, before_created_at)?;
+    hydrate_history_from_window(conn, session_id, before_created_at, &window)
+}
+
+/// Hydrate the selection loaded by this caller's read transaction.
+pub(crate) fn hydrate_history_from_window(
+    conn: &Connection,
+    session_id: &str,
+    before_created_at: i64,
+    window: &ConversationWindow,
+) -> Result<Vec<LlmMessage>, String> {
+    hydrate_history_from_window_with_clocks(conn, session_id, before_created_at, window, false)
+}
+
+pub(crate) fn hydrate_history_from_window_with_clocks(
+    conn: &Connection,
+    session_id: &str,
+    before_created_at: i64,
+    window: &ConversationWindow,
+    include_clocks: bool,
+) -> Result<Vec<LlmMessage>, String> {
     let ids = serde_json::to_string(&window.ids).map_err(|e| e.to_string())?;
     let has_provisional = conn
         .query_row(
@@ -605,16 +678,22 @@ pub(crate) fn hydrate_llm_history(
         } else {
             None
         };
+        let clock = if include_clocks && role == "user" {
+            stored_turn_clock(metadata.as_deref())
+        } else {
+            None
+        };
         if ledger.is_some() {
             private_turn_times.insert(created_at);
         }
         decoded_rows.push((
             (role, content, tool_calls, tool_call_id, created_at),
             ledger,
+            clock,
         ));
     }
     let mut history = Vec::new();
-    for ((role, content, tool_calls, tool_call_id, created_at), ledger) in decoded_rows {
+    for ((role, content, tool_calls, tool_call_id, created_at), ledger, clock) in decoded_rows {
         if let Some(ledger) = ledger {
             history.extend(ledger);
         } else if role != "tool" || !private_turn_times.contains(&created_at) {
@@ -623,6 +702,7 @@ pub(crate) fn hydrate_llm_history(
                 "tool" => "tool",
                 _ => "user",
             };
+            history.extend(clock.map(|clock| clock.to_message()));
             history.push(LlmMessage {
                 role: protocol_role.into(),
                 content,
@@ -695,6 +775,11 @@ pub(crate) fn hydrate_llm_history(
         .collect())
 }
 
+fn stored_turn_clock(metadata: Option<&str>) -> Option<crate::agent::prompt::TurnClock> {
+    let metadata: serde_json::Value = serde_json::from_str(metadata?).ok()?;
+    crate::agent::prompt::TurnClock::parse(metadata.get("hostTurnClock")?.as_str()?)
+}
+
 fn is_provider_terminal_failure(tool_name: &str, output: &str) -> bool {
     tool_name == "agent_loop"
         && (output.starts_with("模型连续") || output.starts_with("模型请求未完成"))
@@ -713,9 +798,9 @@ fn has_unknown_result(message: &Message) -> bool {
     })
 }
 
-/// Count proven repairs, without cloning tool output bodies or trusting an
+/// Count settled diagnostic/operation failures without cloning tool output bodies or trusting an
 /// empty/stale TaskFacts record. Missing/ambiguous call bindings stay failed.
-fn repaired_failure_count(calls: &[ToolCallInfo], results: &[ToolResultInfo]) -> usize {
+fn settled_failure_count(calls: &[ToolCallInfo], results: &[ToolResultInfo]) -> usize {
     if results.iter().all(|result| result.success) {
         return 0;
     }
@@ -750,6 +835,17 @@ fn repaired_failure_count(calls: &[ToolCallInfo], results: &[ToolResultInfo]) ->
             let Some(failed_args) = arguments(failed) else {
                 return false;
             };
+            if !failed.confirmation_required
+                && failed.confirmation_status.is_none()
+                && crate::agent::compaction::retained_original_history_receipt(
+                    &failed.tool_name,
+                    &failed.call_id,
+                    &failed_args,
+                    &failed.output,
+                )
+            {
+                return true;
+            }
             results[index + 1..].iter().any(|succeeded| {
                 succeeded.success
                     && succeeded.tool_name == failed.tool_name
@@ -773,14 +869,14 @@ fn receipt_run_state(
     results: &[ToolResultInfo],
     explicit_continue: bool,
 ) -> crate::agent::run_state::DerivedRunState {
-    let repaired = repaired_failure_count(calls, results);
+    let settled = settled_failure_count(calls, results);
     let unknown = results
         .iter()
         .any(|result| crate::agent::ToolResult::is_result_unknown(result.success, &result.output));
     derive_run_state(RunStateInput {
-        // A repaired rejection/failed attempt is settled, not a fake success.
+        // A retained-history diagnostic or repaired attempt is not a fake success.
         // Public counts and receipts retain the complete, truthful attempt log.
-        total_steps: calls.len().saturating_sub(repaired),
+        total_steps: calls.len().saturating_sub(settled),
         completed_steps: results.iter().filter(|result| result.success).count(),
         has_pending_confirmation: results.iter().any(|result| {
             result.confirmation_required && result.confirmation_status.as_deref() == Some("pending")
@@ -791,7 +887,7 @@ fn receipt_run_state(
         has_approved_confirmation: results
             .iter()
             .any(|result| result.confirmation_status.as_deref() == Some("approved")),
-        has_failure: unknown || results.iter().filter(|result| !result.success).count() > repaired,
+        has_failure: unknown || results.iter().filter(|result| !result.success).count() > settled,
         has_unknown_result: unknown,
         provider_terminal_failure: results
             .iter()
@@ -997,10 +1093,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn precondition_recovery_projects_completion_without_rewriting_receipts() {
+        let name = "set_delivery_day";
+        let rejection = crate::agent::ToolResult::precondition_rejected(name, "revision", "stale");
+        for (day, failed_output, status, resumable) in [
+            ("Thursday", rejection.content.clone(), "completed", false),
+            ("Friday", rejection.content.clone(), "needs_attention", true),
+            (
+                "Thursday",
+                format!("Error: {}", rejection.content),
+                "needs_attention",
+                true,
+            ),
+            (
+                "Thursday",
+                r#"Error: {"code":"RESULT_UNKNOWN"}"#.into(),
+                "needs_attention",
+                false,
+            ),
+        ] {
+            let calls = [
+                ToolCallInfo {
+                    id: "first".into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({"day":"Thursday","revision":17}).to_string(),
+                },
+                ToolCallInfo {
+                    id: "retry".into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({"day":day,"revision":18}).to_string(),
+                },
+            ];
+            let results = [
+                ToolResultInfo {
+                    call_id: "first".into(),
+                    tool_name: name.into(),
+                    success: false,
+                    output: failed_output,
+                    error: None,
+                    confirmation_required: false,
+                    confirmation_status: None,
+                },
+                ToolResultInfo {
+                    call_id: "retry".into(),
+                    tool_name: name.into(),
+                    success: true,
+                    output: "updated".into(),
+                    error: None,
+                    confirmation_required: false,
+                    confirmation_status: None,
+                },
+            ];
+            let state = receipt_run_state(&calls, &results, false);
+            assert_eq!(state.status.as_str(), status);
+            assert_eq!(state.resumable, resumable);
+        }
+    }
+
+    #[test]
     fn recovered_compaction_allows_approved_continuation_without_rewriting_receipts() {
         for scenario in [
             "recovered",
             "first-iteration",
+            "retained-original",
+            "retained-original-bad-id",
+            "retained-original-external-tool",
             "earlier-success",
             "unknown",
             "wrong-id",
@@ -1043,6 +1200,16 @@ mod tests {
                 _ => {}
             }
             let mut steps = vec![failed, recovered];
+            if scenario.starts_with("retained-original") {
+                steps.pop(); // No later compaction success can settle this receipt.
+                let failed = &mut steps[0];
+                failed.output = "Context compaction failed: checkpoint did not reduce the context; original history retained".into();
+                if scenario == "retained-original-bad-id" {
+                    failed.call_id = "model-tool-call".into();
+                } else if scenario == "retained-original-external-tool" {
+                    failed.tool_name = "write_file".into();
+                }
+            }
             if scenario == "earlier-success" {
                 steps.swap(0, 1);
             }
@@ -1095,7 +1262,10 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            let is_recovered = matches!(scenario, "recovered" | "first-iteration");
+            let is_recovered = matches!(
+                scenario,
+                "recovered" | "first-iteration" | "retained-original"
+            );
             let expected = if is_recovered {
                 "continue_suggested"
             } else {
@@ -1125,7 +1295,20 @@ mod tests {
                 0,
                 "the original failed receipt must remain failed"
             );
-            assert_eq!(results.iter().filter(|result| result.success).count(), 2);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM agent_steps WHERE session_id='s' AND success=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                if scenario.starts_with("retained-original") {
+                    1
+                } else {
+                    2
+                },
+                "{scenario}: maintenance may settle a failure without inventing a success"
+            );
         }
     }
 
@@ -1327,7 +1510,14 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (id, session_id, role, content, tool_calls, created_at)
              VALUES ('a', 's', 'assistant', 'queued', ?1, 2)",
-            [r#"[{"id":"complete","name":"delegate_work","arguments":"{}"},{"id":"orphan","name":"read_file","arguments":"{}"}]"#],
+            [r#"[{"id":"complete","name":"delegate_work","arguments":"{}"},{"id":"orphan","name":"read_file","arguments":"{}"},{"id":"agent-loop-01234567-89ab-4cde-8fab-0123456789ab","name":"agent_loop","arguments":"null"}]"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_name, created_at)
+             VALUES ('host', 's', 'tool', '模型未在 45 秒内响应。此前已完成的操作结果已保留。',
+                     'agent-loop-01234567-89ab-4cde-8fab-0123456789ab', 'agent_loop', 2)",
+            [],
         )
         .unwrap();
         conn.execute(
@@ -1350,6 +1540,20 @@ mod tests {
         );
         assert_eq!(history[2].role, "tool");
         assert_eq!(history[2].tool_call_id.as_deref(), Some("complete"));
+        assert_eq!(history[2].content, "queued receipt");
+        assert_eq!(history[0].content, "inspect");
+        assert_eq!(history[1].content, "queued");
+        assert!(crate::llm::plan_history_can_replay(
+            &history,
+            "gpt-6-luna",
+            "fixture"
+        ));
+        let untouched: String = conn
+            .query_row("SELECT content FROM messages WHERE id='host'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(untouched.contains("45 秒"));
 
         let expected = serde_json::json!({ "app_id": "observer", "mode": "image" });
         for arguments in [serde_json::json!(expected.to_string()), expected.clone()] {
@@ -1506,16 +1710,8 @@ pub(crate) fn refresh_persisted_task_run_from_steps(
     let (calls, results): (Vec<_>, Vec<_>) = steps
         .into_iter()
         .map(|(id, name, input, output, success)| {
-            let pending = success != 1 && output.contains("Confirmation required");
-            let status = if pending {
-                Some("pending")
-            } else if output.contains("Confirmation rejected") {
-                Some("rejected")
-            } else if success == 1 && output.contains("Confirmation approved") {
-                Some("approved")
-            } else {
-                None
-            };
+            let status =
+                crate::agent::ToolResult::confirmation_status_from_output(success == 1, &output);
             (
                 ToolCallInfo {
                     id: id.clone(),
@@ -1528,7 +1724,7 @@ pub(crate) fn refresh_persisted_task_run_from_steps(
                     success: success == 1,
                     output,
                     error: None,
-                    confirmation_required: pending,
+                    confirmation_required: status == Some("pending"),
                     confirmation_status: status.map(str::to_owned),
                 },
             )

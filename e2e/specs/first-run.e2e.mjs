@@ -16,12 +16,16 @@ writeFileSync(ownedStopScript, "require('node:fs').writeFileSync(process.argv[2]
 const notepadPath = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'notepad.exe');
 const mcpFixturePath = fileURLToPath(new URL('../fixtures/mcp-stdio.cjs', import.meta.url));
 
-async function navigatePrimary(label) {
+async function revealSidebar() {
   const menuHidden = await browser.execute(() => document.querySelector('.sidebar')?.getBoundingClientRect().right <= 0);
   if (menuHidden) {
     await browser.$('[aria-label="打开菜单"]').click();
     await browser.waitUntil(() => browser.execute(() => document.querySelector('.sidebar')?.getBoundingClientRect().left >= 0), { timeout: 5_000 });
   }
+}
+
+async function navigatePrimary(label) {
+  await revealSidebar();
   await browser.$('.sidebar-primary-nav').$(`button=${label}`).click();
 }
 
@@ -37,7 +41,7 @@ async function returnToProjectConversation() {
 
 async function returnToDailyConversation() {
   await navigatePrimary('日常');
-  await browser.waitUntil(async () => (await browser.$('.chat-header-workspace-kind').getText()) === '个人空间', {
+  await browser.waitUntil(async () => (await browser.$('.chat-header-session-title').getText()) === 'AngelBot 日常', {
     timeout: 10_000, timeoutMsg: 'Personal did not become active through daily navigation',
   });
 }
@@ -571,7 +575,7 @@ describe('first-run desktop experience', () => {
 
     const modelNotice = await browser.$('.model-config-notice');
     await modelNotice.waitForDisplayed({ timeout: 20_000 });
-    assert.match(await modelNotice.getText(), /连接模型后即可开始对话/);
+    assert.match(await modelNotice.getText(), /尚未连接模型/);
 
     const preferredDark = await browser.execute(() => document.documentElement.classList.contains('dark'));
     await browser.execute(() => document.documentElement.classList.remove('dark'));
@@ -591,57 +595,20 @@ describe('first-run desktop experience', () => {
       { timeout: 5_000, timeoutMsg: 'settings dialog did not receive keyboard focus' },
     );
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), '模型与 API');
-    assert.equal(await settingsDialog.$('button=模型与连接').getAttribute('aria-current'), 'page');
-    assert.equal((await settingsDialog.$$('.settings-nav-group-button')).length, 5);
-    assert.equal((await settingsDialog.$$('.settings-nav-item')).length, 0, 'a single-page group needs no duplicate child entry');
-
-    // Only the active multi-page group exposes its children. Check the actual
-    // nested navigation, then return to the API page before continuing.
-    await settingsDialog.$('button=常规').click();
-    await settingsDialog.$('.settings-nav-item.active').waitForDisplayed({ timeout: 5_000 });
-    const settingsNavigationLayout = await browser.execute(() => {
-      const item = document.querySelector('.settings-nav-item.active');
-      const itemLabel = item?.querySelector('.settings-nav-label');
-      const itemIcon = item?.querySelector('.settings-nav-icon');
-      const group = item?.closest('.settings-nav-group');
-      const groupLabel = group?.querySelector('.settings-nav-group-button');
-      const pages = group?.querySelector('.settings-nav-pages');
-      if (!(item instanceof HTMLElement) || !(itemLabel instanceof HTMLElement) || !(itemIcon instanceof HTMLElement) || !(groupLabel instanceof HTMLElement) || !(pages instanceof HTMLElement)) return null;
-      const groupStyle = getComputedStyle(groupLabel);
-      const text = document.createRange();
-      text.selectNodeContents(groupLabel);
-      return {
-        justifyContent: getComputedStyle(item).justifyContent,
-        itemLabelLeft: Math.round(itemLabel.getBoundingClientRect().left),
-        itemIconLeft: Math.round(itemIcon.getBoundingClientRect().left),
-        expectedLabelLeft: Math.round(itemIcon.getBoundingClientRect().right + Number.parseFloat(getComputedStyle(item).columnGap)),
-        groupTextLeft: Math.round(text.getBoundingClientRect().left),
-        expectedGroupTextLeft: Math.round(groupLabel.getBoundingClientRect().left + Number.parseFloat(groupStyle.paddingLeft)),
-        childIndent: getComputedStyle(pages).paddingLeft,
-        itemFontSize: getComputedStyle(itemLabel).fontSize,
-        groupFontSize: groupStyle.fontSize,
-      };
-    });
-    assert.ok(settingsNavigationLayout, 'active multi-page settings navigation must be rendered');
-    assert.deepEqual(settingsNavigationLayout, {
-      justifyContent: 'flex-start',
-      itemLabelLeft: settingsNavigationLayout.expectedLabelLeft,
-      itemIconLeft: settingsNavigationLayout.groupTextLeft + 8,
-      expectedLabelLeft: settingsNavigationLayout.expectedLabelLeft,
-      groupTextLeft: settingsNavigationLayout.expectedGroupTextLeft,
-      expectedGroupTextLeft: settingsNavigationLayout.expectedGroupTextLeft,
-      childIndent: '8px',
-      itemFontSize: '14px',
-      groupFontSize: '14px',
-    });
-    await settingsDialog.$('button=模型与连接').click();
+    assert.equal(await settingsDialog.$('button=模型与 API').getAttribute('aria-current'), 'page');
+    const settingsRoutes = () => browser.execute(() =>
+      Array.from(document.querySelectorAll('.settings-nav-item'), item => item.textContent));
+    const initialRoutes = await settingsRoutes();
+    assert.equal(initialRoutes.length, 14);
+    await settingsDialog.$('button=外观').click();
+    await browser.waitUntil(async () => (await settingsDialog.$('.settings-page-title').getText()) === '外观', { timeout: 5_000 });
+    assert.equal(await settingsDialog.$('button=外观').getAttribute('aria-current'), 'page');
+    assert.deepEqual(await settingsRoutes(), initialRoutes);
+    await settingsDialog.$('button=模型与 API').click();
     await browser.waitUntil(async () => (await settingsDialog.$('.settings-page-title').getText()) === '模型与 API', { timeout: 5_000 });
-    assert.equal(await settingsDialog.$('.settings-page-title').getText(), '模型与 API');
-    assert.equal(await settingsDialog.$('button=模型与连接').getAttribute('aria-current'), 'page');
-    assert.equal(await settingsDialog.$('#model-default-heading').getText(), '默认模型');
-    const connectionEditor = await settingsDialog.$('.model-connection-editor');
-    if (await connectionEditor.getAttribute('open') === null) await connectionEditor.$('summary').click();
-    assert.equal(await settingsDialog.$('#model-provider-heading').getText(), '连接方式');
+    assert.equal(await settingsDialog.$('button=模型与 API').getAttribute('aria-current'), 'page');
+    await settingsDialog.$('h3=默认模型').waitForDisplayed({ timeout: 5_000 });
+    await settingsDialog.$('h3=连接方式').waitForDisplayed({ timeout: 5_000 });
     await settingsDialog.$('.model-field select').waitForDisplayed({ timeout: 5_000 });
     await browser.execute(() => document.documentElement.classList.remove('dark'));
     await browser.pause(200);
@@ -655,7 +622,6 @@ describe('first-run desktop experience', () => {
     // and fresh tool discovery without a network service or model credential.
     assert.ok(existsSync(mcpFixturePath), `MCP E2E fixture is missing: ${mcpFixturePath}`);
     const mcpFixtureArgs = `"${mcpFixturePath}"`;
-    await settingsDialog.$('button=工具与应用').click();
     await settingsDialog.$('button=工具服务 MCP').click();
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), 'MCP 服务');
     await settingsDialog.$('button=添加服务').click();
@@ -838,7 +804,6 @@ describe('first-run desktop experience', () => {
     assert.match(await settingsDialog.getText(), /可供 AngelBot 使用/);
     await browser.saveScreenshot(join(screenshotDir, 'desktop-control-settings.png'));
 
-    await settingsDialog.$('button=隐私与权限').click();
     await settingsDialog.$('button=文件访问').click();
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), '文件访问');
     assert.equal(await settingsDialog.$('button=文件访问').getAttribute('aria-current'), 'page');
@@ -855,6 +820,7 @@ describe('first-run desktop experience', () => {
     await browser.execute((id) => {
       window.__angelbotE2eWorkspaceId = id;
     }, createdProject.workspace.id);
+    await revealSidebar();
     const quickSwitchButton = await browser.$('[aria-label="快速切换"]');
     await quickSwitchButton.waitForDisplayed({ timeout: 20_000 });
     await quickSwitchButton.click();
@@ -1093,7 +1059,6 @@ describe('first-run desktop experience', () => {
     await browser.$('button[aria-label="设置"]').click();
     const projectSettingsDialog = await browser.$('[role="dialog"][aria-modal="true"]');
     await projectSettingsDialog.waitForDisplayed({ timeout: 5_000 });
-    await projectSettingsDialog.$('button=隐私与权限').click();
     await projectSettingsDialog.$('button=项目联网权限').click();
     assert.equal(await projectSettingsDialog.$('.settings-page-title').getText(), '项目联网权限');
     await projectSettingsDialog.$('//*[contains(text(), "docs.example.test")]').waitForDisplayed({ timeout: 5_000 });
@@ -1345,7 +1310,8 @@ describe('first-run desktop experience', () => {
     await navigatePrimary('资料库');
     const libraryPage = await browser.$('.library-page');
     await libraryPage.waitForDisplayed({ timeout: 10_000 });
-    assert.match(await libraryPage.getText(), /保存常用内容，了解助手记住了什么、能使用哪些能力。/);
+    assert.equal(await libraryPage.$('h1').getText(), '资料库');
+    assert.equal(await libraryPage.$('[role="tab"][aria-label="参考资料"]').getAttribute('aria-selected'), 'true');
     const memoryTab = await libraryPage.$('[role="tab"][aria-label="关于我的记忆"]');
     await memoryTab.click();
     assert.equal(await memoryTab.getAttribute('aria-selected'), 'true');
@@ -1361,8 +1327,6 @@ describe('first-run desktop experience', () => {
       await workbenchButton.click();
     }
     await browser.$('.right-panel').waitForDisplayed({ timeout: 10_000 });
-    const workbenchBack = await browser.$('.right-panel-back');
-    if (await workbenchBack.isDisplayed()) await workbenchBack.click();
     const workbenchState = await browser.execute(() => ({
       shellClass: document.querySelector('.app-shell')?.className,
       panelCount: document.querySelectorAll('.right-panel').length,
@@ -1383,7 +1347,6 @@ describe('first-run desktop experience', () => {
     assert.match(await completedDelegation.getText(), /已完成/);
     await browser.saveScreenshot(join(screenshotDir, 'project-workbench.png'));
 
-    await browser.$('.right-panel-back').click();
     const filesEntry = await browser.$('.workbench-tabs').$('button=文件');
     await filesEntry.waitForDisplayed({ timeout: 5_000 });
     await filesEntry.click();

@@ -5,8 +5,10 @@ export type AutomationNotificationStatus = 'unconfirmed' | 'requested' | 'muted'
 export interface AutomationRunSummary { id:string; status:string; summary:string; exitCode?:number|null; startedAt:number; stopControl?:'available'|'requested'; notificationStatus?: AutomationNotificationStatus; }
 export interface AutomationRun extends AutomationRunSummary { output:string; }
 export interface AutomationDashboardItem extends Automation { latestRun:AutomationRunSummary|null; lastSkippedAt:number|null; }
-export interface AutomationDashboard { items:AutomationDashboardItem[]; }
-export const getAutomationDashboard = () => invoke<AutomationDashboard>('get_automation_dashboard');
+export interface AutomationRunRequest { automationId: string; runId: string; }
+export interface AutomationDashboard { items: AutomationDashboardItem[]; acceptedRequests: AutomationRunRequest[]; }
+export const getAutomationDashboard = (pendingRequests: AutomationRunRequest[] = []) =>
+  invoke<AutomationDashboard>('get_automation_dashboard', { pendingRequests });
 export const getAutomations = () => invoke<Automation[]>('get_automations');
 export interface WorkspaceAutomationStatus {
   id: string;
@@ -37,7 +39,9 @@ export interface CreateMaaAutomationInput { title:string; triggerValue:string; w
 export const createMaaAutomation = (input: CreateMaaAutomationInput) => invoke<Automation>('create_maa_automation', { ...input });
 export const setAutomationEnabled = (id:string, enabled:boolean) => invoke<void>('set_automation_enabled',{id,enabled});
 export const deleteAutomation = (id:string) => invoke<void>('delete_automation',{id});
-export const runAutomationNow = (id:string) => invoke<void>('run_automation_now',{id});
+export type ManualAutomationStart = { status: 'accepted' } | { status: 'rejected'; error: string };
+export const runAutomationNow = (id: string, runId: string) =>
+  invoke<ManualAutomationStart>('run_automation_now', { id, runId });
 export const stopAutomationRun = (automationId:string, runId:string) => invoke<void>('stop_automation_run',{id:automationId,runId});
 /** Explicit scan command; periodic scans are owned by the desktop host. */
 export const runDueAutomations = () => invoke<number>('run_due_automations');

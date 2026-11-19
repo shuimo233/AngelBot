@@ -7,6 +7,17 @@
 
 use std::process::Command;
 
+/// cmd.exe interprets these characters even when launched through Command.
+pub(crate) fn windows_batch_argument_is_literal(value: &str) -> bool {
+    !value.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!' | '"'
+            )
+    })
+}
+
 pub(crate) fn apply_minimal_child_environment(command: &mut Command) {
     command.env_clear();
     #[cfg(windows)]

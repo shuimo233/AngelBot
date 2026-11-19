@@ -12,7 +12,7 @@ interface ActiveStep {
 
 export function WorkflowStatusBar({ expanded }: { expanded: boolean }) {
   const messages = useMessagesStore((s) => s.messages);
-  const profile = useSettingsStore((s) => s.profile);
+  const profile = useSettingsStore((s) => s.activeProfile);
   const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
   const [activeTools, setActiveTools] = useState<ActiveStep[]>([]);
 
@@ -115,7 +115,7 @@ export function WorkflowStatusBar({ expanded }: { expanded: boolean }) {
           <span className="workflow-status-title">Persona</span>
         </div>
         <div className="workflow-persona-preview">
-          <div className="workflow-persona-name">{profile.name || '未设置'}</div>
+          <div className="workflow-persona-name">{profile.name.trim() || 'AngelBot'}</div>
           <div className="workflow-persona-bio">
             {profile.bio ? (profile.bio.length > 80 ? profile.bio.slice(0, 80) + '…' : profile.bio) : '—'}
           </div>

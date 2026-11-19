@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+use crate::llm::ToolSchema;
+
 /// Tool execution modes
 ///
 /// `Sequential` is the default; `Parallel` is set explicitly on a tool via
@@ -188,21 +190,30 @@ impl Tool {
         build_function_schema(&self.name, &desc_with_label, &self.parameters)
     }
 
-    /// Convert to enhanced function schema with parameter details (Issue #52).
-    /// When `include_param_details` is true, the description appends each
-    /// parameter's name and description so the LLM knows exactly what to pass.
-    pub fn to_function_schema_enhanced(&self) -> Value {
+    /// Build the provider schema with optional parameter details in its description.
+    pub(crate) fn to_provider_schema(&self, enhanced: bool) -> ToolSchema {
+        ToolSchema {
+            name: self.name.clone(),
+            description: if enhanced {
+                self.enhanced_description()
+            } else {
+                self.description.clone()
+            },
+            parameters: self.parameters.clone(),
+        }
+    }
+
+    fn enhanced_description(&self) -> String {
         let param_details = build_param_details(&self.parameters);
-        let enhanced_desc = if param_details.is_empty() {
+        if param_details.is_empty() {
             self.description.clone()
         } else {
             format!("{}\n\n参数说明:\n{}", self.description, param_details)
-        };
-        build_function_schema(&self.name, &enhanced_desc, &self.parameters)
+        }
     }
 }
 
-/// Internal helper for the three public `to_function_schema*` methods.
+/// Internal helper for OpenAI-format schema views.
 /// Description is pre-computed by the caller (it differs between the
 /// variants); everything else is identical, so this keeps the shape
 /// definition in one place.
@@ -773,6 +784,24 @@ impl ToolResult {
         }
     }
 
+    /// The handler verified that a stale precondition prevented any effect.
+    /// Only this argument may change when a later success settles the failure.
+    pub fn precondition_rejected(name: &str, argument: &str, message: &str) -> Self {
+        Self {
+            name: name.into(),
+            success: false,
+            content: serde_json::json!({
+                "code": "TOOL_PRECONDITION_REJECTED",
+                "tool_name": name,
+                "argument": argument,
+                "message": message,
+            })
+            .to_string(),
+            terminate_batch: false,
+            images: Vec::new(),
+        }
+    }
+
     /// Issue #082: create a result that signals "stop executing this batch".
     pub fn terminate_batch(name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
@@ -802,6 +831,28 @@ impl ToolResult {
             return false;
         };
         value.get("code").and_then(|code| code.as_str()) == Some("RESULT_UNKNOWN")
+    }
+
+    /// Recognize persisted host receipts, including the legacy error wrapper.
+    /// Tool output may quote these phrases inside a structured receipt.
+    pub(crate) fn confirmation_status_from_output(
+        success: bool,
+        content: &str,
+    ) -> Option<&'static str> {
+        let content = content.strip_prefix("Error: ").unwrap_or(content);
+        if success {
+            content
+                .starts_with("Confirmation approved")
+                .then_some("approved")
+        } else if content.starts_with("Confirmation required") {
+            Some("pending")
+        } else if content.starts_with("Confirmation rejected") {
+            Some("rejected")
+        } else if content.starts_with("Confirmation cancelled") {
+            Some("cancelled")
+        } else {
+            None
+        }
     }
 
     /// Format result for LLM consumption — returns a structured string
@@ -842,7 +893,7 @@ pub mod schemas {
                 "path": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "The path to a text file or a read-only DOCX/XLSX text snapshot, relative to the work directory"
+                    "description": "The path to a text file or a read-only DOCX, XLSX, or PDF text snapshot, relative to the work directory"
                 },
                 "offset": {"type":"integer","minimum":0,"description":"Plain text only: zero-based Unicode character offset, not a line number. A window returns content and explicit partial/next_offset metadata."},
                 "limit": {"type":"integer","minimum":1,"maximum":2000,"description":"Plain text window length in Unicode characters, default 1200 when any window option is supplied. Encoded output is at most 5000 bytes; continue with next_offset."},
@@ -864,7 +915,7 @@ pub mod schemas {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Plain text content; DOCX/XLSX creation or overwrite is not supported"
+                    "description": "Plain text content; DOCX, XLSX, and PDF are read-only"
                 }
             },
             "additionalProperties": false,
@@ -1136,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_function_schema_enhanced_includes_params() {
+    fn test_provider_schema_enhanced_includes_params() {
         let tool = Tool::new(
             "test_tool",
             "测试工具",
@@ -1151,10 +1202,9 @@ mod tests {
                 "required": ["arg1"]
             }),
         );
-        let schema = tool.to_function_schema_enhanced();
-        let func = schema.get("function").unwrap();
-        assert!(func["description"].as_str().unwrap().contains("第一个参数"));
-        assert!(func["description"].as_str().unwrap().contains("参数说明"));
+        let schema = tool.to_provider_schema(true);
+        assert!(schema.description.contains("第一个参数"));
+        assert!(schema.description.contains("参数说明"));
     }
 
     #[test]

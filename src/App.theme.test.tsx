@@ -4,6 +4,7 @@ import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { AppearanceSettings } from './components/Settings/pages/AppearanceSettings';
+import { useAppearanceStore } from './stores/appearance';
 import { useThemeStore } from './stores/theme';
 
 vi.mock('./components/Sidebar', () => ({
@@ -74,8 +75,7 @@ describe('App theme synchronization', () => {
     vi.stubGlobal('matchMedia', vi.fn(() => media));
     localStorage.setItem('theme', 'system');
     const view = render(<StrictMode><App /><AppearanceSettings /></StrictMode>);
-    await user.click(screen.getByRole('button', { name: '主题' }));
-    expect(screen.getByLabelText('颜色主题')).toHaveValue('system');
+    expect(screen.getByRole('radio', { name: '跟随系统' })).toBeChecked();
 
     act(() => {
       media.matches = true;
@@ -84,14 +84,28 @@ describe('App theme synchronization', () => {
 
     expect(document.documentElement).toHaveClass('dark');
     expect(screen.getByRole('button', { name: '浅色模式' })).toBeInTheDocument();
-    expect(screen.getByLabelText('颜色主题')).toHaveValue('system');
+    expect(screen.getByRole('radio', { name: '跟随系统' })).toBeChecked();
 
     await user.click(screen.getByRole('button', { name: '浅色模式' }));
-    expect(screen.getByLabelText('颜色主题')).toHaveValue('light');
+    expect(screen.getByRole('radio', { name: '浅色' })).toBeChecked();
     expect(document.documentElement).not.toHaveClass('dark');
 
     view.unmount();
     expect(listeners.size).toBe(0);
     expect(media.removeEventListener).toHaveBeenCalledTimes(media.addEventListener.mock.calls.length);
+  });
+
+  it('restores reading and background preferences without opening Settings', () => {
+    localStorage.setItem('chatFontSize', '18');
+    localStorage.setItem('chatFontFamily', 'KaiTi');
+    localStorage.setItem('reduceMotion', 'true');
+    localStorage.setItem('bgImage', 'data:image/png;base64,example');
+    localStorage.setItem('bgOpacity', '40');
+    render(<StrictMode><App /></StrictMode>);
+    expect(document.documentElement.style.getPropertyValue('--ui-chat-font-size')).toBe('18px');
+    expect(document.documentElement.style.getPropertyValue('--ui-chat-font-family')).toBe('"KaiTi", var(--ui-font-sans)');
+    expect(useAppearanceStore.getState().bgImage).toBe('data:image/png;base64,example');
+    expect(document.documentElement.style.getPropertyValue('--bg-opacity')).toBe('0.4');
+    expect(document.documentElement).toHaveAttribute('data-reduced-motion');
   });
 });

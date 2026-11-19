@@ -1,31 +1,34 @@
-import { Component, Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, type ErrorInfo, type ReactNode } from 'react';
-import { useMessagesStore, type LiveBlock } from '$stores/messages';
+import { Component, Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, type ErrorInfo, type ReactNode } from 'react';
+import { useMessagesStore, type LiveBlock, type QueuedFollowUp } from '$stores/messages';
 import { useSessionsStore } from '$stores/sessions';
 import { projectCandidatesForMessage, useWorkspacesStore } from '$stores/workspaces';
 import { resolveWorkspaceIntent, type Workspace } from '$lib/commands/workspace';
 import { usePreferencesStore } from '$stores/preferences';
 import { useSettingsStore } from '$stores/settings';
-import { ComposerInput, type ComposerInputHandle } from './Composer/ComposerInput';
-import { ChatEmptyState } from './ChatEmptyState';
+import { useAppearanceStore } from '$stores/appearance';
+import { ComposerInput, type ComposerInputHandle, type ComposerSendResult } from './Composer/ComposerInput';
+import { ChatEmptyState, ChatStarterPrompts } from './ChatEmptyState';
 import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { ChatHeader } from './ChatHeader';
 import { ConversationNavigation } from './ConversationNavigation';
+import { messagePageBounds, TRANSCRIPT_PAGE_SIZE, useTranscriptWindow } from './ChatArea/useTranscriptWindow';
+import { latestResultToReview, unknownResultCalls } from './ChatArea/pendingResultReview';
+import type { WorkspaceView } from './RightPanel';
 import { useThinkingEffortStore } from '$stores/thinkingEffort';
-import { sendMessage, getMessages, resolveAgentConfirmation, interruptAgent, pauseAgent, resumeAgent, submitInProgressCommand } from '$lib/commands';
-import { deleteMessage, editAndResendMessage } from '$lib/commands/message';
+import { sendMessage, resolveAgentConfirmation, interruptAgent, pauseAgent, resumeAgent, submitSteeringMessage } from '$lib/commands';
+import { continueAgentTask, deleteMessage, editAndResendMessage, getMessagePage, searchConversationPage, type MessagePage, type ForegroundInteractionPayload } from '$lib/commands/message';
 import { getWorkspaceTaskUnderstanding, type TaskDecisionProjection } from '$lib/commands/task-understanding';
 import { MessageActions } from './MessageActions';
-import { ContentBlockRenderer } from './ContentBlockRenderer';
+import { ContentBlockRenderer, groupBlocksIntoSegments } from './ContentBlockRenderer';
+import { locateWorkspaceFile, MessageMarkdown, WorkspaceFileLink, workspaceFilePath } from './MessageMarkdown';
+import { completedReplyDeliveries, ReplyFileDelivery } from './CompletedFileTask';
 import {
   authoritativeToolResultsByCallId,
   contentBlocksFromDurableEvents,
   getDurableAgentRunEvents,
+  subscribeAgentSessionEvents,
 } from '$lib/commands/agent-event';
-import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { Message, ToolCall, ToolResult, PersonalityTemplate, TextAttachment } from '$types';
+import type { Message, ToolCall, ToolResult, TextAttachment, TraitConfig } from '$types';
 import { TextAttachmentDetails } from './TextAttachmentDetails';
 import { cardDescription } from '$lib/tavern-card';
 import { extractSecureWebSearchSetup } from '$lib/web-search-setup';
@@ -34,12 +37,34 @@ import { TaskDecisionCard } from './TaskDecisionCard';
 import { RuntimeHealthNotice } from './RuntimeHealthNotice';
 import { UpdateNotice } from './UpdateNotice';
 import { ModelConfigurationNotice } from './ModelConfigurationNotice';
-import { formatModelSendError } from '$lib/model-config';
+import { formatModelSendError, getModelConfigReadiness, openModelSettings } from '$lib/model-config';
 import { getToolDisplayName, parseMcpToolIdentity } from '$lib/tool-display';
 import { desktopActionOperation, desktopConfirmationOperation, getToolConfirmationSummary, requiresDesktopActionPreview, requiresDesktopConfirmationPreview } from '$lib/tool-confirmation';
-import { toolActionReceipt } from '$lib/tool-action-result';
+import { isResultUnknown, toolActionReceipt } from '$lib/tool-action-result';
 import { DesktopActionApproval, type DesktopApprovalRecheck, type DesktopApprovalResolution } from './DesktopActionApproval';
 import { ToolActionApproval } from './ToolActionApproval';
+
+const TIMELINE_REPLAY_CONCURRENCY = 4;
+const RECENT_TIMELINE_LIMIT = 6;
+const EMPTY_FOLLOW_UPS: QueuedFollowUp[] = [];
+
+const isStopPending = (sessionId: string) => useMessagesStore.getState().stoppingSessions.has(sessionId);
+
+function updateFollowUps(sessionId: string, update: (items: QueuedFollowUp[]) => QueuedFollowUp[]) {
+  useMessagesStore.setState((state) => ({
+    queuedFollowUps: {
+      ...state.queuedFollowUps,
+      [sessionId]: update(state.queuedFollowUps[sessionId] ?? EMPTY_FOLLOW_UPS),
+    },
+  }));
+}
+
+function followUpsCanContinue(reply: Message) {
+  return reply.role === 'assistant' && Boolean(reply.content.trim())
+    && (!reply.taskRun || reply.taskRun.status === 'completed')
+    && ![...authoritativeToolResultsByCallId(reply.toolResults ?? []).values()]
+      .some((result) => result.confirmationRequired && result.confirmationStatus === 'pending');
+}
 
 // ─── Tool Display Helpers ──────────────────────────────────────────────────────
 
@@ -56,9 +81,18 @@ function timestampToDate(timestamp: number): Date {
 
 // ─── Tool Executing Indicator ─────────────────────────────────────────────────
 
-const INTERNAL_TOOL_NAMES = new Set(['record_task_understanding']);
+const INTERNAL_TOOL_NAMES = new Set(['record_task_understanding', 'pending_user_message']);
 const isInternalTool = (toolName: string) => INTERNAL_TOOL_NAMES.has(toolName);
 const isRestrictedNetworkExploration = (toolName: string) => toolName === 'delegate_network_exploration';
+const LIVE_RUN_PHASES = new Map([
+  ['正在理解你的请求', '正在理解请求'],
+  ['正在分析任务并规划下一步', '正在规划下一步'],
+  ['正在规划下一步', '正在规划下一步'],
+  ['正在生成回复', '正在生成回复'],
+  ['正在整理结果', '正在整理结果'],
+  ['正在继续任务', '正在继续任务'],
+  ['正在基于编辑后的消息重新生成', '正在重新生成'],
+]);
 
 /**
  * A failed confirmation IPC request has not changed the durable decision.
@@ -95,7 +129,8 @@ function markUnknownPersistedConfirmation(messageId: string, callId: string): vo
     messages: state.messages.map((message) => {
       if (message.id !== messageId) return message;
       const toolName = message.toolCalls?.find((tool) => tool.id === callId)?.name;
-      if (!toolName || (!requiresDesktopActionPreview(toolName) && !toolName.startsWith('mcp_'))) return message;
+      if (!toolName || (toolName !== 'run_project_command'
+        && !requiresDesktopActionPreview(toolName) && !toolName.startsWith('mcp_'))) return message;
       const result: ToolResult = {
         callId,
         toolName,
@@ -280,6 +315,12 @@ const AgentStepTechnicalDetails = ({
               {memory}
             </div>
           ))}
+          <div>
+            <button type="button" className="agent-step-detail-toggle"
+              onClick={() => window.dispatchEvent(new CustomEvent('open-settings', { detail: 'memory' }))}>
+              查看与更正已保存的记忆
+            </button>
+          </div>
         </div>
       )}
 
@@ -319,14 +360,16 @@ function getStepVerb(toolName: string) {
 function ToolActionReceipts({
   toolCalls = [],
   toolResults = [],
+  showUnknown = true,
 }: {
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
+  showUnknown?: boolean;
 }) {
   const results = authoritativeToolResultsByCallId(toolResults);
   const receipts = toolCalls.flatMap((tool) => {
     const receipt = toolActionReceipt(tool.name, results.get(tool.id));
-    return receipt ? [{ tool, receipt }] : [];
+    return receipt && (showUnknown || receipt.status !== 'result_unknown') ? [{ tool, receipt }] : [];
   });
   if (receipts.length === 0) return null;
 
@@ -342,6 +385,142 @@ function ToolActionReceipts({
         </div>
       ))}
     </div>
+  );
+}
+
+function ResultReviewCard({ message, onOpenFiles }: { message: Message; onOpenFiles?: () => void }) {
+  const calls = unknownResultCalls(message);
+  const call = calls.length === 1 ? calls[0] : undefined;
+  const file = call && ['write_file', 'edit_file'].includes(call.name)
+    ? workspaceFilePath(parseToolArguments(call).path)
+    : null;
+  const allWorkspaceActions = calls.every(({ name }) => ['run_project_command', 'write_file', 'edit_file'].includes(name));
+  const detail = call?.name === 'prepare_message_draft' ? '草稿可能已写入。请先到目标应用核对。'
+    : call?.name === 'set_trusted_app_text' ? '输入框可能已改动。请先到目标应用核对。'
+    : allWorkspaceActions ? '工作区文件可能已改动。请先核对实际结果，再决定下一步。'
+    : '操作可能已经生效。请先核对目标应用或服务，再决定下一步。';
+  return (
+    <section className="task-recovery-card task-result-review" aria-label="核对操作结果">
+      <div className="task-recovery-header">
+        <strong>结果待核对</strong>
+        {onOpenFiles && allWorkspaceActions && (
+          <button type="button" onClick={file ? () => locateWorkspaceFile(file) : onOpenFiles}>
+            {file ? '核对目标文件' : '查看工作区文件'}
+          </button>
+        )}
+      </div>
+      <p>{detail}</p>
+      {file && <p className="task-result-review__path">{file}</p>}
+    </section>
+  );
+}
+
+const TASK_RECOVERY_LABELS: Readonly<Partial<Record<string, string>>> = {
+  needs_attention: '任务未完成',
+  continue_suggested: '任务可继续',
+  stopped: '任务已停止',
+  paused: '任务已暂停',
+  failed: '任务失败',
+  provider_unavailable: '模型连接不可用',
+};
+
+function latestConversationMessage(messages: readonly Message[], sessionId: string | undefined) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.sessionId === sessionId && (message.role === 'assistant' || message.role === 'user')) return message;
+  }
+}
+
+type TaskRecoveryAction = 'continue' | 'resultsOnly';
+// Keep the affordance aligned with foreground_results_reply.rs; the backend
+// still decides eligibility from the authoritative journal.
+const RESULTS_REPLY_SOURCES = new Set(['read_file', 'list_workspace_items', 'recall_conversation', 'read_conversation', 'read_tool_result']);
+
+function hasSavedWebSearchSource(output: string | undefined): boolean {
+  try {
+    const data = JSON.parse(output ?? '');
+    return data?.kind === 'web_search_evidence' && data.trust === 'untrusted_external'
+      && typeof data.provider === 'string' && typeof data.truncated === 'boolean'
+      && Array.isArray(data.results) && data.results.some((item: unknown) => {
+        if (typeof item !== 'object' || !item) return false;
+        const { title, url, snippet } = item as Record<string, unknown>;
+        if (typeof title !== 'string' || typeof snippet !== 'string' || typeof url !== 'string' || url.length > 2048) return false;
+        try {
+          const source = new URL(url);
+          return ['https:', 'http:'].includes(source.protocol) && !!source.hostname && !source.username && !source.password;
+        } catch { return false; }
+      });
+  } catch { return false; }
+}
+
+function taskRecoveryState(message: Message) {
+  const results = authoritativeToolResultsByCallId(message.toolResults ?? []);
+  const unknown = message.toolResults?.some(isResultUnknown) ?? false;
+  const awaitingApproval = [...results.values()].some((result) =>
+    result.confirmationStatus === 'pending' || (!result.success && /^(?:Error: )?Confirmation required/.test(result.output ?? '')));
+  const successful = [...results.values()].filter((result) => result.success
+    && !isInternalTool(result.toolName) && result.toolName !== 'agent_loop'
+    && result.confirmationStatus !== 'rejected' && result.confirmationStatus !== 'pending' && result.confirmationStatus !== 'cancelled'
+    && result.verification?.matched !== false);
+  const run = message.taskRun;
+  let action: TaskRecoveryAction | undefined;
+  if (run?.id === message.id && run.confirmationState !== 'pending' && !unknown && !awaitingApproval) {
+    if (run.resumable) action = 'continue';
+    else if (run.status === 'provider_unavailable' && run.resumable === false
+      && successful.some(result => RESULTS_REPLY_SOURCES.has(result.toolName)
+        || (result.toolName === 'web_search' && hasSavedWebSearchSource(result.output)))) action = 'resultsOnly';
+  }
+  return { lastSuccess: successful.at(-1), unknown, action };
+}
+
+function TaskRecoveryCard({ message, disabled, notice, onRecover, canLocateFiles }: {
+  message: Message;
+  disabled: boolean;
+  notice?: string;
+  onRecover: (action: TaskRecoveryAction) => void;
+  canLocateFiles: boolean;
+}) {
+  const { lastSuccess, unknown, action } = taskRecoveryState(message);
+  const fileOperation = lastSuccess && ['read_file', 'write_file', 'edit_file'].includes(lastSuccess.toolName)
+    ? message.toolCalls?.find((tool) => tool.id === lastSuccess.callId && tool.name === lastSuccess.toolName)
+    : undefined;
+  const path = fileOperation && parseToolArguments(fileOperation)?.path;
+  const lastFile = typeof path === 'string' && path.trim() ? path.trim().replace(/\s+/g, ' ') : '';
+  const files = message.taskFacts?.modifiedFiles ?? [];
+  const lastFilePath = canLocateFiles ? workspaceFilePath(path) : null;
+  const lastFileLabel = lastFile.length > 120 ? `${lastFile.slice(0, 120)}…` : lastFile;
+  const showLastFileLink = lastFilePath && !files.some(file => workspaceFilePath(file) === lastFilePath);
+
+  return (
+    <section className="task-recovery-card" aria-label="任务恢复">
+      <div className="task-recovery-header">
+        <strong>{unknown ? '结果待核对' : TASK_RECOVERY_LABELS[message.taskRun?.status ?? '']}</strong>
+        {action && <button type="button" disabled={disabled} onClick={() => onRecover(action)}>
+          {action === 'resultsOnly' ? '用已有结果回答' : '继续任务'}
+        </button>}
+        {(message.taskRun?.status === 'provider_unavailable' || message.modelRequestFailed) && (
+          <button type="button" onClick={openModelSettings}>检查模型连接</button>
+        )}
+      </div>
+      {lastSuccess && <p>
+        最近成功 · {getToolDisplayName(lastSuccess.toolName)}
+        {lastFile && <> · {showLastFileLink ? <WorkspaceFileLink path={lastFilePath}>{lastFileLabel}</WorkspaceFileLink> : lastFileLabel}</>}
+      </p>}
+      {files.length > 0 && <ul aria-label="本轮已修改的文件">
+        {files.map((path) => {
+          const relativePath = workspaceFilePath(path);
+          return <li key={path}>
+            {relativePath && canLocateFiles ? <button type="button" className="message-file-link"
+              title={`在工作台中定位 ${relativePath}`}
+              onClick={() => locateWorkspaceFile(relativePath)}>
+              {path}
+            </button> : path}
+          </li>;
+        })}
+      </ul>}
+      {unknown && <p>请先核对实际结果。</p>}
+      {notice && <p role="alert">{notice}</p>}
+    </section>
   );
 }
 
@@ -393,7 +572,7 @@ function getRecoveryHint(toolName: string, result?: ToolResult) {
 
 function parseRecalledMemories(output: string) {
   const trimmed = output.trim();
-  if (!trimmed || /no .*memor|没有|沒有/i.test(trimmed)) return [];
+  if (!trimmed || /^(?:no .*memor|本次没有找到相关记忆|本次沒有找到相關記憶)/i.test(trimmed)) return [];
   return trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
@@ -417,6 +596,8 @@ function getStepStatusLabel(needsApproval: boolean, success: boolean | undefined
 const AgentRunSteps = ({
   toolCalls = [],
   toolResults = [],
+  taskCompleted,
+  reviewShown = false,
   sessionId,
   messageId,
   desktopRecheck,
@@ -424,10 +605,12 @@ const AgentRunSteps = ({
 }: {
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
+  taskCompleted: boolean;
+  reviewShown?: boolean;
   sessionId?: string;
   messageId: string;
   desktopRecheck?: DesktopApprovalRecheck;
-  onResolveConfirmation: (
+  onResolveConfirmation?: (
     messageId: string,
     callId: string,
     decision: 'approved' | 'rejected',
@@ -475,18 +658,14 @@ const AgentRunSteps = ({
   // to interrupt the reading flow.
   if (isPassive) return null;
 
-  // Compact summary shown as small inline text
-  const summaryText = hasUnknownActionResult
-    ? '有操作结果待核对'
-    : hasPendingConfirmation
-    ? '等待确认'
-    : hasFailure
-      ? '有步骤失败'
-      : hasRejection
-        ? '已按你的决定取消操作'
-      : completedCount === safeToolCalls.length
-        ? `${completedCount} 个动作已完成`
-        : `${completedCount}/${safeToolCalls.length} 已完成`;
+  // Unknown results and outstanding approvals still take precedence over
+  // a completed task. Known failed receipts stay available as history.
+  const [summaryStatus, summaryText] = hasUnknownActionResult && reviewShown ? ['details', '查看执行记录']
+    : hasUnknownActionResult ? ['unknown', '有操作结果待核对']
+    : hasPendingConfirmation ? ['needs_approval', '等待确认']
+    : hasFailure ? (taskCompleted ? ['completed', '任务已完成 · 查看执行记录'] : ['failed', '有步骤失败'])
+    : hasRejection ? ['cancelled', '已按你的决定取消操作']
+    : ['running', `${completedCount}/${safeToolCalls.length} 已完成`];
 
   return (
     <div className="agent-run-integrated">
@@ -516,7 +695,7 @@ const AgentRunSteps = ({
                 <InlineStatusIcon status={status} />
                 <span>{getStepVerb(tool.name)}</span>
               </span>
-              {needsApproval && needsDesktopPreview && (
+              {needsApproval && needsDesktopPreview && onResolveConfirmation && (
                 <DesktopActionApproval
                   sessionId={sessionId}
                   messageId={messageId}
@@ -528,7 +707,7 @@ const AgentRunSteps = ({
                   onResolve={(decision, previewId) => onResolveConfirmation(messageId, tool.id, decision, previewId)}
                 />
               )}
-              {needsApproval && !needsDesktopPreview && (
+              {needsApproval && !needsDesktopPreview && onResolveConfirmation && (
                 <ToolActionApproval
                   toolName={tool.name}
                   arguments={tool.arguments}
@@ -547,9 +726,7 @@ const AgentRunSteps = ({
       {(
         <button
           type="button"
-          className={`agent-run-disclosure agent-run-disclosure--${
-            hasUnknownActionResult ? 'unknown' : hasPendingConfirmation ? 'needs_approval' : hasFailure ? 'failed' : hasRejection ? 'cancelled' : isPassive ? 'completed' : 'running'
-          }`}
+          className={`agent-run-disclosure agent-run-disclosure--${summaryStatus}`}
           aria-expanded={detailsOpen}
           onClick={() => setDetailsOpen((v) => !v)}
         >
@@ -592,7 +769,7 @@ const AgentRunSteps = ({
                     <AgentStepTechnicalDetails tool={tool} result={result} recalled={recalled} />
                   </AgentRunDetailsBoundary>
 
-                  {result?.success === false && !needsApproval && !rejected && !toolActionReceipt(tool.name, result) && (
+                  {!taskCompleted && result?.success === false && !needsApproval && !rejected && !toolActionReceipt(tool.name, result) && (
                     <div className="agent-step-recovery">
                       <span>此操作未完成：{getRecoveryHint(tool.name, result)}</span>
                     </div>
@@ -609,90 +786,122 @@ const AgentRunSteps = ({
 
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
-/**
- * Extract a project-relative workbench path from a Main-Agent file citation.
- *
- * `angelbot-file:` is deliberately the only accepted link scheme.  It avoids
- * treating model-authored `file://` or absolute Windows paths as an authority
- * to access an arbitrary host location; the workbench resolves the result
- * through the active session's existing file boundary.
- */
-export function workspaceFilePathFromHref(href?: string): string | null {
-  if (!href) return null;
-  try {
-    const parsed = new URL(href);
-    if (
-      parsed.protocol !== 'angelbot-file:'
-      || parsed.host
-      || parsed.search
-      || parsed.hash
-      || parsed.pathname.startsWith('/')
-    ) return null;
-    const path = decodeURIComponent(parsed.pathname);
-    if (!path || /[\\:\x00-\x1f\x7f]/.test(path)) return null;
-    const segments = path.split('/');
-    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
-    return path;
-  } catch {
-    return null;
-  }
-}
-
-function MessageBubble({ content }: { content: string }) {
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      // ReactMarkdown removes unknown schemes by default. Keep the one
-      // deliberately narrow local citation scheme, while every other URL still
-      // passes through the library's standard safety transform.
-      urlTransform={(url) => (
-        workspaceFilePathFromHref(url) ? url : defaultUrlTransform(url)
-      )}
-      components={{
-        code({ className, children, ...props }) {
-          const match = /language-(\w+)/.exec(className || '');
-          const code = String(children).replace(/\n$/, '');
-          if (match) {
-            return (
-              <SyntaxHighlighter
-                style={vscDarkPlus}
-                language={match[1]}
-                PreTag="div"
-              >
-                {code}
-              </SyntaxHighlighter>
-            );
-          }
-          return <code className={className} {...props}>{children}</code>;
-        },
-        a({ href, children, ...props }) {
-          const path = workspaceFilePathFromHref(href);
-          if (!path) return <a href={href} {...props}>{children}</a>;
-          return (
-            <button
-              type="button"
-              className="message-file-link"
-              title={`在工作台中定位 ${path}`}
-              aria-label={`在工作台中定位 ${path}`}
-              onClick={() => window.dispatchEvent(new CustomEvent('angelbot:locate-file', { detail: { path } }))}
-            >
-              {children}
-            </button>
-          );
-        },
-      }}
-    >
-      {content}
-    </ReactMarkdown>
-  );
-}
-
 function completedTimelineText(blocks: LiveBlock[]): string {
-  return blocks
-    .filter((block): block is Extract<LiveBlock, { kind: 'text' }> => block.kind === 'text')
-    .map((block) => block.content.trim())
+  return groupBlocksIntoSegments(blocks)
+    .flatMap((segment) => segment.kind === 'text' ? [segment.content.trim()] : [])
     .filter(Boolean)
     .join('\n\n');
+}
+
+function timelineCandidates(messages: readonly Message[], sessionId: string) {
+  const latest = latestConversationMessage(messages, sessionId);
+  const candidates = new Set<string>();
+  let hasFollowingToolRow = false;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.sessionId !== sessionId) continue;
+    if (message.role === 'tool') {
+      hasFollowingToolRow = true;
+    } else if (message.role === 'user' || message.role === 'assistant') {
+      if (message.role === 'assistant' && (message.toolCalls?.length || message.toolResults?.length
+        || message.timelineBlocks?.length || hasFollowingToolRow
+        || (message === latest && message.taskRun?.status === 'needs_attention'))) {
+        candidates.add(message.id);
+      }
+      hasFollowingToolRow = false;
+    }
+  }
+  return candidates;
+}
+
+function withoutReplayedToolRows(messages: Message[]) {
+  let replayingAssistantTurn = false;
+  return messages.filter((message) => {
+    if (message.role === 'user') replayingAssistantTurn = false;
+    if (message.role === 'assistant') replayingAssistantTurn = Boolean(message.timelineBlocks?.length);
+    return message.role !== 'tool' || !replayingAssistantTurn;
+  });
+}
+
+function retainUnchangedTimelines(source: Message[], previous: Message[], sessionId: string) {
+  const latestId = latestConversationMessage(source, sessionId)?.id;
+  const hydrated = new Map(previous.filter((message) => message.timelineBlocks?.length || message.modelRequestFailed)
+    .map((message) => [message.id, message]));
+  return source.map((message) => {
+    const prior = hydrated.get(message.id);
+    if (!prior || prior.sessionId !== sessionId || message.timelineBlocks?.length) return message;
+    const { timelineBlocks, modelRequestFailed, ...saved } = prior;
+    const { timelineBlocks: _timeline, modelRequestFailed: _failure, ...fresh } = message;
+    // A refreshed durable approval or receipt always outranks cached event
+    // decoration. Preserve an existing timeline only for the same reply data.
+    const keys = Object.keys(fresh) as (keyof typeof fresh)[];
+    if (keys.length !== Object.keys(saved).length || keys.some((key) =>
+      JSON.stringify(fresh[key]) !== JSON.stringify(saved[key]))) return message;
+    if (!modelRequestFailed || message.id === latestId) return prior;
+    return timelineBlocks ? { ...fresh, timelineBlocks } : message;
+  });
+}
+
+async function readMessageTimeline(sessionId: string, message: Message, latest: boolean): Promise<Message> {
+  const events = (await getDurableAgentRunEvents(sessionId, message.id))
+    .filter((event) => event.run_id === message.id && event.session_id === sessionId);
+  const modelRequestFailed = latest && message.taskRun?.status === 'needs_attention'
+    && events.some(({ payload }) => {
+      if (payload.type !== 'Error') return false;
+      const code = (payload.data as { code?: string } | null)?.code;
+      return typeof code === 'string' && code.startsWith('Llm');
+    });
+  const timelineBlocks = contentBlocksFromDurableEvents(events, message.toolResults);
+  if (!timelineBlocks.length) return modelRequestFailed ? { ...message, modelRequestFailed } : message;
+
+  // Append terminal text saved on the reply when no text delta carried it.
+  const finalText = message.content.trim();
+  const emittedText = timelineBlocks.filter((block) => block.kind === 'text').map((block) => block.content).join('');
+  if (finalText && !emittedText.includes(finalText)) {
+    const lastBlock = timelineBlocks[timelineBlocks.length - 1];
+    timelineBlocks.push({
+      kind: 'text',
+      index: lastBlock.index + 1,
+      iterationId: lastBlock.iterationId + 1,
+      content: message.content,
+    });
+  }
+  return modelRequestFailed ? { ...message, timelineBlocks, modelRequestFailed } : { ...message, timelineBlocks };
+}
+
+function HistoricalRunDetails({ message, onLoad }: {
+  message: Message;
+  onLoad: (message: Message) => Promise<Message | undefined>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [loaded, setLoaded] = useState<{ source: Message; result: Message }>();
+  const [loading, setLoading] = useState(false);
+  const load = async () => {
+    setLoading(true);
+    try {
+      const result = await onLoad(message);
+      if (result) setLoaded({ source: message, result });
+    } finally {
+      setLoading(false);
+    }
+  };
+  const loadedCurrent = loaded?.source === message;
+  const blocks = message.timelineBlocks ?? (loadedCurrent ? loaded.result.timelineBlocks : undefined);
+  const steps = blocks?.filter((block): block is Extract<LiveBlock, { kind: 'tool_call' }> =>
+    block.kind === 'tool_call' && !isInternalTool(block.toolName) && block.toolName !== 'agent_loop');
+  return <details className="agent-run-integrated" onToggle={(event) => {
+    setOpen(event.currentTarget.open);
+    if (event.currentTarget.open && !blocks && !loadedCurrent && !loading) void load();
+  }}>
+    <summary className="agent-run-summary">查看运行过程</summary>
+    {open && (loading ? <p role="status">正在读取运行记录…</p>
+      : !blocks && !loadedCurrent ? <p><button type="button" onClick={() => void load()}>重新读取运行记录</button></p>
+        : steps?.length ? <ol aria-label="已记录的运行步骤">
+          {steps.map((step) => <li key={step.index}>{getToolDisplayName(step.toolName)} · {{
+            running: '结束状态未记录', completed: '完成', failed: '失败', needs_approval: '曾等待确认',
+          }[step.status]}</li>)}
+        </ol> : <p>没有可显示的运行步骤。</p>)}
+  </details>;
 }
 
 /** Hide only the empty shell of tool details that are already intentionally hidden. */
@@ -711,8 +920,8 @@ function isEmptySuccessfulToolTurn(message: Message): boolean {
 
 // ─── Personality Mapping ──────────────────────────────────────────────────────
 
-function mapPersonalityTraits(tone: string, personality: string) {
-  const archetypeDefaults: Record<string, Record<string, number>> = {
+function mapPersonalityTraits(tone: string, personality: string): TraitConfig {
+  const archetypeDefaults: Record<string, TraitConfig> = {
     balanced:   { tone: 0, verbosity: 0, formality: 0, humor: 0, dependence: 0, intimacy: 0, patience: 0 },
     cheerful:   { tone: -3, verbosity: 3, formality: 1, humor: 3, dependence: 2, intimacy: 2, patience: 2 },
     serious:    { tone: 2, verbosity: -1, formality: -2, humor: -3, dependence: -2, intimacy: -2, patience: 1 },
@@ -743,6 +952,23 @@ function mapPreferences(prefs: {
   };
 }
 
+function currentForegroundInteraction(): ForegroundInteractionPayload {
+  const profile = useSettingsStore.getState().activeProfile;
+  return {
+    personality: {
+      name: profile.name,
+      description: profile.characterCard
+        ? cardDescription({ name: profile.name, description: profile.bio, firstMes: profile.greeting, card: profile.characterCard })
+        : profile.bio,
+      greeting: profile.greeting,
+      traits: profile.traits ?? mapPersonalityTraits(profile.tone, profile.personality),
+      supplement: profile.personaNotes ?? '',
+    },
+    preferences: mapPreferences(usePreferencesStore.getState().preferences),
+    thinkingEffort: useThinkingEffortStore.getState().effort,
+  };
+}
+
 // ─── Main ChatArea Component ──────────────────────────────────────────────────
 
 function titleFromFirstUserMessage(content: string) {
@@ -751,27 +977,51 @@ function titleFromFirstUserMessage(content: string) {
   return characters.length > 40 ? `${characters.slice(0, 40).join('')}…` : normalized;
 }
 
-export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggleWorkbench?: () => void; workbenchOpen?: boolean }) {
+type PauseAction = {
+  sessionId: string;
+  generation: number;
+  stopEpoch: number;
+  pending: boolean;
+  paused: boolean;
+  error?: string;
+};
+
+export function ChatArea({ onToggleWorkbench, onOpenWorkbenchView, workbenchOpen = false }: {
+  onToggleWorkbench?: () => void;
+  onOpenWorkbenchView?: (view: WorkspaceView) => void;
+  workbenchOpen?: boolean;
+}) {
   const session = useSessionsStore((state) => state.activeSession);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
   const activeWorkspaceKind = useWorkspacesStore((state) => (
     state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId)?.kind ?? null
   ));
   const messages = useMessagesStore((state) => state.messages);
+  const olderTimelineIds = useMemo(() => {
+    if (!session?.id) return new Set<string>();
+    return new Set([...timelineCandidates(messages, session.id)].slice(RECENT_TIMELINE_LIMIT));
+  }, [messages, session?.id]);
+  const latestMessage = latestConversationMessage(messages, session?.id);
+  const resultToReview = useMemo(() => latestResultToReview(messages, session?.id), [messages, session?.id]);
+  const replyDeliveries = useMemo(() => session?.id ? completedReplyDeliveries(messages, session.id) : null, [messages, session?.id]);
+  const recoveryMessage = latestMessage?.role === 'assistant'
+    && TASK_RECOVERY_LABELS[latestMessage.taskRun?.status ?? ''] ? latestMessage : undefined;
+  const [recoveryNotice, setRecoveryNotice] = useState<{ messageId: string; text: string } | null>(null);
   const checkedModelFailure = useRef<string | null>(null);
   useEffect(() => {
-    const latestReply = messages.filter((message) => message.role === 'assistant').at(-1);
-    if (latestReply?.taskRun?.status !== 'provider_unavailable'
-      || checkedModelFailure.current === latestReply.id) return;
-    checkedModelFailure.current = latestReply.id;
+    if (!recoveryMessage || checkedModelFailure.current === recoveryMessage.id
+      || (recoveryMessage.taskRun?.status !== 'provider_unavailable' && !recoveryMessage.modelRequestFailed)) return;
+    checkedModelFailure.current = recoveryMessage.id;
     // A revoked/expired plan may have been invalidated during this turn.
     // Recheck local metadata once; never sign in or retry the failed task.
     void useSettingsStore.getState().refreshApiConfigReadiness();
-  }, [messages]);
-  const input = useMessagesStore((state) => state.input);
+  }, [recoveryMessage]);
+  const input = useMessagesStore((state) => state.inputSessionId === session?.id ? state.input : '');
+  const backgroundImage = useAppearanceStore((state) => state.bgImage);
   const setInput = useMessagesStore((state) => state.setInput);
   const activateInput = useMessagesStore((state) => state.activateInput);
   const clearSubmittedInput = useMessagesStore((state) => state.clearSubmittedInput);
+  const draftSaveFailed = useMessagesStore((state) => session ? state.draftSaveErrors.has(session.id) : false);
   const loadMessages = useMessagesStore((state) => state.loadMessages);
   const appendMessage = useMessagesStore((state) => state.appendMessage);
   const addToolResult = useMessagesStore((state) => state.addToolResult);
@@ -783,6 +1033,12 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
   const streamingText = useMessagesStore((state) => state.streamingText);
   const liveStatus = useMessagesStore((state) => state.liveStatus);
   const liveToolSteps = useMessagesStore((state) => state.liveToolSteps);
+  const runningTool = Object.values(liveToolSteps)
+    .filter((step) => step.status === 'running' && !isInternalTool(step.toolName)).at(-1);
+  const runningToolLabel = runningTool && getToolDisplayName(runningTool.toolName);
+  const liveRunPhase = runningToolLabel && runningToolLabel !== runningTool?.toolName
+    ? `正在${runningToolLabel}`
+    : LIVE_RUN_PHASES.get(liveStatus) ?? '正在执行';
   const liveBlocks = useMessagesStore((state) => state.liveBlocks);
   const liveMessageId = useMessagesStore((state) => state.liveMessageId);
   // The persisted step and the live stream may describe the same pending call.
@@ -791,10 +1047,9 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
   const livePendingCallIds = new Set(liveBlocks.flatMap((block) =>
     block.kind === 'tool_call' && block.status === 'needs_approval' ? [block.callId] : [],
   ));
-  const containerRef = useRef<HTMLDivElement>(null);
   const pendingProjectMessageRef = useRef<{
     text: string; files: TextAttachment[]; workspaceId: string; sessionId: string | null; sourceSessionId?: string; sourceInputToken: object;
-    resolve: (accepted: boolean) => void;
+    resolve: (result: ComposerSendResult) => void;
   } | null>(null);
   const [routeVersion, setRouteVersion] = useState(0);
   const routingRequest = useRef<object | null>(null);
@@ -811,11 +1066,8 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     const pending = pendingProjectMessageRef.current;
     pendingProjectMessageRef.current = null;
     routingRequest.current = null;
-    pending?.resolve(false);
+    pending?.resolve('not_sent');
   }, []);
-  // Keep following only while the reader is already at the newest content.
-  // Streaming updates otherwise must not pull them away from older messages.
-  const shouldFollowLatestRef = useRef(true);
   const composerInputRef = useRef<ComposerInputHandle>(null);
   const [resolvingCallId, setResolvingCallId] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -826,17 +1078,23 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     edit?: { messageId: string; sourceContent: string; content: string };
   } | null>(null);
   const historyAttempt = useRef<symbol | null>(null);
-  const [isPaused, setIsPaused] = useState(false);
+  const [pauseAction, setPauseAction] = useState<PauseAction | null>(null);
+  const pauseAttemptRef = useRef<PauseAction | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
-  const [toolPreset, setToolPreset] = useState<'none' | 'default' | 'full'>('default');
   const [taskDecision, setTaskDecision] = useState<TaskDecisionProjection | null>(null);
   const isStreamingRef = useRef(false);
   // Session changes and new foreground chains take ownership of Main's UI;
   // older refreshes/finally blocks cannot overwrite that newer owner.
   const sessionGenerationRef = useRef(0);
   const stopEpochRef = useRef(0);
+  const isStopping = useMessagesStore((state) => Boolean(session?.id && state.stoppingSessions.has(session.id)));
+  const showRunControls = isStreaming || isStopping;
+  const queuedFollowUps = useMessagesStore((state) => state.queuedFollowUps[session?.id ?? ''] ?? EMPTY_FOLLOW_UPS);
+  const readyFollowUps = useRef<{ sessionId: string; generation: number; stopEpoch: number } | null>(null);
+  const dispatchingFollowUps = useRef(new Set<string>());
+  const [dispatchingFollowUp, setDispatchingFollowUp] = useState<string | null>(null);
+  const waitingFollowUps = queuedFollowUps.filter((item) => item.id !== dispatchingFollowUp);
   isStreamingRef.current = isStreaming;
-  const thinkingEffort = useThinkingEffortStore((s) => s.effort);
 
   // The backend returns a bounded, read-only projection. Personal space and
   // stale workspace state intentionally clear the card rather than showing a
@@ -864,7 +1122,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
       if (typeof path !== 'string' || !path.trim()) return;
       const reference = `[引用文件: ${path.trim()}]`;
       const current = useMessagesStore.getState().input.trim();
-      setInput(current ? `${current}\n${reference}` : reference);
+      setInput(current ? `${current}\n${reference}` : reference, true);
     };
     window.addEventListener('angelbot:reference-file', onReferenceFile);
     return () => window.removeEventListener('angelbot:reference-file', onReferenceFile);
@@ -873,139 +1131,238 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
   const isCurrentSessionGeneration = (sessionId: string, generation: number) =>
     sessionGenerationRef.current === generation
     && useSessionsStore.getState().activeSessionId === sessionId;
+  const currentPauseAction = pauseAction
+    && isCurrentSessionGeneration(pauseAction.sessionId, pauseAction.generation)
+    && pauseAction.stopEpoch === stopEpochRef.current ? pauseAction : null;
+  const isPaused = currentPauseAction?.paused ?? false;
   const currentHistoryAction = historyAction?.sessionId === session?.id
     && historyAction?.generation === sessionGenerationRef.current ? historyAction : null;
   const historyBlocked = Boolean(currentHistoryAction?.pending || currentHistoryAction?.error);
 
-  const hydrateTimelineBlocks = useCallback(async (sessionId: string, source: Message[]) => {
-    const hydrated = await Promise.all(source.map(async (message, index) => {
-      if (message.role !== 'assistant') return message;
-      // The persisted message list can normalize tool results into separate
-      // `tool` rows, so an assistant run is not guaranteed to retain a
-      // `toolCalls` array after completion. In that shape, tool results occur
-      // as subsequent `tool` rows. Avoid replay queries for ordinary assistant
-      // messages, which also keeps normal conversation loading lightweight.
-      let hasFollowingToolRow = false;
-      for (let next = index + 1; next < source.length; next += 1) {
-        const role = source[next].role;
-        if (role === 'user' || role === 'assistant') break;
-        if (role === 'tool') {
-          hasFollowingToolRow = true;
-          break;
-        }
+  const [transcriptTail, setTranscriptTail] = useState<ReturnType<typeof messagePageBounds> | null>(null);
+  const transcriptTailRef = useRef<typeof transcriptTail>(null);
+  const preserveReadingWindowRef = useRef<((messages: Message[], bounds: NonNullable<typeof transcriptTail>) => void) | null>(null);
+  const updateTranscriptTail = useCallback((tail: typeof transcriptTail) => {
+    transcriptTailRef.current = tail;
+    setTranscriptTail(tail);
+  }, []);
+  const commitTailPage = useCallback((page: MessagePage, incoming = page.messages,
+    mode: 'replace' | 'refresh' | 'append' = 'replace') => {
+    const bounds = messagePageBounds(page);
+    const earlier = transcriptTailRef.current;
+    const previous = useMessagesStore.getState().messages;
+    let merged = incoming;
+    if (earlier && !page.reset && mode === 'append') {
+      // Replace optimistic rows by client ID; do not grow the default window
+      // indefinitely when the user stays in the same conversation.
+      merged = [...new Map([...previous, ...incoming].map(message => [message.id, message])).values()];
+      const clipped = merged.length > TRANSCRIPT_PAGE_SIZE;
+      if (clipped) merged = merged.slice(-TRANSCRIPT_PAGE_SIZE);
+      bounds.firstId = clipped ? merged[0]?.id : earlier.firstId ?? bounds.firstId;
+      bounds.lastId ??= earlier.lastId;
+      bounds.hasOlder = clipped || earlier.hasOlder;
+    }
+    if (earlier && mode !== 'replace' && bounds.firstId !== earlier.firstId && bounds.lastId !== earlier.lastId) {
+      preserveReadingWindowRef.current?.(previous, earlier);
+    }
+    updateTranscriptTail(bounds);
+    loadMessages(withoutReplayedToolRows(merged));
+  }, [loadMessages, updateTranscriptTail]);
+
+  const hydrateTimelineBlocks = useCallback(async (
+    sessionId: string, source: Message[], stillCurrent: () => boolean,
+    onHydrated?: (saved: Message, hydrated: Message) => void,
+  ) => {
+    const latestId = latestConversationMessage(source, sessionId)?.id;
+    const recent = new Set([...timelineCandidates(source, sessionId)].slice(0, RECENT_TIMELINE_LIMIT));
+    const pending: number[] = [];
+    for (let index = source.length - 1; index >= 0; index -= 1) {
+      const message = source[index];
+      const needsRecoveryDetails = message.id === latestId && message.taskRun?.status === 'needs_attention'
+        && !message.modelRequestFailed;
+      if (recent.has(message.id) && (needsRecoveryDetails || (!message.timelineBlocks?.length && !message.modelRequestFailed))) {
+        pending.push(index);
       }
-      if (!(message.toolCalls?.length) && !hasFollowingToolRow) return message;
-      try {
-        const events = await getDurableAgentRunEvents(sessionId, message.id);
-        const timelineBlocks = contentBlocksFromDurableEvents(events, message.toolResults);
-        if (!timelineBlocks.length) return message;
-
-        // A terminal error or provider fallback is stored on the message rather
-        // than emitted as a text delta. Keep it at the end of the same stream.
-        const finalText = message.content.trim();
-        const emittedText = timelineBlocks
-          .filter((block) => block.kind === 'text')
-          .map((block) => block.content)
-          .join('');
-        if (finalText && !emittedText.includes(finalText)) {
-          const lastBlock = timelineBlocks[timelineBlocks.length - 1];
-          timelineBlocks.push({
-            kind: 'text',
-            index: (lastBlock?.index ?? 0) + 1,
-            iterationId: (lastBlock?.iterationId ?? 0) + 1,
-            content: message.content,
-          });
+    }
+    const hydrated = [...source];
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(TIMELINE_REPLAY_CONCURRENCY, pending.length) }, async () => {
+      while (next < pending.length && stillCurrent()) {
+        const index = pending[next++];
+        const message = source[index];
+        try {
+          hydrated[index] = await readMessageTimeline(sessionId, message, message.id === latestId);
+          if (hydrated[index] !== message && stillCurrent()) onHydrated?.(message, hydrated[index]);
+        } catch {
+          // The saved reply remains usable without its optional timeline.
         }
-
-        return { ...message, timelineBlocks };
-      } catch {
-        return message;
       }
     }));
-
-    // Legacy persistence stores each inner tool result as a standalone `tool`
-    // message. Once the assistant turn has a journal-backed timeline, those
-    // rows would duplicate the inline tool slices, so omit them for that turn.
-    let replayingAssistantTurn = false;
-    return hydrated.filter((message) => {
-      if (message.role === 'user') replayingAssistantTurn = false;
-      if (message.role === 'assistant') {
-        replayingAssistantTurn = Boolean(message.timelineBlocks?.length);
-      }
-      return message.role !== 'tool' || !replayingAssistantTurn;
-    });
+    return withoutReplayedToolRows(hydrated);
   }, []);
 
-  // Restore only this session's text before painting; attachments keep their
-  // existing scope-bound lifecycle and no draft is written to browser storage.
+  // Restore this session's text before painting. Attachments have their own
+  // scope and never become part of the saved text draft.
   useLayoutEffect(() => { activateInput(session?.id ?? null); }, [session?.id, activateInput]);
 
-  // Load messages when session changes. Failure is not an empty conversation.
+  // The selected conversation observes durable replies independently of the
+  // local streaming turn, which may have left this view before it completed.
   useLayoutEffect(() => {
     const sessionId = session?.id;
     const generation = ++sessionGenerationRef.current;
-    // Reading older messages belongs to this conversation, not the next Main.
-    shouldFollowLatestRef.current = true;
     clearMessages();
+    updateTranscriptTail(null);
     setIsStreaming(false);
-    setIsPaused(false);
+    setPauseAction(null);
+    pauseAttemptRef.current = null;
     setResolvingCallId(null);
     historyAttempt.current = null;
     setHistoryAction(null);
 
-    if (sessionId) {
-      const attempt = Symbol();
-      historyAttempt.current = attempt;
-      const current = () => historyAttempt.current === attempt && isCurrentSessionGeneration(sessionId, generation);
-      setHistoryAction({ sessionId, generation, kind: 'load', pending: true, notice: '正在读取对话记录…' });
-      getMessages(sessionId).then(async (msgs) => {
-        const hydratedMessages = await hydrateTimelineBlocks(sessionId, msgs);
-        if (current()) {
-          loadMessages(hydratedMessages);
-          historyAttempt.current = null;
-          setHistoryAction(null);
-          const active = useSessionsStore.getState().activeSession;
-          const firstUserMessage = msgs.find((message) => message.role === 'user');
-          if (active && !active.title.trim() && firstUserMessage) {
-            const nextTitle = titleFromFirstUserMessage(firstUserMessage.content);
-            if (nextTitle) useSessionsStore.getState().updateSessionTitle(sessionId, nextTitle);
+    if (!sessionId) return;
+    const attempt = Symbol();
+    historyAttempt.current = attempt;
+    setHistoryAction({ sessionId, generation, kind: 'load', pending: true, notice: '正在读取对话记录…' });
+    let disposed = false;
+    let ready = false;
+    let reading = false;
+    let dirty = true;
+    const endedMessages = new Set<string>();
+    const syncHistory = async () => {
+      if (reading || disposed) return;
+      reading = true;
+      try {
+        while (dirty && !disposed) {
+          dirty = false;
+          const initial = historyAttempt.current === attempt;
+          const readGeneration = sessionGenerationRef.current;
+          const transcript = useMessagesStore.getState().messages;
+          const current = () => !disposed && isCurrentSessionGeneration(sessionId, readGeneration)
+            && (initial ? historyAttempt.current === attempt : !historyAttempt.current && !isStreamingRef.current
+              && useMessagesStore.getState().messages === transcript);
+          if (!current()) continue;
+          try {
+            const lastId = transcriptTailRef.current?.lastId;
+            const updatesExisting = transcript.some(message => endedMessages.has(message.id));
+            const afterId = !initial && !updatesExisting ? lastId : undefined;
+            endedMessages.clear();
+            const page = await getMessagePage(sessionId, afterId ? { afterId } : undefined);
+            if (!current()) continue;
+            const msgs = page.messages;
+            const preserved = retainUnchangedTimelines(msgs, transcript, sessionId);
+            commitTailPage(page, preserved, initial ? 'replace' : afterId ? 'append' : 'refresh');
+            setHistoryAction((state) => state?.kind === 'load' && state.sessionId === sessionId
+              && state.generation === readGeneration ? null : state);
+            if (initial) {
+              historyAttempt.current = null;
+              const active = useSessionsStore.getState().activeSession;
+              const firstUserMessage = msgs.find((message) => message.role === 'user');
+              if (!page.hasOlder && active && !active.title.trim() && firstUserMessage) {
+                const nextTitle = titleFromFirstUserMessage(firstUserMessage.content);
+                if (nextTitle) useSessionsStore.getState().updateSessionTitle(sessionId, nextTitle);
+              }
+            }
+            const snapshotCurrent = () => !disposed && !dirty
+              && isCurrentSessionGeneration(sessionId, readGeneration);
+            void hydrateTimelineBlocks(sessionId, preserved, snapshotCurrent, (saved, hydrated) => {
+              const current = useMessagesStore.getState().messages;
+              if (current.includes(saved)) {
+                loadMessages(withoutReplayedToolRows(current.map((message) => message === saved ? hydrated : message)));
+              }
+            });
+          } catch {
+            // A failed background refresh does not replace visible history.
+            if (initial && current()) setHistoryAction({ sessionId, generation, kind: 'load', pending: false, error: true,
+              notice: '暂时无法读取对话记录。输入草稿已保留，请重新载入后继续。' });
+          } finally {
+            if (initial && historyAttempt.current === attempt) historyAttempt.current = null;
           }
         }
-      }).catch(() => {
-        if (current()) setHistoryAction({ sessionId, generation, kind: 'load', pending: false, error: true,
-          notice: '暂时无法读取对话记录。输入草稿已保留，请重新载入后继续。' });
-      }).finally(() => {
-        if (historyAttempt.current === attempt) historyAttempt.current = null;
-      });
-    }
-    return () => { historyAttempt.current = null; };
-  }, [session?.id, clearMessages, loadMessages, hydrateTimelineBlocks]);
+      } finally {
+        reading = false;
+      }
+    };
+    const subscription = subscribeAgentSessionEvents(sessionId, (event) => {
+      // Main publishes MessageEnd only after saving the reply. One read in
+      // flight plus a dirty bit closes the snapshot/event race without polling.
+      if (event.type !== 'MessageEnd' || disposed || isStreamingRef.current) return;
+      const id = (event.data as { message_id?: unknown } | null)?.message_id;
+      if (typeof id === 'string') endedMessages.add(id);
+      dirty = true;
+      if (ready) void syncHistory();
+    });
+    const start = () => { ready = true; return syncHistory(); };
+    // Dev HTTP has no native event bridge, but opening history still works.
+    void subscription.ready.then(start, start);
+    return () => {
+      disposed = true;
+      subscription.unsubscribe();
+      historyAttempt.current = null;
+    };
+  }, [session?.id, clearMessages, loadMessages, hydrateTimelineBlocks, updateTranscriptTail, commitTailPage]);
 
   useEffect(() => () => unsubscribeFromAgentEvents(), [session?.id, unsubscribeFromAgentEvents]);
 
-  const updateFollowLatest = useCallback(() => {
-    const node = containerRef.current;
-    if (!node) return;
-    // A small tolerance prevents fractional layout changes from disabling follow.
-    shouldFollowLatestRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 96;
-  }, []);
-
-  const leaveLatest = useCallback(() => { shouldFollowLatestRef.current = false; }, []);
-  const returnToLatest = useCallback(() => {
-    shouldFollowLatestRef.current = true;
-    const node = containerRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, []);
+  const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
+  const isVisibleMessage = useCallback((message: Message) => message.sessionId === session?.id && (
+    (isStreaming && message.id === streamingMsgId) || message.id === recoveryMessage?.id || message.id === resultToReview?.id
+    || olderTimelineIds.has(message.id) || !isEmptySuccessfulToolTurn(message)
+  ), [session?.id, isStreaming, streamingMsgId, recoveryMessage?.id, resultToReview?.id, olderTimelineIds]);
+  const { containerRef, windowMessages, renderedMessages, hasOlder, hasNewer, hasMoreNewer, paging, pagingError, loadAdjacent, jumpToMessage, returnToLatest, preserveReadingWindow,
+    updateHistoricalMessage, updateFollowLatest, scrollToLatestIfFollowing } = useTranscriptWindow({ sessionId: session?.id, messages, tail: transcriptTail,
+      visible: isVisibleMessage,
+      captureOwner: () => {
+        const sessionId = session?.id;
+        const generation = sessionGenerationRef.current;
+        return () => Boolean(sessionId && isCurrentSessionGeneration(sessionId, generation));
+      },
+      onTailPage: commitTailPage,
+    });
+  useLayoutEffect(() => {
+    preserveReadingWindowRef.current = preserveReadingWindow;
+    return () => { preserveReadingWindowRef.current = null; };
+  }, [preserveReadingWindow]);
+  const windowDeliveries = useMemo(() => hasNewer && session?.id ? completedReplyDeliveries(windowMessages, session.id) : replyDeliveries,
+    [hasNewer, session?.id, windowMessages, replyDeliveries]);
+  const windowTimelineIds = useMemo(() => hasNewer && session?.id ? timelineCandidates(windowMessages, session.id) : olderTimelineIds,
+    [hasNewer, session?.id, windowMessages, olderTimelineIds]);
+  const readHistoricalTimeline = async (message: Message) => {
+    const { sessionId } = message;
+    const generation = sessionGenerationRef.current;
+    try {
+      const hydrated = await readMessageTimeline(sessionId, message, false);
+      if (!isCurrentSessionGeneration(sessionId, generation)) return;
+      const current = useMessagesStore.getState().messages;
+      const inHistoricalWindow = updateHistoricalMessage(message, hydrated);
+      if (current.includes(message)) {
+        if (hydrated !== message) {
+          loadMessages(withoutReplayedToolRows(current.map(saved => saved === message ? hydrated : saved)));
+        }
+        return hydrated;
+      }
+      if (inHistoricalWindow) return hydrated;
+    } catch {
+      // The saved reply is still readable. The disclosure can retry the journal.
+    }
+  };
+  useEffect(() => {
+    const onReviewResult = (event: Event) => {
+      if (resultToReview && (event as CustomEvent<unknown>).detail === resultToReview.id) jumpToMessage(resultToReview.id, true, true);
+    };
+    window.addEventListener('angelbot:review-result-in-chat', onReviewResult);
+    return () => window.removeEventListener('angelbot:review-result-in-chat', onReviewResult);
+  }, [jumpToMessage, resultToReview]);
+  const pendingApproval = hasNewer && !renderedMessages.some(message => message.id === latestMessage?.id)
+    && (livePendingCallIds.size > 0 || latestMessage?.taskRun?.status === 'awaiting_confirmation'
+    || [...authoritativeToolResultsByCallId(latestMessage?.toolResults ?? []).values()]
+      .some((result) => result.confirmationRequired && result.confirmationStatus === 'pending'));
 
   // Auto-scroll on new messages only when the reader has not intentionally
   // navigated away from the bottom of the conversation.
   useEffect(() => {
-    const node = containerRef.current;
-    if (!node || !shouldFollowLatestRef.current) return;
-    node.scrollTop = node.scrollHeight;
-  }, [messages, streamingText, liveStatus, liveToolSteps]);
+    scrollToLatestIfFollowing();
+  }, [renderedMessages, streamingText, liveStatus, liveToolSteps, scrollToLatestIfFollowing]);
 
-  const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
   const confirmationPlaceholderRef = useRef<{ id: string; generation: number } | null>(null);
   const [failedDesktopPreview, setFailedDesktopPreview] = useState<Omit<DesktopApprovalRecheck, 'onRecheck'> | null>(null);
   const desktopRecheck = failedDesktopPreview ? {
@@ -1013,18 +1370,22 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     onRecheck: () => setFailedDesktopPreview((current) => current === failedDesktopPreview ? null : current),
   } : undefined;
 
-  const onSend = async (text: string, files: TextAttachment[] = [], clearSubmittedDraft = true): Promise<boolean> => {
-    if ((!text.trim() && !files.length) || isStreamingRef.current || historyAttempt.current || historyBlocked || routingRequest.current) return false;
+  const onSend = async (text: string, files: TextAttachment[] = [], clearSubmittedDraft = true, queued = false): Promise<ComposerSendResult> => {
+    if ((!text.trim() && !files.length) || isStreamingRef.current || historyAttempt.current || historyBlocked || routingRequest.current) return 'not_sent';
+    if (session?.id && isStopPending(session.id)) return 'not_sent';
+    if (!queued && session?.id && dispatchingFollowUps.current.has(session.id)) return 'not_sent';
+    readyFollowUps.current = null;
     const workspaceState = useWorkspacesStore.getState();
     const secureWebSearch = extractSecureWebSearchSetup(text);
-    const inputToken = useMessagesStore.getState().inputToken;
+    const { inputToken, inputLocalOnly } = useMessagesStore.getState();
     const selected = routeChoice.current;
-    routeChoice.current = null;
+    if (!queued) routeChoice.current = null;
     let destination: Workspace | undefined;
-    if (selected?.sessionId === session?.id && selected?.inputToken === inputToken) {
+    // A queued follow-up belongs to the conversation where it was composed.
+    if (!queued && selected?.sessionId === session?.id && selected?.inputToken === inputToken) {
       destination = selected.workspaceId ? workspaceState.workspaces.find(item => item.id === selected.workspaceId && item.kind === 'project') : undefined;
-      if (selected.workspaceId && !destination) return false;
-    } else {
+      if (selected.workspaceId && !destination) return 'not_sent';
+    } else if (!queued) {
       const candidates = projectCandidatesForMessage(secureWebSearch.displayContent, workspaceState.workspaces, workspaceState.activeWorkspaceId);
       if (candidates.length && session?.id) {
         const request = {};
@@ -1037,8 +1398,8 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         routingRequest.current = request; setRoutingBusy(true); setRoutingDecision(null); setRoutingSelection(null);
         try {
           const intent = await resolveWorkspaceIntent(sourceSession, secureWebSearch.displayContent);
-          if (!ownsRequest()) return false;
-          if (intent.kind === 'clarify') { setRoutingDecision({ sessionId: sourceSession, inputToken, candidates }); return false; }
+          if (!ownsRequest()) return 'not_sent';
+          if (intent.kind === 'clarify') { setRoutingDecision({ sessionId: sourceSession, inputToken, candidates }); return 'not_sent'; }
           if (intent.kind === 'project') {
             destination = useWorkspacesStore.getState().workspaces.find(item => item.id === intent.projectId && item.kind === 'project');
             if (!destination || !candidates.some(item => item.id === destination?.id)) throw new Error('项目目录已变化，请重新选择归属空间。');
@@ -1046,19 +1407,18 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         } catch (cause) {
           if (ownsRequest()) setRoutingDecision({ sessionId: sourceSession, inputToken, candidates,
             error: cause instanceof Error ? cause.message : '暂时无法确认项目归属。' });
-          return false;
+          return 'not_sent';
         } finally { if (routingRequest.current === request) { routingRequest.current = null; setRoutingBusy(false); } }
       }
     }
-    setRoutingSelection(null);
+    if (!queued) setRoutingSelection(null);
     const route = destination;
     if (route) {
       // Routing occurs before a turn begins, so the original text and every
       // later tool/file operation belong to the project's single Main session.
-      if (pendingProjectMessageRef.current) return false;
+      if (pendingProjectMessageRef.current) return 'not_sent';
       const sourceSessionId = session?.id;
-      const sourceGeneration = sessionGenerationRef.current;
-      return new Promise<boolean>((resolve) => {
+      return new Promise<ComposerSendResult>((resolve) => {
         const pending = { text, files, workspaceId: route.id, sessionId: null as string | null, sourceSessionId,
           sourceInputToken: useMessagesStore.getState().inputToken, resolve };
         pendingProjectMessageRef.current = pending;
@@ -1067,7 +1427,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
           if (pendingProjectMessageRef.current !== pending) return;
           if (!accepted) {
             pendingProjectMessageRef.current = null;
-            resolve(false);
+            resolve('not_sent');
             return;
           }
           const currentWorkspace = useWorkspacesStore.getState();
@@ -1076,7 +1436,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
           if (currentWorkspace.activeWorkspaceId !== route.id || !targetSessionId
             || currentSession.activeSessionId !== targetSessionId) {
             pendingProjectMessageRef.current = null;
-            resolve(false);
+            resolve('not_sent');
             return;
           }
           pending.sessionId = targetSessionId;
@@ -1084,33 +1444,49 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
           setRouteVersion((version) => version + 1);
         }).catch(() => {
           if (pendingProjectMessageRef.current === pending) pendingProjectMessageRef.current = null;
-          if (useWorkspacesStore.getState().activeWorkspaceId === workspaceState.activeWorkspaceId
-            && sessionGenerationRef.current === sourceGeneration
-            && useSessionsStore.getState().activeSessionId === sourceSessionId
-            && !useMessagesStore.getState().input.trim()) setInput(text);
-          resolve(false);
+          resolve('not_sent');
         });
       });
     }
-    if (!session?.id) return false;
+    if (!session?.id) return 'not_sent';
     const messageContent = secureWebSearch.displayContent;
     const sessionId = session.id;
     const generation = ++sessionGenerationRef.current;
+    const stopEpoch = stopEpochRef.current;
     // Clear only the draft submitted by this caller, synchronously before
     // subscription can yield. Routed turns do not own the destination draft.
-    if (clearSubmittedDraft) clearSubmittedInput(sessionId, text);
+    setPauseAction(null);
+    pauseAttemptRef.current = null;
+    const clearedToken = {};
+    if (clearSubmittedDraft) clearSubmittedInput(sessionId, text, inputToken, clearedToken);
+    const restoreUnsentInput = () => {
+      if (clearSubmittedDraft && !queued && useMessagesStore.getState().inputToken === clearedToken) {
+        setInput(messageContent, inputLocalOnly || Boolean(secureWebSearch.setup));
+      }
+    };
     clearLiveActivity();
     useMessagesStore.getState().setLiveStatus('正在理解你的请求');
     try { await subscribeToAgentEvents(sessionId); }
     catch {
-      if (isCurrentSessionGeneration(sessionId, generation) && !useMessagesStore.getState().input.trim()) setInput(messageContent);
-      return false;
+      if (isCurrentSessionGeneration(sessionId, generation)) restoreUnsentInput();
+      return 'not_sent';
     }
-    if (!isCurrentSessionGeneration(sessionId, generation)) return false;
+    if (!isCurrentSessionGeneration(sessionId, generation)) return 'not_sent';
+    returnToLatest();
+    const tailId = transcriptTailRef.current?.lastId;
+    // A stopped approval can settle its original row while the next turn
+    // runs. Refresh that receipt too; the ordinary path reads only new rows.
+    const beforeSend = useMessagesStore.getState().messages;
+    const persistedTail = beforeSend.find(message => message.id === tailId);
+    const previousReply = persistedTail?.role === 'assistant' ? persistedTail
+      : latestConversationMessage(beforeSend.filter(message => message.id !== confirmationPlaceholderRef.current?.id), sessionId);
+    const maySettleInPlace = previousReply?.taskRun?.status === 'awaiting_confirmation'
+      || [...authoritativeToolResultsByCallId(previousReply?.toolResults ?? []).values()]
+        .some(result => result.confirmationRequired && result.confirmationStatus === 'pending');
+    const cursor = tailId && !maySettleInPlace ? { afterId: tailId } : undefined;
+    const refreshMode = cursor ? 'append' : tailId ? 'refresh' : 'replace';
     isStreamingRef.current = true;
     setIsStreaming(true);
-    const personality = useSettingsStore.getState().profile;
-    const preferences = usePreferencesStore.getState().preferences;
     const userMessage = {
       id: crypto.randomUUID(),
       sessionId,
@@ -1140,21 +1516,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         role: 'user',
         content: messageContent,
         textAttachments: files,
-        personality: {
-          name: personality.name,
-          description: personality.characterCard
-            ? cardDescription({
-              name: personality.name,
-              description: personality.bio,
-              firstMes: personality.greeting,
-              card: personality.characterCard,
-            })
-            : personality.bio,
-          greeting: personality.greeting,
-          traits: personality.traits ?? mapPersonalityTraits(personality.tone, personality.personality),
-        } as PersonalityTemplate,
-        preferences: mapPreferences(preferences),
-        thinkingEffort,
+        ...currentForegroundInteraction(),
         webSearchSetup: secureWebSearch.setup,
       });
       if (isCurrentSessionGeneration(sessionId, generation)) {
@@ -1164,13 +1526,21 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         // task-run data. Reloading the completed turn keeps later edit/delete
         // actions bound to persisted rows rather than optimistic placeholders.
         try {
-          const refreshedMessages = await hydrateTimelineBlocks(sessionId, await getMessages(sessionId));
-          if (isCurrentSessionGeneration(sessionId, generation)) loadMessages(refreshedMessages);
+          const page = await getMessagePage(sessionId, cursor);
+          const refreshedMessages = await hydrateTimelineBlocks(sessionId, page.messages,
+            () => isCurrentSessionGeneration(sessionId, generation));
+          if (isCurrentSessionGeneration(sessionId, generation)) {
+            commitTailPage(page, refreshedMessages, refreshMode);
+            if (!refreshedMessages.some(message => message.id === reply.id)) appendMessage(reply);
+          }
         } catch {
           if (isCurrentSessionGeneration(sessionId, generation)) appendMessage(reply);
         }
       }
-      return true;
+      if (isCurrentSessionGeneration(sessionId, generation) && stopEpoch === stopEpochRef.current && followUpsCanContinue(reply)) {
+        readyFollowUps.current = { sessionId, generation, stopEpoch };
+      }
+      return 'accepted';
     } catch (err) {
       console.error('[ChatArea] sendMessage error:', err);
       let accepted = false;
@@ -1181,14 +1551,20 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         // Only the durable client ID decides whether the submitted snapshot
         // was accepted. Never automatically retry an uncertain send.
         try {
-          const durableMessages = await getMessages(sessionId);
-          if (!isCurrentSessionGeneration(sessionId, generation)) return false;
-          accepted = durableMessages.some((message) => message.id === userMessage.id
+          const page = await getMessagePage(sessionId, cursor);
+          if (page.reset && !page.messages.some(message => message.id === userMessage.id)) {
+            const submitted = await getMessagePage(sessionId, { aroundId: userMessage.id });
+            if (submitted.messages.some(message => message.id === userMessage.id && message.sessionId === sessionId && message.role === 'user')) accepted = true;
+          }
+          const durableMessages = page.messages;
+          if (!isCurrentSessionGeneration(sessionId, generation)) return 'unknown';
+          accepted ||= durableMessages.some((message) => message.id === userMessage.id
             && message.sessionId === sessionId && message.role === 'user');
           if (accepted) {
-            const refreshedMessages = await hydrateTimelineBlocks(sessionId, durableMessages);
+            const refreshedMessages = await hydrateTimelineBlocks(sessionId, durableMessages,
+              () => isCurrentSessionGeneration(sessionId, generation));
             if (isCurrentSessionGeneration(sessionId, generation)) {
-              loadMessages(refreshedMessages);
+              commitTailPage(page, refreshedMessages, refreshMode);
               // Only this accepted user's durable failed reply can replace the
               // transport error, after its visible transcript has loaded.
               durableFailureVisible = refreshedMessages.some((message) =>
@@ -1199,8 +1575,8 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
             }
           } else useMessagesStore.getState().removeMessage(userMessage.id);
         } catch { /* Unknown persistence: retain attachments for user inspection. */ }
-        if (!isCurrentSessionGeneration(sessionId, generation)) return false;
-        if (!accepted && !useMessagesStore.getState().input.trim()) setInput(messageContent);
+        if (!isCurrentSessionGeneration(sessionId, generation)) return 'unknown';
+        if (!accepted) restoreUnsentInput();
         if (!durableFailureVisible) appendMessage({
           id: crypto.randomUUID(),
           sessionId,
@@ -1209,7 +1585,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
           createdAt: Date.now(),
         });
       }
-      return accepted;
+      return accepted ? 'accepted' : 'unknown';
     } finally {
       // A live confirmation may take over this anchor before send returns.
       // Other stale requests still clean only their own optimistic message.
@@ -1225,37 +1601,175 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
 
   const onAbort = async () => {
     const sessionId = session?.id;
+    if (!sessionId || !isStreamingRef.current || isStopPending(sessionId)) return;
     const generation = sessionGenerationRef.current;
+    useMessagesStore.setState((state) => ({ stoppingSessions: new Set(state.stoppingSessions).add(sessionId) }));
     // Fence continuation immediately; interrupt IPC may be slow or lost.
     stopEpochRef.current += 1;
+    readyFollowUps.current = null;
     unsubscribeFromAgentEvents();
     setIsStreaming(false);
-    setIsPaused(false);
+    setPauseAction(null);
+    pauseAttemptRef.current = null;
     setResolvingCallId(null);
-    if (sessionId) {
+    try {
+      await interruptAgent(sessionId);
+    } catch {
+      if (isCurrentSessionGeneration(sessionId, generation)) appendMessage({
+        id: crypto.randomUUID(), sessionId, role: 'assistant', createdAt: Date.now(),
+        content: '未能确认停止请求，Agent 可能仍在执行。请先核对运行状态与操作结果，不要重复提交原任务。',
+      });
+    } finally {
+      useMessagesStore.setState((state) => {
+        const stoppingSessions = new Set(state.stoppingSessions);
+        stoppingSessions.delete(sessionId);
+        return { stoppingSessions };
+      });
+      if (isCurrentSessionGeneration(sessionId, generation)) composerInputRef.current?.focus();
+    }
+  };
+
+  const onContinueTask = async (messageId: string, action: TaskRecoveryAction) => {
+    const sessionId = session?.id;
+    if (!sessionId || isStreamingRef.current || historyBlocked || historyAttempt.current || routingRequest.current
+      || resolvingCallId || dispatchingFollowUps.current.has(sessionId) || isStopPending(sessionId)) return;
+    const source = latestConversationMessage(useMessagesStore.getState().messages, sessionId);
+    if (source?.id !== messageId || taskRecoveryState(source).action !== action) return;
+    const resultsOnly = action === 'resultsOnly';
+    const { activeApiConfig, apiConfigLoaded, apiConfigLoadError } = useSettingsStore.getState();
+    const readiness = getModelConfigReadiness(activeApiConfig, apiConfigLoaded, apiConfigLoadError);
+    if (import.meta.env.VITE_ANGELBOT_DESKTOP_E2E !== '1'
+      && (readiness.kind === 'needs-credentials' || readiness.kind === 'invalid')) {
+      openModelSettings();
+      return;
+    }
+
+    const generation = ++sessionGenerationRef.current;
+    const stopEpoch = stopEpochRef.current;
+    const current = () => isCurrentSessionGeneration(sessionId, generation);
+    const placeholderId = crypto.randomUUID();
+    readyFollowUps.current = null;
+    setRecoveryNotice(null);
+    setPauseAction(null);
+    pauseAttemptRef.current = null;
+    clearLiveActivity();
+    useMessagesStore.getState().setLiveStatus(resultsOnly ? '正在根据已有结果回答' : '正在继续任务');
+    isStreamingRef.current = true;
+    setIsStreaming(true);
+    try {
+      await subscribeToAgentEvents(sessionId);
+      if (!current() || stopEpoch !== stopEpochRef.current) return;
+      setStreamingMsgId(placeholderId);
+      appendMessage({ id: placeholderId, sessionId, role: 'assistant', content: '', createdAt: Date.now() });
+      let reply: Message | undefined;
       try {
-        await interruptAgent(sessionId);
+        reply = await continueAgentTask({ sessionId, messageId, interaction: currentForegroundInteraction(), ...(resultsOnly ? { resultsOnly: true } : {}) });
+      } catch (error) {
+        if (current() && stopEpoch === stopEpochRef.current) {
+          setRecoveryNotice({ messageId, text: formatModelSendError(error) });
+        }
+      }
+      if (!current()) return;
+      try {
+        const page = await getMessagePage(sessionId);
+        const refreshed = await hydrateTimelineBlocks(sessionId, page.messages, current);
+        if (!refreshed.some((message) => message.id === messageId)
+          || (reply && !refreshed.some((message) => message.id === reply?.id))) {
+          throw new Error('Continuation history is not confirmed');
+        }
+        if (current()) commitTailPage(page, refreshed, 'refresh');
       } catch {
-        if (isCurrentSessionGeneration(sessionId, generation)) appendMessage({
-          id: crypto.randomUUID(), sessionId, role: 'assistant', createdAt: Date.now(),
-          content: '未能确认停止请求，Agent 可能仍在执行。请先核对运行状态与操作结果，不要重复提交原任务。',
-        });
+        if (!current()) return;
+        if (reply) appendMessage(reply);
+        else setHistoryAction({ sessionId, generation, pending: false, error: true, kind: 'load',
+          notice: '未能核对任务状态，请重新载入对话。' });
+      }
+      if (!resultsOnly && reply && current() && stopEpoch === stopEpochRef.current && followUpsCanContinue(reply)) {
+        readyFollowUps.current = { sessionId, generation, stopEpoch };
+      }
+    } catch {
+      if (current() && stopEpoch === stopEpochRef.current) {
+        setRecoveryNotice({ messageId, text: '未能连接到任务运行状态，请重试。' });
+      }
+    } finally {
+      if (confirmationPlaceholderRef.current?.id !== placeholderId) useMessagesStore.getState().removeMessage(placeholderId);
+      if (current()) {
+        isStreamingRef.current = false;
+        setIsStreaming(false);
+        setStreamingMsgId(null);
+        window.dispatchEvent(new Event(AUTOMATIONS_UPDATED_EVENT));
       }
     }
   };
 
   const togglePause = async () => {
-    if (!session?.id) return;
-    if (isPaused) await resumeAgent(session.id); else await pauseAgent(session.id);
-    setIsPaused((paused) => !paused);
+    if (!session?.id || !isStreamingRef.current || isStopPending(session.id)) return;
+    const sessionId = session.id;
+    const generation = sessionGenerationRef.current;
+    const stopEpoch = stopEpochRef.current;
+    const previous = pauseAttemptRef.current;
+    if (previous?.sessionId === sessionId && previous.generation === generation
+      && previous.stopEpoch === stopEpoch) return;
+    const attempt: PauseAction = { sessionId, generation, stopEpoch, pending: true, paused: isPaused };
+    const targetPaused = !isPaused;
+    pauseAttemptRef.current = attempt;
+    setPauseAction(attempt);
+    const current = () => pauseAttemptRef.current === attempt && isStreamingRef.current
+      && isCurrentSessionGeneration(sessionId, generation) && stopEpochRef.current === stopEpoch;
+    try {
+      if (targetPaused) await pauseAgent(sessionId); else await resumeAgent(sessionId);
+      if (current()) {
+        setPauseAction({ ...attempt, paused: targetPaused, pending: false });
+      }
+    } catch {
+      if (current()) setPauseAction({ ...attempt, pending: false,
+        error: `未能确认${targetPaused ? '暂停' : '继续运行'}，请核对当前任务状态；不会自动重试。`,
+      });
+    } finally {
+      if (pauseAttemptRef.current === attempt) pauseAttemptRef.current = null;
+    }
   };
 
   const onSteer = async (text: string) => {
-    if (session?.id) await submitInProgressCommand(session.id, text, 'steer');
+    const { liveMessageId: replyId, inputToken } = useMessagesStore.getState();
+    if (!session?.id || !replyId) throw new Error('当前轮暂时无法接收引导。');
+    if (isStopPending(session.id)) throw new Error('正在停止，请稍候。');
+    await submitSteeringMessage(session.id, replyId, text);
+    clearSubmittedInput(session.id, text, inputToken);
   };
-  const onFollowUp = async (text: string) => {
-    if (session?.id) await submitInProgressCommand(session.id, text, 'follow_up');
+  const onFollowUp = (text: string) => {
+    if (!session?.id) throw new Error('会话不可用。');
+    if (isStopPending(session.id)) throw new Error('正在停止，请稍候。');
+    updateFollowUps(session.id, (items) => [...items, { id: crypto.randomUUID(), text }]);
   };
+
+  const sendNextFollowUp = async () => {
+    const sessionId = session?.id;
+    const next = queuedFollowUps[0];
+    if (!sessionId || !next || next.unconfirmed || isStreamingRef.current
+      || dispatchingFollowUps.current.has(sessionId) || isStopPending(sessionId)) return;
+    dispatchingFollowUps.current.add(sessionId);
+    setDispatchingFollowUp(next.id);
+    try {
+      const result = await onSend(next.text, [], false, true);
+      if (result === 'accepted') updateFollowUps(sessionId, (items) => items.filter((item) => item.id !== next.id));
+      if (result === 'unknown') updateFollowUps(sessionId, (items) => items.map((item) =>
+        item.id === next.id ? { ...item, unconfirmed: true } : item));
+    } finally {
+      dispatchingFollowUps.current.delete(sessionId);
+      setDispatchingFollowUp((id) => id === next.id ? null : id);
+    }
+  };
+
+  useEffect(() => {
+    if (showRunControls || dispatchingFollowUp || historyBlocked || routingBusy) return;
+    const ready = readyFollowUps.current;
+    if (!ready) return;
+    readyFollowUps.current = null;
+    if (ready.sessionId === session?.id && ready.generation === sessionGenerationRef.current && ready.stopEpoch === stopEpochRef.current) {
+      void sendNextFollowUp();
+    }
+  });
 
   /**
    * Confirmation handler used by ContentBlockRenderer. It resolves the tool
@@ -1277,22 +1791,22 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     if (currentHistoryAction?.kind === 'load' && currentHistoryAction.pending) return;
     pendingProjectMessageRef.current = null;
     if (activeWorkspaceId !== routedMessage.workspaceId || session?.id !== routedMessage.sessionId) {
-      routedMessage.resolve(false);
+      routedMessage.resolve('not_sent');
       return;
     }
     const sending = onSend(routedMessage.text, routedMessage.files, false);
     const routedGeneration = sessionGenerationRef.current;
-    void sending.then((accepted) => {
-      if (accepted) {
+    void sending.then((result) => {
+      if (result === 'accepted') {
         const sourceSessionId = routedMessage.sourceSessionId;
         if (sourceSessionId) clearSubmittedInput(sourceSessionId, routedMessage.text, routedMessage.sourceInputToken);
       }
-      if (!accepted && isCurrentSessionGeneration(routedMessage.sessionId!, routedGeneration)
+      if (result !== 'accepted' && isCurrentSessionGeneration(routedMessage.sessionId!, routedGeneration)
         && useWorkspacesStore.getState().activeWorkspaceId === routedMessage.workspaceId
         && useSessionsStore.getState().activeSessionId === routedMessage.sessionId) {
         composerInputRef.current?.restoreFiles(routedMessage.files);
       }
-      routedMessage.resolve(accepted);
+      routedMessage.resolve(result);
     });
   }, [session?.id, activeWorkspaceId, routeVersion, currentHistoryAction?.kind, currentHistoryAction?.pending, clearSubmittedInput]);
 
@@ -1303,9 +1817,29 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     previewId?: string,
   ): Promise<DesktopApprovalResolution> => {
     if (!session?.id || resolvingCallId) return;
+    if (isStopPending(session.id)) throw new Error('正在停止，请稍候。');
     const sessionId = session.id;
     const generation = ++sessionGenerationRef.current;
     const stopEpoch = stopEpochRef.current;
+    const stillCurrent = () => isCurrentSessionGeneration(sessionId, generation)
+      && stopEpoch === stopEpochRef.current;
+    const loadConfirmationHistory = (page: MessagePage) => {
+      const refreshed = page.messages;
+      commitTailPage(page, refreshed, 'refresh');
+      const latest = latestConversationMessage(refreshed, sessionId);
+      if (latest?.role !== 'assistant' || latest.taskRun?.status !== 'needs_attention') return;
+      // Show the receipt and continuation immediately. Only read the latest
+      // recovery journal for the optional connection action.
+      void hydrateTimelineBlocks(sessionId, [latest], stillCurrent).then(([hydrated]) => {
+        if (!stillCurrent() || !hydrated.modelRequestFailed) return;
+        const current = useMessagesStore.getState().messages;
+        const last = latestConversationMessage(current, sessionId);
+        if (last?.id !== latest.id || last.taskRun?.status !== 'needs_attention' || last.modelRequestFailed) return;
+        loadMessages(current.map((message) => message === last ? { ...message, modelRequestFailed: true } : message));
+      });
+    };
+    setPauseAction(null);
+    pauseAttemptRef.current = null;
     const liveTool = useMessagesStore.getState().liveBlocks.find((block): block is Extract<LiveBlock, { kind: 'tool_call' }> =>
       block.kind === 'tool_call' && block.callId === callId);
     const toolName = useMessagesStore.getState().messages.find((message) => message.id === messageId)
@@ -1336,6 +1870,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         }));
         await subscribeToAgentEvents(sessionId);
         if (!isCurrentSessionGeneration(sessionId, generation) || stopEpoch !== stopEpochRef.current) return;
+        if (hasNewer) returnToLatest();
         if (!placeholderId) {
           placeholderId = crypto.randomUUID();
           appendMessage({ id: placeholderId, sessionId, role: 'assistant', content: '', createdAt: Date.now() });
@@ -1350,6 +1885,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         callId,
         decision,
         previewId,
+        ...(decision === 'approved' ? { interaction: currentForegroundInteraction() } : {}),
       });
       resolved = true;
       if (isCurrentSessionGeneration(sessionId, generation)) {
@@ -1358,17 +1894,22 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
 
       if (isCurrentSessionGeneration(sessionId, generation)) {
         clearLiveActivity();
-        const refreshedMessages = await getMessages(sessionId);
+        const page = await getMessagePage(sessionId);
         if (!isCurrentSessionGeneration(sessionId, generation)) return;
-        loadMessages(refreshedMessages);
+        loadConfirmationHistory(page);
+        const reply = page.messages.find((message) => message.id === messageId);
+        if (decision === 'approved' && reply?.taskRun?.status === 'completed'
+          && stopEpoch === stopEpochRef.current && followUpsCanContinue(reply)) {
+          readyFollowUps.current = { sessionId, generation, stopEpoch };
+        }
       }
     } catch (err) {
       console.error('[ChatArea] resolve confirmation error:', err);
       if (isCurrentSessionGeneration(sessionId, generation)) {
         try {
-          const refreshedMessages = await getMessages(sessionId);
+          const page = await getMessagePage(sessionId);
           if (isCurrentSessionGeneration(sessionId, generation)) {
-            const durableTurn = refreshedMessages.find((message) => message.id === messageId && message.sessionId === sessionId);
+            const durableTurn = page.messages.find((message) => message.id === messageId && message.sessionId === sessionId);
             const durableResult = authoritativeToolResultsByCallId(durableTurn?.toolResults ?? []).get(callId);
             const stillPending = durableResult?.confirmationRequired && durableResult.confirmationStatus === 'pending';
             const recheckRequired = !resolved && decision === 'approved' && previewId && stillPending;
@@ -1376,13 +1917,15 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
             // This is UI-only evidence, not a retryable/unknown tool result.
             if (recheckRequired) setFailedDesktopPreview({ sessionId, messageId, callId, previewId });
             clearLiveActivity();
-            loadMessages(refreshedMessages);
+            loadConfirmationHistory(page);
             if (recheckRequired) return 'recheck_required';
           }
         } catch {
           if (!isCurrentSessionGeneration(sessionId, generation)) return;
-          if (!resolved && decision === 'approved' && (previewId || toolName?.startsWith('mcp_'))) {
-            if (toolName && (requiresDesktopActionPreview(toolName) || toolName.startsWith('mcp_'))) {
+          const mayHaveExecuted = toolName === 'run_project_command' || toolName?.startsWith('mcp_')
+            || Boolean(previewId && toolName && requiresDesktopActionPreview(toolName));
+          if (!resolved && decision === 'approved' && (previewId || mayHaveExecuted)) {
+            if (mayHaveExecuted) {
               markUnknownPersistedConfirmation(messageId, callId);
               useMessagesStore.setState((state) => ({ liveBlocks: markUnknownLiveConfirmation(state.liveBlocks, callId) }));
             }
@@ -1419,16 +1962,18 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
   // ── Message action handlers ─────────────────────────────────────────────────
 
   const messagesRef = useRef(messages);
-  messagesRef.current = messages;
+  messagesRef.current = windowMessages;
 
   const handleEditMessage = useCallback(async (messageId: string, newContent: string) => {
-    if (!session?.id || isStreamingRef.current || historyAttempt.current || historyBlocked) return;
+    if (!session?.id || isStreamingRef.current || isStopPending(session.id) || historyAttempt.current || historyBlocked) return;
     const sessionId = session.id;
     const generation = ++sessionGenerationRef.current;
+    const stopEpoch = stopEpochRef.current;
     const attempt = Symbol();
     historyAttempt.current = attempt;
     const current = () => historyAttempt.current === attempt && isCurrentSessionGeneration(sessionId, generation);
-    const edit = { messageId, sourceContent: messagesRef.current.find((message) => message.id === messageId)?.content ?? '', content: newContent };
+    const transcript = messagesRef.current;
+    const edit = { messageId, sourceContent: transcript.find((message) => message.id === messageId)?.content ?? '', content: newContent };
     const placeholderId = crypto.randomUUID();
     setHistoryAction({ sessionId, generation, pending: true, edit });
     try {
@@ -1438,7 +1983,7 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
       useMessagesStore.getState().setLiveStatus('正在基于编辑后的消息重新生成');
       await subscribeToAgentEvents(sessionId);
       if (!current()) return;
-      const transcript = messagesRef.current;
+      returnToLatest();
       const editedIndex = transcript.findIndex((message) => message.id === messageId);
       if (editedIndex >= 0) {
         // Backend atomically replaces the edited turn and its later branch.
@@ -1463,27 +2008,17 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
           ],
         });
       }
-      const personality = useSettingsStore.getState().profile;
-      const preferences = usePreferencesStore.getState().preferences;
       const reply = await editAndResendMessage({
         sessionId,
         messageId,
         content: newContent,
-        personality: {
-          name: personality.name,
-          description: personality.characterCard
-            ? cardDescription({ name: personality.name, description: personality.bio, firstMes: personality.greeting, card: personality.characterCard })
-            : personality.bio,
-          greeting: personality.greeting,
-          traits: personality.traits ?? mapPersonalityTraits(personality.tone, personality.personality),
-        } as PersonalityTemplate,
-        preferences: mapPreferences(preferences),
-        thinkingEffort,
+        ...currentForegroundInteraction(),
       });
       if (current()) {
         useMessagesStore.getState().removeMessage(placeholderId);
         try {
-          const durableMessages = await getMessages(sessionId);
+          const page = await getMessagePage(sessionId);
+          const durableMessages = page.messages;
           if (!current()) return;
 
           // Never let a transient or inconsistent reload erase the local
@@ -1494,10 +2029,13 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
             throw new Error('Edited turn not confirmed');
           }
 
-          const hydrated = await hydrateTimelineBlocks(sessionId, durableMessages);
+          const hydrated = await hydrateTimelineBlocks(sessionId, durableMessages, current);
           if (!current()) return;
-          loadMessages(hydrated);
+          commitTailPage(page, hydrated);
           setHistoryAction(null);
+          if (stopEpoch === stopEpochRef.current && followUpsCanContinue(reply)) {
+            readyFollowUps.current = { sessionId, generation, stopEpoch };
+          }
         } catch {
           if (!current()) return;
           appendMessage(reply);
@@ -1510,10 +2048,11 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         // Read the durable branch, never restore the pre-send snapshot as fact
         // and never retry the edit automatically.
         try {
-          const hydrated = await hydrateTimelineBlocks(sessionId, await getMessages(sessionId));
+          const page = await getMessagePage(sessionId);
+          const hydrated = await hydrateTimelineBlocks(sessionId, page.messages, current);
           if (!current()) return;
           clearLiveActivity();
-          loadMessages(hydrated);
+          commitTailPage(page, hydrated);
           setHistoryAction({ sessionId, generation, pending: false,
             notice: '未能确认重新生成结果；已载入保存记录，请先核对任务状态。',
             edit: hydrated.some((message) => message.id === messageId && message.role === 'user'
@@ -1531,12 +2070,12 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
       }
       if (historyAttempt.current === attempt) historyAttempt.current = null;
     }
-  }, [session?.id, historyBlocked, thinkingEffort, clearLiveActivity, subscribeToAgentEvents, appendMessage, hydrateTimelineBlocks, loadMessages]);
+  }, [session?.id, historyBlocked, clearLiveActivity, subscribeToAgentEvents, appendMessage, hydrateTimelineBlocks, commitTailPage, returnToLatest]);
 
   // Omitting messageId only reloads history; it never retries an edit or delete
   // whose outcome is unknown. Both paths preserve the same generation owner.
   const handleHistoryAction = useCallback(async (messageId?: string) => {
-    if (!session?.id || isStreaming || historyAttempt.current) return;
+    if (!session?.id || isStreaming || isStopPending(session.id) || historyAttempt.current) return;
     if (messageId && currentHistoryAction?.error) return;
     if (messageId && !confirm('删除这条消息及其后续分支？已执行的操作不会撤销，删除记录无法恢复。')) return;
     const sessionId = session.id;
@@ -1551,11 +2090,13 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     try {
       if (messageId) await deleteMessage(messageId);
       if (!current()) return;
-      const hydrated = await hydrateTimelineBlocks(sessionId, await getMessages(sessionId));
+      const page = await getMessagePage(sessionId);
+      const hydrated = await hydrateTimelineBlocks(sessionId, page.messages, current);
       if (current()) {
         if (!isStreamingRef.current) {
           clearLiveActivity();
-          loadMessages(hydrated);
+          returnToLatest();
+          commitTailPage(page, hydrated);
         }
         setHistoryAction(edit && hydrated.some((message) => message.id === edit.messageId && message.role === 'user'
           && message.content === edit.sourceContent && message.content !== edit.content)
@@ -1568,11 +2109,13 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
     } finally {
       if (historyAttempt.current === attempt) historyAttempt.current = null;
     }
-  }, [session?.id, isStreaming, currentHistoryAction?.error, currentHistoryAction?.edit, currentHistoryAction?.kind, clearLiveActivity, hydrateTimelineBlocks, loadMessages]);
+  }, [session?.id, isStreaming, currentHistoryAction?.error, currentHistoryAction?.edit, currentHistoryAction?.kind, clearLiveActivity, hydrateTimelineBlocks, commitTailPage, returnToLatest]);
 
   const handleCopyMessage = useCallback((_messageId: string) => {
     // Clipboard write is handled inside MessageActions; this is just a callback hook
   }, []);
+
+  const showEmptyState = messages.length === 0 && !historyBlocked;
 
   return (
     <main className="main-with-nav">
@@ -1590,30 +2133,25 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
         <RuntimeHealthNotice />
         <ModelConfigurationNotice />
         <TaskDecisionCard decision={taskDecision} />
-      <div className={`chat-transcript${messages.some(message => message.role === 'user' && message.sessionId === session?.id) ? ' chat-transcript--indexed' : ''}`}>
+      <div className={`chat-main${showEmptyState ? ' chat-main--empty' : ''}`}>
+      <div className={`chat-transcript${(hasOlder || renderedMessages.some(message => message.role === 'user')) ? ' chat-transcript--indexed' : ''}`}>
+      {backgroundImage && <img className="chat-background-image" src={backgroundImage} alt="" aria-hidden="true" draggable={false} />}
       <div className="messages" ref={containerRef} onScroll={updateFollowLatest}>
-        {messages.length === 0 && !historyBlocked && (
-          <ChatEmptyState
-            onDraftSelect={(prompt) => composerInputRef.current?.insertIfEmpty(prompt)}
-            showStarters={!input.trim()}
-          />
-        )}
-        {messages.filter((message) => (isStreaming && message.id === streamingMsgId)
-          || !isEmptySuccessfulToolTurn(message)).map((message) => (
+        {showEmptyState && <ChatEmptyState />}
+        {pagingError && <p className="conversation-page" role="status">{pagingError}</p>}
+        {hasOlder && <button className="conversation-page" type="button" aria-disabled={paging} onClick={(event) => loadAdjacent('older', event.detail === 0, event.currentTarget)}>加载更早消息</button>}
+        {renderedMessages.map((message) => {
+          const reviewingResult = !showRunControls && message.id === resultToReview?.id;
+          const delivery = onOpenWorkbenchView && !reviewingResult && !(isStreaming && message.id === streamingMsgId)
+            ? windowDeliveries?.get(message.id) : undefined;
+          return (
           <Fragment key={message.id}>
           <div className={`message-row ${message.role}`} data-conversation-message-id={message.id}>
-            {message.role === 'user' && (
-              <div className="message-avatar">
-                <div className="avatar user-avatar">U</div>
-              </div>
-            )}
             <div className={`message-content ${(
               message.timelineBlocks?.length
               || (isStreaming && message.role === 'assistant' && message.id === streamingMsgId && liveBlocks.length)
               || (message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0)
             ) ? 'message-content--agent-turn' : ''}`}>
-              {message.role === 'user' && <div className="message-role-label">你</div>}
-
               {/* Tool execution: compact inline badges, not a separate panel */}
               {message.role === 'assistant' && (message.toolCalls?.length ?? 0) > 0 && (
                 !message.timelineBlocks?.length
@@ -1627,10 +2165,12 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
                     ? message.toolCalls?.filter((tool) => !livePendingCallIds.has(tool.id))
                     : message.toolCalls}
                   toolResults={message.toolResults}
+                  taskCompleted={message.taskRun?.status === 'completed'}
+                  reviewShown={!showRunControls && message.id === resultToReview?.id}
                   sessionId={session?.id}
                   messageId={message.id}
                   desktopRecheck={desktopRecheck}
-                  onResolveConfirmation={onResolveConfirmation}
+                  onResolveConfirmation={isStopping ? undefined : onResolveConfirmation}
                 />
               )}
 
@@ -1643,13 +2183,22 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
               )}
 
               {message.role === 'assistant' && !(isStreaming && message.id === streamingMsgId) && (
-                <ToolActionReceipts toolCalls={message.toolCalls} toolResults={message.toolResults} />
+                <>
+                  {message.toolCalls?.filter((tool) => tool.name === 'pending_user_message').map((tool) => {
+                    const { content } = parseToolArguments(tool);
+                    return typeof content === 'string' && (
+                      <p key={tool.id} className="composer-steering-receipt"><strong>引导</strong> {content}</p>
+                    );
+                  })}
+                  <ToolActionReceipts toolCalls={message.toolCalls} toolResults={message.toolResults}
+                    showUnknown={showRunControls || message.id !== resultToReview?.id} />
+                </>
               )}
 
               {/* Live streaming is rendered through ContentBlockRenderer below; no separate timeline needed. */}
 
               {/* Live streaming: unified ContentBlock stream (text + inline tool cards).
-                  Replaces both MessageBubble text panel and the parallel LiveAgentActivity
+                  Replaces both the standalone text panel and the parallel LiveAgentActivity
                   timeline so reasoning and tool calls are rendered in arrival order. */}
               {isStreaming && message.role === 'assistant' && message.id === streamingMsgId && liveBlocks.length ? (
                 <div className="message-bubble message-bubble--content-stream">
@@ -1665,17 +2214,17 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
                 <div className="message-bubble message-bubble--completed-agent-turn">
                   {message.content.trim() ? (
                     <div className="completed-agent-final-answer">
-                      <MessageBubble content={message.content} />
+                      <MessageMarkdown content={message.content} deliveredFiles={delivery} />
                     </div>
                   ) : completedTimelineText(message.timelineBlocks) ? (
                     <div className="completed-agent-final-answer">
-                      <MessageBubble content={completedTimelineText(message.timelineBlocks)} />
+                      <MessageMarkdown content={completedTimelineText(message.timelineBlocks)} deliveredFiles={delivery} />
                     </div>
                   ) : null}
                 </div>
               ) : (
                 <div className="message-bubble">
-                  <MessageBubble content={message.id === streamingMsgId ? streamingText : message.content} />
+                  <MessageMarkdown content={message.id === streamingMsgId ? streamingText : message.content} deliveredFiles={delivery} />
                 </div>
               )}
 
@@ -1683,62 +2232,140 @@ export function ChatArea({ onToggleWorkbench, workbenchOpen = false }: { onToggl
                 <ToolExecutingIndicator toolName={message.metadata.executingTool} />
               )}
 
-              <div className="message-time">
-                    {timestampToDate(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-              </div>
+              {reviewingResult ? (
+                <ResultReviewCard message={message}
+                  onOpenFiles={onOpenWorkbenchView ? () => onOpenWorkbenchView('files') : undefined} />
+              ) : delivery ? <ReplyFileDelivery files={delivery} /> : null}
 
-              <MessageActions
-                message={message}
-                disabled={(isStreaming || historyBlocked) && message.role === 'user'}
-                recoveredEditContent={!historyBlocked && currentHistoryAction?.edit?.messageId === message.id
-                  && currentHistoryAction.edit.sourceContent === message.content ? currentHistoryAction.edit.content : undefined}
-                isStreaming={isStreaming && message.id === streamingMsgId}
-                onEdit={handleEditMessage}
-                onDelete={handleHistoryAction}
-                onCopy={handleCopyMessage}
-              />
+              {!showRunControls && message.id !== resultToReview?.id && message.id === recoveryMessage?.id && (
+                <TaskRecoveryCard message={message} disabled={historyBlocked || routingBusy || Boolean(resolvingCallId)}
+                  notice={recoveryNotice?.messageId === message.id ? recoveryNotice.text : undefined}
+                  onRecover={(action) => { void onContinueTask(message.id, action); }}
+                  canLocateFiles={Boolean(onToggleWorkbench || onOpenWorkbenchView)} />
+              )}
+
+              {windowTimelineIds.has(message.id) && <HistoricalRunDetails message={message} onLoad={readHistoricalTimeline} />}
+
+              <div className="message-footer">
+                <span className="message-time">
+                  {message.role === 'user' && '你 · '}
+                  {timestampToDate(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+                <MessageActions
+                  message={message}
+                  disabled={(showRunControls || historyBlocked) && message.role === 'user'}
+                  recoveredEditContent={!historyBlocked && currentHistoryAction?.edit?.messageId === message.id
+                    && currentHistoryAction.edit.sourceContent === message.content ? currentHistoryAction.edit.content : undefined}
+                  isStreaming={isStreaming && message.id === streamingMsgId}
+                  onEdit={handleEditMessage}
+                  onDelete={handleHistoryAction}
+                  onCopy={handleCopyMessage}
+                />
+              </div>
             </div>
           </div>
           </Fragment>
-        ))}
+        ); })}
+        {hasMoreNewer && <button className="conversation-page" type="button" aria-disabled={paging} onClick={(event) => loadAdjacent('newer', event.detail === 0, event.currentTarget)}>加载较新消息</button>}
       </div>
-      <ConversationNavigation key={session?.id ?? 'none'} messages={messages} sessionId={session?.id} containerRef={containerRef} onNavigateAway={leaveLatest} onReturnToLatest={returnToLatest} />
+      <ConversationNavigation key={session?.id ?? 'none'} messages={renderedMessages} renderedMessages={renderedMessages} sessionId={session?.id}
+        evidenceMessages={windowMessages} replyDeliveries={windowDeliveries ?? undefined}
+        loadSearchPage={transcriptTail?.hasOlder || hasNewer ? searchConversationPage : undefined}
+        containerRef={containerRef} showReturnToLatest={hasNewer} onJumpToMessage={jumpToMessage} onReturnToLatest={returnToLatest} />
       </div>
-      <WorkspaceActivityCapsule />
       <div className="composer">
+        <WorkspaceActivityCapsule
+          reviewInConversation={!showRunControls && Boolean(resultToReview)}
+          workbenchOpen={workbenchOpen}
+          onOpenTasks={onOpenWorkbenchView ? () => onOpenWorkbenchView('activity') : undefined} />
+        {resultToReview && !showRunControls && (resultToReview.id !== latestMessage?.id || hasNewer) && (
+          <div className="chat-history-feedback">
+            <button type="button" onClick={() => jumpToMessage(resultToReview.id, true, true)}>查看待核对结果</button>
+          </div>
+        )}
+        {pendingApproval && latestMessage && <div className="chat-history-feedback" role="status">
+          <button type="button" onClick={() => jumpToMessage(latestMessage.id, true, true)}>查看待确认操作</button>
+        </div>}
         {currentHistoryAction && <div className="chat-history-feedback" role={currentHistoryAction.pending ? 'status' : 'alert'}>
           <span>{currentHistoryAction.pending ? currentHistoryAction.notice ?? '正在更新对话记录…' : currentHistoryAction.notice
             ?? '未能确认删除或更新对话，请重新载入后核对结果，勿直接重复删除或发送。'}</span>
           {currentHistoryAction.error && <button type="button" onClick={() => { void handleHistoryAction(); }}>重新载入对话</button>}
         </div>}
-        {isStreaming && <div className="agent-run-controls" aria-label="运行控制">
-          <div className="agent-run-status">
-            <span className={`agent-run-status-dot${isPaused ? ' paused' : ''}`} aria-hidden="true" />
-            <span>{isPaused ? '已暂停' : '正在执行'}</span>
-            <small>{isPaused ? '恢复后将继续当前任务' : '可介入当前任务或排队后续指令'}</small>
-          </div>
-          <div className="agent-run-actions">
-            <button type="button" onClick={togglePause}>{isPaused ? '继续运行' : '暂停'}</button>
-            <button type="button" className="agent-run-stop" onClick={onAbort}>停止运行</button>
-          </div>
-        </div>}
+        {session?.id && waitingFollowUps.length > 0 && <section className="composer-queue" aria-label="待发送队列">
+          <header>
+            <span>队列 <span className="composer-queue-count">{waitingFollowUps.length}</span></span>
+            {!isStreaming && <button type="button" disabled={Boolean(isStopping || dispatchingFollowUp || historyBlocked || routingBusy || queuedFollowUps[0]?.unconfirmed)}
+              onClick={() => { void sendNextFollowUp(); }}>发送下一条</button>}
+          </header>
+          <ol>
+            {waitingFollowUps.map((item, index) => <li key={item.id}>
+              <span className="composer-queue-text" title={item.text}>
+                {item.unconfirmed && <strong>送达待核对 · </strong>}{item.text}
+              </span>
+              <button type="button" aria-label={`上移第 ${index + 1} 条待发消息`} title="上移"
+                disabled={index === 0} onClick={() => {
+                  updateFollowUps(session.id, (items) => {
+                    const position = items.findIndex((candidate) => candidate.id === item.id);
+                    if (position <= 0 || items[position - 1].id === dispatchingFollowUp) return items;
+                    const reordered = [...items];
+                    [reordered[position - 1], reordered[position]] = [reordered[position], reordered[position - 1]];
+                    return reordered;
+                  });
+                }}>↑</button>
+              <button type="button" aria-label={`编辑第 ${index + 1} 条待发消息`} title="移回空输入框编辑"
+                disabled={Boolean(input.trim())} onClick={() => {
+                  setInput(item.text, true);
+                  updateFollowUps(session.id, (items) => items.filter((candidate) => candidate.id !== item.id));
+                  composerInputRef.current?.focus();
+                }}>编辑</button>
+              <button type="button" aria-label={`移除第 ${index + 1} 条待发消息`} title="移除"
+                onClick={() =>
+                  updateFollowUps(session.id, (items) => items.filter((candidate) => candidate.id !== item.id))}>×</button>
+            </li>)}
+          </ol>
+        </section>}
+        {draftSaveFailed && <p className="chat-history-feedback" role="status">未能将草稿更新保存到本机，重新打开前请先复制需要保留的内容。</p>}
         <ComposerInput
           ref={composerInputRef}
           value={input}
-          onChange={setInput}
+          onChange={(text) => setInput(text, showRunControls)}
           onSend={onSend}
           scopeKey={`${activeWorkspaceId ?? ''}:${session?.id ?? ''}`}
-          onAbort={onAbort}
+          runControls={showRunControls && (
+            <div className="agent-run-controls">
+              <div className="agent-run-status" role="status">
+                <span className="agent-run-status-dot" data-attention={isPaused || Boolean(currentPauseAction?.error)} aria-hidden="true" />
+                <span>{isStopping ? '正在停止…' : currentPauseAction?.error ? '运行状态未确认'
+                  : currentPauseAction?.pending ? `正在请求${isPaused ? '继续运行' : '暂停'}…`
+                    : isPaused ? '已暂停' : liveRunPhase}</span>
+              </div>
+              <div className="agent-run-actions">
+                <button type="button" onClick={togglePause} disabled={isStopping || currentPauseAction?.pending}
+                  aria-busy={currentPauseAction?.pending || undefined}>{isPaused ? '继续运行' : '暂停'}</button>
+                <button type="button" className="agent-run-stop" title="停止运行" aria-label="停止运行"
+                  disabled={isStopping} aria-busy={isStopping || undefined} onClick={onAbort}>
+                  <span className="agent-run-stop-icon" aria-hidden="true" />
+                  停止
+                </button>
+              </div>
+              {currentPauseAction?.error && <p className="agent-run-error" role="alert">{currentPauseAction.error}</p>}
+            </div>
+          )}
+          stopPending={isStopping}
           onSteer={onSteer}
           onFollowUp={onFollowUp}
-          isStreaming={isStreaming}
-          toolPreset={toolPreset}
-          onToolPresetChange={setToolPreset}
+          isStreaming={showRunControls}
           soundEnabled={soundEnabled}
           onSoundToggle={() => setSoundEnabled((v) => !v)}
           disabled={!session || (historyBlocked && currentHistoryAction?.kind !== 'load')}
-          sendDisabled={historyBlocked || routingBusy}
+          sendDisabled={isStopping || historyBlocked || routingBusy || (!isStreaming && Boolean(dispatchingFollowUp))}
         />
+        {showEmptyState && !showRunControls && <ChatStarterPrompts
+          isProject={activeWorkspaceKind === 'project'}
+          hidden={Boolean(input.trim())}
+          onDraftSelect={(prompt) => composerInputRef.current?.insertIfEmpty(prompt)}
+        />}
+      </div>
       </div>
       </div>
     </main>

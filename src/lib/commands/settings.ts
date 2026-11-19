@@ -87,6 +87,7 @@ export interface ApiProviderConfig {
   plan_connected?: boolean;
   plan_enabled?: boolean;
   plan_account_label?: string | null;
+  plan_status_error?: string | null;
 }
 
 export interface ChatgptPlanStatus {

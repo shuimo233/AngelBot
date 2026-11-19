@@ -134,7 +134,7 @@ async function chooseWorkspace(item) {
   await navigatePrimary(daily ? '日常' : '项目');
   if (daily) {
     await browser.waitUntil(async () =>
-      await browser.$('.chat-header-workspace-kind').getText() === '个人空间',
+      await browser.$('.chat-header-session-title').getText() === 'AngelBot 日常',
     { timeout: 10_000, timeoutMsg: 'restored personal workspace did not become active' });
     assert.equal(await browser.$('.sidebar-primary-nav').$('button=日常').getAttribute('aria-current'), 'page');
   } else {
@@ -152,7 +152,6 @@ async function openDataSettings() {
   await browser.$('button[aria-label="设置"]').click();
   const dialog = await browser.$('[role="dialog"][aria-modal="true"]');
   await dialog.waitForDisplayed({ timeout: 10_000 });
-  await dialog.$('button=记忆与数据').click();
   await dialog.$('button=数据').click();
   return dialog;
 }
@@ -270,8 +269,9 @@ describe('native project backup restore', () => {
         await chooseWorkspace(manifest.projectA);
         assert.ok(!(await browser.$('.messages').getText()).includes('restore-a-inactive-branch'));
         await openFiles();
-        await browser.$('.workbench-error').waitForDisplayed({ timeout: 10_000 });
-        assert.match(await browser.$('.workbench-error').getText(), /项目目录尚未确认/);
+        const fileError = await browser.$('.workbench-files [role="alert"]');
+        await fileError.waitForDisplayed({ timeout: 10_000 });
+        assert.match(await fileError.getText(), /项目目录尚未确认/);
         assert.equal(await browser.$('.file-item').isExisting(), false);
         await openDataSettings();
         checkpoint('awaiting-directory-confirmation', { projectA: manifest.projectA, projectB: manifest.projectB,

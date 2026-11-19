@@ -401,6 +401,8 @@ fn decision_error(error: DelegationServiceError) -> String {
         }
         DelegationServiceError::MaterializationInProgress =>
             "canonical write outcome is unknown; inspect the project before retrying, cancelling or discarding its recovery evidence".to_string(),
+        DelegationServiceError::WorkspaceBusy =>
+            "another reviewed change is being applied to this project; this request performed no canonical write and its candidate remains available; wait for the active operation to finish".to_string(),
         DelegationServiceError::Stopped => "delegated delivery control is stopped".to_string(),
         _ => "delegated delivery decision failed".to_string(),
     }
@@ -416,6 +418,17 @@ mod tests {
         delegation_service::test_support::{recording_service, ServiceCall},
         ToolCall,
     };
+
+    #[test]
+    fn decision_errors_distinguish_busy_workspace_from_unknown_effects() {
+        let busy = decision_error(DelegationServiceError::WorkspaceBusy);
+        assert!(busy.contains("no canonical write"));
+        assert!(busy.contains("candidate remains available"));
+        assert!(!busy.contains("outcome is unknown"));
+        let unknown = decision_error(DelegationServiceError::MaterializationInProgress);
+        assert!(unknown.contains("outcome is unknown"));
+        assert!(unknown.contains("before retrying"));
+    }
 
     #[test]
     fn normal_control_keeps_review_and_materialization_capabilities() {

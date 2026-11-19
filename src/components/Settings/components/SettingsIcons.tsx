@@ -91,6 +91,7 @@ export interface SettingsNavItem {
 export const settingsNavItems: SettingsNavItem[] = [
   { id: 'executionPermission', label: '执行权限', icon: SettingsIcons.executionPermission },
   { id: 'desktopControl', label: '电脑操作', icon: SettingsIcons.desktopControl },
+  { id: 'channels', label: '渠道与远程访问', icon: SettingsIcons.webSearch },
   { id: 'fileAccess', label: '文件访问', icon: SettingsIcons.data },
   { id: 'personality', label: '性格', icon: SettingsIcons.personality },
   { id: 'memory', label: '记忆', icon: SettingsIcons.memory },

@@ -8,6 +8,19 @@
  */
 import { invoke } from '../invoke';
 
+export interface MemoryControls {
+  useLongTermMemory: boolean;
+  evolutionEnabled: boolean;
+}
+
+export function initializeMemoryControls(legacy: MemoryControls): Promise<MemoryControls> {
+  return invoke<MemoryControls>('initialize_memory_controls', { legacy });
+}
+
+export function saveMemoryControls(update: Partial<MemoryControls>): Promise<MemoryControls> {
+  return invoke<MemoryControls>('set_memory_controls', { update });
+}
+
 // Rust 返回的 snake_case 类型
 export interface RustMemory {
   id: string;
@@ -24,18 +37,21 @@ export interface RustMemory {
   forget_stage: string;
   created_at: number;
   updated_at: number;
+  superseded_by?: string;
 }
 
 // ============================================
 // Basic Memory Operations
 // ============================================
 
-export async function getMemories(): Promise<RustMemory[]> {
-  return invoke<RustMemory[]>('get_memories');
+export async function getMemories(includeReplaced = false): Promise<RustMemory[]> {
+  return includeReplaced
+    ? invoke<RustMemory[]>('get_memories', { includeReplaced })
+    : invoke<RustMemory[]>('get_memories');
 }
 
-export async function saveMemory(memory: MemoryInput): Promise<void> {
-  return invoke<void>('save_memory', { memory });
+export async function saveMemory(memory: MemoryInput): Promise<string> {
+  return invoke<string>('save_memory', { memory });
 }
 
 export async function deleteMemory(id: string): Promise<void> {
@@ -67,11 +83,11 @@ export interface UpdateMemoryRequest {
   isPermanent: boolean;
 }
 
-export interface MemoryConflict {
+export interface MemoryReviewCandidate {
   memory_id: string;
   content: string;
-  category: string;
-  similarity: number;
+  source: string;
+  updated_at: number;
 }
 
 export interface MemoryHistoryEntry {
@@ -216,19 +232,26 @@ export async function updateMemory(req: UpdateMemoryRequest): Promise<void> {
   return invoke<void>('update_memory', { req });
 }
 
-export async function detectMemoryConflicts(
-  content: string,
-  threshold?: number
-): Promise<MemoryConflict[]> {
-  return invoke<MemoryConflict[]>('detect_memory_conflicts', { content, threshold });
+export async function findRelatedMemories(memoryId: string): Promise<MemoryReviewCandidate[]> {
+  return invoke<MemoryReviewCandidate[]>('find_related_memories', { memory_id: memoryId });
 }
 
 export async function getMemoryHistory(memoryId: string): Promise<MemoryHistoryEntry[]> {
   return invoke<MemoryHistoryEntry[]>('get_memory_history', { memory_id: memoryId });
 }
 
-export async function mergeMemories(sourceId: string, targetId: string): Promise<void> {
-  return invoke<void>('merge_memories', { source_id: sourceId, target_id: targetId });
+export async function replaceMemory(req: {
+  sourceId: string; sourceContent: string; targetId: string; targetContent: string;
+}): Promise<void> {
+  return invoke<void>('replace_memory', { req });
+}
+
+export async function setMemoryPaused(id: string, paused: boolean): Promise<void> {
+  return invoke<void>('set_memory_paused', { id, paused });
+}
+
+export async function restoreReplacedMemory(id: string, replacementId: string): Promise<void> {
+  return invoke<void>('restore_replaced_memory', { id, replacementId });
 }
 
 /**

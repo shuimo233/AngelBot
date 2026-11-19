@@ -413,6 +413,22 @@ fn conflicts_busy_roots_bad_journals_and_links_fail_without_touching_sources() {
     .unwrap();
     assert!(open(&paths, false, false).is_err());
     assert!(paths.legacy.join("data.db").exists());
+    assert_eq!(read_journal(&paths).unwrap().unwrap().phase, "rolled_back");
+    let legacy = open(&paths, false, false).unwrap();
+    assert!(legacy.legacy_recovery);
+    drop(legacy);
+    // Explicit owner retirement preserves the old tree outside migration inputs;
+    // normal startup remains on the old profile until migration is requested.
+    let retained = _temp.path().join("retained-worktree");
+    fs::rename(paths.legacy.join("delegated/task"), &retained).unwrap();
+    let migrated = open(&paths, true, false).unwrap();
+    assert_eq!(migrated.root, paths.current);
+    assert_eq!(read_journal(&paths).unwrap().unwrap().phase, "complete");
+    assert_eq!(
+        fs::read(retained.join(".git")).unwrap(),
+        b"gitdir: outside-managed-root"
+    );
+    drop(migrated);
     let (_temp, paths) = fixture();
     let before = fingerprint(&paths.legacy.join("data.db")).unwrap();
     let (_, reader) = borrow_saved_for(&paths).unwrap();

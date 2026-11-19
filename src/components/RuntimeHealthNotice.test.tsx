@@ -8,6 +8,23 @@ vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: vi.fn() }));
 vi.mock('$lib/commands/runtime-health', () => ({ getRuntimeHealth: vi.fn() }));
 
 describe('RuntimeHealthPanel', () => {
+  it('定时调度未启动时显示手动恢复，不提供会沿用登录参数的重启按钮', () => {
+    render(<RuntimeHealthPanel health={{
+      status: 'degraded', delegationAvailable: true,
+      issues: [{
+        code: 'settings_defaults', severity: 'warning', title: '部分设置未能载入', detail: '', recoveryAction: 'restart',
+      }, {
+        code: 'automation_scheduler_unavailable', severity: 'warning', title: '定时调度未启动',
+        detail: '从托盘退出 AngelBot，再从开始菜单手动打开。本次登录触发不会补跑。', recoveryAction: 'none',
+      }],
+    }} onRestart={vi.fn()} />);
+    const summary = screen.getByText('部分能力受限').closest('summary');
+    expect(summary).toHaveTextContent('定时调度未启动');
+    expect(summary?.parentElement).toHaveAttribute('open');
+    expect(screen.getByText(/从开始菜单手动打开/)).toBeVisible();
+    expect(screen.queryByRole('button', { name: '重新启动 AngelBot' })).not.toBeInTheDocument();
+  });
+
   it('把主动关闭子代理显示为安静提示而非系统故障', () => {
     const health: RuntimeHealth = {
       status: 'ready',
@@ -34,6 +51,9 @@ describe('RuntimeHealthPanel', () => {
       status: 'degraded',
       delegationAvailable: true,
       issues: [{
+        code: 'storage_migration', severity: 'notice', title: '资料目录迁移待处理',
+        detail: '继续使用原目录保存资料。', recoveryAction: 'none',
+      }, {
         code: 'ephemeral_storage',
         severity: 'critical',
         title: '本地数据未连接',
@@ -44,6 +64,7 @@ describe('RuntimeHealthPanel', () => {
 
     const { container, unmount } = render(<RuntimeHealthPanel health={health} onRestart={onRestart} />);
     expect(screen.getByText('部分能力受限')).toBeInTheDocument();
+    expect(container.querySelector('.runtime-health-summary')).toHaveTextContent('本地数据未连接');
     expect(container.querySelector('details')).toHaveAttribute('open');
     screen.getByRole('button', { name: '重新启动 AngelBot' }).focus();
     fireEvent.click(screen.getByRole('button', { name: '重新启动 AngelBot' }));

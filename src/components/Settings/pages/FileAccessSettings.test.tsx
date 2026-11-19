@@ -1,4 +1,5 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { FileAccessSettings } from './FileAccessSettings';
 import { useSessionsStore } from '$stores/sessions';
@@ -24,7 +25,7 @@ describe('FileAccessSettings', () => {
 
     render(<FileAccessSettings />);
 
-    expect(await screen.findByText('AngelBot 的文件范围')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'AngelBot' })).toBeInTheDocument();
     expect(screen.getByText('项目根目录')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '保存目录' })).not.toBeInTheDocument();
     expect(screen.queryByText('执行权限')).not.toBeInTheDocument();
@@ -39,8 +40,29 @@ describe('FileAccessSettings', () => {
     vi.mocked(getSessionFileAccess).mockResolvedValue({ workDir: 'C:/isolated/results', additionalReadDirs: [] });
     render(<FileAccessSettings />);
 
-    expect(screen.getByText('AngelBot 日常不连接项目文件')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'AngelBot 日常' })).toBeInTheDocument();
     expect(await screen.findByText('C:/isolated/results')).toBeInTheDocument();
     expect(getSessionFileAccess).toHaveBeenCalledWith(session.id);
+  });
+
+  it('places the recovery action and unapproved status beside the restored project path', async () => {
+    const user = userEvent.setup();
+    const path = 'D:/Restored/Project';
+    useWorkspacesStore.setState({
+      workspaces: [{ id: 'restored', name: '恢复项目', kind: 'project', rootPath: path, directoryConfirmed: false, createdAt: 1, updatedAt: 1, activeSessionId: session.id }],
+      activeWorkspaceId: 'restored', loading: false, lastError: null,
+    });
+    vi.mocked(getSessionFileAccess).mockResolvedValue({ workDir: path, additionalReadDirs: [] });
+    const listener = vi.fn();
+    window.addEventListener('open-settings', listener);
+    try {
+      render(<FileAccessSettings />);
+      const row = (await screen.findByText(path)).closest<HTMLElement>('.settings-row')!;
+      expect(within(row).getByText('尚未授权')).toBeInTheDocument();
+      await user.click(within(row).getByRole('button', { name: '确认恢复目录' }));
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ detail: 'data' }));
+    } finally {
+      window.removeEventListener('open-settings', listener);
+    }
   });
 });

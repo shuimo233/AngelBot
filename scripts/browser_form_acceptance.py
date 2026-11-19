@@ -285,25 +285,31 @@ def verify_restored_upload(owned, written, reopened, restored, business):
     assert business['drafts'][1] == new
 
 
-def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=False, cache_settle_ms=0, cache_continuation=False):
-    """One availability/replay call or two cache calls, never a business retry."""
+def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=False, cache_settle_ms=0, cache_continuation=False, *, cache_exact_repeat=False):
+    """Run the selected bounded probe over synthetic data."""
     (ROOT / 'logs').mkdir(exist_ok=True)
     recorded_db = recorded_db.resolve(strict=True) if recorded_db is not None else None
-    assert not (recorded_db and cache_comparison)
+    cache_probe = cache_comparison or cache_exact_repeat
+    assert sum(bool(mode) for mode in (recorded_db, cache_comparison, cache_exact_repeat)) <= 1
     assert not cache_alternate or cache_comparison
     assert not cache_continuation or cache_comparison and not cache_alternate
     assert 0 <= cache_settle_ms <= 30000 and (cache_comparison or cache_settle_ms == 0)
-    owned = Path(tempfile.mkdtemp(prefix='cache-comparison-' if cache_comparison else 'inference-replay-' if recorded_db else 'model-probe-', dir=ROOT / 'logs'))
+    cache_journey = 'cache-exact-repeat' if cache_exact_repeat else 'cache-comparison'
+    cache_marker = cache_journey.replace('-', '_').upper()
+    request_limit = 4 if cache_exact_repeat else 2
+    owned = Path(tempfile.mkdtemp(prefix=f'{cache_journey}-' if cache_probe else 'inference-replay-' if recorded_db else 'model-probe-', dir=ROOT / 'logs'))
     report_path = owned / 'acceptance.json'
     report = {'status': 'building', 'scope': 'saved-luna-single-provider-call-no-tools',
               'requestCount': None, 'toolCount': 0, 'checkedAt': None}
     if recorded_db:
         report.update(scope='recorded synthetic protocol with reconstructed current host instructions; one provider invocation, no tool execution; not byte-exact replay or business acceptance',
                       sourceDatabaseSha256=hashlib.sha256(recorded_db.read_bytes()).hexdigest())
-    if cache_comparison:
+    if cache_probe:
         report.update(scope='two identical independent synthetic requests; diagnostic compatibility, no tools, browser or business replay; not a cold/warm guarantee')
         if cache_continuation:
             report['scope'] = 'two synthetic turns with the production native codec; no tools, browser or business replay; not a cold/warm guarantee'
+        if cache_exact_repeat:
+            report['scope'] = 'four identical ordinary synthetic requests to saved Luna; no comparison metadata or tools'
         report['comparisonMode'] = 'authorized-alternate-from-catalog' if cache_alternate else 'saved-luna'
         report['sourceSha256'] = {p:hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in (
             'scripts/browser_form_acceptance.py','src-tauri/src/commands/message_live_tests.rs',
@@ -312,7 +318,7 @@ def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=Fa
     def record():
         report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
     record()
-    print(f'{"CACHE_COMPARISON_REPORT" if cache_comparison else "MODEL_PROBE_REPORT"} {report_path}', flush=True)
+    print(f'{cache_marker + "_REPORT" if cache_probe else "MODEL_PROBE_REPORT"} {report_path}', flush=True)
     try:
         with (owned / 'live.log').open('w', encoding='utf-8') as log:
             with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
@@ -324,8 +330,8 @@ def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=Fa
                 env.update({'ANGELBOT_LIVE_MODEL_JOURNEY': 'recorded-inference',
                             'ANGELBOT_PRIVATE_REPLAY_DB': str(recorded_db),
                             'ANGELBOT_PRIVATE_REPLAY_OUTPUT': str(owned / 'diagnostics.db')})
-            if cache_comparison:
-                env.update(ANGELBOT_LIVE_MODEL_JOURNEY='cache-comparison', ANGELBOT_PRIVATE_CACHE_PROBE_ROOT=str(owned))
+            if cache_probe:
+                env.update(ANGELBOT_LIVE_MODEL_JOURNEY=cache_journey, ANGELBOT_PRIVATE_CACHE_PROBE_ROOT=str(owned))
                 env['ANGELBOT_CACHE_COMPARISON_SETTLE_MS'] = str(cache_settle_ms)
                 if cache_continuation:
                     env['ANGELBOT_CACHE_COMPARISON_CONTINUATION'] = '1'
@@ -337,18 +343,24 @@ def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=Fa
             result = subprocess.run([str(binary), 'commands::message::live_tests::configured_model_completes_bounded_file_task',
                                      '--exact', '--ignored', '--nocapture', '--test-threads=1'],
                                     cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                    timeout=75 + (30 if cache_alternate else 0) + cache_settle_ms / 1000,
+                                    timeout=(125 if cache_exact_repeat else 75) + (30 if cache_alternate else 0) + cache_settle_ms / 1000,
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        prefix = 'CACHE_COMPARISON_REPORT ' if cache_comparison else 'RECORDED_INFERENCE_REPORT ' if recorded_db else 'MODEL_AVAILABILITY_REPORT '
+        prefix = f'{cache_marker}_REPORT ' if cache_probe else 'RECORDED_INFERENCE_REPORT ' if recorded_db else 'MODEL_AVAILABILITY_REPORT '
         with (owned / 'live.log').open(encoding='utf-8') as log:
             markers = [line.removeprefix(prefix).strip() for line in log if line.startswith(prefix)]
-        if result.returncode or len(markers) != 1 or len(markers[0]) > (16384 if cache_comparison else 1024 if recorded_db else 256):
-            raise RuntimeError('The single-request model probe did not return one terminal report')
+        if result.returncode or len(markers) != 1 or len(markers[0]) > (32768 if cache_exact_repeat else 16384 if cache_comparison else 1024 if recorded_db else 256):
+            raise RuntimeError('The model probe did not return one terminal report')
         outcome = json.loads(markers[0])
-        if cache_comparison:
+        if cache_probe:
+            statuses = ('instrumentation_unavailable', 'timed_out', 'quota_exceeded', 'unavailable', 'unexpected_response')
+            if cache_exact_repeat:
+                statuses += ('measured', 'metering_unavailable', 'fingerprint_unavailable', 'request_mismatch')
+            else:
+                statuses += ('catalog_unavailable', 'model_not_listed', 'binding_changed', 'invalid_diagnostics', 'diagnostics_reported', 'diagnostics_unavailable', 'not_reported')
             if (not isinstance(outcome, dict) or set(outcome) != {'status','requestCount','toolCount','requests','diagnosticRef','binding','savedBinding','defaultBindingUnchanged','settleMs','settleElapsedMs','cacheMode','requestShape','nativeReplayUsed'}
-                    or outcome['status'] not in ('instrumentation_unavailable','catalog_unavailable','model_not_listed','binding_changed','timed_out','quota_exceeded','unavailable','unexpected_response','invalid_diagnostics','diagnostics_reported','diagnostics_unavailable','not_reported')
-                    or type(outcome['requestCount']) is not int or not 0 <= outcome['requestCount'] <= 2
+                    or outcome['status'] not in statuses
+                    or type(outcome['requestCount']) is not int or not 0 <= outcome['requestCount'] <= request_limit
+                    or outcome['status'] == 'measured' and outcome['requestCount'] != request_limit
                     or type(outcome['toolCount']) is not int or outcome['toolCount'] != 0
                     or not isinstance(outcome['requests'],list) or len(outcome['requests']) != outcome['requestCount']
                     or not (outcome['diagnosticRef'] is None or isinstance(outcome['diagnosticRef'],str) and re.fullmatch(r'diag:evidence_[0-9a-f]{32}',outcome['diagnosticRef']))):
@@ -362,7 +374,7 @@ def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=Fa
                 raise RuntimeError('The cache comparison returned an invalid default-binding receipt')
             if outcome['cacheMode'] != 'implicit_default':
                 raise RuntimeError('The cache comparison returned an unexpected breakpoint condition')
-            if (outcome['requestShape'] != ('native_continuation' if cache_continuation else 'independent')
+            if (outcome['requestShape'] != ('exact_repeat' if cache_exact_repeat else 'native_continuation' if cache_continuation else 'independent')
                     or outcome['nativeReplayUsed'] is not None and type(outcome['nativeReplayUsed']) is not bool):
                 raise RuntimeError('The cache comparison returned an invalid continuation condition')
             if (type(outcome['settleMs']) is not int or outcome['settleMs'] != cache_settle_ms
@@ -371,8 +383,9 @@ def run_model_probe(recorded_db=None, cache_comparison=False, cache_alternate=Fa
                 raise RuntimeError('The cache comparison returned an invalid settling interval')
             report.update(outcome,checkedAt=time.time())
             record()
-            print(f'CACHE_COMPARISON_STATUS {report["status"]}',flush=True)
-            return 0 if report['status']=='diagnostics_reported' and report['defaultBindingUnchanged'] is True else 2
+            print(f'{cache_marker}_STATUS {report["status"]}',flush=True)
+            success_status = 'measured' if cache_exact_repeat else 'diagnostics_reported'
+            return 0 if report['status'] == success_status and report['defaultBindingUnchanged'] is True else 2
         expected = {'status', 'requestCount', 'toolCount'}
         if recorded_db:
             expected |= {'historyCount', 'schemaCount', 'diagnosticRef', 'reconstructedNotByteExact'}
@@ -416,6 +429,7 @@ def main():
     modes.add_argument('--upload-report', action='store_true', help='Upload a synthetic Daily CSV, reopen read-only, then verify a new upload task in the same Main after encrypted restore and explicit service reauthorization')
     modes.add_argument('--model-probe', action='store_true', help='One saved Luna plan provider call only; no browser, Main task, tools or business retry')
     modes.add_argument('--cache-comparison', action='store_true', help='At most two synthetic Luna requests to check cache diagnostic compatibility; no tools or business retries')
+    modes.add_argument('--cache-exact-repeat', action='store_true', help='At most four identical ordinary Luna requests; no cache comparison metadata or tools')
     parser.add_argument('--cache-alternate', action='store_true', help='With explicit user approval and --cache-comparison: use one authorized Sol model from the current plan catalog for at most two requests; never save it as default')
     parser.add_argument('--cache-settle-ms', type=int, default=0, help='With --cache-comparison: wait 0..30000ms between the two completed independent calls; no additional requests')
     parser.add_argument('--cache-continuation', action='store_true', help='With --cache-comparison: preserve the first native response and append a second synthetic turn, instead of two independent requests')
@@ -429,10 +443,11 @@ def main():
         parser.error('--cache-continuation requires --cache-comparison; keep the saved model binding')
     if not 0 <= args.cache_settle_ms <= 30000 or args.cache_settle_ms and not args.cache_comparison:
         parser.error('--cache-settle-ms requires --cache-comparison and a value from 0 to 30000')
-    if args.model_probe or args.recorded_inference or args.cache_comparison:
+    if args.model_probe or args.recorded_inference or args.cache_comparison or args.cache_exact_repeat:
         if args.mcp_cli or args.hold_for_inspection:
             parser.error('--model-probe does not use a browser or inspection window')
-        return run_model_probe(args.recorded_inference, args.cache_comparison, args.cache_alternate, args.cache_settle_ms, args.cache_continuation)
+        return run_model_probe(args.recorded_inference, args.cache_comparison, args.cache_alternate, args.cache_settle_ms, args.cache_continuation,
+                               cache_exact_repeat=args.cache_exact_repeat)
     if not args.mcp_cli:
         parser.error('--mcp-cli is required for browser tasks')
     cli = args.mcp_cli.resolve(strict=True)

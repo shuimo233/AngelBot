@@ -1262,16 +1262,14 @@ fn stop_running_mcp_servers(state: &AppState) -> Result<(), String> {
 fn clear_all_user_data_from_connection(conn: &mut rusqlite::Connection) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     queue_active_mcp_references_for_cleanup(&tx)?;
+    clear_memory_records(&tx)?;
     tx.execute_batch(
         "UPDATE projects SET active_session_id = NULL;
          DELETE FROM messages;
          DELETE FROM context_summaries;
          DELETE FROM scheduled_tasks;
-         DELETE FROM memories;
          DELETE FROM mcp_servers;
          DELETE FROM agent_permission_grants;
-         DELETE FROM adaptive_constraint_evidence;
-         DELETE FROM adaptive_constraints;
          DELETE FROM profile;
          DELETE FROM sessions;
          DELETE FROM projects;
@@ -1280,6 +1278,21 @@ fn clear_all_user_data_from_connection(conn: &mut rusqlite::Connection) -> Resul
     .map_err(|e| format!("Failed to clear database: {}", e))?;
     tx.commit()
         .map_err(|e| format!("Failed to clear database: {}", e))
+}
+
+fn clear_memory_records(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "DELETE FROM memory_history;
+         DELETE FROM memory_index;
+         DELETE FROM knowledge_edges;
+         DELETE FROM knowledge_nodes;
+         DELETE FROM core_memory_blocks;
+         DELETE FROM evolution_proposals;
+         DELETE FROM memories;
+         DELETE FROM adaptive_constraint_evidence;
+         DELETE FROM adaptive_constraints;",
+    )
+    .map_err(|e| format!("无法清除本地记忆: {e}"))
 }
 
 fn queue_active_mcp_references_for_cleanup(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -1413,6 +1426,45 @@ fn reject_plain_mcp_credentials(import: &serde_json::Value) -> Result<(), String
     Ok(())
 }
 
+fn restored_memory_controls(
+    import: &serde_json::Value,
+    local: Option<super::memory::MemoryControls>,
+) -> Result<super::memory::MemoryControls, String> {
+    use super::memory::{MemoryControls, MEMORY_CONTROLS_SETTING};
+
+    let mut rows = import
+        .get("settings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row.get("key").and_then(serde_json::Value::as_str) == Some(MEMORY_CONTROLS_SETTING)
+        });
+    let backup = rows
+        .next()
+        .map(|row| {
+            row.get("value")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| serde_json::from_str::<MemoryControls>(value).ok())
+                .ok_or("备份中的记忆开关格式无效。")
+        })
+        .transpose()?;
+    if rows.next().is_some() {
+        return Err("备份包含重复的记忆开关。".to_owned());
+    }
+    Ok(match (local, backup) {
+        (Some(local), Some(backup)) => MemoryControls {
+            use_long_term_memory: local.use_long_term_memory && backup.use_long_term_memory,
+            evolution_enabled: local.evolution_enabled && backup.evolution_enabled,
+        },
+        (None, Some(backup)) => backup,
+        // A legacy backup cannot prove that recall or learning was enabled on
+        // the source. In particular, the renderer may have seeded defaults on
+        // a fresh destination before the user reached the import screen.
+        (_, None) => MemoryControls::OFF,
+    })
+}
+
 /// The caller holds the MCP policy gate across child revocation and the full
 /// restore, including permission-grant writes.
 fn import_data_under_gate(
@@ -1448,21 +1500,21 @@ fn import_data_under_gate(
         None // Older backups remain valid and never delete existing results.
     };
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let memory_controls =
+        restored_memory_controls(import, super::memory::read_memory_controls(&tx)?)?;
 
     // Replace mode: drop all data first
     if mode == "replace" {
         queue_active_mcp_references_for_cleanup(&tx)?;
+        clear_memory_records(&tx)?;
         tx.execute_batch(
             "UPDATE projects SET active_session_id = NULL;
              UPDATE sessions SET leaf_message_id = NULL;
              DELETE FROM messages;
              DELETE FROM context_summaries;
              DELETE FROM scheduled_tasks;
-             DELETE FROM memories;
              DELETE FROM mcp_servers;
              DELETE FROM agent_permission_grants;
-             DELETE FROM adaptive_constraint_evidence;
-             DELETE FROM adaptive_constraints;
              DELETE FROM profile;
              DELETE FROM sessions;
              DELETE FROM settings WHERE key NOT IN ('schema_version','browser_runtime_namespace');",
@@ -1535,6 +1587,7 @@ fn import_data_under_gate(
                             | "browser_runtime_namespace"
                             | "autostart_enabled"
                             | "autostart_launch_args"
+                            | super::memory::MEMORY_CONTROLS_SETTING
                     )
                 )
             })
@@ -1543,6 +1596,7 @@ fn import_data_under_gate(
         imported["settings"] =
             serde_json::Value::Number(batch_import(&tx, "settings", &portable)?.into());
     }
+    super::memory::write_memory_controls(&tx, memory_controls)?;
     if let Some(arr) = import.get("scheduled_tasks").and_then(|v| v.as_array()) {
         imported["scheduled_tasks"] =
             serde_json::Value::Number(batch_import(&tx, "scheduled_tasks", arr)?.into());
@@ -1816,6 +1870,45 @@ mod tests {
             dev_event_store: None,
             desktop_adapter: crate::desktop_control::create_mock_adapter(),
             desktop_action_previews: Default::default(),
+        }
+    }
+
+    fn seed_legacy_memory_records(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "INSERT INTO memories (id, scope, category, content, created_at, updated_at)
+             VALUES ('memory', 'global', 'fact', 'synthetic memory', 1, 1);
+             INSERT INTO memory_history (id, memory_id, operation, previous_content, created_at)
+             VALUES ('edit', 'memory', 'update', 'synthetic previous value', 1),
+                    ('orphan', 'old-memory', 'update', 'synthetic removed value', 1);
+             INSERT INTO memory_index (id, memory_id) VALUES ('index', 'memory');
+             INSERT INTO core_memory_blocks (id, block_type, label, content, created_at, updated_at)
+             VALUES ('core', 'human', 'synthetic core', 'synthetic core content', 1, 1);
+             INSERT INTO evolution_proposals (id, proposal_type, content, created_at)
+             VALUES ('proposal', 'memory', 'synthetic proposal', 1);
+             INSERT INTO knowledge_nodes (id, entity_type, label, created_at)
+             VALUES ('source', 'memory', 'synthetic node', 1), ('target', 'person', 'synthetic person', 1);
+             INSERT INTO knowledge_edges (id, source_id, target_id, predicate, evidence, created_at)
+             VALUES ('edge', 'source', 'target', 'related', 'synthetic graph evidence', 1);",
+        )
+        .unwrap();
+    }
+
+    fn assert_legacy_memory_records_cleared(conn: &rusqlite::Connection) {
+        for table in [
+            "memories",
+            "memory_history",
+            "memory_index",
+            "core_memory_blocks",
+            "evolution_proposals",
+            "knowledge_nodes",
+            "knowledge_edges",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be empty");
         }
     }
 
@@ -2765,11 +2858,75 @@ mod tests {
     }
 
     #[test]
+    fn memory_controls_survive_restore_and_legacy_import_starts_disabled() {
+        use crate::commands::memory::{
+            initialize_memory_controls_impl, read_memory_controls, write_memory_controls,
+            MemoryControls,
+        };
+
+        let source = test_state();
+        let target = test_state();
+        let backup_controls = MemoryControls {
+            use_long_term_memory: true,
+            evolution_enabled: false,
+        };
+        let local_controls = MemoryControls {
+            use_long_term_memory: false,
+            evolution_enabled: true,
+        };
+        write_memory_controls(&source.db.lock().unwrap(), backup_controls).unwrap();
+        let backup = export_data_impl(
+            &source,
+            Some(ExportOptions {
+                scope: Some("settings".into()),
+            }),
+        )
+        .unwrap();
+        let fresh = test_state();
+        import_data_impl(&fresh, backup.clone(), None).unwrap();
+        assert_eq!(
+            read_memory_controls(&fresh.db.lock().unwrap()).unwrap(),
+            Some(backup_controls)
+        );
+
+        seed_legacy_memory_records(&target.db.lock().unwrap());
+        write_memory_controls(&target.db.lock().unwrap(), local_controls).unwrap();
+        import_data_impl(
+            &target,
+            backup,
+            Some(ImportOptions {
+                mode: Some("replace".into()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_memory_controls(&target.db.lock().unwrap()).unwrap(),
+            Some(MemoryControls::OFF)
+        );
+        assert_legacy_memory_records_cleared(&target.db.lock().unwrap());
+
+        let legacy = test_state();
+        let first_launch_defaults = MemoryControls {
+            use_long_term_memory: true,
+            evolution_enabled: true,
+        };
+        assert_eq!(
+            initialize_memory_controls_impl(&legacy, first_launch_defaults).unwrap(),
+            first_launch_defaults
+        );
+        import_data_impl(&legacy, r#"{"version":1,"memories":[]}"#.into(), None).unwrap();
+        assert_eq!(
+            read_memory_controls(&legacy.db.lock().unwrap()).unwrap(),
+            Some(MemoryControls::OFF)
+        );
+    }
+
+    #[test]
     fn clearing_user_data_removes_content_but_preserves_schema_marker() {
         let mut conn = test_db();
         conn.execute("INSERT INTO sessions (id, title, created_at, updated_at) VALUES ('session', 'Session', 1, 1)", []).unwrap();
         conn.execute("INSERT INTO messages (id, session_id, role, content, created_at) VALUES ('message', 'session', 'user', 'hello', 1)", []).unwrap();
-        conn.execute("INSERT INTO memories (id, scope, category, content, created_at, updated_at) VALUES ('memory', 'global', 'fact', 'remember', 1, 1)", []).unwrap();
+        seed_legacy_memory_records(&conn);
         conn.execute(
             "INSERT INTO settings (key, value, updated_at) VALUES ('custom_setting', 'value', 1)",
             [],
@@ -2786,10 +2943,10 @@ mod tests {
 
         clear_all_user_data_from_connection(&mut conn).unwrap();
 
+        assert_legacy_memory_records_cleared(&conn);
         for table in [
             "sessions",
             "messages",
-            "memories",
             "adaptive_constraints",
             "adaptive_constraint_evidence",
         ] {

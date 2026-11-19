@@ -117,8 +117,9 @@ impl Drop for LiveOwner {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Origin {
+pub(super) enum Origin<'a> {
     Manual,
+    ManualRequest(&'a str),
     Scheduled,
 }
 
@@ -295,7 +296,7 @@ pub(super) enum Admission {
 pub(super) fn admit(
     state: &AppState,
     id: &str,
-    origin: Origin,
+    origin: Origin<'_>,
     now: i64,
     on_update: &dyn Fn(),
 ) -> Result<Admission, String> {
@@ -305,6 +306,11 @@ pub(super) fn admit(
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if let Origin::ManualRequest(run_id) = origin {
+            if manual_run_exists(&transaction, id, run_id)? {
+                return Ok(Admission::Consumed);
+            }
+        }
         let automation = transaction
             .query_row(
                 "SELECT id,title,prompt,trigger_kind,trigger_value,enabled,permission_summary,
@@ -366,7 +372,7 @@ pub(super) fn admit(
             on_update();
             return Ok(Admission::Consumed);
         }
-        if origin == Origin::Manual && execution_is_busy(&transaction, id)? {
+        if origin != Origin::Scheduled && execution_is_busy(&transaction, id)? {
             return Err("该自动化已在执行，不会重复启动".to_string());
         }
         if pause_unsupported_schedule_in_tx(&transaction, &automation, now, None)? {
@@ -379,7 +385,10 @@ pub(super) fn admit(
                 Err("自动化定时频率不受支持，已暂停".to_string())
             };
         }
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = match origin {
+            Origin::ManualRequest(run_id) => run_id.to_owned(),
+            Origin::Manual | Origin::Scheduled => Uuid::new_v4().to_string(),
+        };
         let live_owner = LiveOwner::reserve(database, id, &run_id)?;
         transaction
             .execute(
@@ -452,7 +461,7 @@ pub(super) fn execute_ticket(
 pub(super) fn run(
     state: &AppState,
     id: &str,
-    origin: Origin,
+    origin: Origin<'_>,
     now: i64,
     on_update: &dyn Fn(),
     execute: &dyn Fn(&AppState, &Automation) -> ScriptRunResult,

@@ -307,12 +307,17 @@ async fn request_transport_diagnostics_keep_fixed_failure_kinds_without_urls() {
         .unwrap();
     // A bound listener that does not accept/respond deterministically times out.
     let timeout_message = transport_provider
-        .chat(&[message("user", "OK")], None, None)
+        .chat_stream_classified(&[message("user", "OK")], None, None, None)
         .await
         .unwrap_err();
-    assert!(timeout_message.contains("请求超时"));
-    assert!(!timeout_message.contains("fixture-private"));
-    assert!(!timeout_message.contains(&address.to_string()));
+    assert_eq!(timeout_message.kind, LlmFailureKind::TimedOut);
+    assert!(timeout_message.diagnostic.contains("请求超时"));
+    assert!(!timeout_message.diagnostic.contains("fixture-private"));
+    assert!(!timeout_message.diagnostic.contains(&address.to_string()));
+    assert!(timeout_message
+        .kind
+        .visible_notice()
+        .is_some_and(|notice| notice.contains("网络")));
     drop(listener);
     // Windows can take longer than the deliberately tiny timeout above to
     // return connection refused. Give this distinct failure its own deadline.
@@ -323,15 +328,19 @@ async fn request_transport_diagnostics_keep_fixed_failure_kinds_without_urls() {
         .build()
         .unwrap();
     let refused_message = transport_provider
-        .chat(&[message("user", "OK")], None, None)
+        .chat_stream_classified(&[message("user", "OK")], None, None, None)
         .await
         .unwrap_err();
     assert!(
-        refused_message.contains("连接建立失败"),
-        "{refused_message}"
+        refused_message.diagnostic.contains("连接建立失败"),
+        "{refused_message:?}"
     );
-    assert!(!refused_message.contains("fixture-private"));
-    assert!(!refused_message.contains(&address.to_string()));
+    assert!(!refused_message.diagnostic.contains("fixture-private"));
+    assert!(!refused_message.diagnostic.contains(&address.to_string()));
+    assert!(refused_message
+        .kind
+        .visible_notice()
+        .is_some_and(|notice| notice.contains("网络")));
 }
 
 fn parser(mode: ModelAuthMode) -> ResponsesStream {
@@ -516,6 +525,54 @@ fn native_compaction_replays_only_the_bound_window_without_new_tool_authority() 
             matches!(calls.completed.take().unwrap().response.into_parts().0, LlmResponse::ToolCalls { calls, .. } if calls.len() == 1 && calls[0].id == "after-checkpoint")
         );
     }
+}
+
+#[test]
+fn native_checkpoint_prunes_superseded_turn_clocks_and_keeps_current_clock() {
+    use crate::agent::prompt::TurnClock;
+
+    let mode = ModelAuthMode::ChatgptPlan;
+    let checkpoint =
+        json!({"type":"compaction","id":"cmp_owned","encrypted_content":"opaque-owned-checkpoint"});
+    let mut stream = parser(mode);
+    stream
+        .feed(
+            &event(&completed(vec![
+                checkpoint.clone(),
+                output_message("ready", "final_answer"),
+            ])),
+            None,
+        )
+        .unwrap();
+    let mut compacted = message("assistant", "ready");
+    compacted.protocol_state = stream.completed.take().unwrap().response.into_parts().1;
+
+    let prior = TurnClock::parse("2026-11-11T23:59:00+08:00")
+        .unwrap()
+        .to_message();
+    let current = TurnClock::parse("2026-11-12T00:01:00+08:00")
+        .unwrap()
+        .to_message();
+    let mut history = vec![
+        message("system", "owner instructions"),
+        message("developer", "live host policy"),
+        prior.clone(),
+        message("user", "previous task"),
+        compacted,
+    ];
+    let p = provider(mode, "gpt-5.4");
+    let within_turn = p.request_body(&history, None, None).unwrap();
+    assert_eq!(within_turn["input"][1]["content"], prior.content);
+    assert_eq!(within_turn["input"][2], checkpoint);
+
+    history.extend([current.clone(), message("user", "next task")]);
+    let next_turn = p.request_body(&history, None, None).unwrap();
+    assert_eq!(next_turn["instructions"], "owner instructions");
+    assert_eq!(next_turn["input"][0]["content"], "live host policy");
+    assert_eq!(next_turn["input"][1], checkpoint);
+    assert_eq!(next_turn["input"][3]["content"], current.content);
+    assert_eq!(next_turn["input"][4]["content"], "next task");
+    assert!(!next_turn.to_string().contains("2026-11-11T23:59:00"));
 }
 
 #[test]
@@ -718,6 +775,31 @@ fn endpoint_never_routes_plan_credentials_to_custom_hosts_or_backend_api() {
         .as_str(),
         "https://gateway.example/openai/v1/responses"
     );
+}
+
+#[test]
+fn implicit_cache_breakpoint_probe_changes_only_one_stable_content_block() {
+    let p = provider(ModelAuthMode::ChatgptPlan, "gpt-6-luna");
+    let mut messages = [
+        message("developer", "stable synthetic prefix"),
+        message("user", "first suffix"),
+    ];
+    let mut expected = p.request_body(&messages, None, None).unwrap();
+    assert!(p.enable_implicit_cache_breakpoint());
+    let first = p.request_body(&messages, None, None).unwrap();
+    expected["input"][0]["content"] = json!([{
+        "type":"input_text",
+        "text":"stable synthetic prefix",
+        "prompt_cache_breakpoint":{"mode":"explicit"},
+    }]);
+    assert_eq!(first, expected);
+    assert!(first.get("prompt_cache_options").is_none());
+    assert!(first.get("prompt_cache_retention").is_none());
+    messages[1].content = "second suffix".into();
+    expected["input"][1]["content"] = json!("second suffix");
+    assert_eq!(p.request_body(&messages, None, None).unwrap(), expected);
+    assert!(p.request_body(&messages[1..], None, None).is_err());
+    assert!(!provider(ModelAuthMode::ApiKey, "gpt-6-luna").enable_implicit_cache_breakpoint());
 }
 
 #[test]
@@ -1635,6 +1717,45 @@ fn fixture_provider(
 }
 
 #[tokio::test]
+async fn responses_rejected_or_non_stream_reply_has_a_safe_visible_reason() {
+    for (status, media_type, body, notice) in [
+        (
+            400,
+            "application/json",
+            r#"{"error":{"code":"unsupported_parameter","param":"tools","message":"private-rejection"}}"#,
+            "模型服务拒绝了请求",
+        ),
+        (
+            200,
+            "text/html",
+            "<html>private-gateway</html>",
+            "模型服务返回的响应格式不符合预期",
+        ),
+        (
+            200,
+            "text/event-stream",
+            "data: private-event\n\n",
+            "模型服务返回的响应格式不符合预期",
+        ),
+    ] {
+        let (provider, server) =
+            fixture_provider(status, Some(media_type), body.as_bytes().to_vec());
+        let failure = provider
+            .chat_stream_classified(&[message("user", "private-input")], None, None, None)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        let visible = failure.kind.visible_detail().unwrap_or_default();
+        assert!(
+            visible.contains(notice) && visible.contains(&format!("HTTP {status}")),
+            "fixture HTTP {status} {media_type}: {failure:?}"
+        );
+        assert!(!visible.contains("private-"));
+        assert!(!failure.diagnostic.contains("private-"));
+    }
+}
+
+#[tokio::test]
 async fn http_response_seam_exposes_safe_non_sse_categories_without_accepting_output() {
     for (status, media_type, body, expected) in [
         (
@@ -1701,7 +1822,7 @@ async fn http_json_error_preserves_recovery_even_when_status_is_success_without_
 }
 
 #[tokio::test]
-async fn classified_requests_only_recognize_exact_quota_codes_across_http_and_sse() {
+async fn classified_requests_distinguish_quota_from_rate_limits_across_http_and_sse() {
     for (code, kind) in [
         (
             "subscription_sharing_usage_limit_exceeded",
@@ -1712,7 +1833,7 @@ async fn classified_requests_only_recognize_exact_quota_codes_across_http_and_ss
             "subscription_sharing_usage_unavailable",
             LlmFailureKind::Unclassified,
         ),
-        ("rate_limit_exceeded", LlmFailureKind::Unclassified),
+        ("rate_limit_exceeded", LlmFailureKind::RateLimited),
         ("unknown", LlmFailureKind::Unclassified),
     ] {
         let error = json!({"code":code,"message":"secret-token insufficient_quota subscription_sharing_usage_limit_exceeded"});
@@ -1755,6 +1876,18 @@ async fn classified_requests_only_recognize_exact_quota_codes_across_http_and_ss
                 }
                 .unwrap_err();
                 server.join().unwrap();
+                let kind = if kind == LlmFailureKind::Unclassified {
+                    if status == 429 {
+                        LlmFailureKind::RateLimited
+                    } else {
+                        LlmFailureKind::Protocol {
+                            stage: LlmProtocolStage::ProviderReportedFailure,
+                            http_status: Some(status),
+                        }
+                    }
+                } else {
+                    kind
+                };
                 assert_eq!(failure.kind, kind, "HTTP {status}, {media_type:?}, {code}");
                 if media_type.is_none() {
                     assert!(failure.diagnostic.contains("响应类型：缺失"));
@@ -1762,7 +1895,7 @@ async fn classified_requests_only_recognize_exact_quota_codes_across_http_and_ss
                 assert!(!failure.diagnostic.contains("secret-token"));
                 assert_eq!(
                     failure.kind.visible_notice().is_some(),
-                    kind == LlmFailureKind::QuotaExceeded
+                    kind != LlmFailureKind::Unclassified
                 );
             }
         }
@@ -1777,7 +1910,7 @@ async fn classified_requests_only_recognize_exact_quota_codes_across_http_and_ss
         .await
         .unwrap_err();
     server.join().unwrap();
-    assert_eq!(failure.kind, LlmFailureKind::Unclassified);
+    assert_eq!(failure.kind, LlmFailureKind::RateLimited);
     assert!(!failure.diagnostic.contains("secret-token"));
 }
 
@@ -1819,7 +1952,7 @@ async fn string_only_provider_errors_stay_unclassified_without_diagnostic_parsin
     );
     assert_eq!(
         LlmFailureKind::QuotaExceeded.visible_notice(),
-        Some("当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。")
+        Some("当前模型用量已达限制。请检查服务商额度，恢复后可继续任务。")
     );
 }
 

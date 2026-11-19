@@ -15,9 +15,13 @@ export function RuntimeHealthPanel({
   const [restartError, setRestartError] = useState<string | null>(null);
   const restartInFlight = useRef(false);
   const hasCriticalIssue = health.issues.some((issue) => issue.severity === 'critical');
-  const needsRestart = health.issues.some((issue) => issue.recoveryAction === 'restart');
+  const schedulerIssue = health.issues.find(issue => issue.code === 'automation_scheduler_unavailable');
+  // The ordinary restart action preserves launch args. Recovery here must
+  // start from a manual launch so it cannot arm another login occurrence.
+  const needsRestart = !schedulerIssue && health.issues.some((issue) => issue.recoveryAction === 'restart');
   const ephemeralStorage = health.issues.some((issue) => issue.code === 'ephemeral_storage');
-  const primaryIssue = health.issues[0];
+  const primaryIssue = health.issues.find(issue => issue.severity === 'critical')
+    ?? schedulerIssue ?? health.issues.find(issue => issue.severity === 'warning') ?? health.issues[0];
 
   if (!primaryIssue) return null;
 
@@ -40,7 +44,7 @@ export function RuntimeHealthPanel({
   return (
     <details
       className={`runtime-health-notice ${health.status === 'degraded' ? 'is-warning' : 'is-notice'}`}
-      open={hasCriticalIssue || undefined}
+      open={hasCriticalIssue || !!schedulerIssue || undefined}
     >
       <summary className="runtime-health-summary">
         <span className="runtime-health-indicator" aria-hidden="true" />

@@ -85,8 +85,38 @@ fn startup_uses_owned_execution_once_and_does_not_replay_on_manual_relaunch() {
     );
 }
 
-fn execute(state: &AppState, origin: Origin, now: i64) -> Result<bool, String> {
+fn execute(state: &AppState, origin: Origin<'_>, now: i64) -> Result<bool, String> {
     run(state, "script", origin, now, &|| {}, &completed)
+}
+
+#[test]
+fn manual_request_receipt_is_persisted_before_launch_and_duplicate_cannot_relaunch() {
+    let state = setup();
+    let run_id = "a509f7f8-846e-43c2-9cef-39bfd9a430e1";
+    let origin = Origin::ManualRequest(run_id);
+    let Admission::Started(ticket) = admit(&state, "script", origin, 15, &|| {}).unwrap() else {
+        panic!("expected the first request to claim execution");
+    };
+    assert_eq!(ticket.run_id, run_id);
+    assert!(matches!(
+        admit(&state, "script", origin, 16, &|| {}).unwrap(),
+        Admission::Consumed
+    ));
+    execute_ticket(&state, ticket, &|| {}, &|state, automation, _, _| {
+        completed(state, automation)
+    })
+    .unwrap();
+    assert!(matches!(
+        admit(&state, "script", origin, 17, &|| {}).unwrap(),
+        Admission::Consumed
+    ));
+    let conn = state.db.lock().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM automation_runs", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 fn owner(state: &AppState) -> Option<String> {

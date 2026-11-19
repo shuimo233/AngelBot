@@ -40,7 +40,7 @@ describe('WebSearchSettings', () => {
 
     expect(await screen.findByDisplayValue('https://api.tavily.com/search')).toHaveAttribute('readonly');
     expect(screen.getByLabelText('API Key')).toHaveValue('');
-    expect(screen.getByPlaceholderText('已安全保存；重新保存时请输入 API Key')).toBeInTheDocument();
+    expect(screen.getByLabelText('API Key')).toHaveAccessibleDescription('重新保存时需输入密钥。');
     expect(screen.getByRole('checkbox', { name: '允许使用联网搜索' })).not.toBeChecked();
   });
 

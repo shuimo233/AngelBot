@@ -4,7 +4,9 @@ import { loadApiConfig as loadApiConfigCmd, saveApiConfig as saveApiConfigCmd, t
 import { getProviderMeta } from '$lib/providers';
 
 interface SettingsState {
+  /** Editable settings form. The active copy changes only after a successful save. */
   profile: Persona;
+  activeProfile: Persona;
   /** Settings form draft; never use this to label or bind running conversations. */
   apiConfig: ApiConfig;
   activeApiConfig: ApiConfig;
@@ -19,6 +21,7 @@ interface SettingsState {
   updateApiConfig: (config: Partial<ApiConfig>) => void;
   discardApiConfigDraft: () => void;
   invalidatePlanBinding: (credentialRef: string | null) => void;
+  refreshPlanBinding: (status: Pick<ApiConfig, 'credentialRef' | 'planConnected' | 'planEnabled' | 'planAccountLabel' | 'planStatusError'>) => void;
   persistApiConfig: () => Promise<void>;
 }
 
@@ -84,6 +87,7 @@ export function fromRustConfig(rust: ApiProviderConfig): ApiConfig {
     planConnected: rust.plan_connected,
     planEnabled: rust.plan_enabled,
     planAccountLabel: rust.plan_account_label,
+    planStatusError: rust.plan_status_error,
     maxTokens: rust.max_tokens,
     temperature: rust.temperature,
   };
@@ -135,16 +139,19 @@ export function hasUnsavedApiConfig(draft: ApiConfig, active: ApiConfig): boolea
 }
 
 let apiConfigRequest = 0;
+const initialProfile = loadFromStorage(STORAGE_KEY_PROFILE, defaultProfile);
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
-  profile: loadFromStorage(STORAGE_KEY_PROFILE, defaultProfile),
+  profile: initialProfile,
+  activeProfile: initialProfile,
   apiConfig: defaultApiConfig,
   activeApiConfig: defaultApiConfig,
   apiConfigLoaded: false,
   apiConfigLoadError: null,
 
   loadProfile: () => {
-    set({ profile: loadFromStorage(STORAGE_KEY_PROFILE, defaultProfile) });
+    const profile = loadFromStorage(STORAGE_KEY_PROFILE, defaultProfile);
+    set({ profile, activeProfile: profile });
   },
 
   updateProfile: (partial) => {
@@ -154,6 +161,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   persistProfile: () => {
     const { profile } = get();
     localStorage.setItem(STORAGE_KEY_PROFILE, JSON.stringify(profile));
+    set({ activeProfile: profile });
   },
 
   loadApiConfig: async () => {
@@ -212,6 +220,19 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     if (active.authMode === 'chatgpt_plan' && (!credentialRef || active.credentialRef !== credentialRef)) {
       set({ activeApiConfig: { ...active, planConnected: false, planEnabled: false } });
     }
+  },
+
+  refreshPlanBinding: (status) => {
+    const active = get().activeApiConfig;
+    if (active.authMode !== 'chatgpt_plan') return;
+    const matches = Boolean(active.credentialRef && active.credentialRef === status.credentialRef);
+    set({ activeApiConfig: {
+      ...active,
+      planConnected: matches && Boolean(status.planConnected),
+      planEnabled: matches && Boolean(status.planEnabled),
+      planAccountLabel: matches ? status.planAccountLabel : null,
+      planStatusError: status.planStatusError,
+    } });
   },
 
   persistApiConfig: async () => {

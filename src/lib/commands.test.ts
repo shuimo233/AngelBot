@@ -8,10 +8,14 @@ describe('commands', () => {
   });
 
   it('reads the dashboard through its typed command and preserves read failures', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, data: { items: [] } })))
+    const pendingRequests = [{ automationId: 'task-a', runId: 'run-a' }];
+    const data = { items: [], acceptedRequests: pendingRequests };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, data })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: 'dashboard unavailable' })));
-    expect(await getAutomationDashboard()).toEqual({ items: [] });
-    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string).cmd).toBe('get_automation_dashboard');
+    expect(await getAutomationDashboard(pendingRequests)).toEqual(data);
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      cmd: 'get_automation_dashboard', args: { pendingRequests },
+    });
     await expect(getAutomationDashboard()).rejects.toThrow('dashboard unavailable');
   });
 

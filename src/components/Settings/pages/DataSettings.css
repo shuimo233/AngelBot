@@ -1,0 +1,29 @@
+.data-directories {
+  display: grid;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.data-directory {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--ui-space-3);
+  padding-block: var(--ui-space-3);
+}
+
+.data-directory + .data-directory { border-block-start: 1px solid var(--color-border-muted); }
+.data-directory > label { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--ui-space-2); align-items: start; }
+.data-directory > label span { display: grid; gap: 3px; min-width: 0; }
+.data-directory code, .data-default-path { color: var(--color-text-secondary); font-size: var(--ui-size-sm); overflow-wrap: anywhere; }
+
+.backup-rules { margin: 0; }
+.backup-rules dt { color: var(--color-text); font-weight: var(--ui-weight-title); }
+.backup-rules dd { margin: 0; }
+
+@container (max-width: 390px) {
+  .data-directory { grid-template-columns: minmax(0, 1fr); }
+  .data-directory > button { justify-self: start; }
+}

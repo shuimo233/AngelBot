@@ -4,6 +4,7 @@ use crate::agent::tool::ToolResult;
 use serde_json::{json, Value};
 
 pub(crate) const MAX_VIEW_BYTES: usize = 5000;
+pub(crate) const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 6_000;
 pub(crate) trait ToolContextProjector: Send + Sync {
     /// None means the original must remain visible: no durable source, an
     /// ineligible result, or no useful reduction. Errors also retain the raw
@@ -13,6 +14,7 @@ pub(crate) trait ToolContextProjector: Send + Sync {
         call_id: &str,
         tool_name: &str,
         result: &ToolResult,
+        visible_history: &[crate::llm::Message],
     ) -> Result<Option<String>, String>;
 }
 

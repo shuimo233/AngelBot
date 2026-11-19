@@ -1,17 +1,9 @@
 //! Desktop E2E Adapter and fixtures, compiled only for the isolated app.
 
-use super::{
-    bind_session_provider, ForegroundModelIdentity, ForegroundModelRequest, ModelResolutionError,
-    ResolvedForegroundModel,
-};
+use super::{resolved_model, ModelResolutionError, ResolvedForegroundModel};
 use crate::llm::{LlmProvider, ProviderConfig, ThinkingSettings};
-use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
 
-pub(super) fn resolve(
-    db: &Arc<Mutex<Connection>>,
-    request: ForegroundModelRequest<'_>,
-) -> Result<Option<ResolvedForegroundModel>, ModelResolutionError> {
+pub(super) fn prepare() -> Result<Option<ResolvedForegroundModel>, ModelResolutionError> {
     let Some(replies) = desktop_e2e_replies()? else {
         return Ok(None);
     };
@@ -26,19 +18,11 @@ pub(super) fn resolve(
         max_tokens: 1_024,
         temperature: 0.0,
     };
-    bind_session_provider(db, request.session_id, &config, request.now)?;
-    Ok(Some(ResolvedForegroundModel {
-        provider: Box::new(DesktopE2eProvider { replies }),
-        thinking_settings: None,
-        context_window_tokens: crate::llm::context_window_tokens(&config),
-        max_output_tokens: config.max_tokens as usize,
-        identity: ForegroundModelIdentity {
-            provider_profile_ref: config.profile_identity(),
-            credential_handle_ref: config.credential_identity(),
-            provider: config.provider,
-            model: config.model,
-        },
-    }))
+    Ok(Some(resolved_model(
+        config,
+        Box::new(DesktopE2eProvider { replies }),
+        None,
+    )))
 }
 
 /// Deterministic offline provider used only by the compiled desktop E2E app.
@@ -172,7 +156,7 @@ impl LlmProvider for DesktopE2eProvider {
     ) -> Result<crate::llm::LlmResponse, String> {
         let index = DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst);
         if matches!(self.replies.get(index), Some(DesktopE2eReply::Pending))
-            && !desktop_e2e_is_checkpoint_request(messages, tools, thinking)
+            && desktop_e2e_checkpoint_request(messages, tools, thinking).is_none()
             && !desktop_e2e_is_reviewed_delivery_summary(tools)
         {
             DESKTOP_E2E_NEXT_REPLY
@@ -199,9 +183,14 @@ impl LlmProvider for DesktopE2eProvider {
     ) -> Result<crate::llm::LlmResponse, String> {
         // Compaction uses this same provider between interactive turns. Model
         // that separate protocol, rather than consuming a desktop script step.
-        if desktop_e2e_is_checkpoint_request(messages, tools, thinking) {
+        if let Some(rolling) = desktop_e2e_checkpoint_request(messages, tools, thinking) {
+            let carryover = if rolling {
+                "## Continuing Commitments\nEarlier work remains pending in the retained messages.\n\n"
+            } else {
+                ""
+            };
             return Ok(crate::llm::LlmResponse::Text {
-                text: "## Goal\nResume the current bounded task from retained recent messages.\n\n\
+                text: format!("{carryover}## Goal\nResume the current bounded task from retained recent messages.\n\n\
                        ## Constraints & Preferences\nUse only the current authorized capabilities.\n\n\
                        ## Progress\n### Done\nThis deterministic test fixture omits historical content and asserts no completed user work.\n\
                        ### In Progress\nUnfinished work remains unfinished.\n\
@@ -209,8 +198,7 @@ impl LlmProvider for DesktopE2eProvider {
                        ## Key Decisions\nRetained messages remain authoritative.\n\n\
                        ## Verification\nOnly actual tool receipts establish execution; this checkpoint asserts no action result.\n\n\
                        ## Relevant Files\nNo historical file facts are carried by this test fixture.\n\n\
-                       ## Next Steps\nContinue the current request; obtain fresh observation references after each desktop action."
-                    .to_string(),
+                       ## Next Steps\nContinue the current request; obtain fresh observation references after each desktop action."),
                 stop_reason: crate::llm::StopReason::EndTurn,
             });
         }
@@ -322,13 +310,14 @@ impl LlmProvider for DesktopE2eProvider {
     }
 }
 
-fn desktop_e2e_is_checkpoint_request(
+/// Identify a canonical fixture request and whether it has a prior checkpoint.
+fn desktop_e2e_checkpoint_request(
     messages: &[crate::llm::Message],
     tools: Option<&[crate::llm::ToolSchema]>,
     thinking: Option<&ThinkingSettings>,
-) -> bool {
+) -> Option<bool> {
     let [message] = messages else {
-        return false;
+        return None;
     };
     if tools.is_some()
         || thinking.is_some()
@@ -338,29 +327,42 @@ fn desktop_e2e_is_checkpoint_request(
         || !message.tool_images.is_empty()
         || message.protocol_state.is_some()
     {
-        return false;
+        return None;
     }
-    let template = crate::agent::compaction::checkpoint_prompt("", None);
-    let (prefix, _) = template.split_once("\n\n<conversation>\n").unwrap();
-    let Some(mut body) = message.content.strip_prefix(prefix) else {
-        return false;
-    };
-    let facts = if let Some(with_facts) = body.strip_prefix("\n\n<verified-task-facts>\n") {
-        let Some((facts, remaining)) = with_facts.split_once("\n</verified-task-facts>") else {
-            return false;
+    use crate::agent::compaction::{foreground_checkpoint_prompt, CheckpointPolicy};
+
+    [
+        CheckpointPolicy::Generic,
+        CheckpointPolicy::Daily,
+        CheckpointPolicy::Project,
+    ]
+    .into_iter()
+    .flat_map(|policy| [false, true].map(move |rolling| (policy, rolling)))
+    .find_map(|(policy, rolling)| {
+        let template = foreground_checkpoint_prompt(policy, rolling.then_some(""), "", None);
+        let (prefix, _) = template.split_once("\n\n<conversation>\n")?;
+        let mut body = message.content.strip_prefix(prefix)?;
+        let facts = if let Some(with_facts) = body.strip_prefix("\n\n<verified-task-facts>\n") {
+            let (facts, remaining) = with_facts.split_once("\n</verified-task-facts>")?;
+            body = remaining;
+            Some(facts)
+        } else {
+            None
         };
-        body = remaining;
-        Some(facts)
-    } else {
-        None
-    };
-    let Some(transcript) = body
-        .strip_prefix("\n\n<conversation>\n")
-        .and_then(|value| value.strip_suffix("\n</conversation>"))
-    else {
-        return false;
-    };
-    message.content == crate::agent::compaction::checkpoint_prompt(transcript, facts)
+        let transcript = body
+            .strip_prefix("\n\n<conversation>\n")?
+            .strip_suffix("\n</conversation>")?;
+        let expected = if rolling {
+            let (previous, new) = transcript
+                .strip_prefix("<previous-checkpoint>\n")?
+                .strip_suffix("\n</new-transcript>")?
+                .split_once("\n</previous-checkpoint>\n\n<new-transcript>\n")?;
+            foreground_checkpoint_prompt(policy, Some(previous), new, facts)
+        } else {
+            foreground_checkpoint_prompt(policy, None, transcript, facts)
+        };
+        (message.content == expected).then_some(rolling)
+    })
 }
 
 const DESKTOP_E2E_PROVENANCE_ERROR: &str = "desktop E2E observation provenance assertion failed";
@@ -998,7 +1000,136 @@ fn desktop_e2e_replies() -> Result<Option<Vec<DesktopE2eReply>>, ModelResolution
 mod desktop_e2e_tests {
     use super::*;
     use crate::llm::{Message, ToolSchema};
+    use rusqlite::Connection;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn interrupted_file_task_continues_in_the_same_conversation() {
+        const CHILD: &str = "ANGELBOT_DESKTOP_E2E_CONTINUATION_TEST_CHILD";
+        const INPUT: &str = "item,count\napple,3\npear,2\n";
+        const REPORT: &str = "result,count\ntotal,5\n";
+        if std::env::var_os(CHILD).is_none() {
+            // Each offline desktop script owns a process-wide model cursor.
+            let script = json!([
+                {"type":"tool_calls","calls":[
+                    {"id":"read-input","name":"read_file","arguments":{"path":"input.csv"}}
+                ]},
+                {"type":"tool_calls","calls":[
+                    {"id":"write-report","name":"write_file","arguments":{"path":"summary.csv","content":REPORT}}
+                ]},
+                {"type":"text","text":"已写入清单，读回核验尚未完成。","finishReason":"length"},
+                {"type":"tool_calls","calls":[
+                    {"id":"read-report","name":"read_file","arguments":{"path":"summary.csv"}}
+                ]},
+                {"type":"text","text":"已读回 summary.csv，合计为 5。",
+                 "expectUserContentIncludes":["已知事实","summary.csv"]}
+            ]);
+            let module = module_path!().split_once("::").unwrap().1;
+            let name =
+                format!("{module}::interrupted_file_task_continues_in_the_same_conversation");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT", script.to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("input.csv"), INPUT).unwrap();
+        let database = directory.path().join("continuation.db");
+        let mut state = crate::tests::test_app_state();
+        let conn = Connection::open(&database).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id,name,path,kind,directory_confirmed,created_at)
+             VALUES ('project','Recovery project',?1,'project',1,1)",
+            [project.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id,title,created_at,updated_at,project_id)
+             VALUES ('main','Recovery',1,1,'project')",
+            [],
+        )
+        .unwrap();
+        state.db = Arc::new(Mutex::new(conn));
+        crate::commands::message::set_agent_execution_permission_impl(&state, "full_access")
+            .unwrap();
+
+        let before = crate::handle_dev_command(
+            "send_message",
+            &json!({"req":{"sessionId":"main","role":"user","content":"读取 input.csv，生成 summary.csv 并读回核验。"}}),
+            &state,
+        );
+        assert_eq!(before["ok"], true, "{before}");
+        assert_eq!(
+            before["data"]["taskRun"]["status"], "needs_attention",
+            "{before}"
+        );
+        assert_eq!(before["data"]["taskRun"]["resumable"], true, "{before}");
+        assert_eq!(
+            before["data"]["taskFacts"]["modified_files"],
+            json!(["summary.csv"])
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("summary.csv")).unwrap(),
+            REPORT
+        );
+
+        let source_id = before["data"]["id"].as_str().unwrap();
+        drop(state);
+        let mut state = crate::tests::test_app_state();
+        state.db = Arc::new(Mutex::new(Connection::open(&database).unwrap()));
+        let after = crate::handle_dev_command(
+            "continue_agent_task",
+            &json!({"req":{"sessionId":"main","messageId":source_id}}),
+            &state,
+        );
+        assert_eq!(after["ok"], true, "{after}");
+        assert_eq!(after["data"]["parentId"], source_id);
+        assert_eq!(after["data"]["taskRun"]["status"], "completed");
+        let readback = after["data"]["toolResults"].as_array().unwrap();
+        assert_eq!(readback.len(), 1);
+        assert_eq!(readback[0]["toolName"], "read_file");
+        assert_eq!(readback[0]["success"], true);
+        assert!(readback[0]["output"].as_str().unwrap().contains("total,5"));
+        let history =
+            crate::handle_dev_command("get_messages", &json!({"sessionId":"main"}), &state);
+        let messages = history["data"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|message| message["toolResults"].as_array())
+                .flatten()
+                .filter(|result| result["toolName"] == "write_file" && result["success"] == true)
+                .count(),
+            1,
+            "{history}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("summary.csv")).unwrap(),
+            REPORT
+        );
+    }
 
     fn message(role: &str, content: &str) -> Message {
         Message {
@@ -1166,6 +1297,32 @@ mod desktop_e2e_tests {
             "[user]\nEarlier bounded work remains unfinished.",
             None,
         );
+        let rolling = crate::agent::compaction::rolling_checkpoint_prompt(
+            "Earlier bounded work remains unfinished.",
+            "[user]\nRead the archive for this turn only.",
+            Some("unfinished: owned desktop task"),
+        );
+        use crate::agent::compaction::{foreground_checkpoint_prompt, CheckpointPolicy};
+        for policy in [CheckpointPolicy::Daily, CheckpointPolicy::Project] {
+            for previous in [None, Some("Earlier commitment remains open.")] {
+                let scoped = foreground_checkpoint_prompt(
+                    policy,
+                    previous,
+                    "[user]\nContinue bounded work.",
+                    Some("unfinished: owned desktop task"),
+                );
+                assert_eq!(
+                    desktop_e2e_checkpoint_request(&[message("user", &scoped)], None, None),
+                    Some(previous.is_some()),
+                );
+                assert!(desktop_e2e_checkpoint_request(
+                    &[message("user", &scoped.replace("## Goal", "## Other"))],
+                    None,
+                    None,
+                )
+                .is_none());
+            }
+        }
         let mut with_call_id = message("user", &checkpoint);
         with_call_id.tool_call_id = Some("not-a-checkpoint".into());
         let mut with_calls = message("user", &checkpoint);
@@ -1173,6 +1330,10 @@ mod desktop_e2e_tests {
         let malformed_requests = vec![
             vec![message("user", "Please explain CONTEXT CHECKPOINT")],
             vec![message("user", &checkpoint.replace("## Goal", "## Other"))],
+            vec![message(
+                "user",
+                &rolling.replace("<new-transcript>", "<untrusted-copy>"),
+            )],
             vec![message(
                 "user",
                 checkpoint.trim_end_matches("</conversation>"),
@@ -1237,6 +1398,18 @@ mod desktop_e2e_tests {
                 start
             );
         }
+        let response = provider
+            .chat(&[message("user", &rolling)], None, None)
+            .await
+            .unwrap();
+        let crate::llm::LlmResponse::Text { text, .. } = response else {
+            panic!("rolling compaction must return a text checkpoint");
+        };
+        assert!(text.starts_with("## Continuing Commitments\n"));
+        assert_eq!(
+            DESKTOP_E2E_NEXT_REPLY.load(std::sync::atomic::Ordering::SeqCst),
+            start
+        );
         use crate::agent::compaction::{CompactionHook, CompactionOutcome, DefaultCompactionHook};
         let hook = DefaultCompactionHook::with_token_budget(provider.clone(), 32, 4);
         let mut compacted = vec![

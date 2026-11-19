@@ -6,8 +6,11 @@ const FOCUSABLE_SELECTOR = [
   'input:not([disabled])',
   'select:not([disabled])',
   'textarea:not([disabled])',
+  'details > summary:first-of-type:not([tabindex="-1"])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(', ');
+
+const modalStack: HTMLElement[] = [];
 
 interface DialogFocusOptions {
   isOpen: boolean;
@@ -27,31 +30,45 @@ export function useDialogFocus<T extends HTMLElement>({
   onCloseRef.current = onClose;
 
   useEffect(() => {
-    if (!isOpen) return;
+    const dialog = dialogRef.current;
+    if (!isOpen || !dialog) return;
+    modalStack.push(dialog);
 
     returnFocusRef.current = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
 
     const frame = requestAnimationFrame(() => {
-      const dialog = dialogRef.current;
+      if (modalStack.at(-1) !== dialog) return;
       const initialFocus = initialFocusSelector
-        ? dialog?.querySelector<HTMLElement>(initialFocusSelector)
+        ? dialog.querySelector<HTMLElement>(initialFocusSelector)
         : dialog;
-      initialFocus?.focus({ preventScroll: true });
+      (initialFocus ?? dialog).focus({ preventScroll: true });
     });
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (modalStack.at(-1) !== dialog || event.defaultPrevented) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         onCloseRef.current();
         return;
       }
 
-      const dialog = dialogRef.current;
-      if (event.key !== 'Tab' || !dialog) return;
+      if (event.key !== 'Tab') return;
 
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+        .filter((element) => {
+          if (element.closest('[hidden], [inert]')) return false;
+          // Responsive navigation stays mounted; do not trap focus in its hidden branch.
+          for (let ancestor: HTMLElement | null = element; ancestor; ancestor = ancestor.parentElement) {
+            if (ancestor instanceof HTMLDetailsElement && !ancestor.open
+              && !ancestor.querySelector(':scope > summary')?.contains(element)) return false;
+            const style = getComputedStyle(ancestor);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (ancestor === dialog) break;
+          }
+          return true;
+        });
       if (focusable.length === 0) {
         event.preventDefault();
         dialog.focus();
@@ -74,7 +91,9 @@ export function useDialogFocus<T extends HTMLElement>({
     return () => {
       cancelAnimationFrame(frame);
       window.removeEventListener('keydown', handleKeyDown);
-      returnFocusRef.current?.focus({ preventScroll: true });
+      const wasTop = modalStack.at(-1) === dialog;
+      modalStack.splice(modalStack.indexOf(dialog), 1);
+      if (wasTop) returnFocusRef.current?.focus({ preventScroll: true });
     };
   }, [initialFocusSelector, isOpen]);
 

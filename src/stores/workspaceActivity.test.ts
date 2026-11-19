@@ -149,6 +149,18 @@ describe('workspace activity ownership', () => {
     expect(useWorkspaceActivityStore.getState().error).toBe('读取失败');
   });
 
+  it('refreshes a previously idle workbench after a reply ends without runner activity', async () => {
+    vi.mocked(getWorkspaceActivity).mockResolvedValueOnce(snapshot('A', 1))
+      .mockResolvedValueOnce(work('A', 2, 'needsDecision'));
+    useWorkspaceActivityStore.getState().observe('A', 'main-A');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getWorkspaceActivity).toHaveBeenCalledTimes(1);
+    listeners.get('agent_event_main-A')?.({ payload: { type: 'MessageEnd', data: { message_id: 'saved-reply' } } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getWorkspaceActivity).toHaveBeenCalledTimes(2);
+    expect(useWorkspaceActivityStore.getState().projection?.cursor).toBe(2);
+  });
+
   it('does no background polling while hidden or waiting for a user decision, and refreshes on return', async () => {
     const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
     vi.mocked(getWorkspaceActivity).mockResolvedValueOnce(work('A', 1, 'running'))

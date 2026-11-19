@@ -4,7 +4,9 @@
 //! user-facing read seam: it resolves the Workspace's selected conversation
 //! before adapting the existing durable delegation projection.
 
-use crate::agent::attention::{load_visible_summary, VisibleAttentionSummary};
+use crate::agent::attention::{
+    dismiss_retry_reminders, load_visible_summary, VisibleAttentionSummary,
+};
 use crate::agent::supervision::delegation_activity_adapter::{
     get_for_session, DelegationProjection, PendingDecisionProjection,
 };
@@ -27,15 +29,7 @@ pub fn get_workspace_activity_projection_impl(
     conn: &Connection,
     workspace_id: &str,
 ) -> Result<WorkspaceActivityProjection, String> {
-    let session_id: String = conn
-        .query_row(
-            "SELECT active_session_id FROM projects WHERE id = ?1",
-            params![workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "工作区不存在。".to_owned())?;
+    let session_id = selected_session(conn, workspace_id)?;
     let projection = get_for_session(conn, &session_id)?;
     let attention = load_visible_summary(conn, &session_id)?;
     Ok(WorkspaceActivityProjection {
@@ -45,6 +39,40 @@ pub fn get_workspace_activity_projection_impl(
         pending_decisions: projection.pending_decisions,
         attention,
     })
+}
+
+fn selected_session(conn: &Connection, workspace_id: &str) -> Result<String, String> {
+    conn.query_row(
+        "SELECT active_session_id FROM projects WHERE id = ?1",
+        params![workspace_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "工作区不存在。".to_owned())
+}
+
+pub(crate) fn dismiss_workspace_task_reminders_impl(
+    state: &AppState,
+    workspace_id: &str,
+    session_id: &str,
+    reminder_ids: &[String],
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|error| error.to_string())?;
+    if selected_session(&conn, workspace_id)? != session_id {
+        return Err("工作区已切换，请重新查看任务提醒。".into());
+    }
+    dismiss_retry_reminders(&conn, session_id, reminder_ids)
+}
+
+#[tauri::command]
+pub fn dismiss_workspace_task_reminders(
+    state: State<AppState>,
+    workspace_id: String,
+    session_id: String,
+    reminder_ids: Vec<String>,
+) -> Result<(), String> {
+    dismiss_workspace_task_reminders_impl(&state, &workspace_id, &session_id, &reminder_ids)
 }
 
 #[tauri::command]
@@ -66,11 +94,16 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE profile (id INTEGER PRIMARY KEY, updated_at INTEGER);
              CREATE TABLE sessions (id TEXT PRIMARY KEY, work_dir TEXT);
+             CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT);
+             CREATE TABLE task_runs (id TEXT PRIMARY KEY, session_id TEXT);
              CREATE TABLE attention_states (
                  id TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL,
                  goal_ref TEXT NOT NULL,
                  status TEXT NOT NULL,
+                 category TEXT DEFAULT 'runtime_failure',
+                 next_action TEXT DEFAULT 'retry',
+                 recovery_ref TEXT,
                  scope_owner_profile_id INTEGER,
                  scope_workspace_key TEXT
              );",

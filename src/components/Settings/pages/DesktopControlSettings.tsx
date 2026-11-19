@@ -12,6 +12,9 @@ import {
   type TrustedDesktopApp,
   type TrustedDesktopAppRuntimeStatus,
 } from '$lib/commands/desktop';
+import { Button, Input, TextField } from '../../../ui';
+import { SettingsSection } from '../components/SettingsSection';
+import './PermissionSettings.css';
 
 const emptyForm = { id: '', displayName: '', executablePath: '', launch: true, draft: false, fill: false, interact: false, draftSelector: '', enabled: true };
 
@@ -40,6 +43,7 @@ function discoveryErrorLabel(reason: unknown) {
 }
 
 export function DesktopControlSettings() {
+  const editorRef = useRef<HTMLDivElement>(null);
   const [apps, setApps] = useState<TrustedDesktopApp[]>([]);
   const [statuses, setStatuses] = useState<Record<string, TrustedDesktopAppRuntimeStatus>>({});
   const [form, setForm] = useState(emptyForm);
@@ -90,6 +94,8 @@ export function DesktopControlSettings() {
   const edit = (app: TrustedDesktopApp) => {
     clearDiscovery(); setError(null);
     setForm({ id: app.id, displayName: app.displayName, executablePath: app.executablePath, launch: app.capabilities.includes('launch'), draft: app.capabilities.includes('draft'), fill: app.capabilities.includes('fill'), interact: app.capabilities.includes('interact'), draftSelector: app.draftSelector ?? '', enabled: app.enabled });
+    editorRef.current?.focus({ preventScroll: true });
+    editorRef.current?.scrollIntoView?.({ block: 'start' });
   };
   const pickExecutable = async () => {
     setError(null);
@@ -158,75 +164,96 @@ export function DesktopControlSettings() {
     }
   };
 
-  return <div className="settings-page-content desktop-control-settings">
-    <section className="desktop-control-card">
-      <p className="desktop-control-eyebrow">DESKTOP CONTROL</p><h3>受信任的电脑操作</h3>
-      <p>AngelBot 优先使用项目文件能力和按工作区启用的 MCP；只有应用没有稳定接口时，才使用这里授权的 Windows 桌面操作。</p>
-      <dl className="desktop-control-layers">
-        <div><dt>项目文件</dt><dd>读写、创建目录，并可在资源管理器中定位当前项目内的文件。</dd></div>
-        <div><dt>MCP</dt><dd>应用提供 MCP 或本地连接器时，使用结构化工具完成操作。</dd></div>
-        <div><dt>桌面回退</dt><dd>查看已授权应用的窗口结构、控件状态或单窗口图像，或通过 Windows UI Automation 填写文本、操作已明确授权的控件；每次写入或操作前需要核对并确认。</dd></div>
-      </dl>
-      <div className="desktop-control-safety"><b>安全边界</b><span>添加或保存应用后，AngelBot 可读取该应用当前窗口的部分控件名称和标识，必要时获取单窗口图像并交给当前模型。图像可能包含私人内容；不会采集全桌面，不保存截图，检测到密码控件、锁屏或受保护窗口时拒绝捕获，但不能保证识别所有敏感内容。请只添加你愿意交给模型查看的应用。图像查看遵循对话中的整体操作权限；“完全访问”不逐次询问，其他模式先确认。能否打开应用、填写消息草稿或其他文本字段、操作控件由下方分别设置；图像本身不授予点击或输入权限，每次写入或操作前仍会核对具体目标，文本写入还会核对完整内容。文本填写不包含点击发送，目标应用可能自动保存或同步；调用、选中、展开或收起控件默认关闭，单独授权后仍须逐次确认，可能触发发送或删除，不能仅凭控件名称推断安全或权限。未登记程序和歧义控件会被拒绝。</span></div>
-    </section>
-    <section className="desktop-control-card">
-      <h3>{editing ? '编辑受信任应用' : '添加受信任应用'}</h3>
-      <label htmlFor="desktop-executable-path">程序路径</label>
-      <div className="desktop-control-path-field">
-        <input id="desktop-executable-path" value={form.executablePath} onChange={(event) => { clearDiscovery(); setForm({ ...form, executablePath: event.target.value }); }} placeholder="选择或填写完整的 .exe 路径" />
-        <button type="button" className="secondary" disabled={busy} onClick={pickExecutable}>选择程序</button>
-      </div>
-      <label>显示名称<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} placeholder="例如 Codex" /></label>
-      <label>内部标识<input value={form.id} disabled={editing} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="选择程序后自动生成" /><small>用于让 AngelBot 准确选择应用，通常不需要手动修改。</small></label>
-      <div className="desktop-control-capabilities">
-        <label><input type="checkbox" checked={form.launch} onChange={(event) => setForm({ ...form, launch: event.target.checked })} />允许打开应用</label>
-        <label><input type="checkbox" checked={form.draft} onChange={(event) => { clearDiscovery(); setForm({ ...form, draft: event.target.checked }); }} />允许填写消息草稿</label>
-        <label><input type="checkbox" checked={form.fill} onChange={(event) => setForm({ ...form, fill: event.target.checked })} />允许填写普通文本字段</label>
-        <label><input type="checkbox" checked={form.interact} onChange={(event) => setForm({ ...form, interact: event.target.checked })} />操作控件</label>
-        <label><input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />启用此配置</label>
-      </div>
-      <p>控件观察也可按需读取所选区域内最多 80 字的可见静态文字，用于核对结果，可能含个人内容；不读取编辑框值、密码、隐藏内容或后台页面，也不增加操作权限。</p>
-      {!form.launch && !form.draft && !form.fill && !form.interact && <p>仅查看：AngelBot 可查看此应用的窗口结构、控件状态或单窗口图像，但不能替你打开应用、填写文本或操作控件。</p>}
-      {editingLegacyApp && <p>这是旧版查看范围，尚未允许单窗口图像。保存后会允许将此应用的单窗口图像交给当前模型；如不需要，请保持原配置。</p>}
-      {form.fill && <p>允许后可填写当前窗口中经核对的普通文本字段；目标应用可能自动保存或同步。此权限不包含操作控件、勾选复选框、发送消息或修改密码。</p>}
-      {form.interact && <p>允许后可逐次确认并调用、选中、展开或收起当前窗口中经核对的控件，也可勾选／取消勾选普通复选框或小幅滚动。为准确选择下拉框和列表项，会读取它们最多 80 字的短名称，可能含个人内容；不读取字段值、密码控件或后台页面。操作可能触发发送、删除或其他不可撤销后果。控件已达到目标状态时不重复操作，状态无法确认时停止；半选复选框不自动切换。已允许窗口图像时，还可对稳定、无缩放的单个窗口提出一次左键点击；必须单独核对图像中的标记位置并确认，画面或窗口变化即拒绝，不支持键盘、拖拽或自动重试。名称不代表安全或授权，回执只确认请求已发出或对应控件状态，仍需检查任务结果，不代表目标已完成。</p>}
-      {savedPathChanged && form.fill && <p>程序路径已修改；请先取消普通文本字段填写权限并保存新路径，再单独授权新程序。</p>}
-      {savedPathChanged && form.interact && <p>程序路径已修改；请先取消操作控件权限并保存新路径，再单独授权新程序。</p>}
-      {form.draft && <>
-        <label>草稿输入框名称<input value={form.draftSelector} onChange={(event) => setForm({ ...form, draftSelector: event.target.value })} placeholder="可从当前窗口查找，或手动填写" /><small>只按名称定位唯一的普通输入框；不会读取其中的文字。</small></label>
-        <div className="desktop-control-discovery">
-          <button type="button" className="secondary" disabled={busy || discoveryBusy || !canDiscover} onClick={discoverTargets}>{discoveryBusy ? '正在查找…' : '查找当前窗口的输入框'}</button>
-          {!editing && <small>新应用请先只勾选“允许打开应用”并保存，然后编辑它来查找输入框。</small>}
-          {savedPathChanged && <small>程序路径已修改；请先取消草稿权限并保存新路径，再重新查找输入框。</small>}
-          {canDiscover && <small>先打开该应用并让目标输入框可见。已停用的应用也可以在这里配置，启用后 AngelBot 才能使用。</small>}
-        </div>
-        {discoveryError && <p className="desktop-control-error" role="alert">查找失败：{discoveryError}</p>}
-        {activeDiscovery && <div className="desktop-control-discovery-results" aria-live="polite">
-          {activeDiscovery.candidates.length === 0 ? <p>当前窗口没有可安全填写的输入框。请确认输入框可见、未被禁用，或手动核对名称。</p> : <>
-            <p>找到 {activeDiscovery.candidates.length} 个可填写输入框。选择后仍需保存配置；不会立即授权或填写。</p>
-            <ul>{activeDiscovery.candidates.map((candidate) => <li key={candidate.name}><button type="button" className={form.draftSelector === candidate.name ? 'is-selected' : ''} onClick={() => setForm((current) => ({ ...current, draftSelector: candidate.name }))} aria-pressed={form.draftSelector === candidate.name}>选择“{candidate.name}”</button></li>)}</ul>
-          </>}
-          {selectorNotDiscovered && <p className="desktop-control-discovery-warning">当前填写的名称未出现在本次查找结果中。请打开正确窗口后重试，或从列表重新选择。</p>}
-        </div>}
-      </>}
-      <div className="desktop-control-actions"><button disabled={busy || !valid} onClick={save}>{editingLegacyApp ? '保存并允许查看' : editing ? '保存配置' : '添加并允许查看'}</button>{form.id && <button className="secondary" disabled={busy} onClick={() => { clearDiscovery(); setForm(emptyForm); }}>取消</button>}</div>
-      {error && <p className="desktop-control-error" role="alert">{error}</p>}
-    </section>
-    <section className="desktop-control-card"><h3>可接触的应用</h3>
-      {loading && <p aria-live="polite">正在检查应用状态…</p>}
-      {!loading && apps.length === 0 && <p>尚未添加应用。默认情况下，AngelBot 无权操作任何外部程序。</p>}
-      {!loading && legacyApps.length > 0 && <div className="desktop-control-safety desktop-control-upgrade">
-        <b>旧配置需要确认</b>
-        <span>以下 {legacyApps.length} 个应用尚未允许单窗口图像：{legacyApps.map((app) => app.displayName).join('、')}。原有结构查看和操作权限保持不变。确认后可将这些应用的单窗口图像交给当前模型，可能包含私人内容；不采集全桌面，不保存截图。图像查看遵循整体操作权限，不授予点击或输入权限。你也可以逐个编辑并保存。</span>
-        <button type="button" className="secondary" disabled={busy} onClick={confirmLegacyApps}>允许查看上述应用</button>
-        {scopeError && <p className="desktop-control-error" role="alert">确认失败：{scopeError}</p>}
-      </div>}
-      {apps.map((app) => {
+  return <div className="settings-page-content desktop-permissions">
+    <SettingsSection title="受信任应用">
+      {loading && <p className="permission-copy" aria-live="polite">正在检查应用状态…</p>}
+      {!loading && apps.length === 0 && <p className="permission-copy">尚未授权应用。</p>}
+      {apps.length > 0 && <ul className="settings-rows desktop-permission-apps">{apps.map((app) => {
         const runtimeStatus = statuses[app.id];
         const actions = app.capabilities.filter((capability) => capability !== 'observe' && capability !== 'observeImage');
         const scope = app.capabilities.includes('observeImage') ? '可查看结构与图像' : app.capabilities.includes('observe') ? '仅结构，图像需确认' : '旧配置，尚未允许查看';
-        return <div className="desktop-control-row" key={app.id}><div><b>{app.displayName}</b><code>{app.executablePath}</code><small className={runtimeStatus === 'executableUnavailable' ? 'is-unavailable' : ''}>{runtimeStatusLabel(runtimeStatus)} · {scope} · {actions.length ? actions.map(capabilityLabel).join(' · ') : '仅查看'}</small></div><button disabled={busy} onClick={() => edit(app)}>编辑</button><button disabled={busy} onClick={() => remove(app.id)}>移除</button></div>;
-      })}
-    </section>
+        return <li className="desktop-permission-app" key={app.id}>
+          <div><strong>{app.displayName}</strong><code>{app.executablePath}</code><small className={runtimeStatus === 'executableUnavailable' ? 'permission-error' : undefined}>{runtimeStatusLabel(runtimeStatus)} · {scope} · {actions.length ? actions.map(capabilityLabel).join(' · ') : '仅查看'}</small></div>
+          <div className="settings-form-actions">
+            <Button size="small" variant="ghost" disabled={busy} onClick={() => remove(app.id)}>移除</Button>
+            <Button size="small" disabled={busy} onClick={() => edit(app)}>编辑</Button>
+          </div>
+        </li>;
+      })}</ul>}
+      {!loading && legacyApps.length > 0 && <div className="desktop-permission-upgrade permission-related-action">
+        <div className="permission-related-copy">
+          <strong>旧配置需要确认</strong>
+          <p>{legacyApps.map((app) => app.displayName).join('、')} · 确认后可把窗口图像发给模型，可能含隐私。</p>
+        </div>
+        <Button size="small" disabled={busy} onClick={confirmLegacyApps}>允许查看上述应用</Button>
+        {scopeError && <p className="permission-error" role="alert">确认失败：{scopeError}</p>}
+      </div>}
+    </SettingsSection>
+    <SettingsSection title={editing ? '编辑受信任应用' : '添加受信任应用'}>
+      <div className="settings-rows desktop-permission-form" ref={editorRef} tabIndex={-1}>
+        <div className="desktop-permission-field">
+          <label className="ui-field-label" htmlFor="desktop-executable-path">程序路径</label>
+          <div className="settings-field-action">
+            <Input id="desktop-executable-path" value={form.executablePath} onChange={(event) => { clearDiscovery(); setForm({ ...form, executablePath: event.target.value }); }} placeholder="选择或填写完整的 .exe 路径" />
+            <Button disabled={busy} onClick={pickExecutable}>选择程序</Button>
+          </div>
+        </div>
+        <div className="desktop-permission-identity">
+          <TextField label="显示名称" value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} placeholder="例如 Codex" />
+          <TextField label="内部标识" value={form.id} disabled={editing} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="选择程序后自动生成" />
+        </div>
+        <fieldset className="desktop-permission-options">
+          <legend>允许操作</legend>
+          <label><input type="checkbox" checked={form.launch} onChange={(event) => setForm({ ...form, launch: event.target.checked })} />允许打开应用</label>
+          <label><input type="checkbox" checked={form.draft} onChange={(event) => { clearDiscovery(); setForm({ ...form, draft: event.target.checked }); }} />允许填写消息草稿</label>
+          <label><input type="checkbox" checked={form.fill} onChange={(event) => setForm({ ...form, fill: event.target.checked })} />允许填写普通文本字段</label>
+          <label><input type="checkbox" checked={form.interact} onChange={(event) => setForm({ ...form, interact: event.target.checked })} />操作控件</label>
+        </fieldset>
+        {form.draft && <div className="desktop-permission-draft">
+          <TextField label="草稿输入框名称" value={form.draftSelector} onChange={(event) => setForm({ ...form, draftSelector: event.target.value })} placeholder="查找或手动填写" hint="按名称定位唯一的普通输入框。" />
+          <div className="desktop-permission-discovery permission-related-action">
+            <div className="permission-related-copy">
+              {!editing && <small>新应用请先只勾选「允许打开应用」并保存，再编辑查找。</small>}
+              {savedPathChanged && <small>请先取消草稿权限并保存新路径，再查找。</small>}
+              {canDiscover && <small>请先打开目标输入框所在的窗口。</small>}
+            </div>
+            <Button size="small" disabled={busy || discoveryBusy || !canDiscover} onClick={discoverTargets}>{discoveryBusy ? '正在查找…' : '查找当前窗口的输入框'}</Button>
+          </div>
+          {discoveryError && <p className="permission-error" role="alert">查找失败：{discoveryError}</p>}
+          {activeDiscovery && <div className="desktop-permission-results" aria-live="polite">
+            {activeDiscovery.candidates.length === 0 ? <p>没有可安全填写的输入框。请核对窗口或手动填写名称。</p> : <>
+              <p>选定输入框后保存。</p>
+              <ul>{activeDiscovery.candidates.map((candidate) => <li key={candidate.name}>
+                <Button size="small" onClick={() => setForm((current) => ({ ...current, draftSelector: candidate.name }))}
+                  aria-pressed={form.draftSelector === candidate.name}>选择“{candidate.name}”</Button>
+              </li>)}</ul>
+            </>}
+            {selectorNotDiscovered && <p className="permission-warning">结果中没有此名称。请核对窗口或重新选择。</p>}
+          </div>}
+        </div>}
+        <div className="desktop-permission-copy">
+          <strong>查看范围</strong>
+          <p>读取目标窗口的控件，含隐私的窗口图像可能发给模型。截图不保存。</p>
+          <p>完全访问可直接查看图像，其余模式需确认。</p>
+          <p>最多读取 80 字可见静态文字，跳过编辑框值、密码、隐藏内容和后台页面。</p>
+          {editingLegacyApp && <p className="permission-warning">保存即授权图像查看。</p>}
+          {form.fill && <p>填写需逐次确认，应用可能自动保存或同步。限普通文本字段。</p>}
+          {form.interact && <>
+            <p>控件操作需逐次确认，可读取最多 80 字的下拉项名称。</p>
+            <p>图像点击需确认位置，窗口或画面变化时停止。操作可能触发发送或删除。</p>
+          </>}
+          {savedPathChanged && form.fill && <p className="permission-warning">请先取消普通文本字段填写权限，再保存新路径。</p>}
+          {savedPathChanged && form.interact && <p className="permission-warning">请先取消操作控件权限，再保存新路径。</p>}
+        </div>
+        <div className="desktop-permission-submit">
+          <label><input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />启用此配置</label>
+          <div className="settings-form-actions">
+            {form.id && <Button variant="ghost" disabled={busy} onClick={() => { clearDiscovery(); setForm(emptyForm); }}>取消</Button>}
+            <Button variant="primary" disabled={busy || !valid} onClick={save}>{editingLegacyApp ? '保存并允许查看' : editing ? '保存配置' : '添加并允许查看'}</Button>
+          </div>
+        </div>
+      </div>
+      {error && <p className="permission-error" role="alert">{error}</p>}
+    </SettingsSection>
   </div>;
 }

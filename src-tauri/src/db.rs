@@ -256,6 +256,8 @@ const MIGRATIONS: &[(i32, &str)] = &[
         85,
         include_str!("migrations/085_provider_usage_details.sql"),
     ),
+    (86, include_str!("migrations/086_delegation_executor.sql")),
+    (87, include_str!("migrations/087_composer_drafts.sql")),
 ];
 
 /// Short human-readable description for each migration version, used in
@@ -347,6 +349,8 @@ const MIGRATION_DESCRIPTIONS: &[&str] = &[
     "branch-anchored conversation checkpoints",
     "checkpoint task facts and source invalidation",
     "optional provider-reported cache and reasoning usage",
+    "executor selection for delegated tasks",
+    "local text drafts for conversation composers",
 ];
 
 /// Read an integer setting, returning `default` if the key is missing or unparseable.
@@ -885,6 +889,10 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             } else {
                 (*sql).to_owned()
             }
+        } else if *version == 86 && delegations_has_column(conn, "executor") {
+            // A restored catalog can retain the column without the migration
+            // journal. Do not reset an already-authorized executor to default.
+            String::new()
         } else {
             (*sql).to_owned()
         };
@@ -1506,6 +1514,34 @@ mod tests {
         let version_after_second = get_setting_int(&conn, "schema_version", 0);
 
         assert_eq!(version_after_first, version_after_second);
+    }
+
+    #[test]
+    fn delegated_executor_migration_recovers_a_missing_journal_without_changing_executor() {
+        let (_tmp, conn) = setup_test_db();
+        migrate(&conn).unwrap();
+        seed_explorer_delegation(&conn, "change", "implementer", "fixture-scope");
+        let load = || {
+            conn.query_row::<String, _, _>(
+                "SELECT executor FROM delegations WHERE id='plan-delegation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(load(), "internal");
+        conn.execute(
+            "UPDATE delegations SET executor='codex_cli' WHERE id='plan-delegation'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM migration_log WHERE version=86", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(load(), "codex_cli");
+        assert!(conn
+            .execute("UPDATE delegations SET executor='unrecognized'", [])
+            .is_err());
     }
 
     #[test]

@@ -32,6 +32,7 @@ const projection = {
   attention: {
     open_count: 2,
     message: '有工作需要继续处理，进度已安全保留。请回到主对话说明下一步。',
+    retry_reminder_ids: ['attn_retry'],
   },
 };
 
@@ -65,6 +66,7 @@ describe('Workspace activity command boundary', () => {
       attention: {
         openCount: 2,
         message: '有工作需要继续处理，进度已安全保留。请回到主对话说明下一步。',
+        retryReminderIds: ['attn_retry'],
       },
     });
   });

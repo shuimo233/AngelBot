@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CommandPalette } from './index';
@@ -18,6 +18,7 @@ describe('CommandPalette', () => {
     useWorkspacesStore.setState({
       workspaces: [personal, project],
       activeWorkspaceId: 'personal',
+      recentProjectIds: [],
       loading: false,
       lastError: null,
       loadWorkspaces: vi.fn().mockResolvedValue(undefined),
@@ -108,5 +109,23 @@ describe('CommandPalette', () => {
 
     expect(screen.getByText('没有找到“不存在的入口”')).toBeInTheDocument();
     expect(screen.getByText(/试试项目名称/)).toBeInTheDocument();
+  });
+
+  it('limits visible workspace options while finding a project beyond that limit by path', async () => {
+    const user = userEvent.setup();
+    const tail = { ...project, id: 'last', name: 'Archive', rootPath: 'D:/owned/archive' };
+    const others = Array.from({ length: 30 }, (_, number) => ({ ...project, id: `p${number}`, name: `Project ${number}` }));
+    useWorkspacesStore.setState({ workspaces: [personal, ...others, tail] });
+    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    expect(within(screen.getByRole('group', { name: '工作区' })).getAllByRole('option')).toHaveLength(20);
+    expect(screen.getByRole('option', { name: /全部项目/ })).toBeVisible();
+    expect(screen.queryByRole('option', { name: /Archive/ })).not.toBeInTheDocument();
+    const search = screen.getByRole('textbox', { name: '快速切换' });
+    await user.type(search, String.raw`D:\owned\archive`);
+    expect(search).toHaveAttribute('aria-activedescendant', 'command-workspace-last');
+    fireEvent.keyDown(search, { key: 'Enter', isComposing: true });
+    expect(openWorkspace).not.toHaveBeenCalled();
+    await user.keyboard('{Enter}');
+    expect(openWorkspace).toHaveBeenCalledWith(tail.id);
   });
 });

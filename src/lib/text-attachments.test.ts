@@ -23,7 +23,7 @@ describe('explicit text attachment snapshots', () => {
   it('rejects unsupported, path-like, blank or deceptive filenames before reading', async () => {
     const reader = vi.spyOn(FileReader.prototype, 'readAsArrayBuffer');
     try {
-      for (const name of ['photo.png', 'report.pdf', 'book.xls', 'macros.xlsm', 'old.doc', ' .docx', '../notes.txt', 'folder\\notes.txt', 'bad\n.txt', 'bad\u202e.txt', '.txt', 'txt', `${'中'.repeat(67)}.txt`]) {
+      for (const name of ['photo.png', 'book.xls', 'macros.xlsm', 'old.doc', ' .docx', '../notes.txt', 'folder\\notes.txt', 'bad\n.txt', 'bad\u202e.txt', '.txt', 'txt', `${'中'.repeat(67)}.txt`]) {
         const error = await loadTextAttachments([new File(['hello'], name)]).catch((failure: unknown) => failure);
         expect(error).toBeInstanceOf(Error);
         expect((error as Error).message).not.toContain(name);
@@ -59,9 +59,9 @@ describe('explicit text attachment snapshots', () => {
     finally { reader.mockRestore(); }
   });
 
-  it('charges document extracted text, not ZIP bytes, and preserves the same snapshot contract', async () => {
+  it('charges extracted text and preserves the document snapshot contract', async () => {
     const bytes = new Uint8Array(MAX_TEXT_ATTACHMENT_BYTES + 1).fill(255);
-    for (const format of ['DOCX', 'XLSX']) {
+    for (const format of ['DOCX', 'XLSX', 'PDF']) {
       const snapshot = { name: `安排.${format}`, text: `【${format} 文字快照】\n事项\t完成` };
       extractMock.mockResolvedValueOnce(snapshot);
       expect(await loadTextAttachments([new File([bytes], snapshot.name)])).toEqual([snapshot]);

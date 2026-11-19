@@ -320,7 +320,7 @@ mod tests {
                 dir.path(),
             );
             assert!(!edited.success);
-            assert!(edited.content.contains("不能用文本写入"));
+            assert!(edited.content.contains("只能读取文字快照"));
             assert_eq!(
                 std::fs::read(dir.path().join("今日安排.DOCX")).unwrap(),
                 bytes

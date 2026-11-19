@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { getWorkspaceActivity, type WorkspaceActivityProjection } from '$lib/commands/workspace-activity';
 import { subscribeAgentSessionEvents } from '$lib/commands/agent-event';
+import { createProjectionRefresh } from '$lib/projection-refresh';
 
 interface WorkspaceActivityState {
   projection: WorkspaceActivityProjection | null;
@@ -20,11 +21,10 @@ function messageFrom(error: unknown): string {
 }
 
 const pollingStatuses = new Set(['queued', 'running', 'awaitingSummary', 'awaitingReview', 'materializationPending', 'unknown']);
-const refreshEvents = new Set(['AgentStart', 'ToolExecutionEnd', 'AgentEnd', 'Error']);
+const refreshEvents = new Set(['AgentStart', 'ToolExecutionEnd', 'MessageEnd', 'AgentEnd', 'Error']);
 
 /** Owns read synchronization only. Hints never execute, retry or approve work. */
 export const useWorkspaceActivityStore = create<WorkspaceActivityState>((set, get) => {
-  let read: { workspaceId: string; started: boolean; dirty: boolean; promise: Promise<void> } | null = null;
   let observation: {
     workspaceId: string; sessionId: string; consumers: number;
     nativeConnected: boolean; timer?: number; dispose: () => void;
@@ -37,7 +37,7 @@ export const useWorkspaceActivityStore = create<WorkspaceActivityState>((set, ge
   const schedule = () => {
     stopPolling();
     const owner = observation;
-    if (!owner || read || document.visibilityState === 'hidden'
+    if (!owner || reads.isPending() || document.visibilityState === 'hidden'
       || !get().projection?.work.some((item) => pollingStatuses.has(item.status))) return;
     owner.timer = window.setTimeout(() => {
       owner.timer = undefined;
@@ -48,47 +48,35 @@ export const useWorkspaceActivityStore = create<WorkspaceActivityState>((set, ge
     stopPolling();
     observation?.dispose();
     observation = null;
-    read = null; // Late reads cannot commit into a replacement lease.
+    reads.invalidate();
     set({ isLoading: false });
   };
+  const reads = createProjectionRefresh({
+    read: async (workspaceId: string) => {
+      const projection = await getWorkspaceActivity(workspaceId);
+      if (projection.workspaceId !== workspaceId) throw new Error('收到不属于当前工作区的任务状态，请重新检查。');
+      return projection;
+    },
+    onSuccess: (_, projection) => set({ projection, error: null }),
+    onError: (error) => set({ error: messageFrom(error) }),
+    onStart: (workspaceId) => {
+      stopPolling();
+      set(get().workspaceId === workspaceId ? { isLoading: true } : {
+        workspaceId, sessionId: observation?.sessionId ?? null,
+        projection: null, isLoading: true, error: null,
+      });
+    },
+    onIdle: () => {
+      set({ isLoading: false });
+      schedule();
+    },
+  });
 
   return {
     projection: null, workspaceId: null, sessionId: null, isLoading: false, error: null,
     refresh: (workspaceId) => {
       if (!workspaceId || (observation && observation.workspaceId !== workspaceId)) return Promise.resolve();
-      if (read?.workspaceId === workspaceId) {
-        if (read.started) read.dirty = true; // At most one trailing read, not N parallel requests.
-        return read.promise;
-      }
-      stopPolling();
-      const request: NonNullable<typeof read> = {
-        workspaceId, dirty: false, started: false,
-        promise: Promise.resolve().then(async () => {
-          request.started = true;
-          do {
-            if (read !== request) return;
-            request.dirty = false;
-            try {
-              const projection = await getWorkspaceActivity(workspaceId);
-              if (projection.workspaceId !== workspaceId) throw new Error('收到不属于当前工作区的任务状态，请重新检查。');
-              if (read === request) set({ projection, error: null });
-            } catch (error) {
-              if (read === request) set({ error: messageFrom(error) });
-            }
-          } while (read === request && request.dirty);
-        }).finally(() => {
-          if (read !== request) return;
-          read = null;
-          set({ isLoading: false });
-          schedule();
-        }),
-      };
-      read = request;
-      set(get().workspaceId === workspaceId ? { isLoading: true } : {
-        workspaceId, sessionId: observation?.sessionId ?? null,
-        projection: null, isLoading: true, error: null,
-      });
-      return request.promise;
+      return reads.request(workspaceId);
     },
     observe: (workspaceId, sessionId) => {
       if (!workspaceId || !sessionId) return () => {};

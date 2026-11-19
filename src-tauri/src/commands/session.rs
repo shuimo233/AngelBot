@@ -466,6 +466,7 @@ mod tests {
         let metadata = foreground_text_attachments::metadata(&[TextAttachment {
             name: "notes.txt".into(),
             text: "行,值\n一,二".into(),
+            reference_only: false,
         }])
         .unwrap();
         conn.execute(

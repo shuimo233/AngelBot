@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -20,7 +20,7 @@ describe('Sidebar workspace navigator', () => {
     localStorage.clear();
     useThemeStore.setState({ layout: 'A' });
     useWorkspacesStore.setState({
-      workspaces: [personal, project], activeWorkspaceId: 'personal', loading: false, lastError: null,
+      workspaces: [personal, project], recentProjectIds: [], activeWorkspaceId: 'personal', loading: false, lastError: null,
       loadWorkspaces: vi.fn().mockResolvedValue(undefined),
       openWorkspace: vi.fn().mockResolvedValue(true),
       createProject: vi.fn().mockResolvedValue(true),
@@ -40,21 +40,52 @@ describe('Sidebar workspace navigator', () => {
     expect(screen.queryByText('angelbot-main')).not.toBeInTheDocument();
   });
 
+  it('keeps the current project and seven recent shortcuts, with a way to open the full project page', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const projects = Array.from({ length: 12 }, (_, index) => ({
+      ...project, id: `project-${index}`, name: `项目 ${index}`, updatedAt: 20 - index,
+      directoryConfirmed: index !== 10,
+    }));
+    useWorkspacesStore.setState({ workspaces: [personal, ...projects], recentProjectIds: ['missing', 'project-9', 'project-11'], activeWorkspaceId: 'project-11' });
+    render(<Sidebar onClose={onClose} />);
+
+    const shortcuts = within(screen.getByRole('navigation', { name: '最近项目' }));
+    const orderedLabels = shortcuts.getAllByRole('button', { name: /^项目 \d+$/ }).map((button) => button.textContent);
+    expect(orderedLabels).toEqual(['项目 11', '项目 9', ...Array.from({ length: 6 }, (_, index) => `项目 ${index}`)]);
+    expect(shortcuts.getByRole('button', { name: '项目 11' })).toHaveAttribute('aria-current', 'true');
+    expect(shortcuts.getByRole('button', { name: '确认恢复目录（1）' })).toBeInTheDocument();
+
+    await user.click(shortcuts.getByRole('button', { name: '全部项目' }));
+    expect(useNavigationStore.getState().currentPage).toBe('projects');
+    expect(useWorkspacesStore.getState().openWorkspace).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(shortcuts.queryByRole('button', { name: '全部项目' })).not.toBeInTheDocument();
+
+    act(() => useThemeStore.setState({ layout: 'B' }));
+    expect(screen.queryByRole('navigation', { name: '最近项目' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '项目 11' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '项目', current: 'page' })).toBeInTheDocument();
+  });
+
   it('switches layout without navigating or reopening a workspace', async () => {
     const user = userEvent.setup();
     render(<Sidebar />);
     const toggle = screen.getByRole('button', { name: '切换界面布局' });
-    expect(toggle.closest('.sidebar-identity')).not.toBeNull();
+    expect(toggle.previousElementSibling).toHaveClass('sidebar-profile-name');
+    expect(toggle.parentElement).toHaveClass('sidebar-identity');
     expect(toggle.closest('footer')).toBeNull();
     expect(toggle.textContent).toBe('');
     expect(toggle.querySelector('svg')).toHaveAttribute('width', '20');
     expect(toggle.querySelector('svg')).toHaveAttribute('height', '20');
     expect(toggle).toHaveAttribute('title', '收起文字侧栏，切换到 B 生活视图');
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
     await user.tab();
     expect(toggle).toHaveFocus();
     await user.keyboard('{Enter}');
     expect(toggle).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: '切换界面布局' })).toBe(toggle);
+    expect(toggle).toHaveFocus();
     expect(toggle).toHaveAttribute('title', '展开文字侧栏，切换到 A 安静工作区');
     expect(useThemeStore.getState().layout).toBe('B');
     expect(localStorage.getItem('ui-layout')).toBe('B');
@@ -164,7 +195,7 @@ describe('Sidebar workspace navigator', () => {
       });
       render(<Sidebar />);
 
-      const empty = screen.queryByText('添加常用文件夹，在独立项目里接着上次的事继续。');
+      const empty = screen.queryByText('暂无项目');
       if (state === 'empty') expect(empty).toBeInTheDocument();
       else expect(empty).not.toBeInTheDocument();
       if (state === 'loading') expect(screen.getByRole('status')).toHaveTextContent('正在读取工作区');

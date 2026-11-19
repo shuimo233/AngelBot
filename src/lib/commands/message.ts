@@ -42,7 +42,7 @@ export async function saveMessageReply(sessionId: string, messageId: string): Pr
   }
 }
 
-/** Extract explicitly selected Office bytes into the read-only snapshot contract. */
+/** Extract explicitly selected document bytes into the read-only snapshot contract. */
 export async function extractDocumentText(name: string, dataBase64: string): Promise<TextAttachment> {
   try {
     return await invoke('extract_document_text', { req: { name, dataBase64 } });
@@ -190,19 +190,19 @@ export interface FlatPreferences {
   evolutionEnabled?: boolean;
 }
 
-export interface SendMessageArgs {
+export interface ForegroundInteractionPayload {
+  personality?: PersonalityPayload;
+  preferences?: FlatPreferences | null;
+  thinkingEffort?: 'low' | 'medium' | 'high';
+}
+
+export interface SendMessageArgs extends ForegroundInteractionPayload {
   sessionId: string;
   /** Stable client-generated ID used for the persisted user turn. */
   clientMessageId?: string;
   role: 'user' | 'assistant';
   content: string;
   textAttachments?: TextAttachment[];
-  /** Optional personality template to inject into system prompt */
-  personality?: PersonalityTemplate;
-  /** Optional user preferences to inject into system prompt */
-  preferences?: FlatPreferences | null;
-  /** Optional provider-native reasoning preference */
-  thinkingEffort?: 'low' | 'medium' | 'high';
   /** Sensitive credential envelope. It is never included in `content`. */
   webSearchSetup?: {
     provider: string;
@@ -214,6 +214,45 @@ export interface SendMessageArgs {
 export async function getMessages(sessionId: string): Promise<Message[]> {
   return (await invoke<Message[]>('get_messages', { sessionId })).map(normalizeMessageContract);
 }
+
+export type MessagePageCursor =
+  | { beforeId: string; afterId?: never; aroundId?: never; newerId?: never }
+  | { afterId: string; beforeId?: never; aroundId?: never; newerId?: never }
+  | { aroundId: string; beforeId?: never; afterId?: never; newerId?: never }
+  | { newerId: string; beforeId?: never; afterId?: never; aroundId?: never };
+
+export interface MessagePage {
+  messages: Message[];
+  hasOlder: boolean;
+  hasNewer: boolean;
+  reset?: boolean;
+}
+
+export async function getMessagePage(sessionId: string, cursor?: MessagePageCursor): Promise<MessagePage> {
+  const page = await invoke<MessagePage>('get_message_page', { sessionId, ...cursor });
+  return { ...page, messages: page.messages.map(normalizeMessageContract) };
+}
+
+export interface ConversationSearchHit {
+  id: string;
+  text: string;
+  role: 'user' | 'assistant';
+  createdAt: number;
+}
+
+export interface ConversationSearchPage {
+  results: ConversationSearchHit[];
+  nextBeforeId: string | null;
+}
+
+export function searchConversationPage(args: { sessionId: string; query: string; beforeId?: string }): Promise<ConversationSearchPage> {
+  return invoke<ConversationSearchPage>('search_conversation_page', { ...args });
+}
+
+/** Foreground persona projection, shared by send and edit/resend. */
+export type PersonalityPayload = Partial<Pick<PersonalityTemplate, 'id' | 'name' | 'description' | 'greeting' | 'traits'>> & {
+  supplement?: string;
+};
 
 export async function sendMessage(args: SendMessageArgs): Promise<Message> {
   return normalizeMessageContract(await invoke<Message>('send_message', {
@@ -238,6 +277,7 @@ export async function resolveAgentConfirmation(args: {
   decision: 'approved' | 'rejected';
   /** Required for approving a backend-preflighted desktop action. */
   previewId?: string;
+  interaction?: ForegroundInteractionPayload;
 }): Promise<ToolResult> {
   // The Tauri command receives a single `req` payload. Keep the production
   // IPC shape aligned with the dev HTTP command gateway.
@@ -283,6 +323,9 @@ export async function preflightPendingDesktopAction(args: {
 export async function continueAgentTask(args: {
   sessionId: string;
   messageId: string;
+  interaction?: ForegroundInteractionPayload;
+  /** Ask for a fresh reply from saved receipts, without running tools again. */
+  resultsOnly?: boolean;
 }): Promise<Message> {
   return normalizeMessageContract(await invoke<Message>('continue_agent_task', { req: args }));
 }
@@ -303,13 +346,10 @@ export async function updateMessageContent(messageId: string, content: string): 
 }
 
 /** Edit a user turn and replace its later transcript with a newly generated reply. */
-export async function editAndResendMessage(args: {
+export async function editAndResendMessage(args: ForegroundInteractionPayload & {
   sessionId: string;
   messageId: string;
   content: string;
-  personality?: PersonalityTemplate;
-  preferences?: FlatPreferences | null;
-  thinkingEffort?: 'low' | 'medium' | 'high';
 }): Promise<Message> {
   return normalizeMessageContract(await invoke<Message>('edit_and_resend_message', {
     req: {

@@ -40,6 +40,16 @@ code, pre, kbd { font-family: var(--ui-font-mono); }
 .ui-notice--success { background: var(--ui-success-soft); color: var(--ui-success); }
 .ui-notice--warning { background: var(--ui-warning-soft); color: var(--ui-warning); }
 .ui-notice--danger { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-notice--inline {
+  min-width: 0;
+  margin: 0;
+  padding: var(--ui-space-2) var(--ui-space-3);
+  border: 1px solid var(--ui-border);
+  font-size: var(--ui-size-sm);
+  line-height: var(--ui-leading-base);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .ui-tag {
   display: inline-flex;
   align-items: center;
@@ -61,6 +71,20 @@ code, pre, kbd { font-family: var(--ui-font-mono); }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--ui-border-strong); border: 2px solid var(--ui-canvas); border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: var(--ui-text-secondary); }
+}
+
+:root[data-reduced-motion] {
+  --ui-duration-fast: 0ms;
+  --ui-duration-base: 0ms;
+  --ui-duration-enter: 0ms;
+}
+:root[data-reduced-motion] *,
+:root[data-reduced-motion] *::before,
+:root[data-reduced-motion] *::after {
+  animation-duration: .01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: .01ms !important;
+  scroll-behavior: auto !important;
 }
 
 @media (prefers-reduced-motion: reduce) {

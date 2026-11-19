@@ -5,6 +5,12 @@ separate. A normal local release build creates the supported per-user NSIS
 installer without any updater key. The GitHub release workflow is the only path that enables the
 updater plugin and creates signed update artifacts.
 
+Early GitHub **Pre-releases** and later stable releases have different evidence
+requirements. A clean Windows VM, Authenticode certificate and completed manual
+checklist are not prerequisites for an early pre-release; disclose their status
+instead. Automated checks, code correctness, permission checks and explicit
+publication authorization remain required.
+
 ## Repository workflow
 
 - `main` is the default/integration branch (renamed from public `dev` on
@@ -101,6 +107,11 @@ private recovery material outside published trees and release artifacts.
 
 ## One-time repository setup
 
+This setup is for the existing updater-enabled release workflow, not a general
+prerequisite for publishing an unsigned early pre-release. The workflow still
+requires its updater configuration; this document does not change that workflow
+or add an unsigned publishing path.
+
 1. Generate the updater key pair on a trusted machine:
 
    ```powershell
@@ -118,21 +129,53 @@ Never commit either key or the generated `src-tauri/tauri.release.conf.json`.
 The release workflow writes that config from the public key at runtime.
 
 The updater signature proves that an update came from AngelBot. Windows
-Authenticode signing is a separate distribution requirement: configure a
-trusted Windows code-signing certificate before treating the installer as a
-public, warning-free download.
+Authenticode signing is separate: an unsigned early installer may be published
+with that limitation disclosed, but must not be described as Windows-signed or
+warning-free. Updater signing is still required when distributing updater artifacts.
 
 ## Release procedure
 
-Before running a generated installer, resolve the current installation blockers
-in [the unified roadmap](../docs/current-roadmap.md). `release:check` and a
-successful build do not prove runtime-directory alignment, data preservation,
-uninstall behavior or clean-account installation; do not run a quarantined
-artifact or treat those checks as installer acceptance.
+### Early pre-release
+
+1. Keep version metadata aligned and put the complete candidate source into an
+   explicit reviewed commit under the normal PR/check rules before tagging it.
+   Do not tag an old HEAD while the built candidate exists only as uncommitted
+   changes. Reuse passing `full`, scoped native and build evidence while their
+   inputs and acceptance conditions remain unchanged.
+   Code changes still require the affected checks; do not delete tests or weaken
+   assertions to publish sooner.
+2. Review the actual changes and artifact contents. Known data-loss, unauthorized
+   action or unsafe replay defects must be resolved; an unchecked manual item is
+   not itself a confirmed defect or a reason to create a VM.
+3. Disclose unsigned status, installer checks not performed, supported scope and
+   known limitations in the release notes. An early release does not claim clean
+   installation, general computer control or natural multi-day reliability.
+4. With explicit owner authorization, manually create a draft GitHub release
+   from that candidate commit using a non-`v*` tag such as `preview-0.2.0`, upload
+   the verified local NSIS and release notes, then publish as **Pre-release**, not
+   Latest. The preview tag is release metadata, not a change to the app version.
+   Do not upload updater signatures or `latest.json` for this no-updater build.
+
+The existing `release.yml` runs for `v*` tags, requires updater private/public keys,
+enables `production-updater` and sets `prerelease: false`. Keep it for the later
+stable/updater route; do not use a `v*` tag for the manual early route or weaken
+its checks. This distinction does not waive source PR checks or authorize a tag,
+push or release by itself; no new workflow or channel framework is needed.
+
+The [beta checklist](../docs/desktop-beta-checklist.md) remains a manual and
+extended-acceptance inventory, not an all-items gate for this early stage.
+
+### Stable promotion and updater-enabled releases
+
+Close the checks relevant to the stable release's advertised capabilities in
+[the unified roadmap](../docs/current-roadmap.md). `release:check` and a successful
+build do not prove runtime-directory alignment, data preservation, uninstall
+behavior or clean-account installation. Do not run a quarantined artifact or
+label an unperformed check as passed.
 
 1. Update the same SemVer version in `package.json`, `src-tauri/Cargo.toml`, and
    `src-tauri/tauri.conf.json`.
-2. Run:
+2. Run the following when current, matching evidence is not already available:
 
    ```powershell
    python scripts/verify.py full
@@ -144,10 +187,10 @@ artifact or treat those checks as installer acceptance.
    `src-tauri/target/release/bundle/`.
 4. Create and push the matching tag, for example `v0.1.0`. The release
    preflight rejects tags that do not match the application version.
-5. GitHub Actions creates a draft release containing the NSIS installer, signatures,
+5. With the updater workflow configured, GitHub Actions creates a draft release containing the NSIS installer, signatures,
    and `latest.json`. Install the draft artifacts on a clean Windows account
    and verify launch, first-run setup, project creation, and update behavior.
-6. Publish the draft only after the smoke test passes. Draft releases are not
+6. Promote the draft to stable only after the applicable smoke test passes. Draft releases are not
    served by the `releases/latest/download/latest.json` updater endpoint.
 
 ## Recovery

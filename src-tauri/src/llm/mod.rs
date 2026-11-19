@@ -11,6 +11,7 @@ mod metering;
 mod provider;
 pub mod router;
 pub(crate) mod tracked;
+mod transport;
 pub mod usage;
 
 // Issue #103: DeepSeek V4 API rejects legacy `deepseek-chat` / `deepseek-reasoner`
@@ -25,6 +26,10 @@ pub use anthropic::AnthropicProvider;
 pub use embedding::create_embedding_provider;
 pub mod auth;
 mod catalog;
+pub(crate) use catalog::{
+    create_foreground_provider_for_app, create_session_foreground_provider_for_app,
+    invalidate_foreground_websocket_for_app,
+};
 pub use catalog::{create_provider_for_app, create_provider_with_credentials};
 pub mod chatgpt_auth;
 mod openai_responses;
@@ -34,6 +39,7 @@ pub mod protocol;
 pub use openai_compat::OpenAiCompatibleProvider;
 #[cfg(test)]
 pub(crate) use openai_responses::native_context_shape;
+pub(crate) use openai_responses::plan_history_can_replay;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use protocol::{ModelAuthMode, ModelProtocol, ProtocolContinuation};
 #[allow(unused_imports)]
@@ -345,6 +351,7 @@ pub struct ProviderCacheDiagnostics {
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderResponseMetadata {
+    pub transport: Option<String>,
     pub model_matches_requested: Option<bool>,
     pub service_tier: Option<String>,
     pub organization_matches_previous: Option<bool>,
@@ -518,14 +525,119 @@ pub fn resolve_thinking_settings(
 pub enum LlmFailureKind {
     Unclassified,
     QuotaExceeded,
+    TransportUnavailable,
+    Authentication,
+    PermissionDenied,
+    RateLimited,
+    ServiceUnavailable,
+    TimedOut,
+    ResponseInterrupted,
+    Protocol {
+        stage: LlmProtocolStage,
+        http_status: Option<u16>,
+    },
+}
+
+/// Only fixed states are safe to show; an adapter error string is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProtocolStage {
+    PrepareRequest,
+    LoadCredentials,
+    RequestRejected,
+    ProviderReportedFailure,
+    ResponseType,
+    ResponseValidation,
+}
+
+impl LlmProtocolStage {
+    fn notice(self) -> &'static str {
+        match self {
+            Self::PrepareRequest => "模型请求无法按所选接口的格式生成；请求未发送。",
+            Self::LoadCredentials => "暂时无法读取、刷新或使用模型登录凭据；请求未发送。",
+            Self::RequestRejected => "模型服务拒绝了请求。请检查接口地址、模型和请求设置。",
+            Self::ProviderReportedFailure => "模型服务报告处理失败，未返回可用结果。",
+            Self::ResponseType => "模型服务返回的响应格式不符合预期。请检查接口地址或代理。",
+            Self::ResponseValidation => "模型服务返回的响应格式不符合预期，无法校验完成结果。",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrepareRequest => "准备请求",
+            Self::LoadCredentials => "读取模型凭据",
+            Self::RequestRejected => "请求准入",
+            Self::ProviderReportedFailure => "服务端处理",
+            Self::ResponseType => "响应类型检查",
+            Self::ResponseValidation => "响应协议校验",
+        }
+    }
 }
 
 impl LlmFailureKind {
+    pub(crate) fn event_code(self) -> crate::agent::event::ErrorCode {
+        use crate::agent::event::ErrorCode;
+        match self {
+            Self::Unclassified | Self::Protocol { .. } => ErrorCode::LlmError,
+            Self::QuotaExceeded => ErrorCode::LlmQuotaExceeded,
+            Self::TransportUnavailable => ErrorCode::LlmTransportError,
+            Self::Authentication => ErrorCode::LlmAuthentication,
+            Self::PermissionDenied => ErrorCode::LlmPermissionDenied,
+            Self::RateLimited => ErrorCode::LlmRateLimited,
+            Self::ServiceUnavailable => ErrorCode::LlmServiceUnavailable,
+            Self::TimedOut => ErrorCode::LlmTimedOut,
+            Self::ResponseInterrupted => ErrorCode::LlmResponseInterrupted,
+        }
+    }
+
+    pub(crate) fn from_event_code(code: &str) -> Option<Self> {
+        match code {
+            "LlmError" => Some(Self::Unclassified),
+            "LlmQuotaExceeded" => Some(Self::QuotaExceeded),
+            "LlmTransportError" => Some(Self::TransportUnavailable),
+            "LlmAuthentication" => Some(Self::Authentication),
+            "LlmPermissionDenied" => Some(Self::PermissionDenied),
+            "LlmRateLimited" => Some(Self::RateLimited),
+            "LlmServiceUnavailable" => Some(Self::ServiceUnavailable),
+            "LlmTimedOut" => Some(Self::TimedOut),
+            "LlmResponseInterrupted" => Some(Self::ResponseInterrupted),
+            _ => None,
+        }
+    }
+
     pub fn visible_notice(&self) -> Option<&'static str> {
         match self {
             Self::Unclassified => None,
-            Self::QuotaExceeded => Some("当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。"),
+            Self::QuotaExceeded => {
+                Some("当前模型用量已达限制。请检查服务商额度，恢复后可继续任务。")
+            }
+            Self::TransportUnavailable => {
+                Some("模型服务连接失败或请求超时。请检查网络与系统代理，连接恢复后可继续任务。")
+            }
+            Self::Authentication => {
+                Some("模型身份验证失败。请检查 API Key 或登录状态，恢复后可继续任务。")
+            }
+            Self::PermissionDenied => {
+                Some("模型服务拒绝了请求。请检查账号授权和模型权限，恢复后可继续任务。")
+            }
+            Self::RateLimited => Some("模型请求过于频繁。稍等片刻后可继续任务。"),
+            Self::ServiceUnavailable => Some("模型服务暂时不可用。服务恢复后可继续任务。"),
+            Self::TimedOut => Some("等待模型服务响应超时。请检查网络，连接恢复后可继续任务。"),
+            Self::ResponseInterrupted => Some("模型输出中途断开。连接恢复后可继续任务。"),
+            Self::Protocol { stage, .. } => Some(stage.notice()),
         }
+    }
+
+    /// A scoped recovery surface can include the numeric HTTP status without
+    /// exposing raw adapter diagnostics, response bodies or supplied text.
+    pub(crate) fn visible_detail(&self) -> Option<String> {
+        let notice = self.visible_notice()?;
+        let Self::Protocol { stage, http_status } = self else {
+            return Some(notice.into());
+        };
+        let status = http_status
+            .map(|status| format!("；HTTP {status}"))
+            .unwrap_or_default();
+        Some(format!("{notice}（阶段：{}{status}）", stage.label()))
     }
 }
 
@@ -534,6 +646,26 @@ impl LlmFailureKind {
 pub struct LlmFailure {
     pub kind: LlmFailureKind,
     pub diagnostic: String,
+}
+
+impl LlmFailure {
+    pub(super) fn at_protocol_stage(
+        mut self,
+        stage: LlmProtocolStage,
+        http_status: Option<u16>,
+    ) -> Self {
+        match &mut self.kind {
+            LlmFailureKind::Unclassified => {
+                self.kind = LlmFailureKind::Protocol { stage, http_status }
+            }
+            LlmFailureKind::Protocol {
+                http_status: status,
+                ..
+            } if status.is_none() => *status = http_status,
+            _ => {} // Never overwrite a more specific recovery classification.
+        }
+        self
+    }
 }
 
 impl From<String> for LlmFailure {
@@ -566,6 +698,11 @@ pub trait LlmProvider: Send + Sync {
     /// provider binding or retries inference when the route rejects the field.
     #[cfg(test)]
     fn enable_cache_comparison(&self) -> bool {
+        false
+    }
+    /// Synthetic Plan probe only: leave implicit caching in its default mode.
+    #[cfg(test)]
+    fn enable_implicit_cache_breakpoint(&self) -> bool {
         false
     }
     #[cfg(test)]

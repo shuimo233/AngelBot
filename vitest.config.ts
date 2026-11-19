@@ -6,6 +6,8 @@ import { availableParallelism } from 'node:os';
 export default defineConfig({
   plugins: [react()],
   test: {
+    // Build/worktree snapshots under target/ are not maintained frontend tests.
+    include: ['src/**/*.{test,spec}.?(c|m)[jt]s?(x)'],
     // Avoid a Windows fork burst (spawn EBUSY / exhausted pool IDs) on
     // many-core desktops. Keep file isolation and every test enabled.
     minWorkers: 1,

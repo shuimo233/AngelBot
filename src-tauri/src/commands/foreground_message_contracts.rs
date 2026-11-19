@@ -95,6 +95,9 @@ pub struct PersonalityPayload {
     pub greeting: Option<String>,
     #[serde(default)]
     pub traits: Option<TraitsPayload>,
+    /// Explicitly selected/edited persona notes, never the raw card or worldbook.
+    #[serde(default)]
+    pub supplement: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,7 +118,7 @@ pub struct TraitsPayload {
     pub patience: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct PreferencesPayload {
     #[serde(default, rename = "responseLength")]
     pub response_length: Option<String>,
@@ -133,6 +136,33 @@ pub struct PreferencesPayload {
     pub pet_peeves: Option<Vec<String>>,
     #[serde(default, rename = "evolutionEnabled")]
     pub evolution_enabled: Option<bool>,
+}
+
+/// UI-owned presentation and memory choices for a new interactive slice.
+/// This carries no authority, tools, history or user message content.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundInteractionPayload {
+    pub personality: Option<PersonalityPayload>,
+    pub preferences: Option<PreferencesPayload>,
+    pub thinking_effort: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InteractiveContinuation<T> {
+    #[serde(flatten)]
+    pub request: T,
+    #[serde(default)]
+    pub interaction: ForegroundInteractionPayload,
+}
+
+impl<T> From<T> for InteractiveContinuation<T> {
+    fn from(request: T) -> Self {
+        Self {
+            request,
+            interaction: ForegroundInteractionPayload::default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

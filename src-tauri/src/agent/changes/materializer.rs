@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
     review_artifact_store::{ReviewArtifactStore, ReviewArtifactStoreError},
@@ -149,6 +149,8 @@ pub enum MaterializationError {
     AlreadyTerminal,
     #[error("materialization effect is indeterminate")]
     Indeterminate,
+    #[error("another reviewed change is being applied to this workspace")]
+    WorkspaceBusy,
     #[error("canonical workspace is unavailable")]
     WorkspaceUnavailable,
     #[error("canonical workspace has drifted")]
@@ -194,13 +196,7 @@ where
             .ok_or(MaterializationError::ArtifactNotReady)?;
 
         if let Some(existing) = self.load_receipt(&request.confirmation_id)? {
-            return match existing.status {
-                MaterializationStatus::Applied => Ok(existing),
-                MaterializationStatus::Applying | MaterializationStatus::Unknown => {
-                    Err(MaterializationError::Indeterminate)
-                }
-                MaterializationStatus::Refused => Err(MaterializationError::AlreadyTerminal),
-            };
+            return existing_receipt_outcome(existing);
         }
 
         let change = self.approve_binding(&request, change_set_id)?;
@@ -217,12 +213,24 @@ where
             .locate(&request.scope)
             .map_err(|_| MaterializationError::WorkspaceUnavailable)?;
         let canonical = canonicalize_git_root(&canonical)?;
-        let head = self.git_output(&canonical, vec!["rev-parse".into(), "HEAD".into()])?;
-        let head = text_line(&head).ok_or(MaterializationError::WorkspaceDrift)?;
-        if head != request.artifact.base_commit {
-            return self.refuse(&request, "base_commit_drift");
+        // Claim before inspecting a mutable checkout. The durable receipt, not
+        // a process-local mutex, owns the workspace until a known terminal
+        // result. No DB lock is held while invoking Git.
+        let receipt = self.begin_receipt(&request, change_set_id)?;
+        if receipt.status == MaterializationStatus::Applied {
+            return Ok(receipt);
         }
-        let status = self.git_output(
+        let head = match self.git_output(&canonical, vec!["rev-parse".into(), "HEAD".into()]) {
+            Ok(head) => head,
+            Err(_) => return self.record_refusal(&receipt, &request, "pre_apply_read_failed"),
+        };
+        let Some(head) = text_line(&head) else {
+            return self.record_refusal(&receipt, &request, "base_commit_drift");
+        };
+        if head != request.artifact.base_commit {
+            return self.record_refusal(&receipt, &request, "base_commit_drift");
+        }
+        let status = match self.git_output(
             &canonical,
             vec![
                 "status".into(),
@@ -230,12 +238,14 @@ where
                 "--untracked-files=all".into(),
                 "-z".into(),
             ],
-        )?;
+        ) {
+            Ok(status) => status,
+            Err(_) => return self.record_refusal(&receipt, &request, "pre_apply_read_failed"),
+        };
         if !status.is_empty() {
-            return self.refuse(&request, "canonical_workspace_dirty");
+            return self.record_refusal(&receipt, &request, "canonical_workspace_dirty");
         }
 
-        let receipt = self.begin_receipt(&request, change_set_id)?;
         let cherry_pick = self.git.run(
             &canonical,
             &[
@@ -367,7 +377,31 @@ where
             .map_err(|_| MaterializationError::InvalidRequest)?;
         self.db
             .with_conn_mut(|conn| {
-                conn.execute(
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|_| MaterializationError::Storage)?;
+                if let Some(existing) = load_receipt(&tx, &request.confirmation_id)
+                    .map_err(|_| MaterializationError::Storage)?
+                {
+                    return existing_receipt_outcome(existing);
+                }
+                let occupied: Option<String> = tx
+                    .query_row(
+                        "SELECT receipt.status FROM delegation_materialization_receipts receipt
+                     JOIN work_packages package ON package.id=receipt.work_package_id
+                     WHERE package.workspace_key=?1 AND receipt.status IN ('applying','unknown')
+                     ORDER BY CASE receipt.status WHEN 'unknown' THEN 0 ELSE 1 END LIMIT 1",
+                        [&request.scope.workspace_key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| MaterializationError::Storage)?;
+                match occupied.as_deref() {
+                    Some("unknown") => return Err(MaterializationError::Indeterminate),
+                    Some(_) => return Err(MaterializationError::WorkspaceBusy),
+                    None => {}
+                }
+                tx.execute(
                     "INSERT INTO delegation_materialization_receipts
                      (id,confirmation_id,change_set_id,work_package_id,scope_digest,artifact_id,
                       base_commit,reviewed_commit_sha,reviewed_diff_hash,changed_paths_json,status,
@@ -388,29 +422,13 @@ where
                     ],
                 )
                 .map_err(|_| MaterializationError::Storage)?;
-                load_receipt(conn, &request.confirmation_id)
+                let receipt = load_receipt(&tx, &request.confirmation_id)
                     .map_err(|_| MaterializationError::Storage)?
-                    .ok_or(MaterializationError::Storage)
+                    .ok_or(MaterializationError::Storage)?;
+                tx.commit().map_err(|_| MaterializationError::Storage)?;
+                Ok(receipt)
             })
             .map_err(|_| MaterializationError::Storage)?
-    }
-
-    fn refuse(
-        &self,
-        request: &MaterializeRequest,
-        reason: &str,
-    ) -> Result<MaterializationReceipt, MaterializationError> {
-        // Refusal before a Git effect is safe to record and invalidates the
-        // confirmation so a stale approval cannot be retried silently.
-        let receipt = self.begin_receipt(
-            request,
-            request
-                .artifact
-                .change_set_id
-                .as_deref()
-                .ok_or(MaterializationError::ArtifactNotReady)?,
-        )?;
-        self.record_refusal(&receipt, request, reason)
     }
 
     fn record_refusal(
@@ -426,21 +444,10 @@ where
             request.now,
             None,
         )?;
-        self.db
-            .with_conn_mut(|conn| {
-                conn.execute(
-                    "UPDATE work_package_confirmations
-                     SET status='invalidated',updated_at=?1
-                     WHERE id=?2 AND status='approved'",
-                    params![request.now, request.confirmation_id],
-                )
-                .map_err(|_| MaterializationError::Storage)
-            })
-            .map_err(|_| MaterializationError::Storage)??;
         Err(match reason {
             "canonical_workspace_dirty" => MaterializationError::WorkspaceDirty,
             "base_commit_drift" => MaterializationError::WorkspaceDrift,
-            "cherry_pick_conflict" => MaterializationError::GitFailed,
+            "cherry_pick_conflict" | "pre_apply_read_failed" => MaterializationError::GitFailed,
             _ => MaterializationError::BindingInvalid,
         })
     }
@@ -471,16 +478,30 @@ where
     ) -> Result<MaterializationReceipt, MaterializationError> {
         self.db
             .with_conn_mut(|conn| {
-                conn.execute(
+                let tx = conn.transaction().map_err(|_| MaterializationError::Storage)?;
+                let changed = tx.execute(
                     "UPDATE delegation_materialization_receipts
                      SET status=?1,error_class=?2,updated_at=?3,applied_at=?4
-                     WHERE id=?5 AND status IN ('applying','refused','unknown')",
+                     WHERE id=?5 AND status='applying'",
                     params![status.as_str(), error_class, updated_at, applied_at, id],
                 )
                 .map_err(|_| MaterializationError::Storage)?;
-                load_receipt_by_id(conn, id)
+                if changed != 1 {
+                    return Err(MaterializationError::Indeterminate);
+                }
+                if status == MaterializationStatus::Refused {
+                    tx.execute(
+                        "UPDATE work_package_confirmations SET status='invalidated',updated_at=?1
+                         WHERE id=(SELECT confirmation_id FROM delegation_materialization_receipts WHERE id=?2)
+                         AND status='approved'",
+                        params![updated_at, id],
+                    ).map_err(|_| MaterializationError::Storage)?;
+                }
+                let receipt = load_receipt_by_id(&tx, id)
                     .map_err(|_| MaterializationError::Storage)?
-                    .ok_or(MaterializationError::Storage)
+                    .ok_or(MaterializationError::Storage)?;
+                tx.commit().map_err(|_| MaterializationError::Storage)?;
+                Ok(receipt)
             })
             .map_err(|_| MaterializationError::Storage)?
     }
@@ -494,6 +515,18 @@ where
             return Err(MaterializationError::GitFailed);
         }
         Ok(output.stdout)
+    }
+}
+
+fn existing_receipt_outcome(
+    receipt: MaterializationReceipt,
+) -> Result<MaterializationReceipt, MaterializationError> {
+    match receipt.status {
+        MaterializationStatus::Applied => Ok(receipt),
+        MaterializationStatus::Applying | MaterializationStatus::Unknown => {
+            Err(MaterializationError::Indeterminate)
+        }
+        MaterializationStatus::Refused => Err(MaterializationError::AlreadyTerminal),
     }
 }
 

@@ -85,6 +85,6 @@ export function AutomationTimePicker({ value, onChange }: { value: string; onCha
         <small>{part === 'hour' ? '内圈为 00、13–23 时。' : '方向键可逐分钟调整。'}</small>
         <div className="automation-clock-actions"><Button onClick={() => setOpen(false)}>取消</Button><Button variant="primary" onClick={() => part === 'hour' ? setPart('minute') : confirm()}>{part === 'hour' ? '选择分钟' : '确定'}</Button></div>
     </Dialog>
-    <small>按系统时区执行。</small>
+    <small>使用本机时间。到点时需保持 AngelBot 运行。</small>
   </div>;
 }
