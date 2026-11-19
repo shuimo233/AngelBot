@@ -1047,6 +1047,8 @@ mod desktop_e2e_tests {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         std::fs::create_dir(&project).unwrap();
+        let project_root =
+            crate::commands::file::display_work_dir(&project.canonicalize().unwrap());
         std::fs::write(project.join("input.csv"), INPUT).unwrap();
         let database = directory.path().join("continuation.db");
         let mut state = crate::tests::test_app_state();
@@ -1055,7 +1057,7 @@ mod desktop_e2e_tests {
         conn.execute(
             "INSERT INTO projects (id,name,path,kind,directory_confirmed,created_at)
              VALUES ('project','Recovery project',?1,'project',1,1)",
-            [project.to_str().unwrap()],
+            [&project_root],
         )
         .unwrap();
         conn.execute(

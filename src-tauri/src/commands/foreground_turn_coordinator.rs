@@ -570,6 +570,8 @@ test('report agrees with input', () => {
             let directory = tempfile::tempdir().unwrap();
             let workspace = directory.path().join("project");
             std::fs::create_dir(&workspace).unwrap();
+            let project_root =
+                crate::commands::file::display_work_dir(&workspace.canonicalize().unwrap());
             std::fs::write(workspace.join("input.json"), input_json).unwrap();
             std::fs::write(workspace.join("verify-report.cjs"), verify_report).unwrap();
             let database = directory.path().join("data.db");
@@ -579,7 +581,7 @@ test('report agrees with input', () => {
             conn.execute(
                 "INSERT INTO projects (id,name,path,kind,directory_confirmed,created_at)
                  VALUES ('fixture-project','Calculation',?1,'project',1,1)",
-                [workspace.to_str().unwrap()],
+                [&project_root],
             ).unwrap();
             conn.execute(
                 "INSERT INTO sessions (id,title,created_at,updated_at,project_id)

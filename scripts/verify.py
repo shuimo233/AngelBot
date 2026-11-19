@@ -179,4 +179,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Windows CI redirects stdout to a pipe. Preserve UTF-8 Rust diagnostics there.
+    sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())

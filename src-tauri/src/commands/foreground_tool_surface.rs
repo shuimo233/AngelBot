@@ -698,6 +698,8 @@ mod tests {
     fn state_with_pending_network_confirmation(workspace: &std::path::Path) -> AppState {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
+        let project_root =
+            crate::commands::file::display_work_dir(&workspace.canonicalize().unwrap());
         conn.execute(
             "INSERT OR IGNORE INTO profile (id, updated_at) VALUES (1, 1)",
             [],
@@ -707,14 +709,14 @@ mod tests {
             "INSERT INTO projects
                 (id, name, path, created_at, kind, updated_at, active_session_id)
              VALUES ('project-network', 'Network project', ?1, 1, 'project', 1, NULL)",
-            params![workspace.to_string_lossy().to_string()],
+            params![project_root],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sessions
                 (id, title, created_at, updated_at, work_dir, project_id, agent_provider, agent_model)
              VALUES ('network-session', 'Network', 1, 1, ?1, 'project-network', 'deepseek', 'deepseek-v4')",
-            params![workspace.to_string_lossy().to_string()],
+            params![project_root],
         )
         .unwrap();
         conn.execute(

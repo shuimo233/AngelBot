@@ -4259,7 +4259,7 @@ mod mcp_registry_name_tests {
         }
         let image_data = base64::engine::general_purpose::STANDARD.encode(png_bytes);
         let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("lost-response.js");
+        let script = directory.path().join("lost-response.cjs");
         std::fs::write(
             &script,
             r#"
@@ -4355,7 +4355,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             manager.stop("lost-response").unwrap();
             let connecting = manager.clone();
             let args = serde_json::json!([
-                directory.path().join("lost-response.js"),
+                directory.path().join("lost-response.cjs"),
                 mode,
                 "",
                 directory.path().join("effects.txt")

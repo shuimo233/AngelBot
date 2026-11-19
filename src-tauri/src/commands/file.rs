@@ -906,34 +906,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, unix))]
     fn project_workspace_keeps_its_delegation_root() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::migrate(&conn).unwrap();
-        let root = tempdir().unwrap();
-        let root_path = root.path().to_string_lossy().to_string();
-        conn.execute(
-            "INSERT INTO projects (id, name, path, created_at, kind, updated_at, active_session_id)
-             VALUES ('project-1', 'Project', ?1, 1, 'project', 1, NULL)",
-            rusqlite::params![root_path],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions (id, title, created_at, updated_at, context_version, work_dir, project_id)
-             VALUES ('project-main', '', 1, 1, 0, ?1, 'project-1')",
-            rusqlite::params![root_path],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE projects SET active_session_id = 'project-main' WHERE id = 'project-1'",
-            [],
+        let state = crate::tests::test_app_state();
+        crate::db::migrate(&state.db.lock().unwrap()).unwrap();
+        let fixture = tempdir().unwrap();
+        let parent = display_work_dir(&fixture.path().canonicalize().unwrap());
+        let root = Path::new(&parent).join("project");
+        let selection = Path::new(&parent).join("selection");
+        std::fs::create_dir(&root).unwrap();
+        crate::tests::create_test_directory_link(&selection, &root);
+        let opened = crate::commands::workspace::create_project_workspace_impl(
+            &state,
+            selection.to_str().unwrap().to_owned(),
+            None,
+            None,
+            None,
         )
         .unwrap();
 
-        let resolved = resolve_delegation_workspace_root(&conn, "project-main")
+        // Once selected, the project is bound to the canonical target even if
+        // the path used in the folder picker no longer exists.
+        #[cfg(windows)]
+        std::fs::remove_dir(&selection).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&selection).unwrap();
+        let conn = state.db.lock().unwrap();
+        let resolved = resolve_delegation_workspace_root(&conn, &opened.session.id)
             .unwrap()
             .expect("project workspace must keep delegation available");
 
-        assert_eq!(resolved, root.path());
+        assert_eq!(resolved, root);
     }
 
     #[test]

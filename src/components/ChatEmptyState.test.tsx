@@ -153,8 +153,17 @@ describe('ChatEmptyState', () => {
   });
 
   it('用户已在输入时不再展示会覆盖草稿的任务起点', () => {
-    render(<ChatStarterPrompts isProject={false} hidden onDraftSelect={vi.fn()} />);
+    const onDraftSelect = vi.fn();
+    const { rerender } = render(<ChatStarterPrompts isProject={false} hidden={false} onDraftSelect={onDraftSelect} />);
+    const starter = screen.getByRole('button', { name: /整理今天的安排/ });
+
+    rerender(<ChatStarterPrompts isProject={false} hidden onDraftSelect={onDraftSelect} />);
+    expect(starter).toBeInTheDocument();
+    expect(starter).toBeDisabled();
     expect(screen.queryByRole('region', { name: '对话示例' })).not.toBeInTheDocument();
+
+    rerender(<ChatStarterPrompts isProject={false} hidden={false} onDraftSelect={onDraftSelect} />);
+    expect(screen.getByRole('button', { name: /整理今天的安排/ })).toBeEnabled();
   });
 
   it('项目空状态提示从哪里查看文件与任务', () => {

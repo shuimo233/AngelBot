@@ -115,9 +115,11 @@ describe('first-run desktop experience', () => {
       '帮我把今天要处理的事情整理成按优先级排序的行动清单。先问我缺少的关键信息。',
     );
     assert.equal((await browser.$$('.message-row.user')).length, 0, 'starter must only prepare a draft');
-    await browser.$('//button[contains(., "整理今天的安排")]').waitForExist({ reverse: true, timeout: 5_000 });
+    await personalStarter.waitForDisplayed({ reverse: true, timeout: 5_000 });
+    assert.equal(await personalStarter.isEnabled(), false);
     await composer.clearValue();
-    await browser.$('//button[contains(., "整理今天的安排")]').waitForDisplayed({ timeout: 5_000 });
+    await personalStarter.waitForDisplayed({ timeout: 5_000 });
+    assert.equal(await personalStarter.isEnabled(), true);
 
     const sendButton = await browser.$('button[title="发送"]');
     // Real Tauri IPC extraction, not a browser/model mock. A rejected batch
@@ -587,7 +589,7 @@ describe('first-run desktop experience', () => {
     await browser.saveScreenshot(join(screenshotDir, 'first-run-dark.png'));
     await browser.execute((restoreDark) => document.documentElement.classList.toggle('dark', restoreDark), preferredDark);
 
-    await modelNotice.$('button=模型设置').click();
+    await modelNotice.$('button=连接模型').click();
     const settingsDialog = await browser.$('[role="dialog"][aria-modal="true"]');
     await settingsDialog.waitForDisplayed({ timeout: 5_000 });
     await browser.waitUntil(
@@ -607,9 +609,10 @@ describe('first-run desktop experience', () => {
     await settingsDialog.$('button=模型与 API').click();
     await browser.waitUntil(async () => (await settingsDialog.$('.settings-page-title').getText()) === '模型与 API', { timeout: 5_000 });
     assert.equal(await settingsDialog.$('button=模型与 API').getAttribute('aria-current'), 'page');
-    await settingsDialog.$('h3=默认模型').waitForDisplayed({ timeout: 5_000 });
     await settingsDialog.$('h3=连接方式').waitForDisplayed({ timeout: 5_000 });
     await settingsDialog.$('.model-field select').waitForDisplayed({ timeout: 5_000 });
+    await settingsDialog.$('button=高级选项').click();
+    await settingsDialog.$('h3=默认模型').waitForDisplayed({ timeout: 5_000 });
     await browser.execute(() => document.documentElement.classList.remove('dark'));
     await browser.pause(200);
     await browser.saveScreenshot(join(screenshotDir, 'model-settings.png'));
