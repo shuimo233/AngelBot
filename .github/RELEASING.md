@@ -49,7 +49,12 @@ publication authorization remain required.
   final commit subject. A development merge is not a release; publishing tags or
   installers still requires explicit authorization. Do not enable automatic merging.
 - The merge checks are `Windows full verification`, `Windows desktop smoke test`
-  and `PR policy`. The latter handles title edits without rerunning Windows builds.
+  and `PR policy`. The desktop check requires two independent Windows jobs.
+  `Windows desktop smoke` sends one scripted message and verifies the same reply
+  after reload. `Windows desktop journey` exercises the longer workflows with
+  their own fixtures and reports each phase by name. Open the failed job for its
+  screenshot and diagnostic JSON. The policy check handles title edits without
+  rerunning Windows builds.
   Windows jobs also run for draft PRs on open, code update and reopen. Becoming
   ready for review changes no source input, so only the metadata policy reruns;
   it does not replace, bypass or remove any required check.
@@ -179,7 +184,8 @@ label an unperformed check as passed.
 
    ```powershell
    python scripts/verify.py full
-   npm run test:desktop
+   python scripts/desktop_e2e.py --suite smoke
+   python scripts/desktop_e2e.py --suite journey
    npm run release:build
    ```
 

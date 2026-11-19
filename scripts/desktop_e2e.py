@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and smoke-test the real desktop shell in an isolated runtime."""
+"""Run the isolated desktop smoke, full journey or an opt-in probe."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import re
 import socket
 import subprocess
 import sys
@@ -21,6 +20,7 @@ import tempfile
 import zipfile
 
 from native_uia_smoke import await_snapshot, owned_fixture
+from verify import isolated_environment
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -306,11 +306,338 @@ def assert_terminal_e2e_cleanup(data_dir: Path) -> None:
         connection.close()
 
 
+def desktop_environment(runtime: Path) -> dict[str, str]:
+    """Do not reuse a developer's live settings, credentials or fixture overrides."""
+    env = {key: value for key, value in isolated_environment().items()
+           if not key.startswith(("ANGELBOT_", "VITE_ANGELBOT_"))}
+    env.update({
+        "ANGELBOT_DESKTOP_E2E": "1",
+        "VITE_ANGELBOT_DESKTOP_E2E": "1",
+        "ANGELBOT_DESKTOP_E2E_DATA_DIR": str(runtime / "angelbot-data"),
+        "WEBVIEW2_USER_DATA_FOLDER": str(runtime / "webview"),
+        "APPDATA": str(runtime),
+        "LOCALAPPDATA": str(runtime),
+    })
+    return env
+
+
+def configure_journey(env: dict[str, str]) -> None:
+    """Add the delegated worker, office snapshots and scripted full journey."""
+    env.update(
+        {
+            "ANGELBOT_DESKTOP_E2E_SEED_NETWORK_APPROVAL": "1",
+            "ANGELBOT_DESKTOP_E2E_EXPLORER_SCRIPT": json.dumps(
+                {
+                    "exchanges": [
+                        {
+                            "host": "docs.example.test",
+                            "method": "GET",
+                            "path_and_query": "/search?q=angelbot-e2e",
+                            "status": 200,
+                            "content_type": "application/json",
+                            "body": json.dumps(
+                                {
+                                    "results": [
+                                        {
+                                            "title": "AngelBot E2E documentation",
+                                            "url": "https://docs.example.test/angelbot-e2e",
+                                            "snippet": "Deterministic public Explorer evidence.",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            "ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT": json.dumps(
+                [
+                    {
+                        "type": "tool_calls",
+                        "text": "我会设置一个不调用模型的本地提醒。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-reminder",
+                                "name": "schedule_reminder",
+                                "arguments": {
+                                    "title": "核对今天的安排",
+                                    "body": "回看今天的安排，不执行外部操作。",
+                                    "when": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": "本地提醒已设置，你可以在当前对话中回看。",
+                        "expectUserContentIncludes": ["今日安排.docx", "DOCX 正文文字快照", "今天核对安排 & 本地提醒", "本地事项.xlsx", "XLSX 单元格值快照", "native-xlsx-marker", "Windows.log", "native-utf16-marker"],
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "我会把这项重复工作交给当前工作区的自动化处理。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-create-automation",
+                                "name": "create_automation",
+                                "arguments": {
+                                    "title": "每日邮件行动清单",
+                                    "prompt": "检查待处理邮件并生成行动清单；只整理和起草，不要发送邮件。",
+                                    "schedule": "每天 09:00",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": "自动化已创建，并已绑定到当前工作区。",
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "需要你允许后才会打开 Windows 声音设置。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-open-sound-settings",
+                                "name": "open_windows_setting",
+                                "arguments": {"page": "sound"},
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": "已取消打开 Windows 声音设置，并先说明如何调整声音。",
+                    },
+                    {
+                        "type": "text",
+                        "text": "自动化已执行：已整理今日待处理邮件，未发送任何邮件。",
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "我会调用当前项目已启用的本地 MCP 工具；执行前需要你确认。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-mcp-call",
+                                "name": MCP_E2E_TOOL_NAME,
+                                "arguments": {},
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": "本地 MCP 工具已返回校验结果。",
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "需要你允许后才会在当前项目中写入测试文件。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-rejected-write",
+                                "name": "write_file",
+                                "arguments": {
+                                    "path": "rejected-by-e2e.txt",
+                                    "content": "this must never be written",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "需要你允许后才会写入已批准的测试文件。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-approved-write",
+                                "name": "write_file",
+                                "arguments": {
+                                    "path": "approved-by-e2e.txt",
+                                    "content": "approved desktop E2E file content\n",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": "文件已写入：[查看 E2E 文件](angelbot-file:approved-by-e2e.txt)",
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "需要你确认后，才能委派一次受限的公开资料检索。",
+                        "calls": [
+                            {
+                                "id": "desktop-e2e-network-delegation",
+                                "name": "delegate_network_exploration",
+                                "arguments": {
+                                    "goal": "检索 AngelBot 的公开测试资料并返回可核验结论。",
+                                    "explorer_operations": [
+                                        {
+                                            "kind": "search",
+                                            "provider_host": "docs.example.test",
+                                            "query": "angelbot-e2e",
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": "已委派受限公开资料检索；完成后我会汇总可核验的结论。",
+                    },
+                    {
+                        "type": "tool_calls",
+                        "calls": [{"id": "main-stop-list-rejected", "name": "list_automations",
+                                   "arguments": {"query": "停止本次执行检查"}}],
+                    },
+                    {
+                        "type": "automation_stop", "callId": "main-stop-rejected",
+                        "sourceCallId": "main-stop-list-rejected", "title": "停止本次执行检查",
+                    },
+                    {
+                        "type": "tool_calls",
+                        "calls": [{"id": "main-stop-list-approved", "name": "list_automations",
+                                   "arguments": {"query": "停止本次执行检查"}}],
+                    },
+                    {
+                        "type": "automation_stop", "callId": "main-stop-approved",
+                        "sourceCallId": "main-stop-list-approved", "title": "停止本次执行检查",
+                    },
+                    {
+                        "type": "text",
+                        "text": "停止请求已接受，清理结果请查看当前对话的事项回看；已发生的操作不会撤回。",
+                    },
+                    {
+                        "type": "text",
+                        "text": "已读取你选择的日常行动清单；这是文件快照，不会修改原文件。",
+                        "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
+                        "forbiddenToolNames": ["run_project_command"],
+                    },
+                    {
+                        "type": "text",
+                        "text": "上一轮的文件快照仍在当前日常会话中，可以继续整理。",
+                        "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
+                        "forbiddenToolNames": ["run_project_command"],
+                    },
+                    {
+                        "type": "text",
+                        "text": "已按编辑后的要求重新整理，保留了原先选择的文件快照。",
+                        "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
+                        "forbiddenToolNames": ["run_project_command"],
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "请先核对 MAA 自动化范围；本次测试只查看确认卡，不运行游戏。",
+                        "calls": [{
+                            "id": "desktop-e2e-maa-consent",
+                            "name": "create_automation",
+                            "arguments": {
+                                "title": "MAA 确认测试",
+                                "schedule": "每天 18:00",
+                                "executorKind": "maa",
+                                "appId": "desktop-e2e-maa-not-executed",
+                                "launchEmulator": True,
+                                "timeoutSeconds": 1800,
+                            },
+                        }],
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "只有授权仍然有效才会打开测试应用。",
+                        "calls": [{
+                            "id": "desktop-e2e-revoked-app",
+                            "name": "open_trusted_app",
+                            "arguments": {"app_id": "notepad"},
+                        }],
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "请确认是否只查看临时测试窗口的图像。",
+                        "calls": [{
+                            "id": "desktop-e2e-rejected-image",
+                            "name": "observe_trusted_app_window",
+                            "arguments": {"app_id": "desktop-e2e-window", "mode": "image"},
+                        }],
+                    },
+                    {
+                        "type": "tool_calls",
+                        "text": "我会只观察临时测试窗口，不点击或填写。",
+                        "calls": [{
+                            "id": "desktop-e2e-window-image",
+                            "name": "observe_trusted_app_window",
+                            "arguments": {"app_id": "desktop-e2e-window", "mode": "image"},
+                        }],
+                    },
+                    {
+                        "type": "text",
+                        "text": "已看到测试窗口中的两组色块；这是只读观察，没有点击或填写。",
+                        "expectToolImageCallIds": ["desktop-e2e-window-image"],
+                    },
+                    {
+                        "type": "text",
+                        "text": "上一轮图像已释放，当前只保留文字结果。",
+                    },
+                    *owned_desktop_control_replies(),
+                    {
+                        "type": "text",
+                        "text": "今日安排已整理到这一步。",
+                        "finishReason": "length",
+                    },
+                    {
+                        "type": "text",
+                        "text": "已核对现有回复；本轮只补充说明，没有重复任何操作。",
+                        "expectUserContentIncludes": ["先核对现有结果，只补充说明，不重复操作。"],
+                    },
+                ],
+                ensure_ascii=False,
+            ),
+            "ANGELBOT_DESKTOP_E2E_DOCX_BASE64": docx_attachment_fixture(),
+            "ANGELBOT_DESKTOP_E2E_XLSX_BASE64": xlsx_attachment_fixture(),
+            "ANGELBOT_DESKTOP_E2E_FORMULA_XLSX_BASE64": xlsx_attachment_fixture(formula=True),
+            "ANGELBOT_DESKTOP_E2E_UTF16_BASE64": base64.b64encode(b"\xff\xfe" + "Windows 日志\r\nnative-utf16-marker".encode("utf-16-le")).decode("ascii"),
+        }
+    )
+
+
+def run_journey(command: list[str], env: dict[str, str], data_dir: Path) -> None:
+    # Start only after the potentially long desktop build. Always remove
+    # this owned window, including on WDIO failure or --keep-data runs.
+    with tempfile.TemporaryDirectory(prefix="angelbot-e2e-window-") as fixture_dir:
+        with owned_fixture(Path(fixture_dir), env, dense=True) as fixture:
+            env["ANGELBOT_DESKTOP_E2E_WINDOW_EXE"] = str(fixture.executable)
+            before = await_snapshot(fixture.snapshot_path, fixture.process, "ordinary-seed", 5)
+            # Only the Node test runner reads this owned fixture snapshot.
+            # Check the read-only image phase before later intentional UIA
+            # effects, so those effects cannot conceal an earlier mutation.
+            env["ANGELBOT_DESKTOP_E2E_WINDOW_SNAPSHOT"] = str(fixture.snapshot_path)
+            env["ANGELBOT_DESKTOP_E2E_WINDOW_BASELINE"] = json.dumps({
+                key: before.get(key)
+                for key in (*DESKTOP_OBSERVATION_STATE_KEYS, "processId", "windowTitle")
+            })
+            run(command, env)
+            after = await_snapshot(fixture.snapshot_path, fixture.process, "ordinary-seed", 5)
+            for snapshot in (before, after):
+                if (
+                    snapshot.get("processId") != fixture.process.pid
+                    or snapshot.get("windowTitle") != fixture.title
+                    or snapshot.get("denseMode") is not True
+                ):
+                    raise AssertionError("Owned observation fixture identity was lost")
+            for key in DESKTOP_OBSERVATION_STATE_KEYS:
+                if key in {"denseCheckedCounts", "denseUncheckedCounts"}:
+                    continue
+                if before.get(key) != after.get(key):
+                    raise AssertionError(f"Owned desktop task changed unrelated fixture state: {key}")
+            for key in ("denseCheckedCounts", "denseUncheckedCounts"):
+                if before.get(key) != [0, 0, 0, 0] or after.get(key) != [1, 0, 0, 0]:
+                    raise AssertionError(f"Owned desktop task did not act exactly once in region A: {key}")
+    assert_terminal_e2e_cleanup(data_dir)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--keep-data", action="store_true")
     modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--suite", choices=("smoke", "journey"), default="journey",
+                       help="Run the short desktop smoke or the full journey (default: journey).")
     modes.add_argument("--reply-export", action="store_true")
     modes.add_argument("--manual-native", action="store_true",
                        help="Real saved ChatGPT model + owned native window; the user handles approvals.")
@@ -341,328 +668,32 @@ def main() -> int:
         else tempfile.TemporaryDirectory(prefix="angelbot-desktop-e2e-")
     )
     with runtime_directory as runtime_dir:
-        data_dir = Path(runtime_dir) / "angelbot-data"
+        runtime = Path(runtime_dir)
         if keep_data:
-            print(f"Desktop E2E runtime retained at: {runtime_dir}", flush=True)
-        # Match the native smoke's child-environment hygiene. The fixture uses
-        # scripted providers and must not inherit a developer's live secrets.
-        sensitive = re.compile(r"TOKEN|API.?KEY|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
-        env = {name: value for name, value in os.environ.items() if not sensitive.search(name)}
-        env.update({"CARGO_NET_OFFLINE": "true", "NPM_CONFIG_OFFLINE": "true"})
-        env.update(
-            {
-                "ANGELBOT_DESKTOP_E2E": "1",
-                "ANGELBOT_DESKTOP_E2E_SEED_NETWORK_APPROVAL": "1",
-                "ANGELBOT_DESKTOP_E2E_EXPLORER_SCRIPT": json.dumps(
-                    {
-                        "exchanges": [
-                            {
-                                "host": "docs.example.test",
-                                "method": "GET",
-                                "path_and_query": "/search?q=angelbot-e2e",
-                                "status": 200,
-                                "content_type": "application/json",
-                                "body": json.dumps(
-                                    {
-                                        "results": [
-                                            {
-                                                "title": "AngelBot E2E documentation",
-                                                "url": "https://docs.example.test/angelbot-e2e",
-                                                "snippet": "Deterministic public Explorer evidence.",
-                                            }
-                                        ]
-                                    }
-                                ),
-                            }
-                        ]
-                    },
-                    ensure_ascii=False,
-                ),
-                "ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT": json.dumps(
-                    [
-                        {
-                            "type": "tool_calls",
-                            "text": "我会设置一个不调用模型的本地提醒。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-reminder",
-                                    "name": "schedule_reminder",
-                                    "arguments": {
-                                        "title": "核对今天的安排",
-                                        "body": "回看今天的安排，不执行外部操作。",
-                                        "when": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "本地提醒已设置，你可以在当前对话中回看。",
-                            "expectUserContentIncludes": ["今日安排.docx", "DOCX 正文文字快照", "今天核对安排 & 本地提醒", "本地事项.xlsx", "XLSX 单元格值快照", "native-xlsx-marker", "Windows.log", "native-utf16-marker"],
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "我会把这项重复工作交给当前工作区的自动化处理。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-create-automation",
-                                    "name": "create_automation",
-                                    "arguments": {
-                                        "title": "每日邮件行动清单",
-                                        "prompt": "检查待处理邮件并生成行动清单；只整理和起草，不要发送邮件。",
-                                        "schedule": "每天 09:00",
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "自动化已创建，并已绑定到当前工作区。",
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "需要你允许后才会打开 Windows 声音设置。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-open-sound-settings",
-                                    "name": "open_windows_setting",
-                                    "arguments": {"page": "sound"},
-                                }
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "已取消打开 Windows 声音设置，并先说明如何调整声音。",
-                        },
-                        {
-                            "type": "text",
-                            "text": "自动化已执行：已整理今日待处理邮件，未发送任何邮件。",
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "我会调用当前项目已启用的本地 MCP 工具；执行前需要你确认。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-mcp-call",
-                                    "name": MCP_E2E_TOOL_NAME,
-                                    "arguments": {},
-                                }
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "本地 MCP 工具已返回校验结果。",
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "需要你允许后才会在当前项目中写入测试文件。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-rejected-write",
-                                    "name": "write_file",
-                                    "arguments": {
-                                        "path": "rejected-by-e2e.txt",
-                                        "content": "this must never be written",
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "需要你允许后才会写入已批准的测试文件。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-approved-write",
-                                    "name": "write_file",
-                                    "arguments": {
-                                        "path": "approved-by-e2e.txt",
-                                        "content": "approved desktop E2E file content\n",
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "文件已写入：[查看 E2E 文件](angelbot-file:approved-by-e2e.txt)",
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "需要你确认后，才能委派一次受限的公开资料检索。",
-                            "calls": [
-                                {
-                                    "id": "desktop-e2e-network-delegation",
-                                    "name": "delegate_network_exploration",
-                                    "arguments": {
-                                        "goal": "检索 AngelBot 的公开测试资料并返回可核验结论。",
-                                        "explorer_operations": [
-                                            {
-                                                "kind": "search",
-                                                "provider_host": "docs.example.test",
-                                                "query": "angelbot-e2e",
-                                            }
-                                        ],
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "已委派受限公开资料检索；完成后我会汇总可核验的结论。",
-                        },
-                        {
-                            "type": "tool_calls",
-                            "calls": [{"id": "main-stop-list-rejected", "name": "list_automations",
-                                       "arguments": {"query": "停止本次执行检查"}}],
-                        },
-                        {
-                            "type": "automation_stop", "callId": "main-stop-rejected",
-                            "sourceCallId": "main-stop-list-rejected", "title": "停止本次执行检查",
-                        },
-                        {
-                            "type": "tool_calls",
-                            "calls": [{"id": "main-stop-list-approved", "name": "list_automations",
-                                       "arguments": {"query": "停止本次执行检查"}}],
-                        },
-                        {
-                            "type": "automation_stop", "callId": "main-stop-approved",
-                            "sourceCallId": "main-stop-list-approved", "title": "停止本次执行检查",
-                        },
-                        {
-                            "type": "text",
-                            "text": "停止请求已接受，清理结果请查看当前对话的事项回看；已发生的操作不会撤回。",
-                        },
-                        {
-                            "type": "text",
-                            "text": "已读取你选择的日常行动清单；这是文件快照，不会修改原文件。",
-                            "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
-                            "forbiddenToolNames": ["run_project_command"],
-                        },
-                        {
-                            "type": "text",
-                            "text": "上一轮的文件快照仍在当前日常会话中，可以继续整理。",
-                            "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
-                            "forbiddenToolNames": ["run_project_command"],
-                        },
-                        {
-                            "type": "text",
-                            "text": "已按编辑后的要求重新整理，保留了原先选择的文件快照。",
-                            "expectUserContentIncludes": ["daily-actions.csv", "attachment-e2e-marker"],
-                            "forbiddenToolNames": ["run_project_command"],
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "请先核对 MAA 自动化范围；本次测试只查看确认卡，不运行游戏。",
-                            "calls": [{
-                                "id": "desktop-e2e-maa-consent",
-                                "name": "create_automation",
-                                "arguments": {
-                                    "title": "MAA 确认测试",
-                                    "schedule": "每天 18:00",
-                                    "executorKind": "maa",
-                                    "appId": "desktop-e2e-maa-not-executed",
-                                    "launchEmulator": True,
-                                    "timeoutSeconds": 1800,
-                                },
-                            }],
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "只有授权仍然有效才会打开测试应用。",
-                            "calls": [{
-                                "id": "desktop-e2e-revoked-app",
-                                "name": "open_trusted_app",
-                                "arguments": {"app_id": "notepad"},
-                            }],
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "请确认是否只查看临时测试窗口的图像。",
-                            "calls": [{
-                                "id": "desktop-e2e-rejected-image",
-                                "name": "observe_trusted_app_window",
-                                "arguments": {"app_id": "desktop-e2e-window", "mode": "image"},
-                            }],
-                        },
-                        {
-                            "type": "tool_calls",
-                            "text": "我会只观察临时测试窗口，不点击或填写。",
-                            "calls": [{
-                                "id": "desktop-e2e-window-image",
-                                "name": "observe_trusted_app_window",
-                                "arguments": {"app_id": "desktop-e2e-window", "mode": "image"},
-                            }],
-                        },
-                        {
-                            "type": "text",
-                            "text": "已看到测试窗口中的两组色块；这是只读观察，没有点击或填写。",
-                            "expectToolImageCallIds": ["desktop-e2e-window-image"],
-                        },
-                        {
-                            "type": "text",
-                            "text": "上一轮图像已释放，当前只保留文字结果。",
-                        },
-                        *owned_desktop_control_replies(),
-                        {
-                            "type": "text",
-                            "text": "今日安排已整理到这一步。",
-                            "finishReason": "length",
-                        },
-                        {
-                            "type": "text",
-                            "text": "已核对现有回复；本轮只补充说明，没有重复任何操作。",
-                            "expectUserContentIncludes": ["先核对现有结果，只补充说明，不重复操作。"],
-                        },
-                    ],
-                    ensure_ascii=False,
-                ),
-                "VITE_ANGELBOT_DESKTOP_E2E": "1",
-                "ANGELBOT_DESKTOP_E2E_DATA_DIR": str(data_dir),
-                "ANGELBOT_DESKTOP_E2E_DOCX_BASE64": docx_attachment_fixture(),
-                "ANGELBOT_DESKTOP_E2E_XLSX_BASE64": xlsx_attachment_fixture(),
-                "ANGELBOT_DESKTOP_E2E_FORMULA_XLSX_BASE64": xlsx_attachment_fixture(formula=True),
-                "ANGELBOT_DESKTOP_E2E_UTF16_BASE64": base64.b64encode(b"\xff\xfe" + "Windows 日志\r\nnative-utf16-marker".encode("utf-16-le")).decode("ascii"),
-                "APPDATA": runtime_dir,
-                "LOCALAPPDATA": runtime_dir,
-            }
-        )
+            print(f"Desktop E2E runtime retained at: {runtime}", flush=True)
+        env = desktop_environment(runtime)
         npx = "npx.cmd" if os.name == "nt" else "npx"
         if reply_export:
-            run_reply_export_probe(npx, env, Path(runtime_dir), skip_build)
+            run_reply_export_probe(npx, env, runtime, skip_build)
             return 0
+
+        env["ANGELBOT_DESKTOP_E2E_SUITE"] = args.suite
+        if args.suite == "smoke":
+            env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"] = json.dumps([{
+                "type": "text",
+                "text": "angelbot-ci-smoke-ok: 已收到测试消息。",
+                "expectUserContentIncludes": ["angelbot-ci-smoke: 请确认收到测试消息，只回复文字。"],
+            }], ensure_ascii=False)
+        else:
+            configure_journey(env)
+
         prepare_desktop_binary(npx, env, skip_build)
         configure_webdriver_port(env)
-        # Start only after the potentially long desktop build. Always remove
-        # this owned window, including on WDIO failure or --keep-data runs.
-        with tempfile.TemporaryDirectory(prefix="angelbot-e2e-window-") as fixture_dir:
-            with owned_fixture(Path(fixture_dir), env, dense=True) as fixture:
-                env["ANGELBOT_DESKTOP_E2E_WINDOW_EXE"] = str(fixture.executable)
-                before = await_snapshot(fixture.snapshot_path, fixture.process, "ordinary-seed", 5)
-                # Only the Node test runner reads this owned fixture snapshot.
-                # Check the read-only image phase before later intentional UIA
-                # effects, so those effects cannot conceal an earlier mutation.
-                env["ANGELBOT_DESKTOP_E2E_WINDOW_SNAPSHOT"] = str(fixture.snapshot_path)
-                env["ANGELBOT_DESKTOP_E2E_WINDOW_BASELINE"] = json.dumps({
-                    key: before.get(key)
-                    for key in (*DESKTOP_OBSERVATION_STATE_KEYS, "processId", "windowTitle")
-                })
-                run([npx, "wdio", "run", "e2e/wdio.conf.mjs"], env)
-                after = await_snapshot(fixture.snapshot_path, fixture.process, "ordinary-seed", 5)
-                for snapshot in (before, after):
-                    if (
-                        snapshot.get("processId") != fixture.process.pid
-                        or snapshot.get("windowTitle") != fixture.title
-                        or snapshot.get("denseMode") is not True
-                    ):
-                        raise AssertionError("Owned observation fixture identity was lost")
-                for key in DESKTOP_OBSERVATION_STATE_KEYS:
-                    if key in {"denseCheckedCounts", "denseUncheckedCounts"}:
-                        continue
-                    if before.get(key) != after.get(key):
-                        raise AssertionError(f"Owned desktop task changed unrelated fixture state: {key}")
-                for key in ("denseCheckedCounts", "denseUncheckedCounts"):
-                    if before.get(key) != [0, 0, 0, 0] or after.get(key) != [1, 0, 0, 0]:
-                        raise AssertionError(f"Owned desktop task did not act exactly once in region A: {key}")
-        assert_terminal_e2e_cleanup(data_dir)
+        command = [npx, "wdio", "run", "e2e/wdio.conf.mjs"]
+        if args.suite == "smoke":
+            run(command, env)
+        else:
+            run_journey(command, env, runtime / "angelbot-data")
     return 0
 
 

@@ -15,6 +15,7 @@ const mainStopEvidenceDir = mkdtempSync(join(tmpdir(), 'angelbot-main-stop-evide
 writeFileSync(ownedStopScript, "require('node:fs').writeFileSync(process.argv[2], String(process.pid));\nsetInterval(() => {}, 1000);\n");
 const notepadPath = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'notepad.exe');
 const mcpFixturePath = fileURLToPath(new URL('../fixtures/mcp-stdio.cjs', import.meta.url));
+const mcpFixtureArgs = `"${mcpFixturePath}"`;
 
 async function revealSidebar() {
   const menuHidden = await browser.execute(() => document.querySelector('.sidebar')?.getBoundingClientRect().right <= 0);
@@ -46,10 +47,15 @@ async function returnToDailyConversation() {
   });
 }
 
+async function openWorkbench() {
+  const toggle = await browser.$('button[aria-controls="conversation-workbench"]');
+  await toggle.waitForDisplayed({ timeout: 10_000 });
+  if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
+  await browser.$('#conversation-workbench').waitForDisplayed({ timeout: 10_000 });
+}
+
 async function openAutomationRecall() {
-  if (!(await browser.$('.right-panel').isDisplayed())) {
-    await browser.$('[aria-label="打开工作台"]').click();
-  }
+  await openWorkbench();
   await browser.$('.workbench-tabs').$('button=任务').click();
   const recall = await browser.$('.right-panel .workspace-reminders');
   await recall.waitForDisplayed({ timeout: 5_000 });
@@ -59,6 +65,12 @@ async function openAutomationRecall() {
   return recall;
 }
 
+function readImageJourneyMessages() {
+  return browser.tauri.execute(async ({ core }) => {
+    const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
+    return core.invoke('get_messages', { sessionId: personal.activeSessionId });
+  });
+}
 
 after(async () => {
   // A failed assertion may leave the owned script using this directory. Stop
@@ -77,17 +89,22 @@ after(async () => {
 });
 
 describe('first-run desktop experience', () => {
-  it('guides the first task without blocking or sending on the user\'s behalf', async () => {
+  const screenshotDir = join(process.cwd(), 'src-tauri', 'target', 'e2e');
+  let journeyStarted;
+  const phase = name => console.log(`Desktop phase ${name}: ${Date.now() - journeyStarted}ms`);
+  let initialWorkspaces;
+  let createdProject;
+  let waitForOwnedDesktopConsent;
+
+  it('opens Daily, prepares a draft, and sends document attachments', async () => {
     const location = await browser.tauri.execute(() => window.location.href);
     assert.match(location, /^https?:\/\/tauri\.localhost\//);
-    const screenshotDir = join(process.cwd(), 'src-tauri', 'target', 'e2e');
     mkdirSync(screenshotDir, { recursive: true });
-    const journeyStarted = Date.now();
-    const phase = name => console.log(`Desktop phase ${name}: ${Date.now() - journeyStarted}ms`);
+    journeyStarted = Date.now();
     phase('startup');
     console.log(`Main stop evidence: ${mainStopEvidenceDir}`);
 
-    const initialWorkspaces = await browser.tauri.execute(({ core }) => core.invoke('get_workspaces'));
+    initialWorkspaces = await browser.tauri.execute(({ core }) => core.invoke('get_workspaces'));
     assert.deepEqual(initialWorkspaces.map((workspace) => workspace.kind), ['personal']);
     assert.equal(initialWorkspaces[0].rootPath, undefined);
     await browser.execute((sessionId) => {
@@ -267,6 +284,10 @@ describe('first-run desktop experience', () => {
     assert.match(await sheetAttachment.$('pre').getText(), /数字未按日期、百分比或货币格式换算/);
     await browser.saveScreenshot(join(screenshotDir, 'xlsx-sent.png'));
     await sheetAttachment.$('summary').click();
+  }).timeout(90_000);
+
+  it('settles Daily reminders and automation consent, and creates a project', async () => {
+    const composer = await browser.$('textarea[placeholder="给 AngelBot 发消息…"]');
     const reminderRecall = await openAutomationRecall();
     assert.match(await reminderRecall.getText(), /核对今天的安排/);
     assert.match(await reminderRecall.getText(), /待执行 1 · 今日已触发 0/);
@@ -540,7 +561,7 @@ describe('first-run desktop experience', () => {
     await browser.execute((path) => {
       window.__angelbotE2eProjectRoot = path;
     }, projectRoot);
-    const createdProject = await browser.tauri.execute(({ core }) => core.invoke('create_project_workspace', {
+    createdProject = await browser.tauri.execute(({ core }) => core.invoke('create_project_workspace', {
       path: window.__angelbotE2eProjectRoot,
       name: 'Desktop E2E Project',
       agent_provider: null,
@@ -574,7 +595,9 @@ describe('first-run desktop experience', () => {
     }));
     assert.equal(seededNetworkApprovals.approvals.length, 1);
     assert.deepEqual(seededNetworkApprovals.approvals[0].hosts, ['docs.example.test']);
+  }).timeout(120_000);
 
+  it('opens model and tool settings and switches to the project after reload', async () => {
     const modelNotice = await browser.$('.model-config-notice');
     await modelNotice.waitForDisplayed({ timeout: 20_000 });
     assert.match(await modelNotice.getText(), /尚未连接模型/);
@@ -625,7 +648,6 @@ describe('first-run desktop experience', () => {
     // The real local stdio child exercises settings, Tauri lifecycle commands,
     // and fresh tool discovery without a network service or model credential.
     assert.ok(existsSync(mcpFixturePath), `MCP E2E fixture is missing: ${mcpFixturePath}`);
-    const mcpFixtureArgs = `"${mcpFixturePath}"`;
     await settingsDialog.$('button=工具服务 MCP').click();
     assert.equal(await settingsDialog.$('.settings-page-title').getText(), 'MCP 服务');
     await settingsDialog.$('button=添加服务').click();
@@ -855,7 +877,9 @@ describe('first-run desktop experience', () => {
     await browser.execute((id) => {
       window.__angelbotE2eProjectSessionId = id;
     }, createdProject.session.id);
+  }).timeout(120_000);
 
+  it('settles project file consent and reviews one approved network delegation', async () => {
     // Project mutations are always request-mode side effects. Exercise both
     // outcomes against the real scoped file service before opening the Files
     // workbench, so its first tree load observes the approved disk state.
@@ -1050,12 +1074,11 @@ describe('first-run desktop experience', () => {
     await approvedPreview.waitForDisplayed({ timeout: 10_000 });
     assert.match(await approvedPreview.getText(), /approved desktop E2E file content/);
     assert.equal(await browser.$$('//button[contains(@class,"file-item")][contains(.,"rejected-by-e2e.txt")]').length, 0);
-    // Return from the locator's file preview to the workbench root so the
-    // following surface-navigation assertions start from their intended state.
-    const filePreviewBack = await browser.$('.right-panel-back');
-    await filePreviewBack.waitForDisplayed({ timeout: 5_000 });
-    await filePreviewBack.click();
-    await browser.$('.workbench-tabs button').waitForDisplayed({ timeout: 5_000 });
+    // In the wide workbench the file list stays beside the preview.
+    await approvedPreview.$('button=关闭').click();
+    await approvedPreview.waitForExist({ reverse: true, timeout: 5_000 });
+    await approvedFileEntry.waitForDisplayed({ timeout: 5_000 });
+    assert.equal(await approvedFileEntry.getAttribute('aria-current'), 'true');
 
     // Exercise the visible permission-management path against the real IPC and
     // SQLite manager. The fixture is feature-gated inside the desktop E2E build;
@@ -1080,7 +1103,7 @@ describe('first-run desktop experience', () => {
     // status. The physical HTTP/DNS adapter is deterministic, but the
     // approval, plan, lease, worker, delivery, independent-review, and
     // constrained Main-Agent summary paths are the production graph.
-    const networkDelegationComposer = await browser.$('textarea');
+    const networkDelegationComposer = await browser.$('.composer textarea');
     await networkDelegationComposer.waitForDisplayed({ timeout: 10_000 });
     await networkDelegationComposer.setValue('请检索 AngelBot 的公开测试资料，并告诉我结论。');
     const networkDelegationSend = await browser.$('button[title="发送"]');
@@ -1163,13 +1186,15 @@ describe('first-run desktop experience', () => {
     assert.equal(delegatedActivity.status, 'completed');
     assert.equal(delegatedActivity.evidence_count, 1);
     assert.equal(delegatedActivity.reviewer_status, 'passed');
+  }).timeout(150_000);
 
+  it('stops an owned automation run and opens the project workbench', async () => {
     // The three primary surfaces must remain one navigable application, not
     // visually isolated routes that only work in unit tests.
     await navigatePrimary('自动化');
     const automationPage = await browser.$('.automation-page');
     await automationPage.waitForDisplayed({ timeout: 10_000 });
-    assert.match(await automationPage.getText(), /每日邮件行动清单/);
+    await waitForVisible(browser, '//article[contains(@class,"automation-card")][.//h3[text()="每日邮件行动清单"]]', { timeout: 10_000 });
     await browser.saveScreenshot(join(screenshotDir, 'automation-workspace.png'));
     const closeStopWorkbench = await browser.$('[aria-label="关闭工作侧栏"]');
     if (await closeStopWorkbench.isDisplayed()) await closeStopWorkbench.click();
@@ -1198,7 +1223,11 @@ describe('first-run desktop experience', () => {
     });
     await automationPage.$('button=刷新').click();
     const ownedStopCard = await browser.$('//article[contains(@class,"automation-card")][.//h3[text()="停止本次执行检查"]]');
+    await ownedStopCard.waitForDisplayed({ timeout: 10_000 });
+    const ownedStopDetails = await ownedStopCard.$('details.automation-card-details');
+    if (await ownedStopDetails.getAttribute('open') === null) await ownedStopDetails.$('summary').click();
     const stopButton = await ownedStopCard.$('button=停止本次执行');
+    await stopButton.waitForDisplayed({ timeout: 10_000 });
     await stopButton.waitForEnabled({ timeout: 10_000 });
     const ownedStopPid = Number(readFileSync(ownedStopStarted, 'utf8'));
     assert.ok(Number.isInteger(ownedStopPid) && ownedStopPid > 0);
@@ -1208,7 +1237,7 @@ describe('first-run desktop experience', () => {
     for (const decision of ['rejected', 'approved']) {
       const callId = `main-stop-${decision}`;
       const task = decision === 'rejected' ? '请停止本次执行检查，但先让我确认。' : '现在停止本次执行检查。';
-      const stopComposer = await browser.$('textarea');
+      const stopComposer = await browser.$('.composer textarea');
       await stopComposer.setValue(task);
       const send = await browser.$('button[title="发送"]');
       await send.waitForEnabled({ timeout: 5_000 });
@@ -1325,28 +1354,23 @@ describe('first-run desktop experience', () => {
 
     await returnToProjectConversation();
     await browser.$('.chat-area').waitForDisplayed({ timeout: 10_000 });
-    const workbenchAlreadyOpen = await browser.$('.right-panel').isDisplayed();
-    if (!workbenchAlreadyOpen) {
-      const workbenchButton = await browser.$('[aria-label="打开工作台"]');
-      await workbenchButton.waitForDisplayed({ timeout: 20_000 });
-      await workbenchButton.click();
-    }
-    await browser.$('.right-panel').waitForDisplayed({ timeout: 10_000 });
+    await openWorkbench();
     const workbenchState = await browser.execute(() => ({
       shellClass: document.querySelector('.app-shell')?.className,
       panelCount: document.querySelectorAll('.right-panel').length,
-      toggleCount: document.querySelectorAll('[aria-label="打开工作台"]').length,
+      toggleCount: document.querySelectorAll('button[aria-controls="conversation-workbench"]').length,
       projectLabels: Array.from(document.querySelectorAll('.session-item-title')).map((node) => node.textContent),
       workbenchEntries: Array.from(document.querySelectorAll('.workbench-tabs button span')).map((node) => node.textContent),
     }));
     assert.equal(workbenchState.panelCount, 1, JSON.stringify(workbenchState));
+    assert.equal(workbenchState.toggleCount, 1, JSON.stringify(workbenchState));
     assert.deepEqual(workbenchState.workbenchEntries, ['任务', '文件', '浏览器']);
     await browser.$('.right-panel').waitForDisplayed({ timeout: 20_000 });
     const activityTab = await browser.$('.workbench-tabs').$('button=任务');
     await activityTab.click();
     assert.equal(await activityTab.getAttribute('aria-pressed'), 'true');
     await browser.$('.workspace-activity-panel').waitForDisplayed({ timeout: 20_000 });
-    const completedDelegation = await browser.$('.workspace-activity-panel__list');
+    const completedDelegation = await browser.$('//ol[contains(@class,"workspace-activity-panel__list")]/li[contains(@class,"is-completed")][.//strong[contains(.,"AngelBot 的公开测试资料")]]');
     await completedDelegation.waitForDisplayed({ timeout: 10_000 });
     assert.match(await completedDelegation.getText(), /AngelBot 的公开测试资料/);
     assert.match(await completedDelegation.getText(), /已完成/);
@@ -1365,44 +1389,50 @@ describe('first-run desktop experience', () => {
     assert.equal(await readmeEntry.getAttribute('aria-current'), 'true');
     await browser.saveScreenshot(join(screenshotDir, 'project-files.png'));
 
-    // Compact desktop windows keep the conversation usable and promote the
-    // workbench to an inspector drawer instead of squeezing three columns.
+    // The compact workbench covers the conversation until it is dismissed.
     await browser.setWindowSize(1000, 760);
-    await browser.pause(250);
+    const compactBack = await browser.$('.right-panel-back');
+    await compactBack.waitForDisplayed({ timeout: 5_000 });
     const compactWorkbenchState = await browser.execute(() => {
       const panel = document.querySelector('.right-panel');
       const chat = document.querySelector('.chat-area');
-      const main = document.querySelector('.main-with-nav');
       if (!(panel instanceof HTMLElement) || !(chat instanceof HTMLElement)) return null;
+      const bounds = panel.getBoundingClientRect();
       return {
         panelPosition: getComputedStyle(panel).position,
-        panelRight: getComputedStyle(panel).right,
-        chatWidth: Math.round(chat.getBoundingClientRect().width),
-        mainWidth: main instanceof HTMLElement ? Math.round(main.getBoundingClientRect().width) : 0,
+        chatVisibility: getComputedStyle(chat).visibility,
+        panelWidth: Math.round(bounds.width),
+        panelHeight: Math.round(bounds.height),
         viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
       };
     });
     assert.equal(compactWorkbenchState?.panelPosition, 'fixed');
-    assert.equal(compactWorkbenchState?.panelRight, '0px');
-    const compactMinimum = Math.min(650, compactWorkbenchState?.viewportWidth ?? 0);
-    assert.ok((compactWorkbenchState?.mainWidth ?? 0) >= compactMinimum, JSON.stringify(compactWorkbenchState));
-    // Windows reserves up to a scrollbar-width inside the scrolling main
-    // surface. The chat must occupy the rest of that surface; a fixed CSS
-    // width would be DPI-dependent in the real desktop shell.
-    assert.ok(
-      (compactWorkbenchState?.chatWidth ?? 0) >= (compactWorkbenchState?.mainWidth ?? 0) - 16,
-      JSON.stringify(compactWorkbenchState),
-    );
+    assert.equal(compactWorkbenchState.chatVisibility, 'hidden');
+    assert.equal(compactWorkbenchState.panelWidth, compactWorkbenchState.viewportWidth);
+    assert.equal(compactWorkbenchState.panelHeight, compactWorkbenchState.viewportHeight);
     await browser.saveScreenshot(join(screenshotDir, 'compact-workbench.png'));
-    await browser.setWindowSize(1200, 800);
+    await compactBack.click();
+    await preview.waitForExist({ reverse: true, timeout: 5_000 });
+    await readmeEntry.waitForDisplayed({ timeout: 5_000 });
+    assert.equal(await readmeEntry.getAttribute('aria-current'), 'true');
     await browser.$('[aria-label="关闭工作侧栏"]').click();
     await browser.$('.right-panel').waitForExist({ reverse: true, timeout: 5_000 });
+    await browser.$('.chat-area .composer textarea').waitForDisplayed({ timeout: 5_000 });
+    await browser.setWindowSize(1200, 800);
+  }).timeout(120_000);
 
+  it('retains selected Daily attachments and scopes desktop image consent', async () => {
     // User-selected file snapshots must reach the same Main conversation and
     // survive replay/edit without granting Personal a project root. Its owned
     // results tools remain available, but this snapshot turn must not use them. A real
     // File/change event exercises the production reader; no IPC-only shortcut.
     await returnToDailyConversation();
+    const readPersonalMessages = () => browser.tauri.execute(async ({ core }) => {
+      const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
+      if (!personal?.activeSessionId) throw new Error('Personal Main conversation identity missing');
+      return core.invoke('get_messages', { sessionId: personal.activeSessionId });
+    });
     const invalidAttachment = await browser.tauri.execute(async ({ core }) => {
       // The earlier reload clears window globals. Resolve the live identity
       // through the same workspace contract instead of a stale test variable.
@@ -1414,7 +1444,7 @@ describe('first-run desktop experience', () => {
       try {
         await core.invoke('send_message', { req: {
           sessionId, role: 'user', content: 'This invalid attachment must not create a turn.',
-          textAttachments: [{ name: 'unsupported.pdf', text: 'not a supported snapshot' }],
+          textAttachments: [{ name: 'unsupported.zip', text: 'not a supported snapshot' }],
         } });
       } catch { rejected = true; }
       const after = await core.invoke('get_messages', { sessionId });
@@ -1466,11 +1496,13 @@ describe('first-run desktop experience', () => {
     await browser.$('button[title="发送"]').waitForEnabled({ timeout: 5_000 });
     await browser.$('button[title="发送"]').click();
     await waitForVisible(browser, '//*[contains(text(), "已读取你选择的日常行动清单")]', { timeout: 20_000 });
-    const personalMessages = await browser.tauri.execute(async ({ core }) => {
-      const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
-      if (!personal?.activeSessionId) throw new Error('Personal Main conversation identity missing');
-      return core.invoke('get_messages', { sessionId: personal.activeSessionId });
-    });
+    let personalMessages;
+    await browser.waitUntil(async () => {
+      personalMessages = await readPersonalMessages();
+      const source = personalMessages.find((item) => item.role === 'user' && item.textAttachments?.[0]?.name === 'daily-actions.csv');
+      return !!source && personalMessages.some((item) => item.role === 'assistant' && item.parentId === source.id
+        && item.content.includes('已读取你选择的日常行动清单'));
+    }, { timeout: 20_000, timeoutMsg: 'the file snapshot reply did not persist under its source turn' });
     const attachmentMessage = personalMessages.find((item) => item.role === 'user' && item.textAttachments?.[0]?.name === 'daily-actions.csv');
     assert.ok(attachmentMessage, 'explicit file-only turn was not persisted');
     assert.equal(attachmentMessage.content, '', 'file snapshot must not be flattened into the visible prompt');
@@ -1487,6 +1519,9 @@ describe('first-run desktop experience', () => {
     await browser.$('button[title="发送"]').waitForEnabled({ timeout: 5_000 });
     await browser.$('button[title="发送"]').click();
     await waitForVisible(browser, '//*[contains(text(), "上一轮的文件快照仍在当前日常会话中")]', { timeout: 20_000 });
+    await browser.waitUntil(async () => (await readPersonalMessages()).some((item) => item.role === 'assistant'
+      && item.content.includes('上一轮的文件快照仍在当前日常会话中')),
+    { timeout: 20_000, timeoutMsg: 'the file snapshot follow-up did not persist before switching workspaces' });
     // Switching away/back must render the persisted attachment, not a local
     // preview left behind in Composer state.
     await returnToProjectConversation();
@@ -1497,11 +1532,12 @@ describe('first-run desktop experience', () => {
     await attachedRow.$('textarea[aria-label="编辑后的消息内容"]').setValue('按优先级重新整理这份附件。');
     await attachedRow.$('button=重新发送').click();
     await waitForVisible(browser, '//*[contains(text(), "已按编辑后的要求重新整理")]', { timeout: 20_000 });
-    const editedMessages = await browser.tauri.execute(async ({ core }) => {
-      const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
-      if (!personal?.activeSessionId) throw new Error('Personal Main conversation identity missing');
-      return core.invoke('get_messages', { sessionId: personal.activeSessionId });
-    });
+    let editedMessages;
+    await browser.waitUntil(async () => {
+      editedMessages = await readPersonalMessages();
+      return editedMessages.some((item) => item.role === 'assistant' && item.parentId === attachmentMessage.id
+        && item.content.includes('已按编辑后的要求重新整理'));
+    }, { timeout: 20_000, timeoutMsg: 'the edited reply did not persist under the original attachment turn' });
     const editedAttachmentMessage = editedMessages.find((item) => item.id === attachmentMessage.id);
     assert.equal(editedAttachmentMessage?.content, '按优先级重新整理这份附件。');
     assert.deepEqual(editedAttachmentMessage?.textAttachments, attachmentMessage.textAttachments);
@@ -1582,13 +1618,9 @@ describe('first-run desktop experience', () => {
         enabled: true, createdAt: 0, updatedAt: 0,
       },
     }));
-    const readImageJourneyMessages = () => browser.tauri.execute(async ({ core }) => {
-      const personal = (await core.invoke('get_workspaces')).find((item) => item.kind === 'personal');
-      return core.invoke('get_messages', { sessionId: personal.activeSessionId });
-    });
     const imageApproveSelector = 'button=允许发送图像一次';
     phase('window-image');
-    const waitForOwnedDesktopConsent = async (selector, expectedLabels) => {
+    waitForOwnedDesktopConsent = async (selector, expectedLabels) => {
       let lastConsentState = {};
       try {
         await browser.waitUntil(async () => {
@@ -1662,7 +1694,9 @@ describe('first-run desktop experience', () => {
       return reply?.id !== lastImageReply.id && reply?.content === '上一轮图像已释放，当前只保留文字结果。';
     }, { timeout: 20_000, timeoutMsg: 'next turn retained images or consumed an extra scripted reply' });
     await browser.saveScreenshot(join(screenshotDir, 'desktop-window-image-result.png'));
+  }).timeout(150_000);
 
+  it('controls the owned window and retains a truncated reply after reload', async () => {
     // This independent read happens before any intentional UIA mutation.
     // Fixture paths and values stay in the Node runner, not the WebView/model.
     const fixtureSnapshotPath = process.env.ANGELBOT_DESKTOP_E2E_WINDOW_SNAPSHOT;
@@ -1804,6 +1838,7 @@ describe('first-run desktop experience', () => {
 
     await browser.refresh();
     await browser.$('textarea[placeholder="给 AngelBot 发消息…"]').waitForDisplayed({ timeout: 10_000 });
+    await waitForVisible(browser, '//*[contains(text(), "回复达到模型输出长度限制")]', { timeout: 10_000 });
     assert.ok((await browser.$('.chat-area').getText()).includes(partial.content.split('\n\n')[0]));
     assert.ok((await browser.$('.chat-area').getText()).includes('回复达到模型输出长度限制'));
     const reloaded = (await readImageJourneyMessages()).find((message) => message.id === partial.id);
@@ -1816,12 +1851,16 @@ describe('first-run desktop experience', () => {
     await browser.$('button[title="发送"]').click();
     const followupText = '已核对现有回复；本轮只补充说明，没有重复任何操作。';
     await waitForVisible(browser, `//*[contains(text(), "${followupText}")]`, { timeout: 20_000 });
-    const followup = (await readImageJourneyMessages()).filter((message) => message.role === 'assistant').at(-1);
+    let followup;
+    await browser.waitUntil(async () => {
+      followup = (await readImageJourneyMessages()).filter((message) => message.role === 'assistant').at(-1);
+      return followup?.content === followupText;
+    }, { timeout: 20_000, timeoutMsg: 'the explicit follow-up reply did not persist' });
     assert.equal(followup.content, followupText);
     assert.equal(followup.taskRun?.status, 'completed');
     assert.ok((followup.toolResults ?? []).every((result) =>
       result.toolName === 'context_compaction' && result.success), 'followup must not repeat external actions');
     await waitForOwnedCheckboxState(false, 1, 1);
     phase('complete');
-  });
+  }).timeout(120_000);
 });

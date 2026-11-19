@@ -14,15 +14,20 @@ const appBinaryPath = process.env.ANGELBOT_DESKTOP_E2E_BINARY_PATH;
 const replyExportProbe = process.env.ANGELBOT_DESKTOP_E2E_REPLY_EXPORT === '1';
 const modelRecoveryProbe = Boolean(process.env.ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY);
 const projectRestoreProbe = Boolean(process.env.ANGELBOT_DESKTOP_E2E_PROJECT_RESTORE);
+const suite = process.env.ANGELBOT_DESKTOP_E2E_SUITE ?? 'journey';
 if (!appBinaryPath || !path.isAbsolute(appBinaryPath)) {
   throw new Error('Run desktop E2E through python scripts/desktop_e2e.py; its isolated binary path is required.');
+}
+if (suite !== 'smoke' && suite !== 'journey') {
+  throw new Error(`Unknown desktop E2E suite: ${suite}`);
 }
 
 export const config = {
   runner: 'local',
   specs: [projectRestoreProbe ? './specs/project-restore.e2e.mjs'
     : modelRecoveryProbe ? './specs/model-recovery.e2e.mjs'
-    : replyExportProbe ? './specs/reply-export.e2e.mjs' : './specs/first-run.e2e.mjs'],
+    : replyExportProbe ? './specs/reply-export.e2e.mjs'
+    : suite === 'smoke' ? './specs/desktop-smoke.e2e.mjs' : './specs/first-run.e2e.mjs'],
   maxInstances: 1,
   capabilities: [{
     browserName: 'tauri',
@@ -42,12 +47,12 @@ export const config = {
   reporters: ['spec'],
   logLevel: 'warn',
   async afterTest(test, _context, { passed, error, duration }) {
-    // Only the fixed synthetic CI journey is publishable. Never collect from
+    // Only the scripted CI smoke and journey are publishable. Never collect from
     // local/manual/model-recovery profiles or upload their runtime databases.
     if (passed || process.env.GITHUB_ACTIONS !== 'true' || replyExportProbe || modelRecoveryProbe || projectRestoreProbe) return;
     const run = `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`.replace(/[^\w-]/g, '_');
-    const directory = path.join(process.cwd(), 'src-tauri', 'target', 'e2e', 'failure', run);
-    const report = { title: String(test.title).slice(0, 200), duration,
+    const directory = path.join(process.cwd(), 'src-tauri', 'target', 'e2e', 'failure', suite, run);
+    const report = { suite, title: String(test.title).slice(0, 200), duration,
       error: String(error).slice(0, 1500), stack: error?.stack?.slice(0, 2000) };
     try {
       report.state = await boundedDiagnostic(browser.tauri.execute(async ({ core }) => {
@@ -87,8 +92,11 @@ export const config = {
     console.error('Synthetic desktop failure evidence:', JSON.stringify(report));
     // Evidence collection must never replace the original test failure.
   },
-  // This is an end-to-end product journey, not a single RPC assertion.  Each
-  // wait in the spec still has its own short, diagnostic timeout; the outer
-  // budget simply must cover setup plus the independent delegated-review loop.
-  mochaOpts: { ui: 'bdd', timeout: projectRestoreProbe ? 600_000 : replyExportProbe || modelRecoveryProbe ? 300_000 : 90_000 },
+  // The outer journey budget includes setup and the independent delegated-review loop.
+  mochaOpts: {
+    ui: 'bdd',
+    bail: suite === 'journey' && !(replyExportProbe || modelRecoveryProbe || projectRestoreProbe),
+    timeout: projectRestoreProbe ? 600_000
+      : replyExportProbe || modelRecoveryProbe ? 300_000 : suite === 'smoke' ? 60_000 : 90_000,
+  },
 };

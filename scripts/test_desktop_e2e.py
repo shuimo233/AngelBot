@@ -2215,7 +2215,7 @@ const [url, owned] = process.argv.slice(1);
 process.chdir(owned);
 Object.assign(process.env, { ANGELBOT_DESKTOP_E2E_BINARY_PATH: path.join(owned, 'unused.exe'),
   GITHUB_ACTIONS: 'true', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' });
-for (const key of ['ANGELBOT_DESKTOP_E2E_REPLY_EXPORT', 'ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY', 'ANGELBOT_DESKTOP_E2E_PROJECT_RESTORE']) delete process.env[key];
+for (const key of ['ANGELBOT_DESKTOP_E2E_REPLY_EXPORT', 'ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY', 'ANGELBOT_DESKTOP_E2E_PROJECT_RESTORE', 'ANGELBOT_DESKTOP_E2E_SUITE']) delete process.env[key];
 globalThis.window = { __angelbotE2ePersonalSessionId: 'personal-fixture', __angelbotE2eProjectSessionId: 'project-fixture' };
 globalThis.document = { querySelector: () => ({ textContent: 'D'.repeat(8000) }) };
 let captures = 0;
@@ -2241,8 +2241,9 @@ const original = new Error('original failure');
 await config.afterTest({ title: 'synthetic' }, null, { passed: true });
 assert.equal(captures, 0);
 await config.afterTest({ title: 'synthetic' }, null, { passed: false, error: original, duration: 7 });
-const artifact = attempt => path.join(owned, 'src-tauri/target/e2e/failure', `123-${attempt}`, 'failure.json');
+const artifact = (attempt, suite = 'journey') => path.join(owned, 'src-tauri/target/e2e/failure', suite, `123-${attempt}`, 'failure.json');
 const report = JSON.parse(await readFile(artifact(1), 'utf8'));
+assert.equal(report.suite, 'journey');
 assert.equal(report.state.sessions.length, 2);
 assert.equal(report.state.sessions[0].messages.length, 5);
 const row = report.state.sessions[0].messages[0];
@@ -2264,6 +2265,15 @@ assert.equal(personal.messages[0].facts.contextSummary.length, 500);
 assert.equal(personal.messages[0].facts.failedSteps.length, 3);
 assert.equal(personal.messages[0].facts.failedSteps[0].length, 500);
 assert.ok(!JSON.stringify(reloaded).includes('MUST_NOT_EXPORT'));
+process.env.ANGELBOT_DESKTOP_E2E_SUITE = 'smoke';
+process.env.GITHUB_RUN_ATTEMPT = '1';
+delete window.__angelbotE2eProjectSessionId;
+const smoke = (await import(url + '?smoke')).config;
+await smoke.afterTest({ title: 'synthetic smoke' }, null, { passed: false, error: original });
+const smokeReport = JSON.parse(await readFile(artifact(1, 'smoke'), 'utf8'));
+assert.equal(smokeReport.suite, 'smoke');
+assert.deepEqual(smokeReport.state.sessions.map(item => item.sessionId), ['personal-fixture']);
+assert.equal(JSON.parse(await readFile(artifact(1), 'utf8')).title, 'synthetic');
 process.env.GITHUB_RUN_ATTEMPT = '2';
 browser.tauri.execute = async () => { throw new Error('diagnostic unavailable'); };
 browser.saveScreenshot = async () => { throw new Error('screenshot unavailable'); };
@@ -2277,6 +2287,7 @@ process.env.GITHUB_RUN_ATTEMPT = '3';
 const manual = (await import(url + '?manual')).config;
 await manual.afterTest({ title: 'private probe' }, null, { passed: false, error: original });
 await assert.rejects(access(artifact(3)));
+await assert.rejects(access(artifact(3, 'smoke')));
 console.log('bounded synthetic diagnostics checked');
 '''
         with tempfile.TemporaryDirectory(prefix='angelbot-ci-artifact-') as directory:
@@ -2956,7 +2967,9 @@ console.log('bounded synthetic diagnostics checked');
         for arguments, expected in ((["--help"], 0), (["--reply-export", "--manual-native"], 2),
                                     (["--model-recovery", "--reply-export"], 2),
                                     (["--project-restore", "--manual-native"], 2),
-                                    (["--project-restore", "--inspect"], 2), (["--inspect"], 2), (["--typo"], 2)):
+                                    (["--project-restore", "--inspect"], 2), (["--inspect"], 2),
+                                    (["--suite", "unknown"], 2), (["--suite", "smoke", "--model-recovery"], 2),
+                                    (["--suite", "journey", "--reply-export"], 2), (["--typo"], 2)):
             with self.subTest(arguments=arguments), patch.object(sys, "argv", ["desktop_e2e.py", *arguments]), \
                     patch.object(desktop_e2e, "prepare_desktop_binary") as build, \
                     patch.object(manual, "run_manual_native") as start, \
@@ -2967,10 +2980,56 @@ console.log('bounded synthetic diagnostics checked');
             build.assert_not_called()
             start.assert_not_called()
 
+    def test_desktop_smoke_uses_one_isolated_script_without_journey_fixtures(self):
+        stale = {
+            "OPENAI_API_KEY": "owner-only-key",
+            "ANGELBOT_DESKTOP_E2E_MANUAL": "1",
+            "ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY": "old-probe",
+            "ANGELBOT_DESKTOP_E2E_SEED_NETWORK_APPROVAL": "1",
+            "ANGELBOT_DESKTOP_E2E_WINDOW_EXE": "old-window.exe",
+            "ANGELBOT_DESKTOP_E2E_SUITE": "journey",
+            "ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT": "old-model-script",
+            "ANGELBOT_DESKTOP_E2E_DATA_DIR": "owner-data",
+            "VITE_ANGELBOT_DESKTOP_E2E": "old-build",
+            "WEBVIEW2_USER_DATA_FOLDER": "owner-webview",
+        }
+        with patch.object(sys, "argv", ["desktop_e2e.py", "--suite", "smoke", "--skip-build"]), \
+                patch.dict(os.environ, stale), \
+                patch.object(desktop_e2e, "prepare_desktop_binary") as build, \
+                patch.object(desktop_e2e, "configure_webdriver_port") as port, \
+                patch.object(desktop_e2e, "configure_journey") as configure_journey, \
+                patch.object(desktop_e2e, "owned_fixture") as fixture, \
+                patch.object(desktop_e2e, "run") as run:
+            self.assertEqual(desktop_e2e.main(), 0)
+
+        command, env = run.call_args.args
+        self.assertEqual(command[1:], ["wdio", "run", "e2e/wdio.conf.mjs"])
+        build.assert_called_once_with(command[0], env, True)
+        port.assert_called_once_with(env)
+        configure_journey.assert_not_called()
+        fixture.assert_not_called()
+        self.assertEqual(env["ANGELBOT_DESKTOP_E2E_SUITE"], "smoke")
+        self.assertEqual(env["CARGO_NET_OFFLINE"], "true")
+        self.assertEqual(env["NPM_CONFIG_OFFLINE"], "true")
+        runtime = Path(env["LOCALAPPDATA"])
+        self.assertEqual(Path(env["APPDATA"]), runtime)
+        self.assertEqual(Path(env["WEBVIEW2_USER_DATA_FOLDER"]), runtime / "webview")
+        self.assertEqual(Path(env["ANGELBOT_DESKTOP_E2E_DATA_DIR"]), runtime / "angelbot-data")
+        self.assertFalse(runtime.exists(), "smoke runtime must be cleaned on exit")
+        for key, value in stale.items():
+            self.assertNotEqual(env.get(key), value)
+        for suffix in ("DOCX_BASE64", "XLSX_BASE64", "UTF16_BASE64", "EXPLORER_SCRIPT", "WINDOW_BASELINE"):
+            self.assertNotIn(f"ANGELBOT_DESKTOP_E2E_{suffix}", env)
+        self.assertEqual(json.loads(env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"]), [{
+            "type": "text", "text": "angelbot-ci-smoke-ok: 已收到测试消息。",
+            "expectUserContentIncludes": ["angelbot-ci-smoke: 请确认收到测试消息，只回复文字。"],
+        }])
+
     def test_daily_attachment_script_allows_results_but_never_project_commands(self):
         captured = []
 
         def capture_script(_npx, env, _skip_build):
+            self.assertEqual(env["ANGELBOT_DESKTOP_E2E_SUITE"], "journey")
             captured.extend(json.loads(env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"]))
             raise RuntimeError("owned script checkpoint")
 
@@ -3135,15 +3194,19 @@ console.log('bounded synthetic diagnostics checked');
             config.capabilities[0]['tauri:options'].application,
             config.capabilities[0]['wdio:tauriServiceOptions'].appBinaryPath,
             config.services[0][1].appBinaryPath,
-          ], specs: config.specs, timeout: config.mochaOpts.timeout}));
+          ], specs: config.specs, timeout: config.mochaOpts.timeout, bail: config.mochaOpts.bail}));
         """
         binary = REPO_ROOT / "src-tauri/target/desktop-e2e/debug/angelbot.exe"
-        for supplied, probe in ((False, None), (True, None), (True, "reply-export"),
-                                (True, "model-recovery"), (True, "project-restore")):
-            with self.subTest(supplied=supplied, probe=probe):
+        for supplied, probe, suite in ((False, None, None), (True, None, None),
+                                       (True, None, "smoke"), (True, None, "journey"),
+                                       (True, "reply-export", None), (True, "model-recovery", None),
+                                       (True, "project-restore", None)):
+            with self.subTest(supplied=supplied, probe=probe, suite=suite):
                 env = {name: os.environ[name] for name in ("PATH", "SYSTEMROOT") if name in os.environ}
                 if supplied:
                     env["ANGELBOT_DESKTOP_E2E_BINARY_PATH"] = str(binary)
+                if suite:
+                    env["ANGELBOT_DESKTOP_E2E_SUITE"] = suite
                 if probe:
                     flag = {"reply-export": "REPLY_EXPORT", "model-recovery": "MODEL_RECOVERY",
                             "project-restore": "PROJECT_RESTORE"}[probe]
@@ -3156,8 +3219,12 @@ console.log('bounded synthetic diagnostics checked');
                     self.assertEqual(result.returncode, 0, result.stderr)
                     configuration = json.loads(result.stdout)
                     self.assertEqual(configuration["paths"], [str(binary)] * 3)
-                    self.assertEqual(configuration["specs"], [f"./specs/{probe or 'first-run'}.e2e.mjs"])
-                    self.assertEqual(configuration["timeout"], 600_000 if probe == "project-restore" else 300_000 if probe else 90_000)
+                    spec = probe or ("desktop-smoke" if suite == "smoke" else "first-run")
+                    self.assertEqual(configuration["specs"], [f"./specs/{spec}.e2e.mjs"])
+                    timeout = {"project-restore": 600_000, "reply-export": 300_000,
+                               "model-recovery": 300_000, "desktop-smoke": 60_000, "first-run": 90_000}
+                    self.assertEqual(configuration["timeout"], timeout[spec])
+                    self.assertIs(configuration["bail"], spec == "first-run")
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("isolated binary path is required", result.stderr)
