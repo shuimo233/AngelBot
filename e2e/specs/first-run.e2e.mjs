@@ -609,10 +609,11 @@ describe('first-run desktop experience', () => {
     await settingsDialog.$('button=模型与 API').click();
     await browser.waitUntil(async () => (await settingsDialog.$('.settings-page-title').getText()) === '模型与 API', { timeout: 5_000 });
     assert.equal(await settingsDialog.$('button=模型与 API').getAttribute('aria-current'), 'page');
-    await settingsDialog.$('h3=连接方式').waitForDisplayed({ timeout: 5_000 });
-    await settingsDialog.$('.model-field select').waitForDisplayed({ timeout: 5_000 });
+    await settingsDialog.$('.model-provider-grid select').waitForDisplayed({ timeout: 5_000 });
+    await settingsDialog.$('#model-api-key').waitForDisplayed({ timeout: 5_000 });
     await settingsDialog.$('button=高级选项').click();
     await settingsDialog.$('h3=默认模型').waitForDisplayed({ timeout: 5_000 });
+    await settingsDialog.$('input[aria-label="模型标识"]').waitForDisplayed({ timeout: 5_000 });
     await browser.execute(() => document.documentElement.classList.remove('dark'));
     await browser.pause(200);
     await browser.saveScreenshot(join(screenshotDir, 'model-settings.png'));
@@ -1314,8 +1315,9 @@ describe('first-run desktop experience', () => {
     const libraryPage = await browser.$('.library-page');
     await libraryPage.waitForDisplayed({ timeout: 10_000 });
     assert.equal(await libraryPage.$('h1').getText(), '资料库');
-    assert.equal(await libraryPage.$('[role="tab"][aria-label="参考资料"]').getAttribute('aria-selected'), 'true');
-    const memoryTab = await libraryPage.$('[role="tab"][aria-label="关于我的记忆"]');
+    const referenceTab = await libraryPage.$('.//button[@role="tab" and normalize-space(.)="参考资料"]');
+    assert.equal(await referenceTab.getAttribute('aria-selected'), 'true');
+    const memoryTab = await libraryPage.$('.//button[@role="tab" and normalize-space(.)="关于我的记忆"]');
     await memoryTab.click();
     assert.equal(await memoryTab.getAttribute('aria-selected'), 'true');
     await libraryPage.$('.memory-page').waitForDisplayed({ timeout: 10_000 });
