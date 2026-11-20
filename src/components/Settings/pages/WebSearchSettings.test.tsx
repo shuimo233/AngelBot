@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -39,26 +39,38 @@ describe('WebSearchSettings', () => {
     render(<WebSearchSettings />);
 
     expect(await screen.findByDisplayValue('https://api.tavily.com/search')).toHaveAttribute('readonly');
-    expect(screen.getByLabelText('API Key')).toHaveValue('');
-    expect(screen.getByLabelText('API Key')).toHaveAccessibleDescription('重新保存时需输入密钥。');
+    const apiKey = screen.getByLabelText('API Key');
+    await waitFor(() => expect(apiKey).toHaveAccessibleDescription('重新保存时需输入密钥。'));
+    expect(apiKey).toHaveValue('');
     expect(screen.getByRole('checkbox', { name: '允许使用联网搜索' })).not.toBeChecked();
   });
 
   it('requires a fresh hosted-provider key and never sends a custom endpoint', async () => {
     const user = userEvent.setup();
+    let finishLoad!: () => void;
+    vi.mocked(getWebSearchConfig).mockImplementation(() => new Promise((resolve) => {
+      finishLoad = () => resolve(null);
+    }));
     vi.mocked(configureWebSearch).mockResolvedValue({ ...tavilyConfig, enabled: true });
     render(<WebSearchSettings />);
 
-    const saveButton = await screen.findByRole('button', { name: '保存搜索配置' });
+    const apiKey = screen.getByLabelText('API Key');
+    const saveButton = screen.getByRole('button', { name: '保存搜索配置' });
+    expect(apiKey).toBeDisabled();
     expect(saveButton).toBeDisabled();
 
-    await user.type(screen.getByLabelText('API Key'), 'tvly-test-key');
+    await act(async () => finishLoad());
+    expect(apiKey).toBeEnabled();
+    expect(saveButton).toBeDisabled();
+    await user.type(apiKey, 'tvly-test-key');
+    expect(saveButton).toBeEnabled();
     await user.click(saveButton);
 
-    await waitFor(() => expect(configureWebSearch).toHaveBeenCalledWith({
+    expect(configureWebSearch).toHaveBeenCalledTimes(1);
+    expect(configureWebSearch).toHaveBeenCalledWith({
       provider: 'tavily',
       apiKey: 'tvly-test-key',
-    }));
+    });
   });
 
   it('uses a self-hosted SearXNG endpoint without requesting an API key', async () => {
@@ -71,8 +83,9 @@ describe('WebSearchSettings', () => {
     });
     render(<WebSearchSettings />);
 
-    await screen.findByRole('button', { name: '保存搜索配置' });
-    await user.selectOptions(screen.getByLabelText('搜索服务商'), 'searxng');
+    const provider = screen.getByLabelText('搜索服务商');
+    await waitFor(() => expect(provider).toBeEnabled());
+    await user.selectOptions(provider, 'searxng');
 
     expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument();
     expect(screen.getByText(/不需要 API Key/)).toBeInTheDocument();
@@ -93,7 +106,8 @@ describe('WebSearchSettings', () => {
     vi.mocked(setWebSearchEnabled).mockResolvedValue({ ...tavilyConfig, enabled: true });
     render(<WebSearchSettings />);
 
-    const toggle = await screen.findByRole('checkbox', { name: '允许使用联网搜索' });
+    const toggle = screen.getByRole('checkbox', { name: '允许使用联网搜索' });
+    await waitFor(() => expect(toggle).toBeEnabled());
     await user.click(toggle);
 
     await waitFor(() => expect(setWebSearchEnabled).toHaveBeenCalledWith(true));
@@ -109,7 +123,8 @@ describe('WebSearchSettings', () => {
     );
     render(<WebSearchSettings />);
 
-    const toggle = await screen.findByRole('checkbox', { name: '允许使用联网搜索' });
+    const toggle = screen.getByRole('checkbox', { name: '允许使用联网搜索' });
+    await waitFor(() => expect(toggle).toBeEnabled());
     await user.type(screen.getByLabelText('API Key'), 'tvly-test-key');
     await user.click(screen.getByRole('button', { name: '保存搜索配置' }));
 

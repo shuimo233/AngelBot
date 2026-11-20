@@ -634,59 +634,98 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn distinguishes_process_success_failure_unverified_and_cancellation() {
-        fn fixture(script: &str) -> Command {
-            let mut cmd = Command::new("powershell.exe");
-            cmd.args(["-NoProfile", "-NonInteractive", "-Command", script])
+        const CASE: &str = "ANGELBOT_CODEX_PROCESS_TEST_CASE";
+        const READY_PATH: &str = "ANGELBOT_CODEX_PROCESS_TEST_READY_PATH";
+        const PROMPT: &str = "Synthetic prompt";
+        const WATCHDOG: Duration = Duration::from_secs(30);
+
+        if let Ok(case) = std::env::var(CASE) {
+            // EOF also fences the child behind ProcessTree's job assignment.
+            let mut prompt = String::new();
+            std::io::stdin().read_to_string(&mut prompt).unwrap();
+            assert_eq!(prompt, PROMPT);
+            let (event, status) = match case.as_str() {
+                "success" => (Some("turn.completed"), 0),
+                "nonzero" => (Some("turn.completed"), 3),
+                "failed-event" => (Some("turn.failed"), 0),
+                "unverified" => (None, 0),
+                "cancel" => {
+                    std::fs::File::create(std::env::var_os(READY_PATH).unwrap()).unwrap();
+                    loop {
+                        thread::park();
+                    }
+                }
+                _ => panic!("unexpected Codex process test case: {case}"),
+            };
+            if let Some(event) = event {
+                let mut stdout = std::io::stdout().lock();
+                // libtest may have written its test name without a newline.
+                writeln!(stdout, "\n{}", serde_json::json!({"type": event})).unwrap();
+                stdout.flush().unwrap();
+            }
+            std::process::exit(status);
+        }
+
+        let fixture = |case: &str| {
+            let module = module_path!().split_once("::").unwrap().1;
+            let test = format!(
+                "{module}::distinguishes_process_success_failure_unverified_and_cancellation"
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &test, "--nocapture"])
+                .env(CASE, case)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
-            cmd
-        }
+            command
+        };
         let cases = [
-            (
-                r#"[void][Console]::In.ReadToEnd(); [Console]::WriteLine('{"type":"turn.completed"}'); exit 0"#,
-                None,
-            ),
-            (
-                r#"[void][Console]::In.ReadToEnd(); [Console]::WriteLine('{"type":"turn.completed"}'); exit 3"#,
-                Some(CodexError::Failed),
-            ),
-            (
-                r#"[void][Console]::In.ReadToEnd(); [Console]::WriteLine('{"type":"turn.failed"}'); exit 0"#,
-                Some(CodexError::Failed),
-            ),
-            (
-                r#"[void][Console]::In.ReadToEnd(); exit 0"#,
-                Some(CodexError::Unverified),
-            ),
+            ("success", None),
+            ("nonzero", Some(CodexError::Failed)),
+            ("failed-event", Some(CodexError::Failed)),
+            ("unverified", Some(CodexError::Unverified)),
         ];
-        for (script, error) in cases {
+        for (case, error) in cases {
             assert_eq!(
                 run_command(
-                    fixture(script),
-                    "Synthetic prompt".into(),
+                    fixture(case),
+                    PROMPT.into(),
                     &ToolCancellation::new(),
-                    Duration::from_secs(10),
-                    || true
+                    WATCHDOG,
+                    || true,
                 )
                 .err(),
-                error
+                error,
+                "Codex process test case {case}"
             );
         }
+
+        let directory = tempfile::tempdir().unwrap();
+        let ready_path = directory.path().join("ready");
+        let mut command = fixture("cancel");
+        command.env(READY_PATH, &ready_path);
         let cancellation = ToolCancellation::new();
         let signal = cancellation.clone();
-        let task = thread::spawn(move || {
-            run_command(
-                fixture("Start-Sleep -Seconds 30"),
-                "Synthetic prompt".into(),
-                &signal,
-                Duration::from_secs(10),
-                || true,
-            )
-        });
-        thread::sleep(Duration::from_millis(500));
+        let task =
+            thread::spawn(move || run_command(command, PROMPT.into(), &signal, WATCHDOG, || true));
+        let deadline = Instant::now() + WATCHDOG;
+        let ready = loop {
+            if ready_path.is_file() {
+                break true;
+            }
+            if task.is_finished() || Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
         cancellation.cancel();
-        assert_eq!(task.join().unwrap(), Err(CodexError::Cancelled));
+        let result = task.join().unwrap();
+        assert!(
+            ready,
+            "the owned child did not reach its ready state: {result:?}"
+        );
+        assert_eq!(result, Err(CodexError::Cancelled));
     }
 
     #[test]
