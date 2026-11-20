@@ -8,10 +8,8 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
-import tempfile
-import time
 
-from native_uia_smoke import isolated_environment
+from native_uia_smoke import desktop_runtime_directory, isolated_environment
 
 
 def recovery_environment(runtime: Path, evidence: Path, phase: str) -> dict[str, str]:
@@ -49,28 +47,6 @@ def recovery_environment(runtime: Path, evidence: Path, phase: str) -> dict[str,
     return env
 
 
-@contextlib.contextmanager
-def recovery_directory(keep_data: bool):
-    if keep_data:
-        yield Path(tempfile.mkdtemp(prefix="angelbot-recovery-"))
-        return
-
-    directory = tempfile.TemporaryDirectory(prefix="angelbot-recovery-")
-    try:
-        yield Path(directory.name)
-    finally:
-        # WebView2 can release its profile lock shortly after the app exits.
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                directory.cleanup()
-                break
-            except PermissionError as error:
-                if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.2)
-
-
 def run_native_spec(root: Path, npx: str, env: dict[str, str], spec: str | None = None):
     command = [npx, "wdio", "run", "e2e/wdio.conf.mjs"]
     if spec:
@@ -83,7 +59,7 @@ def run_conversation_presentation(root: Path, prepare_binary, configure_port,
     evidence = root / "src-tauri/target/e2e/conversation-presentation"
     evidence.mkdir(parents=True, exist_ok=True)
     npx = "npx.cmd" if os.name == "nt" else "npx"
-    with recovery_directory(False) as runtime:
+    with desktop_runtime_directory("angelbot-recovery-") as runtime:
         env = recovery_environment(runtime, evidence, "first")
         prepare_binary(npx, env, skip_build)
         for phase in ("first", "reopen"):
@@ -109,7 +85,7 @@ def run_model_recovery(root: Path, prepare_binary, configure_port, skip_build: b
               "scope": "native-main-conversation-and-reopen", "phases": {}}
     report_path.write_text(json.dumps(report), encoding="utf-8")
     try:
-        with recovery_directory(keep_data) as runtime:
+        with desktop_runtime_directory("angelbot-recovery-", keep_data) as runtime:
             if keep_data:
                 print(f"Isolated recovery data retained: {runtime}", flush=True)
             npx = "npx.cmd" if os.name == "nt" else "npx"

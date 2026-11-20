@@ -2969,16 +2969,72 @@ console.log('bounded synthetic diagnostics checked');
                                     (["--project-restore", "--manual-native"], 2),
                                     (["--project-restore", "--inspect"], 2), (["--inspect"], 2),
                                     (["--suite", "unknown"], 2), (["--suite", "smoke", "--model-recovery"], 2),
-                                    (["--suite", "journey", "--reply-export"], 2), (["--typo"], 2)):
-            with self.subTest(arguments=arguments), patch.object(sys, "argv", ["desktop_e2e.py", *arguments]), \
-                    patch.object(desktop_e2e, "prepare_desktop_binary") as build, \
-                    patch.object(manual, "run_manual_native") as start, \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
-                    self.assertRaises(SystemExit) as exited:
-                desktop_e2e.main()
-            self.assertEqual(exited.exception.code, expected)
-            build.assert_not_called()
-            start.assert_not_called()
+                                    (["--suite", "journey", "--reply-export"], 2),
+                                    (["--manual-native", "--suite", "journey"], 2),
+                                    (["--suite", "journey", "--project-restore"], 2), (["--typo"], 2)):
+            with self.subTest(arguments=arguments), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(sys, "argv", ["desktop_e2e.py", *arguments]))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                launchers = [stack.enter_context(patch.object(module, name)) for module, name in (
+                    (desktop_e2e, "prepare_desktop_binary"),
+                    (desktop_e2e, "run_reply_export_probe"),
+                    (manual, "run_manual_native"),
+                    (recovery, "run_model_recovery"),
+                    (restore, "run_project_restore"),
+                )]
+                with self.assertRaises(SystemExit) as exited:
+                    desktop_e2e.main()
+                self.assertEqual(exited.exception.code, expected)
+                for launcher in launchers:
+                    launcher.assert_not_called()
+
+    def test_desktop_runtime_retries_short_sharing_violations_only(self):
+        locked = PermissionError("WebView still owns the fixture file")
+        locked.winerror = 32
+        denied = PermissionError("Access denied")
+        denied.winerror = 5
+        with tempfile.TemporaryDirectory() as root:
+            for errors, times, outcome, sleeps in (
+                ([locked, None], [10, 10.1], None, [0.2]),
+                ([locked, locked], [10, 14.875, 15], locked, [0.125]),
+                ([denied], [10], denied, []),
+            ):
+                with self.subTest(errors=errors), \
+                        patch.object(native.tempfile, "TemporaryDirectory") as allocate, \
+                        patch.object(native.time, "monotonic", side_effect=times), \
+                        patch.object(native.time, "sleep") as sleep:
+                    directory = allocate.return_value
+                    directory.name = root
+                    directory.cleanup.side_effect = errors
+                    if outcome is None:
+                        with native.desktop_runtime_directory("owned-") as runtime:
+                            self.assertEqual(runtime, Path(root))
+                    else:
+                        with self.assertRaises(PermissionError) as failure:
+                            with native.desktop_runtime_directory("owned-"):
+                                pass
+                        self.assertIs(failure.exception, outcome)
+                    self.assertEqual(directory.cleanup.call_count, len(errors))
+                    self.assertEqual([args.args[0] for args in sleep.call_args_list], sleeps)
+
+    def test_desktop_runtime_preserves_original_wdio_failure(self):
+        locked = PermissionError("WebView still owns the fixture file")
+        locked.winerror = 32
+        with tempfile.TemporaryDirectory() as root:
+            for persistent in (False, True):
+                original = subprocess.CalledProcessError(1, ["wdio"])
+                with self.subTest(persistent=persistent), \
+                        patch.object(native.tempfile, "TemporaryDirectory") as allocate, \
+                        patch.object(native.time, "monotonic", side_effect=[10, 15 if persistent else 10.1]), \
+                        patch.object(native.time, "sleep"), \
+                        self.assertRaises(subprocess.CalledProcessError) as failure:
+                    allocate.return_value.name = root
+                    allocate.return_value.cleanup.side_effect = [locked] if persistent else [locked, None]
+                    with native.desktop_runtime_directory("owned-"):
+                        raise original
+                self.assertIs(failure.exception, original)
+                self.assertIs(failure.exception.__cause__, locked if persistent else None)
 
     def test_desktop_smoke_uses_one_isolated_script_without_journey_fixtures(self):
         stale = {

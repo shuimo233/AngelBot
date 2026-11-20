@@ -1203,7 +1203,9 @@ describe('ChatArea', () => {
     await waitFor(() => expect(transcript.scrollTop).toBe(transcript.scrollHeight));
   });
 
-  it('paginates a 2,000-message transcript through the typed IPC and preserves old jumps and the live leaf', async () => {
+  it('paginates a 2,000-message transcript through the typed IPC and preserves old jumps and the live leaf', async ({ onTestFinished }) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame'] });
+    onTestFinished(() => { vi.useRealTimers(); });
     const firstSession = makeSession('session-1', 'First');
     const secondSession = makeSession('session-2', 'Second');
     const transcriptFor = (sessionId: string) => Array.from({ length: 2_000 }, (_, index): Message => ({
@@ -1257,18 +1259,26 @@ describe('ChatArea', () => {
     });
     useSessionsStore.setState({ sessions: [firstSession, secondSession], activeSessionId: firstSession.id, activeSession: firstSession });
     const { container } = render(<ChatArea onOpenWorkbenchView={vi.fn()} />);
+    const scroller = container.querySelector<HTMLDivElement>('.messages')!;
+    const composer = within(container.querySelector<HTMLElement>('.composer')!);
     const rows = () => container.querySelectorAll('[data-conversation-message-id]');
     const row = (id: string) => container.querySelector(`[data-conversation-message-id="${id}"]`);
-    await waitFor(() => expect(row('session-1-1999')).toBeInTheDocument());
+    const pageButton = (text: string) => within(scroller).getByText(text, { selector: 'button.conversation-page' });
+    const latestButton = () => screen.getByLabelText('回到最底部', { selector: 'button' });
+    await act(async () => {});
+    expect(row('session-1-1999')).toBeInTheDocument();
     expect(rows()).toHaveLength(80);
     expect(row('session-1-1')).toBeNull();
     expect(reads).toEqual([{ command: 'get_message_page', args: { sessionId: firstSession.id }, count: 80 }]);
 
     const findArchive = async () => {
-      fireEvent.click(screen.getByRole('button', { name: '搜索当前对话' }));
-      fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'docs/archive.md' } });
-      fireEvent.click(await screen.findByRole('button', { name: /docs\/archive\.md/ }));
-      await waitFor(() => expect(row('session-1-1')).toHaveFocus());
+      fireEvent.click(screen.getByLabelText('搜索当前对话', { selector: 'button' }));
+      const search = within(screen.getByRole('dialog', { name: '搜索当前对话' }));
+      fireEvent.change(search.getByRole('searchbox'), { target: { value: 'docs/archive.md' } });
+      await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+      await act(async () => { fireEvent.click(search.getByRole('button', { name: /docs\/archive\.md/ })); });
+      act(() => { vi.advanceTimersToNextFrame(); });
+      expect(row('session-1-1')).toHaveFocus();
       expect(reads.at(-2)).toEqual({ command: 'search_conversation_page', args: { sessionId: firstSession.id, query: 'docs/archive.md' }, count: 1 });
       expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, aroundId: 'session-1-1' }, count: 80 });
     };
@@ -1280,66 +1290,69 @@ describe('ChatArea', () => {
     const oldRow = within(row('session-1-1') as HTMLElement);
     const journal = oldRow.getByText('查看运行过程').parentElement as HTMLDetailsElement;
     fireEvent(journal, new Event('toggle'));
-    journal.open = true;
-    fireEvent(journal, new Event('toggle'));
-    expect(await oldRow.findByRole('list', { name: '已记录的运行步骤' })).toHaveTextContent('读取文件 · 完成');
+    await act(async () => {
+      journal.open = true;
+      fireEvent(journal, new Event('toggle'));
+    });
+    expect(oldRow.getByRole('list', { name: '已记录的运行步骤' })).toHaveTextContent('读取文件 · 完成');
     expect(journalReads).toEqual(['session-1-1']);
     expect(oldRow.getByRole('button', { name: '在工作台中定位 docs/archive.md' })).toBeVisible();
-    fireEvent.click(screen.getByRole('button', { name: '加载较新消息' }));
-    await waitFor(() => expect(rows()).toHaveLength(160));
+    await act(async () => { fireEvent.click(pageButton('加载较新消息')); });
+    expect(rows()).toHaveLength(160);
     expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, newerId: 'session-1-79' }, count: 80 });
 
-    const latest = screen.getByRole('button', { name: '回到最底部' });
-    expect(latest).toBeVisible();
+    expect(latestButton()).toBeVisible();
     durable.push(desktopApprovalFixture().pending);
-    act(() => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'desktop-turn' } }));
-    const pendingApproval = await screen.findByRole('button', { name: '查看待确认操作' });
+    await act(async () => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'desktop-turn' } }));
+    const pendingApproval = composer.getByRole('button', { name: '查看待确认操作' });
     expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, afterId: 'session-1-1999' }, count: 1 });
     expect(row('desktop-turn')).toBeNull();
     fireEvent.click(pendingApproval);
     expect(row('desktop-turn')).toHaveTextContent('请核对输入框。');
-    await waitFor(() => expect(row('desktop-turn')).toHaveFocus());
+    act(() => { vi.advanceTimersToNextFrame(); });
+    expect(row('desktop-turn')).toHaveFocus();
     expect(row('session-1-1999')).toBeInTheDocument();
     expect(rows()).toHaveLength(80);
     expect(reads.filter(read => read.command === 'search_conversation_page')).toHaveLength(1);
 
     await findArchive();
-    act(() => useSessionsStore.setState({ activeSessionId: secondSession.id, activeSession: secondSession }));
-    await waitFor(() => expect(reads.at(-1)?.args).toEqual({ sessionId: secondSession.id }));
-    act(() => useSessionsStore.setState({ activeSessionId: firstSession.id, activeSession: firstSession }));
-    await waitFor(() => expect(row('session-1-1999')).toBeInTheDocument());
+    await act(async () => useSessionsStore.setState({ activeSessionId: secondSession.id, activeSession: secondSession }));
+    expect(reads.at(-1)?.args).toEqual({ sessionId: secondSession.id });
+    await act(async () => useSessionsStore.setState({ activeSessionId: firstSession.id, activeSession: firstSession }));
+    expect(row('session-1-1999')).toBeInTheDocument();
     await act(async () => finishSecondLoad(transcriptFor(secondSession.id)));
     expect(row('session-1-1')).toBeNull();
     expect(row('session-2-1999')).toBeNull();
     expect(rows()).toHaveLength(80);
 
-    const scroller = container.querySelector<HTMLDivElement>('.messages')!;
     scroller.scrollTop = 400;
     const anchor = row('session-1-1921')!;
     vi.spyOn(anchor, 'getBoundingClientRect').mockImplementation(() =>
       new DOMRect(0, [...rows()].indexOf(anchor) * 20 - scroller.scrollTop, 0, 20));
     const originalTop = anchor.getBoundingClientRect().top;
-    fireEvent.click(screen.getByRole('button', { name: '加载更早消息' }));
-    await waitFor(() => expect(rows()).toHaveLength(160));
+    await act(async () => { fireEvent.click(pageButton('加载更早消息')); });
+    expect(rows()).toHaveLength(160);
     expect(anchor.getBoundingClientRect().top).toBe(originalTop);
     expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, beforeId: 'session-1-1921' }, count: 80 });
     expect(reads.filter(read => read.command === 'search_conversation_page')).toHaveLength(2);
 
     durable.push({ id: 'new-during-browse', sessionId: firstSession.id, role: 'assistant', content: '阅读时的新消息', createdAt: 2_002 });
-    act(() => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'new-during-browse' } }));
-    await waitFor(() => expect(useMessagesStore.getState().messages.at(-1)?.id).toBe('new-during-browse'));
+    await act(async () => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'new-during-browse' } }));
+    expect(useMessagesStore.getState().messages.at(-1)?.id).toBe('new-during-browse');
     expect(rows()).toHaveLength(160);
     expect(anchor.getBoundingClientRect().top).toBe(originalTop);
     expect(row('new-during-browse')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '回到最底部' }));
+    fireEvent.click(latestButton());
     expect(row('new-during-browse')).toBeInTheDocument();
     expect(rows()).toHaveLength(80);
 
     durable[durable.length - 2] = { ...durable.at(-2)!, content: '确认已结束', taskRun: undefined, toolCalls: undefined, toolResults: undefined };
-    act(() => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'desktop-turn' } }));
-    await screen.findByText('确认已结束');
-    await userEvent.setup().type(screen.getByRole('textbox', { name: '消息输入' }), '正常发送{Enter}');
-    await screen.findByText('新回复已保存');
+    await act(async () => subscriptions.get(firstSession.id)?.({ type: 'MessageEnd', data: { message_id: 'desktop-turn' } }));
+    expect(row('desktop-turn')).toHaveTextContent('确认已结束');
+    const input = composer.getByRole('textbox', { name: '消息输入' });
+    fireEvent.change(input, { target: { value: '正常发送' } });
+    await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }); });
+    expect(row('durable-reply')).toHaveTextContent('新回复已保存');
     expect(reads.at(-1)).toEqual({ command: 'get_message_page', args: { sessionId: firstSession.id, afterId: 'new-during-browse' }, count: 2 });
     expect(rows()).toHaveLength(80);
     expect(screen.getAllByText('正常发送')).toHaveLength(1);

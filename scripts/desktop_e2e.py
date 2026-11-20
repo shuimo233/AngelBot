@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import argparse
 import base64
 from datetime import datetime, timedelta, timezone
@@ -19,7 +18,7 @@ import sys
 import tempfile
 import zipfile
 
-from native_uia_smoke import await_snapshot, owned_fixture
+from native_uia_smoke import await_snapshot, desktop_runtime_directory, owned_fixture
 from verify import isolated_environment
 
 
@@ -636,7 +635,7 @@ def main() -> int:
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--keep-data", action="store_true")
     modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--suite", choices=("smoke", "journey"), default="journey",
+    modes.add_argument("--suite", choices=("smoke", "journey"),
                        help="Run the short desktop smoke or the full journey (default: journey).")
     modes.add_argument("--reply-export", action="store_true")
     modes.add_argument("--manual-native", action="store_true",
@@ -662,13 +661,9 @@ def main() -> int:
     if args.manual_native:
         from desktop_manual_acceptance import run_manual_native
         return run_manual_native(ROOT, prepare_desktop_binary, skip_build)
-    runtime_directory = (
-        contextlib.nullcontext(tempfile.mkdtemp(prefix="angelbot-desktop-e2e-"))
-        if keep_data
-        else tempfile.TemporaryDirectory(prefix="angelbot-desktop-e2e-")
-    )
-    with runtime_directory as runtime_dir:
-        runtime = Path(runtime_dir)
+    # Python 3.11 argparse can treat a supplied value equal to the argument default as absent.
+    suite = args.suite or "journey"
+    with desktop_runtime_directory("angelbot-desktop-e2e-", keep_data) as runtime:
         if keep_data:
             print(f"Desktop E2E runtime retained at: {runtime}", flush=True)
         env = desktop_environment(runtime)
@@ -677,8 +672,8 @@ def main() -> int:
             run_reply_export_probe(npx, env, runtime, skip_build)
             return 0
 
-        env["ANGELBOT_DESKTOP_E2E_SUITE"] = args.suite
-        if args.suite == "smoke":
+        env["ANGELBOT_DESKTOP_E2E_SUITE"] = suite
+        if suite == "smoke":
             env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"] = json.dumps([{
                 "type": "text",
                 "text": "angelbot-ci-smoke-ok: 已收到测试消息。",
@@ -690,7 +685,7 @@ def main() -> int:
         prepare_desktop_binary(npx, env, skip_build)
         configure_webdriver_port(env)
         command = [npx, "wdio", "run", "e2e/wdio.conf.mjs"]
-        if args.suite == "smoke":
+        if suite == "smoke":
             run(command, env)
         else:
             run_journey(command, env, runtime / "angelbot-data")
