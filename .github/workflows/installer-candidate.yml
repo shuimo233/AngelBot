@@ -1,0 +1,79 @@
+name: Windows installer candidate
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/installer-candidate.yml'
+      - '.github/workflows/release.yml'
+      - 'scripts/installed_desktop_smoke.mjs'
+      - 'scripts/release.py'
+      - 'src-tauri/tauri.conf.json'
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Build and test installed AngelBot
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build the per-user NSIS installer
+        run: npm run release:build
+
+      - name: Install, use and reopen the packaged app
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem src-tauri/target/release/bundle/nsis -File -Filter '*.exe')
+          if ($packages.Count -ne 1) { throw "Expected one NSIS installer, found $($packages.Count)" }
+          $output = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'angelbot-candidate')
+          $installer = Copy-Item -LiteralPath $packages[0].FullName -Destination $output.FullName -PassThru
+          node scripts/installed_desktop_smoke.mjs --installer $installer.FullName --report (Join-Path $output.FullName 'installed-smoke.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $($installer.Name)" | Set-Content -LiteralPath (Join-Path $output.FullName 'SHA256SUMS') -Encoding ascii
+
+      - name: Upload tested installer and receipt
+        uses: actions/upload-artifact@v7
+        with:
+          name: AngelBot-windows-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/angelbot-candidate/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Preserve the installation check receipt on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/angelbot-candidate/installed-smoke.json
+          if-no-files-found: ignore
+          retention-days: 7

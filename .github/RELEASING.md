@@ -142,6 +142,15 @@ warning-free. Updater signing is still required when distributing updater artifa
 
 ### Early pre-release
 
+A verified push to `main` builds a current-user Windows NSIS installer. In
+the same hosted Windows job, the installed application must pass the packaged
+desktop smoke before the workflow uploads `AngelBot-windows-x64-<commit>`.
+Download it from the Verify run for that commit. The artifact contains the tested
+installer, its SHA-256 in `SHA256SUMS`, and `installed-smoke.json`. It is retained
+for 14 days. Changes to the installer workflow also exercise this path on their PR.
+For an early preview, use the exact tested installer from the intended main
+commit as the candidate for the manual publication step below.
+
 1. Keep version metadata aligned and put the complete candidate source into an
    explicit reviewed commit under the normal PR/check rules before tagging it.
    Do not tag an old HEAD while the built candidate exists only as uncommitted

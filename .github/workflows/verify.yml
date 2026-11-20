@@ -129,3 +129,9 @@ jobs:
         env:
           DESKTOP_RESULT: ${{ needs.desktop-suite.result }}
         run: test "$DESKTOP_RESULT" = success
+
+  installer-candidate:
+    name: Deliver verified installer
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [full, desktop-e2e]
+    uses: ./.github/workflows/installer-candidate.yml
