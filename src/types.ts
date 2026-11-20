@@ -20,7 +20,7 @@ export type Session = {
 };
 
 /** Explicit user-supplied text snapshot; never a filesystem permission or path. */
-export type TextAttachment = { name: string; text: string };
+export type TextAttachment = { name: string; text: string; referenceOnly?: true };
 
 export type Message = {
   id: string;
@@ -46,6 +46,8 @@ export type Message = {
   taskFacts?: TaskFacts;
   /** Ordered, durable text/tool timeline for an agent response. */
   timelineBlocks?: import('$stores/messages').LiveBlock[];
+  /** Local UI projection of a durable host model-error event for this run. */
+  modelRequestFailed?: boolean;
 };
 
 /** 工具调用 */
@@ -185,6 +187,8 @@ export type Persona = {
   traits?: TraitConfig;
   /** Imported SillyTavern/TavernCard metadata retained for editing and export. */
   characterCard?: TavernCharacterCard;
+  /** User-selected, editable persona context; separate from personal memory. */
+  personaNotes?: string;
 };
 
 export type TavernCharacterCard = {
@@ -218,6 +222,7 @@ export type ApiConfig = {
   planConnected?: boolean;
   planEnabled?: boolean;
   planAccountLabel?: string | null;
+  planStatusError?: string | null;
   deployment?: string;
   maxTokens: number;
   temperature: number;

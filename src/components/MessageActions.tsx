@@ -69,65 +69,14 @@ interface ActionButtonProps {
 }
 
 function ActionButton({ onClick, disabled, title, children, variant = 'default', active, activeLabel }: ActionButtonProps) {
-  const [pressed, setPressed] = useState(false);
-
-  const isDanger = variant === 'danger';
-  const isActive = active || pressed;
-
   return (
     <button
       type="button"
       disabled={disabled}
       title={title}
       onClick={onClick}
-      onMouseDown={() => setPressed(true)}
-      onMouseUp={() => setPressed(false)}
-      onMouseLeave={(e) => {
-        setPressed(false);
-        if (disabled) return;
-        const el = e.currentTarget;
-        if (isDanger) {
-          el.style.color = 'var(--color-muted)';
-          el.style.background = 'transparent';
-        } else {
-          el.style.color = 'var(--color-muted)';
-          el.style.background = 'transparent';
-        }
-        el.style.borderColor = 'transparent';
-      }}
-      onMouseEnter={(e) => {
-        if (disabled) return;
-        const el = e.currentTarget;
-        if (isDanger) {
-          el.style.color = '#ef4444';
-          el.style.background = 'rgba(239,68,68,0.08)';
-        } else {
-          el.style.color = 'var(--color-text)';
-          el.style.background = 'var(--color-surface)';
-        }
-        el.style.borderColor = 'var(--color-border)';
-      }}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 4,
-        height: 26,
-        padding: '4px 8px',
-        background: isActive ? 'var(--color-surface)' : 'transparent',
-        border: `1px solid ${isActive ? 'var(--color-border)' : 'transparent'}`,
-        borderRadius: 6,
-        color: isDanger ? 'var(--color-muted)' : isActive ? 'var(--color-text)' : 'var(--color-muted)',
-        cursor: disabled ? 'not-allowed' : 'pointer',
-        fontSize: 11,
-        fontWeight: 500,
-        fontFamily: 'inherit',
-        lineHeight: 1,
-        whiteSpace: 'nowrap',
-        userSelect: 'none',
-        opacity: disabled ? 0.4 : 1,
-        transition: 'background 0.12s, color 0.12s, border-color 0.12s',
-        flexShrink: 0,
-      }}
+      className={`action-btn ${variant}`}
+      data-active={active || undefined}
     >
       {activeLabel && active ? <><CheckIcon /><span>{activeLabel}</span></> : children}
     </button>
@@ -238,7 +187,7 @@ export function MessageActions({ message, onEdit, onDelete, onCopy, disabled, is
   };
 
   const handleCopy = async () => {
-    if (disabled || copyAttempt.current || !message.content.trim()) return;
+    if (disabled || isStreaming || copyAttempt.current || !message.content.trim()) return;
     const attempt = Symbol();
     copyAttempt.current = attempt;
     clearTimeout(copyTimer.current);
@@ -279,8 +228,12 @@ export function MessageActions({ message, onEdit, onDelete, onCopy, disabled, is
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
 
+  // A live placeholder or partial reply is not a finished result to copy/export.
+  // Keep the existing component mounted so terminal content unlocks these actions.
+  if (isAssistant && (isStreaming || !message.content.trim())) return null;
+
   return (
-    <div className="message-actions" style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 6, flexWrap: 'wrap' }}>
+    <div className="message-actions">
       {isUser && (
         <>
           <ActionButton onClick={() => setEditing({ source: message, content: message.content })} disabled={disabled} title={disabled ? '请先等待当前操作结束后编辑消息' : '编辑消息'}>

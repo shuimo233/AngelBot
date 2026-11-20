@@ -14,6 +14,8 @@ const base = {
 
 describe('model configuration readiness', () => {
   it('requires provider-matched credentials without blocking application loading', () => {
+    expect(getModelConfigReadiness(base, false)).toEqual({ kind: 'loading' });
+    expect(getModelConfigReadiness(base, true, '暂时无法读取连接')).toMatchObject({ kind: 'unverified' });
     expect(getModelConfigReadiness(base, true)).toMatchObject({ kind: 'needs-credentials' });
     expect(getModelConfigReadiness({ ...base, hasApiKey: true }, true)).toEqual({ kind: 'ready' });
   });
@@ -46,6 +48,8 @@ describe('model configuration readiness', () => {
   it('requires plan permission and an opaque account reference instead of an API key', () => {
     const plan = { ...base, provider: 'openai' as const, baseUrl: 'https://api.openai.com/v1', protocol: 'openai_responses' as const, authMode: 'chatgpt_plan' as const, planEnabled: true, credentialRef: 'opaque-ref' };
     expect(getModelConfigReadiness(plan, true)).toEqual({ kind: 'ready' });
+    expect(getModelConfigReadiness({ ...plan, planEnabled: false, planStatusError: '暂时无法读取账号' }, true))
+      .toMatchObject({ kind: 'unverified' });
     expect(getModelConfigReadiness({ ...plan, planEnabled: false }, true)).toMatchObject({ kind: 'needs-credentials' });
     expect(getModelConfigReadiness({ ...plan, credentialRef: null, hasApiKey: true }, true)).toMatchObject({ kind: 'needs-credentials' });
     expect(getModelConfigReadiness({ ...plan, baseUrl: 'https://gateway.example/v1' }, true)).toMatchObject({ kind: 'invalid' });

@@ -31,6 +31,7 @@ use super::{
 pub use super::delegation_issuance::ForegroundRunIdentity;
 
 pub type DelegateWorkInput = DelegationRequest;
+pub(crate) const CODEX_TOOL: &str = "delegate_codex_change";
 
 #[derive(Clone)]
 pub struct DelegateWorkHandler {
@@ -43,6 +44,53 @@ pub struct DelegateWorkHandler {
 #[derive(Clone)]
 struct ConfirmedNetworkDelegateWorkHandler {
     delegate: DelegateWorkHandler,
+}
+
+#[derive(Clone)]
+struct ConfirmedCodexChange(DelegateWorkHandler);
+
+impl ToolHandler for ConfirmedCodexChange {
+    fn name(&self) -> &str {
+        CODEX_TOOL
+    }
+
+    fn execute(&self, _: &Value, _: &std::path::Path) -> ToolResult {
+        ToolResult::error(
+            CODEX_TOOL,
+            "Codex delegation requires an exact user confirmation",
+        )
+    }
+
+    fn execute_with_context(
+        &self,
+        arguments: &Value,
+        dir: &std::path::Path,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
+        if !context.is_confirmation_approval() {
+            return self.execute(arguments, dir);
+        }
+        if super::codex_cli::installed_executable().is_none() {
+            return ToolResult::error(
+                CODEX_TOOL,
+                "未找到已安装的 Codex CLI；本次未派发，也未切换执行器。",
+            );
+        }
+        let Some(goal) = arguments
+            .as_object()
+            .filter(|value| value.len() == 1)
+            .and_then(|value| value.get("goal"))
+            .and_then(Value::as_str)
+        else {
+            return ToolResult::error(CODEX_TOOL, "Codex 委派只接受任务目标。");
+        };
+        self.0.execute_with_call_id(
+            &json!({"goal":goal,"task_shape":"change","worker_profile":"implementer"}),
+            &context.call_id,
+            CODEX_TOOL,
+            false,
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +193,13 @@ impl DelegateWorkHandler {
                 input,
                 Some(&work.id),
             )
+        } else if tool_name == CODEX_TOOL {
+            self.issuer.issue_confirmed_codex_outcome(
+                &self.identity,
+                call_id,
+                input,
+                Some(&work.id),
+            )
         } else {
             self.issuer
                 .issue_outcome(&self.identity, call_id, input, Some(&work.id))
@@ -167,6 +222,7 @@ impl DelegateWorkHandler {
                         "delegation_id": receipt.delegation_id,
                         "attempt_id": receipt.attempt_id,
                         "work_package_id": receipt.work_package_id,
+                        "executor": if tool_name == CODEX_TOOL { "codex_cli" } else { "internal" },
                         "network_scope": if confirmed_network_scope { "approved_for_this_explorer_task" } else { "not_changed" },
                     })
                     .to_string(),
@@ -181,6 +237,7 @@ impl DelegateWorkHandler {
                         "delegation_id": receipt.delegation_id,
                         "attempt_id": receipt.attempt_id,
                         "work_package_id": receipt.work_package_id,
+                        "executor": if tool_name == CODEX_TOOL { "codex_cli" } else { "internal" },
                         "network_scope": if confirmed_network_scope { "already_approved_for_this_explorer_task" } else { "not_changed" },
                     })
                     .to_string(),
@@ -459,6 +516,20 @@ pub fn register(
     let Some(service) = delegation_service else {
         return;
     };
+    let codex = Tool::new(CODEX_TOOL,
+        "Queue a bounded coding task for the installed Codex CLI, only when the user explicitly requests Codex. User approval is mandatory. Codex runs in the candidate worktree; it cannot apply the result to the project.",
+        json!({"type":"object","additionalProperties":false,"required":["goal"],"properties":{"goal":{"type":"string","minLength":1,"maxLength":600}}}))
+        .with_confirmation(true).with_label("委派给 Codex")
+        .with_prompt_snippet("仅在用户明确要求把编程任务交给 Codex 时使用 delegate_codex_change。目标只包含完成当前项目任务所需信息，不附加会话历史、个人记忆或密钥。等待用户确认；不可用时报告原因，不自动改用其他执行器。");
+    registry.register(
+        codex,
+        Arc::new(ConfirmedCodexChange(DelegateWorkHandler::new(
+            db.clone(),
+            identity.clone(),
+            sandbox_root.clone(),
+            model_binding.clone(),
+        ))),
+    );
     let retry_tool = Tool::new(
         "retry_delegated_delivery",
         "Internally retry one prior delegated delivery after Main-Agent review. It reuses the immutable task boundary, creates a fresh isolated attempt, and never replays completed side effects.",
@@ -552,6 +623,72 @@ mod tests {
     fn model_binding() -> DelegatedModelBindingRequest {
         DelegatedModelBindingRequest::new("provider:default", "model:test", "keychain:default", 1)
             .unwrap()
+    }
+
+    #[test]
+    fn codex_cli_route_needs_confirmation_and_persists_its_executor_with_outbox() {
+        let (db, identity, workspace) = setup("codex-confirm");
+        let root = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["commit", "--allow-empty", "-m", "baseline"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        let (service, _) = recording_service(ContractLimits::default());
+        let mut registry = ToolRegistry::new();
+        register(
+            &mut registry,
+            db.clone(),
+            identity.clone(),
+            root.path().join("sandboxes"),
+            model_binding(),
+            Some(service),
+        );
+        assert!(super::super::registry::requires_immediate_confirmation(
+            CODEX_TOOL
+        ));
+        let direct = registry.execute(
+            &ToolCall::new(CODEX_TOOL.into(), json!({"goal":"Update the fixture"})),
+            "direct",
+            workspace.path(),
+        );
+        assert!(!direct.result.success);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM delegations", [], |row| row.get(0))
+                .unwrap(),
+            0
+        );
+
+        // Test through the same host-only issuance call reached after
+        // confirmation, without depending on Codex on PATH or a subscription.
+        let delegate = DelegateWorkHandler::new(
+            db.clone(),
+            identity,
+            root.path().join("sandboxes"),
+            model_binding(),
+        );
+        let goal = json!({"goal":"Update the fixture","task_shape":"change","worker_profile":"implementer"});
+        let receipt = delegate.execute_with_call_id(&goal, "approved", CODEX_TOOL, false);
+        assert!(receipt.success, "{}", receipt.content);
+        let conn = db.lock().unwrap();
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT d.executor, (SELECT COUNT(*) FROM delegation_outbox) FROM delegations d",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("codex_cli".into(), 1));
     }
 
     #[test]

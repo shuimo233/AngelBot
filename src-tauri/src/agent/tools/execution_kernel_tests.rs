@@ -124,7 +124,7 @@ impl LlmProvider for FailsOnceProvider {
 fn cancelled_kernel_rejects_a_model_turn_before_any_host_work() {
     let cancellation = ToolCancellation::new();
     cancellation.cancel();
-    let kernel = ExecutionKernel::new(cancellation, Duration::from_secs(45), 2);
+    let kernel = ExecutionKernel::new(cancellation, Duration::from_secs(45));
 
     assert_eq!(
         kernel.check_before_model_turn(),
@@ -165,7 +165,7 @@ async fn cancellation_drops_an_inflight_model_without_retry_or_finish() {
     }
     let cancellation = ToolCancellation::new();
     let events = Arc::new(Mutex::new(Vec::<KernelEvent>::new()));
-    let kernel = ExecutionKernel::new(cancellation.clone(), Duration::from_secs(45), 2)
+    let kernel = ExecutionKernel::new(cancellation.clone(), Duration::from_secs(45))
         .with_event_sink({
             let events = events.clone();
             move |event| events.lock().unwrap().push(event)
@@ -199,7 +199,7 @@ async fn cancellation_drops_an_inflight_model_without_retry_or_finish() {
 }
 
 #[tokio::test]
-async fn cancellation_wins_response_and_timeout_backoff_races() {
+async fn cancellation_wins_response_and_timeouts_never_replay() {
     struct CancelsOnResponse(ToolCancellation);
     #[async_trait::async_trait]
     impl LlmProvider for CancelsOnResponse {
@@ -225,7 +225,7 @@ async fn cancellation_wins_response_and_timeout_backoff_races() {
         }
     }
     let cancellation = ToolCancellation::new();
-    let kernel = ExecutionKernel::new(cancellation.clone(), Duration::from_secs(1), 2);
+    let kernel = ExecutionKernel::new(cancellation.clone(), Duration::from_secs(1));
     let mut host = ToolThenTextHost {
         provider: Arc::new(CancelsOnResponse(cancellation)),
         settled: vec![],
@@ -254,29 +254,60 @@ async fn cancellation_wins_response_and_timeout_backoff_races() {
             self.0.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }
+        async fn chat_stream_classified(
+            &self,
+            messages: &[Message],
+            tools: Option<&[ToolSchema]>,
+            thinking: Option<&ThinkingSettings>,
+            deltas: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        ) -> Result<LlmResponse, crate::llm::LlmFailure> {
+            if let Some(deltas) = deltas {
+                let _ = deltas.send("partial reply already received".into());
+            }
+            self.chat(messages, tools, thinking)
+                .await
+                .map_err(Into::into)
+        }
     }
     let cancellation = ToolCancellation::new();
-    let kernel = ExecutionKernel::new(cancellation.clone(), Duration::from_millis(1), 2)
-        .with_event_sink(move |event| {
-            if event.kind == KernelEventKind::ModelTurnRetrying {
-                cancellation.cancel();
-            }
-        });
     let provider = NeverResponds(AtomicUsize::new(0));
+    let expired = ExecutionKernel::new(cancellation.clone(), Duration::ZERO);
+    assert!(matches!(
+        expired.run_model_turn(&provider, &[], None, None, None).await,
+        Err(KernelModelTurnError::TimedOut { timeout }) if timeout.is_zero()
+    ));
+    assert_eq!(
+        provider.0.load(Ordering::SeqCst),
+        0,
+        "no dispatch after budget expiry"
+    );
+    let kernel = ExecutionKernel::new(cancellation, Duration::from_millis(1));
+    let (deltas, mut received) = tokio::sync::mpsc::unbounded_channel();
     let outcome = tokio::time::timeout(
-        Duration::from_millis(200),
-        kernel.run_model_turn(&provider, &[], None, None, None),
+        Duration::from_secs(2),
+        kernel.run_model_turn(&provider, &[], None, None, Some(deltas)),
     )
     .await
-    .expect("stop must interrupt timeout backoff");
-    assert!(matches!(outcome, Err(KernelModelTurnError::Cancelled)));
+    .expect("a model timeout must not start another inference");
+    assert!(matches!(
+        outcome,
+        Err(KernelModelTurnError::TimedOut { .. })
+    ));
     assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        received.try_recv().unwrap(),
+        "partial reply already received"
+    );
+    assert!(
+        received.try_recv().is_err(),
+        "partial output must not be replayed"
+    );
 }
 
 #[tokio::test]
 async fn controlled_tool_batch_emits_stable_boundary_events_around_host_work() {
     let events = Arc::new(Mutex::new(Vec::<KernelEvent>::new()));
-    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(45), 2)
+    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(45))
         .with_event_sink({
             let events = events.clone();
             move |event| events.lock().expect("event lock").push(event)
@@ -305,7 +336,7 @@ async fn controlled_tool_batch_emits_stable_boundary_events_around_host_work() {
 #[test]
 fn controlled_tool_batch_balances_an_early_host_exit_once() {
     let events = Arc::new(Mutex::new(Vec::<KernelEvent>::new()));
-    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(45), 2)
+    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(45))
         .with_event_sink({
             let events = events.clone();
             move |event| events.lock().expect("event lock").push(event)
@@ -344,7 +375,7 @@ async fn provider_error_stops_without_retry_and_a_new_turn_can_recover() {
         "unclassified provider failure",
     ] {
         let events = Arc::new(Mutex::new(Vec::<KernelEvent>::new()));
-        let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(1), 2)
+        let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(1))
             .with_event_sink({
                 let events = events.clone();
                 move |event| events.lock().expect("event lock").push(event)
@@ -397,7 +428,7 @@ async fn provider_error_stops_without_retry_and_a_new_turn_can_recover() {
 #[tokio::test]
 async fn run_owns_model_tool_model_protocol_and_preserves_host_settlement_order() {
     let events = Arc::new(Mutex::new(Vec::<KernelEvent>::new()));
-    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(1), 1)
+    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(1))
         .with_event_sink({
             let events = events.clone();
             move |event| events.lock().expect("event lock").push(event)
@@ -437,7 +468,7 @@ async fn run_owns_model_tool_model_protocol_and_preserves_host_settlement_order(
 
 #[tokio::test]
 async fn run_enforces_explicit_model_turn_budget_without_an_implicit_iteration_limit() {
-    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(1), 1)
+    let kernel = ExecutionKernel::new(ToolCancellation::new(), Duration::from_secs(1))
         .with_budget_policy(BudgetPolicy::new(Some(1), None, None));
     let mut host = ToolThenTextHost {
         provider: Arc::new(ToolThenTextProvider {

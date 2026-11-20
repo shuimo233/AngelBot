@@ -8,6 +8,7 @@ Default: data/hash/projection checks only, no model or owner runtime data.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 from datetime import datetime, timezone
 import hashlib
@@ -19,7 +20,9 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unicodedata
+import uuid
 from urllib.request import urlopen
 
 from companion_eval import parse_rows, summarize_metering
@@ -49,7 +52,14 @@ VARIANT_ARMS = {'result_projection': ('current', 'projection'),
 VARIANT_FIXTURE = ROOT / 'scripts/fixtures/context_continuity.json'
 MAIN_FIXTURE = ROOT / 'scripts/fixtures/main_continuity.json'
 MAIN_TEST = 'commands::message::live_tests::continuous_main::configured_continuous_main'
+LONG_DAILY_FIXTURE = ROOT / 'scripts/fixtures/long_daily_continuity.json'
+LONG_DAILY_TEST = 'commands::message::live_tests::continuous_main::configured_long_daily_continuity'
 ANCHORED_MAIN_CONDITIONS = ('anchored_working_view', 'anchored_working_view_v2', 'anchored_working_view_pressure8k')
+NATURAL_CACHE_MAIN_CONDITION = 'anchored_working_view_natural_cache'
+NATURAL_NATIVE_CACHE_MAIN_CONDITION = 'native_history_natural_cache'
+CROSS_TURN_CACHE_MAIN_CONDITION = 'cross_turn_natural_cache'
+SAME_PROCESS_CACHE_MAIN_CONDITION = 'same_process_natural_cache'
+MAIN_STEADY_CACHE_PHASES = (1, 2)
 CHECKPOINT_REPLAY_TEST = 'commands::message::live_tests::continuous_main::configured_rolling_checkpoint_replay'
 EXPLICIT_PREFERENCE_TEST = 'commands::message::live_tests::continuous_main::configured_explicit_preference_continuity'
 RECALL_VARIANTS = ROOT / 'scripts/fixtures/preference_recall.json'
@@ -98,11 +108,195 @@ def inspect_main_audit(owned, session):
     return {'writeAttempts': attempts, 'writeSuccesses': successes, 'userTurns': turns.get('user',0), 'assistantTurns': turns.get('assistant',0)}
 
 
-def score_main(stages, rows, snapshots, condition='native'):
-    if condition not in ('native', 'completed_view_prototype', *ANCHORED_MAIN_CONDITIONS):
+def summarize_main_tool_projection(conn, rows, tool_name):
+    samples = []
+    for row in rows:
+        visible = {}
+        for frame, metric in zip(row.get('providerInputs', []), row.get('requestMetrics', [])):
+            if (metric.get('responseMetadata') or {}).get('transport') not in ('http', 'websocket_full', 'websocket_delta'):
+                continue
+            for message in frame.get('messages', []):
+                if message.get('role') == 'tool' and isinstance(message.get('content'), str):
+                    visible.setdefault(message.get('toolCallId'), message['content'])
+        for tool in row.get('tools', []):
+            call_id = tool.get('callId')
+            if tool.get('toolName') != tool_name or tool.get('success') is not True or not call_id:
+                continue
+            records = conn.execute("""
+                SELECT id,payload FROM agent_run_events WHERE session_id=? AND event_type='ToolExecutionEnd'
+                AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.data.call_id') END=? LIMIT 2
+            """, (row['session'], call_id)).fetchall()
+            raw = None
+            source_ref = None
+            if len(records) == 1:
+                event_id, encoded = records[0]
+                payload = json.loads(encoded)
+                seal = payload.get('_angelbot_source') or {}
+                source = payload.get('data') or {}
+                if (payload.get('type') == 'ToolExecutionEnd' and isinstance(seal, dict) and seal.get('version') == 1
+                        and isinstance(seal.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', seal['sha256'])
+                        and isinstance(source, dict) and source.get('tool_name') == tool_name and source.get('success') is True
+                        and isinstance(source.get('output'), str)):
+                    raw = source['output']
+                    if tool_name == 'read_file':
+                        try:
+                            source_ref = 'r-' + base64.urlsafe_b64encode(uuid.UUID(event_id).bytes).decode('ascii').rstrip('=')
+                        except ValueError:
+                            pass
+            raw_bytes = len(raw.encode('utf-8')) if raw is not None else None
+            reply = visible.get(call_id)
+            reply_bytes = len(reply.encode('utf-8')) if reply is not None else None
+            omission_rows = None
+            prior_read_call = None
+            reply_source_ref = None
+            if reply is not None:
+                try:
+                    value, _ = json.JSONDecoder().raw_decode(reply.removeprefix('Result: ').lstrip())
+                except ValueError:
+                    value = None
+                if isinstance(value, dict) and isinstance(value.get('sources'), list):
+                    omission_rows = sum(isinstance(source, dict) and isinstance(source.get('text_in_prior_user'), str)
+                                        and bool(source['text_in_prior_user']) and 'text' not in source
+                                        for source in value['sources'])
+                if tool_name == 'read_file' and isinstance(value, dict):
+                    prior_read_call = value.get('same_content_as_read_call')
+                    reply_source_ref = value.get('source_ref')
+            saved = raw_bytes - reply_bytes if raw_bytes is not None and reply_bytes is not None else None
+            sample = {'turn': row['id'], 'rawSealedOutputBytes': raw_bytes, 'modelVisibleReplyBytes': reply_bytes,
+                      'bytesSaved': saved}
+            if tool_name == 'read_file':
+                sample.update(callId=call_id, priorReadCallId=prior_read_call,
+                              sourceRefBound=source_ref is not None and source_ref == reply_source_ref,
+                              modelVisibleFullRaw=raw is not None and reply == f'Result: {raw}',
+                              rawSealedOutputSha256=hashlib.sha256(raw.encode('utf-8')).hexdigest() if raw is not None else None)
+            else:
+                sample.update(omissionMarkerRows=omission_rows,
+                              reducedWithOmission=bool(omission_rows and saved is not None and saved > 0))
+            samples.append(sample)
+    return samples
+
+
+def inspect_main_tool_projection(owned, rows, tool_name):
+    try:
+        with contextlib.closing(sqlite3.connect(f'file:{(owned / "main-data.db").as_posix()}?mode=ro', uri=True)) as conn:
+            return {'available': True, 'samples': summarize_main_tool_projection(conn, rows, tool_name)}
+    except sqlite3.Error:
+        return {'available': False, 'samples': []}
+
+
+def summarize_main_cache(rows):
+    """Separate prepared-request continuity from the cache usage reported by the provider."""
+    groups = {}
+    previous = None
+    prefix_missing = False
+    keys = ('settings', 'tools', 'instructions')
+    for row in rows:
+        metrics = row.get('requestMetrics', [])
+        inputs = row.get('providerInputs', [])
+        for index in range(row['requestCount']):
+            metric = metrics[index] if index < len(metrics) else None
+            frame = inputs[index] if index < len(inputs) else None
+            current = (metric or {}).get('preparedRequestFingerprint')
+            if not frame or not current or not all(key in current for key in (*keys, 'input')):
+                group = 'unclassified'
+                previous = None
+                prefix_missing = True
+            elif not frame.get('tools'):
+                group = 'withoutTools'
+            else:
+                items = current['input']
+                before = previous[1] if previous else None
+                compactions = [item for item in items if item['kind'] == 'compaction']
+                prior_compactions = [item for item in before['input'] if item['kind'] == 'compaction'] if before else []
+                if prefix_missing:
+                    group = 'unclassified'
+                elif compactions and compactions != prior_compactions:
+                    group = 'nativeCompaction'
+                elif before is None:
+                    group = 'firstMainRequest'
+                else:
+                    transition = 'withinTurn' if previous[0] == row['id'] else 'acrossTurns'
+                    same_contract = all(current[key] == before[key] for key in keys)
+                    prior_items = before['input']
+                    if same_contract and items == prior_items:
+                        group = transition + 'Repeat'
+                    elif same_contract and items[:len(prior_items)] == prior_items:
+                        group = transition + 'Append'
+                    else:
+                        group = transition + 'ChangedPrefix'
+                previous = (row['id'], current)
+                prefix_missing = False
+            groups.setdefault(group, []).append({'requestCount': 1, 'requestMetrics': [metric] if metric else []})
+    fields = ('attemptedRequests', 'cacheReadKnownRequests', 'cachedInputTokensObserved',
+              'cacheDenominatorInputTokens', 'tokenCacheHitRateObserved', 'requestCacheHitRateObserved')
+    return {group: {key: value for key, value in summarize_metering(requests).items() if key in fields}
+            for group, requests in groups.items()}
+
+
+def summarize_main_turn_transport(rows, same_process=False):
+    boundaries = {'sameProcess': [], 'afterRestart': []}
+    for previous, row in zip(rows, rows[1:]):
+        key = 'sameProcess' if previous['pid'] == row['pid'] else 'afterRestart'
+        metrics = row.get('requestMetrics') or []
+        first = metrics[0] if metrics else {}
+        metadata = first.get('responseMetadata') or {}
+        usage = first.get('usage') or {}
+        boundaries[key].append({'turn': row['id'], 'transport': metadata.get('transport'),
+                                'inputTokens': usage.get('inputTokens'),
+                                'cachedInputTokens': usage.get('cachedInputTokens')})
+    same = [item['transport'] for item in boundaries['sameProcess']]
+    restart = [item['transport'] for item in boundaries['afterRestart']]
+    first_request = {'http', 'websocket_full'}
+    expected_same, expected_restart = (5, 0) if same_process else (3, 2)
+    boundaries['verified'] = (len(same) == expected_same and 'websocket_delta' in same
+                              and all(route in first_request | {'websocket_delta'} for route in same)
+                              and len(restart) == expected_restart and all(route in first_request for route in restart))
+    return boundaries
+
+
+def summarize_main_metering(rows):
+    metering = summarize_metering(rows)
+    total = metering['cacheDenominatorInputTokens']
+    cached = metering['cachedInputTokensObserved']
+    metering['cacheMissInputTokensObserved'] = total - cached if total is not None and cached is not None else None
+    return metering
+
+
+def summarize_steady_delta_usage(rows):
+    counts = {'deltaRequests': 0, 'zeroHitRequests': 0, 'zeroHitInputTokens': 0,
+              'unknownDeltaUsageRequests': 0, 'unknownTransportRequests': 0}
+    for row in rows:
+        metrics = row.get('requestMetrics', [])
+        for index in range(row['requestCount']):
+            metric = metrics[index] if index < len(metrics) else {}
+            route = (metric.get('responseMetadata') or {}).get('transport')
+            if route is None:
+                counts['unknownTransportRequests'] += 1
+            if route != 'websocket_delta':
+                continue
+            counts['deltaRequests'] += 1
+            usage = metric.get('usage') or {}
+            cached, total = usage.get('cachedInputTokens'), usage.get('inputTokens')
+            if (metric.get('usageStatus') != 'reported' or usage.get('detailsInvalid')
+                    or type(cached) is not int or type(total) is not int or not 0 <= cached <= total):
+                counts['unknownDeltaUsageRequests'] += 1
+            elif cached == 0:
+                counts['zeroHitRequests'] += 1
+                counts['zeroHitInputTokens'] += total
+    return counts
+
+
+def score_main(stages, rows, snapshots, condition='native', *, paced=False, attachment_reference=False):
+    native_cache_history = condition == NATURAL_NATIVE_CACHE_MAIN_CONDITION
+    same_process_cache = condition == SAME_PROCESS_CACHE_MAIN_CONDITION
+    cross_turn_cache = condition in (CROSS_TURN_CACHE_MAIN_CONDITION, SAME_PROCESS_CACHE_MAIN_CONDITION)
+    natural_cache = condition == NATURAL_CACHE_MAIN_CONDITION or native_cache_history or cross_turn_cache
+    anchored = condition in ANCHORED_MAIN_CONDITIONS
+    if condition not in ('native', 'completed_view_prototype') and not (anchored or natural_cache):
         raise ValueError('Unknown Main working-view condition')
     planned = {s['id']: s for s in stages}
     seen, sessions, processes = set(), set(), {}
+    resume_checkpoint_restored = False
     for row in rows:
         key = row['id']
         if key not in planned or key in seen or row['phase'] != planned[key]['phase']:
@@ -120,7 +314,7 @@ def score_main(stages, rows, snapshots, condition='native'):
             restored = (view.get('applied') is True and view.get('userOriginalsPreserved') is True
                         and view.get('opaqueBefore',0) > 0 and view.get('opaqueAfter') == 0
                         and row.get('checkpointInput') is False)
-        elif condition in ANCHORED_MAIN_CONDITIONS:
+        elif anchored or natural_cache:
             view = row.get('workingView') or {}
             saved = view.get('persistedSummary')
             restored = (view.get('applied') is True and view.get('windowUserOriginalsPreserved') is True
@@ -131,25 +325,31 @@ def score_main(stages, rows, snapshots, condition='native'):
             if condition == 'anchored_working_view_pressure8k':
                 restored = (restored and view.get('historyBudgetTokens') == 8192
                             and view.get('runnerWindowTokens', 0) > 8192)
+            if key == 'resume':
+                resume_checkpoint_restored = restored
         row['passed'] = (row['status'] == 'completed' and row['requestCount'] > 0
                          and row.get('durableReply') is True and row.get('scopeClean') is True
                          and all(re.search(p, text, re.I) for p in rule['required'])
                          and not any(re.search(p, text, re.I) for p in rule['forbidden'])
-                         and (not rule.get('native_checkpoint') or row.get('nativeCheckpoint') is True)
-                         and (not rule.get('checkpoint_input') or restored))
+                         and (natural_cache or not rule.get('native_checkpoint') or row.get('nativeCheckpoint') is True)
+                         and (natural_cache or not rule.get('checkpoint_input') or restored))
         if condition == 'completed_view_prototype':
             view = row.get('workingView') or {}
             row['passed'] = row['passed'] and view.get('applied') is True and view.get('userOriginalsPreserved') is True
             row['passed'] = row['passed'] and view.get('incompleteIndexes') == 0
-        elif condition in ANCHORED_MAIN_CONDITIONS:
+        elif anchored or natural_cache:
             view = row.get('workingView') or {}
-            row['passed'] = (row['passed'] and view.get('applied') is True
+            row['passed'] = (row['passed'] and (natural_cache or view.get('applied') is True)
                              and view.get('windowUserOriginalsPreserved') is True and view.get('incompleteIndexes') == 0)
+            if native_cache_history:
+                row['passed'] = (row['passed'] and view.get('applied') is False
+                                 and view.get('nativeRetained') is True)
         if rule.get('readback'):
             row['passed'] = row['passed'] and any(t['toolName'] == 'read_file' and t['success']
                                                   and rule['readback'] in t['output'] for t in row.get('tools', []))
     distinct = (len(processes) == 3 and all(len(p) == 1 for p in processes.values())
                 and len(set.union(*processes.values())) == 3)
+    same_process = len(processes) == 3 and len(set.union(*processes.values())) == 1
     files_ok = len(snapshots) == 3 and all(s.get('draft.json', {}).get('valid') and s['draftUnchanged'] and s.get('sourcesIntact') for s in snapshots)
     files_ok = files_ok and snapshots[-1].get('check.txt', {}).get('valid', False)
     if snapshots:
@@ -162,7 +362,8 @@ def score_main(stages, rows, snapshots, condition='native'):
     within_target = (sum(r['requestCount'] for r in rows) <= budget['provider_calls']
                      and sum(r['inputTokens'] for r in rows) <= budget['input_tokens'])
     summary = {'passed': sum(r['passed'] is True for r in rows), 'planned': 6, 'condition': condition,
-               'metering': summarize_metering(rows),
+               'metering': summarize_main_metering(rows),
+               'cacheByPreparedPrefix': summarize_main_cache(rows),
                'requests': sum(r['requestCount'] for r in rows),
                'inputTokens': sum(r['inputTokens'] for r in rows), 'outputTokens': sum(r['outputTokens'] for r in rows),
                'distinctProcesses': distinct, 'sameSession': len(sessions) == 1,
@@ -171,17 +372,68 @@ def score_main(stages, rows, snapshots, condition='native'):
                'sourceProjection': any(r.get('sourceView') for r in rows), 'withinResourceTarget': within_target,
                'nativeRestoreVerified': condition == 'native' and any(r['id']=='resume' and r.get('checkpointInput') for r in rows),
                'completedViewRestored': condition in ('completed_view_prototype', *ANCHORED_MAIN_CONDITIONS) and any(r['id']=='resume' and r['passed'] for r in rows),
-               'persistedCheckpointRestored': condition in ANCHORED_MAIN_CONDITIONS and any(r['id']=='resume' and r['passed'] for r in rows)}
+               'persistedCheckpointRestored': anchored and any(r['id']=='resume' and r['passed'] for r in rows)}
+    if natural_cache:
+        views = [row.get('workingView') or {} for row in rows]
+        steady_rows = [row for row in rows if row['phase'] in MAIN_STEADY_CACHE_PHASES]
+        summary['steadyMetering'] = summarize_main_metering(steady_rows)
+        summary['steadyWebSocketDeltaUsage'] = summarize_steady_delta_usage(steady_rows)
+        summary.update(persistedCheckpointRestored=resume_checkpoint_restored,
+                       workingViewProjectedTurns=sum(view.get('applied') is True for view in views),
+                       workingViewNativeRetainedTurns=sum(view.get('nativeRetained') is True for view in views))
     complete = seen == set(planned)
-    passed = (complete and summary['passed'] == 6 and distinct and len(sessions) == 1
-              and files_ok and no_replay and summary['sourceProjection'])
+    expected_process_layout = same_process if same_process_cache else distinct
+    passed = (complete and summary['passed'] == 6 and expected_process_layout and len(sessions) == 1
+              and files_ok and no_replay and (natural_cache or summary['sourceProjection']))
+    if same_process_cache:
+        summary['sameProcess'] = same_process
+    if cross_turn_cache:
+        summary['crossTurnTransport'] = summarize_main_turn_transport(rows, same_process_cache)
+        summary['hostTurnClockVerifiedTurns'] = sum(row.get('hostTurnClockVerified') is True for row in rows)
+        passed = (passed and summary['crossTurnTransport']['verified']
+                  and summary['hostTurnClockVerifiedTurns'] == len(stages))
+    if paced:
+        starts = [request.get('requestStartOffsetMs') for row in rows for request in row.get('requestMetrics', [])]
+        gaps = ([b - a for a, b in zip(starts, starts[1:])]
+                if all(type(start) is int for start in starts) else [])
+        shortest = min(gaps, default=None)
+        verified = shortest is not None and shortest >= 5000 and len(starts) == summary['requests']
+        summary['requestPacing'] = {'minimumIntervalMs': 5000, 'shortestObservedIntervalMs': shortest, 'verified': verified}
+        passed = passed and verified
+    if attachment_reference:
+        required = ('checkpoint', 'resume', 'next_task')
+        verified_turns = [row['id'] for row in rows if row['id'] in required and row.get('attachmentReferenceVerified') is True]
+        summary['attachmentReferenceVerifiedTurns'] = verified_turns
+        passed = passed and tuple(verified_turns) == required
     return ('budget_exceeded' if not within_target else 'blocked' if not complete else 'passed' if passed else 'needs_work'), summary
 
 
-def run_main_journey(live, working_view_prototype=False, checkpoint_pressure=False):
+def prepare_main_journey(working_view_prototype=False, checkpoint_pressure=False, *,
+                         natural_cache=False, cache_fixed_clock=False, cache_clock_after_history=False,
+                         cache_native_history=False, cache_archive_attachments=False, cache_cross_turn=False,
+                         cache_same_process=False, cache_paced=False, cache_attachment_reference=False):
     payload, stages, budget = load_main()
     if checkpoint_pressure and not working_view_prototype:
         raise ValueError('History pressure requires the production working view')
+    if natural_cache and (not working_view_prototype or checkpoint_pressure):
+        raise ValueError('Natural-cache measurement requires the production working view without pressure')
+    if (cache_fixed_clock or cache_clock_after_history) and not natural_cache:
+        raise ValueError('Clock measurement requires the natural-cache condition')
+    if cache_fixed_clock and cache_clock_after_history:
+        raise ValueError('Choose one clock measurement condition')
+    if cache_native_history and not natural_cache:
+        raise ValueError('Native-history measurement requires the natural-cache condition')
+    if cache_archive_attachments and (not natural_cache or cache_native_history or cache_fixed_clock or cache_clock_after_history):
+        raise ValueError('Historical attachment comparison requires the natural-cache working view without other treatments')
+    if cache_cross_turn and (not natural_cache or cache_fixed_clock or cache_clock_after_history
+                             or cache_native_history or cache_archive_attachments):
+        raise ValueError('Cross-turn measurement requires the production natural-cache path without other treatments')
+    if cache_same_process and not cache_cross_turn:
+        raise ValueError('Same-process measurement requires the production cross-turn condition')
+    if cache_paced and not cache_same_process:
+        raise ValueError('Main pacing requires the same process across all three phases')
+    if cache_attachment_reference and not cache_cross_turn:
+        raise ValueError('Attachment-reference comparison requires the production cross-turn condition')
     condition = 'anchored_working_view_pressure8k' if checkpoint_pressure else 'anchored_working_view_v2' if working_view_prototype else 'native'
     payload['working_view_prototype'] = working_view_prototype
     payload['checkpoint_pressure'] = checkpoint_pressure
@@ -193,10 +445,99 @@ def run_main_journey(live, working_view_prototype=False, checkpoint_pressure=Fal
             raise ValueError('Unknown Main scope overlay; do not change the frozen prompts or answers')
         for stage in payload['stages']:
             stage['allow_context_reads'] = scope['read_only_context'][stage['id']]
+    if natural_cache:
+        condition = NATURAL_NATIVE_CACHE_MAIN_CONDITION if cache_native_history else NATURAL_CACHE_MAIN_CONDITION
+        for stage in payload['stages']:
+            stage.pop('force_native_checkpoint', None)
+    if cache_fixed_clock:
+        payload['fixed_cache_clock'] = datetime.now().astimezone().isoformat(timespec='seconds')
+    if cache_clock_after_history:
+        payload['cache_clock_after_history'] = True
+    if cache_native_history:
+        payload['cache_native_history'] = True
+    if cache_archive_attachments:
+        payload['cache_archive_attachments'] = True
+    if cache_cross_turn:
+        condition = CROSS_TURN_CACHE_MAIN_CONDITION
+        payload['cache_cross_turn'] = True
+    if cache_same_process:
+        condition = SAME_PROCESS_CACHE_MAIN_CONDITION
+        payload['cache_same_process'] = True
+    if cache_paced:
+        payload['cache_paced'] = True
+    if cache_attachment_reference:
+        payload['cache_attachment_reference'] = True
+    return payload, stages, budget, condition
+
+
+def main_cache_target(report, minimum_percent, *, steady=False):
+    whole = report['summary'].get('metering', {})
+    metering = report['summary'].get('steadyMetering', {}) if steady else whole
+    observed = metering.get('tokenCacheHitRateObserved')
+    observed_percent = observed * 100 if observed is not None else None
+    if report['status'] != 'passed':
+        status = 'task_incomplete'
+    elif whole.get('cacheComplete') is not True or metering.get('cacheComplete') is not True or observed_percent is None:
+        status = 'usage_incomplete'
+    else:
+        status = 'passed' if observed >= minimum_percent / 100 else 'below_target'
+    return {'minimumPercent': minimum_percent, 'observedPercent': observed_percent, 'status': status}
+
+
+def wait_for_main_phase(process, owned, phase):
+    if phase:
+        process.stdin.write(f'{phase}\n'.encode('ascii'))
+        process.stdin.flush()
+    if phase == 2:
+        return process.wait(timeout=600)
+    ready = owned / f'phase-{phase}.ready'
+    deadline = time.monotonic() + 600
+    while not ready.is_file() and process.poll() is None:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, 600)
+        time.sleep(0.05)
+    return process.poll() or 0
+
+
+def stop_main_process(process):
+    if process.poll() is None:
+        process.kill()
+
+
+def run_main_journey(live, working_view_prototype=False, checkpoint_pressure=False, *,
+                     natural_cache=False, cache_fixed_clock=False, cache_clock_after_history=False,
+                     cache_native_history=False, cache_archive_attachments=False,
+                     cache_cross_turn=False, cache_same_process=False, cache_no_session_affinity=False,
+                     cache_paced=False, cache_attachment_reference=False,
+                     minimum_cache_hit_rate=None, minimum_steady_cache_hit_rate=None):
+    if cache_no_session_affinity and not cache_cross_turn:
+        raise ValueError('Session-affinity control requires the production cross-turn condition')
+    payload, stages, budget, condition = prepare_main_journey(
+        working_view_prototype, checkpoint_pressure, natural_cache=natural_cache,
+        cache_fixed_clock=cache_fixed_clock, cache_clock_after_history=cache_clock_after_history,
+        cache_native_history=cache_native_history, cache_archive_attachments=cache_archive_attachments,
+        cache_cross_turn=cache_cross_turn, cache_same_process=cache_same_process,
+        cache_paced=cache_paced, cache_attachment_reference=cache_attachment_reference)
     if not live:
-        print(json.dumps({'status': 'offline_only', 'suite': 'main', 'condition': condition, 'phases': 3,
-                          'ids': [s['id'] for s in stages], 'maxProviderCalls': budget['provider_calls'],
-                          'phase2HistoryWindowTokens': 8192 if checkpoint_pressure else None, 'modelScore': None}))
+        report = {'status': 'offline_only', 'suite': 'main', 'condition': condition, 'phases': 3,
+                  'ids': [s['id'] for s in stages], 'maxProviderCalls': budget['provider_calls'],
+                  'phase2HistoryWindowTokens': 8192 if checkpoint_pressure else None, 'modelScore': None}
+        if natural_cache:
+            report['fixedCacheClock'] = cache_fixed_clock
+            report['cacheClockAfterHistory'] = cache_clock_after_history
+            report['cacheNativeHistory'] = cache_native_history
+            report['cacheArchiveAttachments'] = cache_archive_attachments
+            report['steadyCachePhases'] = list(MAIN_STEADY_CACHE_PHASES)
+        if cache_cross_turn:
+            report['cacheCrossTurn'] = True
+            report['cacheSessionAffinity'] = not cache_no_session_affinity
+        if cache_same_process:
+            report['cacheSameProcess'] = True
+        if cache_paced:
+            report['minimumRequestStartIntervalMs'] = 5000
+        if cache_attachment_reference:
+            report['cacheAttachmentReference'] = True
+        print(json.dumps(report))
         return 0
     owned = Path(tempfile.mkdtemp(prefix='main-continuity-', dir=ROOT / 'logs'))
     paths = ('scripts/context_eval.py', 'scripts/fixtures/main_continuity.json', 'scripts/fixtures/main_continuity_scope_v2.json',
@@ -220,19 +561,55 @@ def run_main_journey(live, working_view_prototype=False, checkpoint_pressure=Fal
              'src-tauri/src/llm/mod.rs', 'src-tauri/src/llm/tracked.rs',
              'src-tauri/src/migrations/083_anchored_context_checkpoints.sql',
              'src-tauri/src/migrations/084_checkpoint_fact_sources.sql', 'src-tauri/src/db.rs')
+    if cache_fixed_clock or cache_clock_after_history:
+        paths += ('src-tauri/src/commands/message_live_tests/minimal_architecture.rs',)
+    if cache_cross_turn:
+        paths += ('src-tauri/src/llm/openai_responses_websocket.rs', 'src-tauri/src/llm/catalog.rs',
+                  'src-tauri/src/commands/foreground_model_factory.rs')
+    if cache_attachment_reference:
+        paths += ('src-tauri/src/commands/foreground_text_attachments.rs',)
     report = {'status': 'building', 'suite': 'main', 'condition': condition, 'checkedAt': datetime.now(timezone.utc).isoformat(),
               'sourceSha256': {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in paths},
               'budget': budget, 'results': [], 'files': [], 'summary': {}, 'phases': [],
               'scopePolicy': 'v2: explicit per-turn read-only Main context permissions; agreement no-tool and file/side-effect limits remain enforced' if working_view_prototype else 'strict control: no tools on no-file turns',
               'historyPressure': {'phase': 2, 'windowTokens': 8192, 'runnerWindowUnchanged': True} if checkpoint_pressure else None,
-              'limits': ['Six frozen synthetic turns, three independent processes; not natural multi-day or subjective companionship',
-                         'anchored_working_view retains originals in the archive; older completed turns may enter an anchored text checkpoint with exact conversation/attachment references. Recent visible history and current protocol remain intact; this is NOT cross-turn native replay acceptance',
+              'limits': ['Six frozen synthetic turns in one process; no process restarts or natural multi-day use' if cache_same_process
+                         else 'Six frozen synthetic turns, three independent processes; not natural multi-day or subjective companionship',
+                         'Natural-cache native control restores archived model history with the same per-turn scope and resource budget' if cache_native_history
+                         else 'anchored_working_view retains originals in the archive; older completed turns may enter an anchored text checkpoint with exact conversation/attachment references. Recent visible history and current protocol remain intact; this is NOT cross-turn native replay acceptance',
                          'Production Main preparation, registry, coordinator and durable completion; not desktop IPC/admission or encrypted restore',
                          'Saved Luna only; full tool catalog retained, synthetic per-turn scope guard rejects other actions before dispatch',
-                         'Owned soft context budget accelerates native compaction; ordinary settings untouched',
+                         'Original bounded fixture budget and production history window; compaction can occur naturally' if natural_cache
+                         else 'Owned soft context budget accelerates native compaction; ordinary settings untouched',
                          'Automatic memory learning disabled; not a preference-extraction or multi-model score',
                          'Absolute provider-reported cost, not an equal-success A/B token-saving claim; 240K input is a phase-stop target']}
     report['limits'].append('Prepared-body fingerprints are test-only JSON structure/content hashes, not server-side cache diagnostics; forced native compaction is reported separately from normal append-only turns.')
+    if natural_cache:
+        report['fixedCacheClock'] = cache_fixed_clock
+        report['cacheClockAfterHistory'] = cache_clock_after_history
+        report['cacheNativeHistory'] = cache_native_history
+        report['cacheArchiveAttachments'] = cache_archive_attachments
+        report['steadyCachePhases'] = list(MAIN_STEADY_CACHE_PHASES)
+        report['limits'].append('Business outcomes are scored independently of observed checkpoint and source projection events.')
+        report['limits'].append('Steady cache metering predeclares phase 0 as startup; every request in phases 1 and 2 is included, including restarts and zero-cache requests.')
+    if cache_fixed_clock:
+        report['limits'].append('The time-independent fixture uses one fixed local timestamp across its three phases to isolate prompt clock churn.')
+    if cache_clock_after_history:
+        report['limits'].append('A fresh trusted clock section follows history in each turn to isolate its position in the prepared prefix.')
+    if cache_archive_attachments:
+        report['limits'].append('The final two turns receive a verified reference in place of the one settled archive attachment.')
+    if cache_cross_turn:
+        report['cacheCrossTurn'] = True
+        report['cacheSessionAffinity'] = not cache_no_session_affinity
+        report['limits'].append('Production session-scoped foreground transport uses the real admission clock. Same-process continuation and cold process restarts are scored from first-request transport receipts.')
+    if cache_same_process:
+        report['cacheSameProcess'] = True
+    if cache_paced:
+        report['minimumRequestStartIntervalMs'] = 5000
+    if cache_attachment_reference:
+        report['cacheAttachmentReference'] = True
+    if cache_no_session_affinity:
+        report['limits'].append('Test-only control disables the production session-id transport hint.')
     if checkpoint_pressure:
         report['limits'].append('8K applies only to isolated phase-2 historical preparation, not the real model/runner window. This forces the existing checkpoint path without changing production policy; it is not small-model acceptance.')
     def record():
@@ -245,43 +622,76 @@ def run_main_journey(live, working_view_prototype=False, checkpoint_pressure=Fal
                 binary = build_cargo_binary(library_test=True)
         env = {k: v for k, v in isolated_environment().items() if not k.startswith(('ANGELBOT_', 'VITE_ANGELBOT_'))}
         env.update(ANGELBOT_CONTEXT_EVAL_LIVE='1', ANGELBOT_CONTEXT_EVAL_SUITE='main', ANGELBOT_PRIVATE_CONTEXT_EVAL_ROOT=str(owned))
+        affinity_flag = 'CODEX_CONTEXT_EVAL_SESSION_AFFINITY'
+        env.pop(affinity_flag, None)
+        if cache_no_session_affinity:
+            env[affinity_flag] = '0'
+        command = [str(binary), MAIN_TEST, '--exact', '--ignored', '--nocapture', '--test-threads=1']
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         draft_hash = None
-        for phase in range(3):
-            calls = sum(r['requestCount'] for r in report['results'])
-            if calls >= budget['provider_calls'] or sum(r['inputTokens'] for r in report['results']) >= budget['input_tokens']:
-                report['status'] = 'budget_exceeded'
-                break
-            (owned / 'main-input.json').write_text(json.dumps(dict(payload, remaining_calls=budget['provider_calls'] - calls), ensure_ascii=False), encoding='utf-8')
-            env['ANGELBOT_CONTEXT_EVAL_PHASE'] = str(phase)
-            path = owned / f'phase-{phase}.log'
-            report['status'] = 'running'
-            record()
-            with path.open('w', encoding='utf-8') as log:
-                result = subprocess.run([str(binary), MAIN_TEST, '--exact', '--ignored', '--nocapture', '--test-threads=1'],
-                                        cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=600,
-                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            rows = parse_rows(path.read_text(encoding='utf-8'), marker='MAIN_CONTINUITY_ROW ', test=MAIN_TEST)
-            report['results'].extend(rows)
-            snapshot = inspect_main_files(owned, draft_hash)
-            if rows:
-                snapshot['audit'] = inspect_main_audit(owned, rows[0]['session'])
-            report['files'].append(snapshot)
-            draft_hash = draft_hash or snapshot.get('draft.json', {}).get('sha256')
-            report['phases'].append({'phase': phase, 'exitCode': result.returncode})
-            report['status'], report['summary'] = score_main(stages, report['results'], report['files'], condition)
-            record()
-            if (report['status'] == 'budget_exceeded' or result.returncode or len(rows) != 2 or any(not r['passed'] for r in rows)
-                    or not snapshot.get('draft.json', {}).get('valid') or not snapshot['draftUnchanged'] or not snapshot['sourcesIntact']):
-                if result.returncode:
-                    report['status'] = 'failed'
-                break
+        shared_process = None
+        with contextlib.ExitStack() as processes:
+            for phase in range(3):
+                calls = sum(r['requestCount'] for r in report['results'])
+                if calls >= budget['provider_calls'] or sum(r['inputTokens'] for r in report['results']) >= budget['input_tokens']:
+                    report['status'] = 'budget_exceeded'
+                    break
+                if shared_process is None:
+                    (owned / 'main-input.json').write_text(json.dumps(dict(payload, remaining_calls=budget['provider_calls'] - calls), ensure_ascii=False), encoding='utf-8')
+                    env['ANGELBOT_CONTEXT_EVAL_PHASE'] = str(phase)
+                path = owned / ('same-process.log' if cache_same_process else f'phase-{phase}.log')
+                report['status'] = 'running'
+                record()
+                if cache_same_process:
+                    if shared_process is None:
+                        log = processes.enter_context(path.open('w', encoding='utf-8'))
+                        shared_process = processes.enter_context(subprocess.Popen(
+                            command, cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
+                            creationflags=creationflags))
+                        processes.callback(stop_main_process, shared_process)
+                    exit_code = wait_for_main_phase(shared_process, owned, phase)
+                else:
+                    with path.open('w', encoding='utf-8') as log:
+                        result = subprocess.run(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                                stdout=log, stderr=log, timeout=600, creationflags=creationflags)
+                    exit_code = result.returncode
+                rows = parse_rows(path.read_text(encoding='utf-8'), marker='MAIN_CONTINUITY_ROW ', test=MAIN_TEST)
+                if cache_same_process:
+                    rows = rows[len(report['results']):]
+                report['results'].extend(rows)
+                snapshot = inspect_main_files(owned, draft_hash)
+                if rows:
+                    snapshot['audit'] = inspect_main_audit(owned, rows[0]['session'])
+                report['files'].append(snapshot)
+                draft_hash = draft_hash or snapshot.get('draft.json', {}).get('sha256')
+                report['phases'].append({'phase': phase, 'exitCode': exit_code})
+                report['status'], report['summary'] = score_main(
+                    stages, report['results'], report['files'], condition,
+                    paced=cache_paced, attachment_reference=cache_attachment_reference)
+                if natural_cache:
+                    report['summary']['recallProjection'] = inspect_main_tool_projection(owned, report['results'], 'recall_conversation')
+                    report['summary']['readFileProjection'] = inspect_main_tool_projection(owned, report['results'], 'read_file')
+                record()
+                if (report['status'] == 'budget_exceeded' or exit_code or len(rows) != 2 or any(not r['passed'] for r in rows)
+                        or not snapshot.get('draft.json', {}).get('valid') or not snapshot['draftUnchanged'] or not snapshot['sourcesIntact']):
+                    if exit_code:
+                        report['status'] = 'failed'
+                    break
     except BaseException:
         report['status'] = 'failed'
         raise
     finally:
+        if minimum_cache_hit_rate is not None:
+            report['cacheTarget'] = main_cache_target(report, minimum_cache_hit_rate)
+        if minimum_steady_cache_hit_rate is not None:
+            report['steadyCacheTarget'] = main_cache_target(report, minimum_steady_cache_hit_rate, steady=True)
         record()
-    print(json.dumps({'status': report['status'], 'summary': report['summary']}), flush=True)
-    return 0 if report['status'] == 'passed' else 2
+    outcome = {'status': report['status'], 'summary': report['summary']}
+    targets = ('cacheTarget', 'steadyCacheTarget')
+    outcome.update((key, report[key]) for key in targets if key in report)
+    print(json.dumps(outcome), flush=True)
+    targets_passed = all(report[key]['status'] == 'passed' for key in targets if key in report)
+    return 0 if report['status'] == 'passed' and targets_passed else 2
 
 
 def inspect_working_view(path):
@@ -307,20 +717,42 @@ def inspect_working_view(path):
 
 def score_checkpoint_replay(row, references, allowed_refs=None):
     text = row.get('answer') or ''
-    source_refs=set(re.findall(r'\br-[A-Za-z0-9_-]{22}(?![A-Za-z0-9_-])',text))
+    sections = re.split(r'(?m)^## Goal[ \t]*$', text, maxsplit=1)
+    if len(sections) != 2 or len(references) != 3:
+        return False
+    commitments, new_work = sections
+    correction_id, correction_revision, archive_ref = references
+    source_refs = set(re.findall(r'\br-[A-Za-z0-9_-]{22}(?![A-Za-z0-9_-])', text))
+    commitments_text = commitments.replace('**', '').replace('`', '')
+    clause = r'(?:^|[\n，,；。;：:])[ \t]*(?:-\s*)?(?:报告[ \t]*)?'
+    no_send = (
+        r'(?:(?:暂不|不|不要|不得|不可|不能|不允许|禁止)(?:擅自)?(?:对外)?(?:发送|外发)'
+        r'|(?:不要|不得|禁止)擅自[^\n；。]{1,14}或(?:对外)?(?:发送|外发))'
+    )
     return (row.get('status') == 'completed' and row.get('requestCount') == 1
-            and all(re.search(p,text,re.I) for p in ('杉影计划','收据.{0,6}缺项','确认',r'不.{0,6}(发送|外发)','ARCH-H32-Q9',r'先.{0,6}(说)?结果'))
-            and not re.search(r'(杉影计划|整个计划).{0,4}(已完成|全部完成)',text)
-            and bool(references) and all(ref in text for ref in references)
+            and row.get('rollingCommitmentsPresent') is True
+            and all(re.search(p, commitments_text) for p in (
+                '杉影计划', r'收据.{0,6}缺项[^\n。；]{0,12}确认', r'先.{0,6}结果', clause + no_send))
+            and not re.search(clause + r'(?:可以|允许|已经|已)(?:直接)?(?:对外)?(?:发送|外发)', commitments_text)
+            and not re.search(
+                r'(?:^|[\n；。])[ \t]*(?:-\s*)?(?:杉影计划|整个计划)[ \t：:]*(?:已完成|全部完成)',
+                commitments_text)
+            and correction_id in commitments and correction_revision in commitments
+            and 'ARCH-H32-Q9' in new_work and archive_ref in new_work
             and source_refs.issubset(set(allowed_refs if allowed_refs is not None else references)))
 
 
-def run_context_worker(owned, test, marker, timeout=150):
-    with (owned/'build.log').open('w',encoding='utf-8') as log,contextlib.redirect_stdout(log),contextlib.redirect_stderr(log):
-        binary=build_cargo_binary(library_test=True)
+def run_context_worker(owned, test, marker, timeout=150, *, environment=None, live=True,
+                       binary=None, log_stem='worker'):
+    if binary is None:
+        with (owned/'build.log').open('w',encoding='utf-8') as log,contextlib.redirect_stdout(log),contextlib.redirect_stderr(log):
+            binary=build_cargo_binary(library_test=True)
     env={k:v for k,v in isolated_environment().items() if not k.startswith(('ANGELBOT_','VITE_ANGELBOT_'))}
-    env.update(ANGELBOT_CONTEXT_EVAL_LIVE='1',ANGELBOT_PRIVATE_CONTEXT_EVAL_ROOT=str(owned))
-    stdout_path,stderr_path=owned/'worker.stdout.log',owned/'worker.stderr.log'
+    env.update(ANGELBOT_CONTEXT_EVAL_LIVE='1' if live else '0',
+               ANGELBOT_PRIVATE_CONTEXT_EVAL_ROOT=str(owned))
+    if environment is not None:
+        env.update(environment)
+    stdout_path,stderr_path=owned/f'{log_stem}.stdout.log',owned/f'{log_stem}.stderr.log'
     # Open outside the exception handler so a failed open cannot be hidden by
     # attempts to read a stream file which was never created.
     with stdout_path.open('wb') as stdout_log,stderr_path.open('wb') as stderr_log:
@@ -335,15 +767,270 @@ def run_context_worker(owned, test, marker, timeout=150):
                     error.output,error.stderr=stdout_bytes,stderr_bytes
                 # A timeout may split UTF-8. Only this human-readable view is
                 # lossy; a failed preservation step cannot replace the error.
-                (owned/'worker.log').write_text(stdout_bytes.decode('utf-8',errors='replace')+'\n'+stderr_bytes.decode('utf-8',errors='replace'),encoding='utf-8')
+                (owned/f'{log_stem}.log').write_text(stdout_bytes.decode('utf-8',errors='replace')+'\n'+stderr_bytes.decode('utf-8',errors='replace'),encoding='utf-8')
             except OSError as preservation_error:
                 error.add_note(f'Worker log preservation failed: {preservation_error}')
             raise
         stdout=stdout_path.read_text(encoding='utf-8')
         stderr=stderr_path.read_text(encoding='utf-8')
-        (owned/'worker.log').write_text(stdout+'\n'+stderr,encoding='utf-8')
+        (owned/f'{log_stem}.log').write_text(stdout+'\n'+stderr,encoding='utf-8')
     result.stdout,result.stderr=stdout,stderr
     return result,parse_rows(result.stdout,marker=marker,test=test)
+
+
+def load_long_daily():
+    fixture = json.loads(LONG_DAILY_FIXTURE.read_text(encoding='utf-8'))
+    expected = fixture.pop('expected')
+    turns = fixture['turnCount']
+    checkpoints = fixture['checkpointAfterTurns']
+    milestones = fixture['milestones']
+    milestone_turns = [item['turn'] for item in milestones]
+    milestone_ids = [item['id'] for item in milestones]
+    if (fixture['schemaVersion'] != 1 or not 50 <= turns <= 100 or len(checkpoints) < 2
+            or checkpoints != sorted(set(checkpoints)) or not 1 < checkpoints[0] < checkpoints[-1] < turns
+            or not fixture['topics'] or len(milestone_turns) != len(set(milestone_turns))
+            or len(milestone_ids) != len(set(milestone_ids))
+            or any(not 1 <= turn <= turns for turn in milestone_turns)
+            or expected['policies'] != ['daily', 'project'] or not expected['qualityChecks']):
+        raise ValueError('Invalid long Daily continuity fixture')
+    return fixture, expected
+
+
+def score_long_daily(fixture, expected, rows):
+    policies = expected['policies']
+    required = expected['qualityChecks']
+    results = {}
+    for row in rows:
+        scope = row.get('scope')
+        if scope not in policies or scope in results:
+            return {}
+        anchors = row.get('anchorIds')
+        checkpoint_count = len(fixture['checkpointAfterTurns'])
+        checks = {
+            'fixtureMatched': row.get('fixtureId') == fixture['fixtureId'],
+            'productionPolicyObserved': row.get('policyObserved') == scope,
+            'turnCountMatched': row.get('turnCount') == fixture['turnCount'],
+            'checkpointAnchorsVerified': (
+                row.get('checkpointCount') == checkpoint_count
+                and row.get('checkpointAfterTurns') == fixture['checkpointAfterTurns']
+                and isinstance(anchors, list) and len(anchors) == checkpoint_count
+                and all(isinstance(anchor, str) and anchor.strip() for anchor in anchors)
+                and len(set(anchors)) == checkpoint_count
+            ),
+            'offlineOnly': (type(row.get('externalProviderCalls')) is int
+                            and row['externalProviderCalls'] == 0
+                            and row.get('scriptedProviderCalls') == checkpoint_count),
+            **{field: row.get(field) is True for field in required},
+        }
+        results[scope] = checks
+    return results
+
+
+def run_long_daily():
+    fixture, expected = load_long_daily()
+    owned = Path(tempfile.mkdtemp(prefix='long-daily-', dir=ROOT / 'logs'))
+    (owned / 'long-daily-input.json').write_text(json.dumps(fixture, ensure_ascii=False), encoding='utf-8')
+    report_path = owned / 'acceptance.json'
+    print(f'CONTEXT_EVAL_REPORT {report_path}', flush=True)
+    fixture_hash = hashlib.sha256(LONG_DAILY_FIXTURE.read_bytes()).hexdigest()
+    source_paths = (
+        'scripts/context_eval.py',
+        'src-tauri/src/agent/conversation/compaction.rs',
+        'src-tauri/src/commands/message.rs',
+        'src-tauri/src/commands/message_live_tests/continuous_main.rs',
+    )
+    report = {
+        'status': 'failed',
+        'suite': 'main_long_daily',
+        'evidence': 'offline_two_process_production_history_with_scripted_checkpoints',
+        'limits': ['Isolated Rust worker process restart, not the normal desktop application.',
+                   'Cross-midnight clocks are synthetic; no live model or natural multi-day use.'],
+        'fixtureId': fixture['fixtureId'],
+        'fixtureSha256': fixture_hash,
+        'sourceSha256': {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in source_paths},
+        'plannedTurnsPerScope': fixture['turnCount'],
+        'plannedCheckpointAfterTurns': fixture['checkpointAfterTurns'],
+        'scopes': expected['policies'],
+        'externalProviderCalls': 0,
+        'modelScore': None,
+        'tokenCacheHitRate': None,
+    }
+    try:
+        with (owned/'build.log').open('w', encoding='utf-8') as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            binary = build_cargo_binary(library_test=True)
+        relative = Path(fixture['artifact']['path'])
+        assert relative.name == str(relative) and relative.name not in ('.', '..')
+        outputs = {'daily': owned/'daily'/'results'/relative, 'project': owned/'project'/relative}
+        def snapshot():
+            return {scope: (file.read_bytes(), file.stat().st_mtime_ns) for scope, file in outputs.items()}
+        seed, seeds = run_context_worker(owned, LONG_DAILY_TEST, 'LONG_DAILY_SEED ', live=False,
+                                         binary=binary, log_stem='seed',
+                                         environment={'ANGELBOT_CONTEXT_EVAL_PHASE': '0'})
+        report['phases'] = [{'phase': 'seed', 'exitCode': seed.returncode, 'rows': seeds}]
+        report['exitCode'] = seed.returncode
+        if seed.returncode == 0:
+            before = snapshot()
+            resume, resumes = run_context_worker(owned, LONG_DAILY_TEST, 'LONG_DAILY_ROW ', live=False,
+                                                 binary=binary, log_stem='resume',
+                                                 environment={'ANGELBOT_CONTEXT_EVAL_PHASE': '1'})
+            report['phases'].append({'phase': 'resume', 'exitCode': resume.returncode, 'rows': resumes})
+            report['exitCode'] = resume.returncode
+            after = snapshot()
+            unchanged = {scope: before[scope] == after[scope] and
+                         after[scope][0] == fixture['artifact']['text'].encode('utf-8') for scope in outputs}
+            rows = join_long_daily_phases(seeds, resumes, expected['policies'], unchanged)
+            report['results'] = rows
+            for scope, (content, _) in after.items():
+                report.setdefault('artifacts', {})[scope] = {
+                    'sha256': hashlib.sha256(content).hexdigest(), 'unchanged': unchanged[scope]}
+            checks = score_long_daily(fixture, expected, rows)
+            report['checks'] = checks
+            if resume.returncode == 0:
+                passed = set(checks) == set(expected['policies']) and all(all(c.values()) for c in checks.values())
+                report['status'] = 'passed' if passed else 'needs_work'
+    finally:
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps({'status': report['status'], 'report': str(report_path)}), flush=True)
+    return 0 if report['status'] == 'passed' else 2
+
+
+def join_long_daily_phases(seeds, resumes, policies, unchanged):
+    def index(rows):
+        result = {row.get('scope'): row for row in rows}
+        return result if len(rows) == len(result) == len(policies) and set(result) == set(policies) else {}
+    seed_rows, resume_rows = index(seeds), index(resumes)
+    if not seed_rows or not resume_rows:
+        return []
+    seed_pids = {row.get('pid') for row in seed_rows.values()}
+    resume_pids = {row.get('pid') for row in resume_rows.values()}
+    distinct = (len(seed_pids) == len(resume_pids) == 1 and not seed_pids & resume_pids
+                and all(type(pid) is int and pid > 0 for pid in seed_pids | resume_pids))
+    return [dict(seed_rows[scope], **{
+        **resume_rows[scope],
+        'sameMainAfterProcessRestart': (distinct and seed_rows[scope]['fixtureId'] == resume_rows[scope]['fixtureId']
+                                        and bool(seed_rows[scope].get('session'))
+                                        and seed_rows[scope]['session'] == resume_rows[scope].get('session')),
+        'artifactPhysicallyUnchanged': unchanged.get(scope) is True,
+    }) for scope in policies]
+
+
+def run_attachment_reference_readback(live):
+    fixture, _, _ = load_main()
+    stages = [
+        {'id': 'attachment_store', 'phase': 0, 'attachment_words': 256,
+         'content': '本轮附件只用于保存。不要读取附件、磁盘或其它资料，只回复：已归档',
+         'read_files': [], 'write_files': []},
+        {'id': 'attachment_readback', 'phase': 0, 'allow_context_reads': True,
+         'content': '请使用 read_conversation 读取上轮 archive-context.txt 附件的最后 100 个字符。照抄上轮引用的 message_id、revision 和 attachment_index，offset 填 total_chars 减 100，limit 填 100。只输出读到的归档校验码，不访问磁盘或其它工具。',
+         'read_files': [], 'write_files': []},
+    ]
+    def validate(_owned, rows, _report):
+        return (len(rows) == 2 and all(row.get('attachmentReferenceVerified') is True for row in rows)
+                and (rows[0].get('answer') or '').strip() == '已归档' and not rows[0].get('tools')
+                and rows[1].get('attachmentTailReadbackVerified') is True)
+
+    return run_owned_two_turn_main(live, 'attachment_reference_readback', fixture['data'], stages,
+                                   {'cache_attachment_reference': True, 'attachment_reference_readback': True}, validate)
+
+
+def run_repeated_file_readback(live):
+    answers = [f'READ-{uuid.uuid4().hex[:16].upper()}' for _ in range(2)]
+    rows = ['label,amount,verification_code', f'first-check,17,{answers[0]}']
+    rows.extend(f'office-supply-{i:02d},{i * 37 % 100},reference-{i:02d}' for i in range(56))
+    rows.append(f'second-check,26,{answers[1]}')
+    csv = '\n'.join(rows) + '\n'
+    data = {'csv': csv, 'archive_tail': 'UNUSED', 'archive_lines': 0}
+    stages = [{'id': f'file_read_{turn}', 'phase': 0,
+               'content': f'请在本轮执行一次 read_file 完整读取 costs.csv。只使用这个工具，path 填 costs.csv，省略其他参数。读取后找出 {turn}-check 行，只输出 verification_code 的值。',
+               'read_files': ['costs.csv'], 'write_files': []}
+              for turn in ('first', 'second')]
+
+    def validate(owned, result_rows, report):
+        projection = inspect_main_tool_projection(owned, result_rows, 'read_file')
+        report['readFileProjection'] = projection
+        path = owned / 'workspace-A' / 'costs.csv'
+        report['inputPreserved'] = path.is_file() and path.read_bytes() == csv.encode('utf-8')
+        samples = projection['samples']
+        if len(result_rows) != 2 or len(samples) != 2 or not report['inputPreserved']:
+            return False
+        first, second = samples
+        return (all(len(row.get('tools') or []) == 1 and row['tools'][0]['toolName'] == 'read_file'
+                    and row['tools'][0]['success'] is True and (row.get('answer') or '').strip() == answer
+                    for row, answer in zip(result_rows, answers))
+                and first['modelVisibleFullRaw'] and second['sourceRefBound']
+                and first['callId'] != second['callId'] and second['priorReadCallId'] == first['callId']
+                and first['rawSealedOutputSha256'] == second['rawSealedOutputSha256']
+                and second['bytesSaved'] is not None and second['bytesSaved'] >= 128)
+
+    return run_owned_two_turn_main(live, 'repeated_file_readback', data, stages,
+                                   {'repeated_file_readback': True}, validate)
+
+
+def run_owned_two_turn_main(live, case, data, stages, fixture_options, validate):
+    report = {'status': 'offline_only', 'suite': f'main_{case}',
+              'maxProviderCalls': 4, 'stages': [s['id'] for s in stages]}
+    if not live:
+        print(json.dumps(report))
+        return 0
+    owned = Path(tempfile.mkdtemp(prefix=case.replace('_', '-') + '-', dir=ROOT / 'logs'))
+    payload = {'data': data, 'stages': stages, 'working_view_prototype': True,
+               'remaining_calls': 4, 'cache_cross_turn': True, **fixture_options}
+    (owned / 'main-input.json').write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+    report_path = owned / 'acceptance.json'
+    print(f'CONTEXT_EVAL_REPORT {report_path}', flush=True)
+    report['status'] = 'failed'
+    try:
+        result, rows = run_context_worker(owned, MAIN_TEST, 'MAIN_CONTINUITY_ROW ', timeout=380,
+                                          environment={'ANGELBOT_CONTEXT_EVAL_SUITE': 'main',
+                                                       'ANGELBOT_CONTEXT_EVAL_PHASE': '0'})
+        report['results'] = rows
+        report['metering'] = summarize_metering(rows)
+        complete = [row.get('id') for row in rows] == report['stages']
+        audit = inspect_main_audit(owned, rows[0]['session']) if complete else None
+        report['audit'] = audit
+        evidence_ok = validate(owned, rows, report)
+        passed = (result.returncode == 0 and complete and all(
+            row.get('status') == 'completed' and row.get('durableReply') is True
+            and row.get('scopeClean') is True and row.get('hostTurnClockVerified') is True for row in rows)
+            and evidence_ok
+            and sum(row['requestCount'] for row in rows) <= report['maxProviderCalls']
+            and audit == {'writeAttempts': 0, 'writeSuccesses': 0, 'userTurns': 2, 'assistantTurns': 2})
+        if result.returncode == 0:
+            report['status'] = 'passed' if passed else 'needs_work'
+    finally:
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps({'status': report['status'], 'metering': report['metering']}), flush=True)
+    return 0 if report['status'] == 'passed' else 2
+
+
+def run_persona_continuity(live):
+    stages = ['persona-chat', 'persona-file', 'persona-reopen']
+    report = {'status': 'offline_only', 'suite': 'main_persona_continuity', 'stages': stages,
+              'maxProviderCalls': 4, 'styleCheck': 'selected phrase in free-form replies and exact structured task output'}
+    if not live:
+        print(json.dumps(report))
+        return 0
+    owned = Path(tempfile.mkdtemp(prefix='persona-continuity-', dir=ROOT / 'logs'))
+    payload = {'data': {'csv': '', 'archive_tail': '', 'archive_lines': 0}, 'stages': [],
+               'remaining_calls': 4, 'persona_continuity': True}
+    (owned / 'main-input.json').write_text(json.dumps(payload), encoding='utf-8')
+    report_path = owned / 'acceptance.json'
+    print(f'CONTEXT_EVAL_REPORT {report_path}', flush=True)
+    report['status'] = 'failed'
+    try:
+        result, rows = run_context_worker(owned, MAIN_TEST, 'MAIN_PERSONA_ROW ', timeout=210,
+                                          environment={'ANGELBOT_CONTEXT_EVAL_SUITE': 'main',
+                                                       'ANGELBOT_CONTEXT_EVAL_PHASE': '0'})
+        report['results'] = rows
+        report['metering'] = summarize_metering(rows)
+        passed = ([row.get('id') for row in rows] == stages and all(row.get('passed') is True for row in rows)
+                  and sum(row.get('requestCount', 0) for row in rows) == report['maxProviderCalls'])
+        if result.returncode == 0:
+            report['status'] = 'passed' if passed else 'needs_work'
+    finally:
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps({'status': report['status'], 'metering': report['metering']}), flush=True)
+    return 0 if report['status'] == 'passed' else 2
 
 
 def natural_preference_checks(rows):
@@ -669,7 +1356,8 @@ def replay_checkpoint(path, live):
     fingerprints = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (source_report,source/'main-data.db')}
     with contextlib.closing(sqlite3.connect((source/'main-data.db').as_uri()+'?mode=ro',uri=True)) as src, contextlib.closing(sqlite3.connect(owned/'main-data.db')) as dst:
         src.backup(dst)
-    payload = {'transcript':transcript,'session_id':row['session'],'source_ids':[s['message_id'] for s in sources]}
+    payload = {'previous_checkpoint':previous,'transcript':newer,'session_id':row['session'],
+               'source_ids':[s['message_id'] for s in sources]}
     (owned/'checkpoint-input.json').write_text(json.dumps(payload,ensure_ascii=False),encoding='utf-8')
     report = {'status':'building','suite':'checkpoint_replay','checkedAt':datetime.now(timezone.utc).isoformat(),
               'sourceRecording':source.name,'sourceFingerprints':fingerprints,'originalPromptSha256':hashlib.sha256(original.encode()).hexdigest(),
@@ -925,7 +1613,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suite', choices=('oracle', 'continuity', 'main'), default='oracle')
     parser.add_argument('--working-view', '--working-view-prototype', dest='working_view_prototype', action='store_true', help='current production anchored working view; old option retained as alias (default: explicit native-replay control)')
-    parser.add_argument('--checkpoint-pressure', action='store_true', help='Main working view only: isolated 8K phase-2 history-preparation window; real runner/model window unchanged')
+    main_cache_mode = parser.add_mutually_exclusive_group()
+    main_cache_mode.add_argument('--checkpoint-pressure', action='store_true', help='Main working view only: isolated 8K phase-2 history-preparation window; real runner/model window unchanged')
+    main_cache_mode.add_argument('--natural-cache', action='store_true', help='Main working view with the original bounded fixture budget and no forced compaction')
+    cache_clock_mode = parser.add_mutually_exclusive_group()
+    cache_clock_mode.add_argument('--cache-fixed-clock', action='store_true', help='Natural-cache comparison with one fixed clock for all six synthetic turns')
+    cache_clock_mode.add_argument('--cache-clock-after-history', action='store_true', help='Natural-cache comparison with the fresh clock section following history')
+    parser.add_argument('--cache-native-history', action='store_true', help='Natural-cache comparison using the existing native-history control')
+    parser.add_argument('--cache-archive-attachments', action='store_true',
+                        help='Natural-cache working-view comparison with a readback reference for a settled attachment')
+    parser.add_argument('--cache-cross-turn', action='store_true',
+                        help='Require observed production WebSocket continuation between turns in the same process')
+    parser.add_argument('--cache-same-process', action='store_true',
+                        help='Run the production cross-turn condition through all three phases in one process')
+    parser.add_argument('--cache-paced', action='store_true',
+                        help='Space metered requests at least five seconds apart in the same-process Main condition')
+    parser.add_argument('--cache-attachment-reference', action='store_true',
+                        help='Send the settled Main fixture background attachment as a production reference')
+    parser.add_argument('--attachment-reference-readback', action='store_true',
+                        help='Verify a production attachment reference by reading its exact saved tail in a two-turn Main case')
+    parser.add_argument('--repeated-file-readback', action='store_true',
+                        help='Verify two fresh reads and the reduced model reply for the second identical read in Main')
+    parser.add_argument('--persona-continuity', action='store_true',
+                        help='Check selected persona, exact file result, and reply after reopening Main; at most four saved-Luna calls')
+    parser.add_argument('--long-daily', action='store_true',
+                        help='Run the offline 64-turn Daily/Project Main continuity comparison with scripted checkpoints')
+    parser.add_argument('--cache-no-session-affinity', action='store_true',
+                        help='Disable the production session-id transport hint for the cross-turn control')
+    parser.add_argument('--minimum-cache-hit-rate', type=float, metavar='PERCENT',
+                        help='Live natural Main only: require this weighted cache hit rate across every request')
+    parser.add_argument('--minimum-steady-cache-hit-rate', type=float, metavar='PERCENT',
+                        help='Live natural Main only: require this weighted cache hit rate in phases 1 and 2, including misses and restarts')
     parser.add_argument('--inspect-working-view', metavar='OWNED_RECORDING', help='read-only working-view shape over an existing synthetic Main recording; no credentials or model')
     parser.add_argument('--replay-checkpoint', metavar='OWNED_RECORDING', help='one checkpoint-only request from a frozen pressure recording; no business tools; requires --live to call Luna')
     parser.add_argument('--explicit-preference', action='store_true', help='isolated learning, file DB reopen and different-project Main; <=2 saved-Luna calls')
@@ -943,6 +1661,51 @@ def main():
     parser.add_argument('--arm', choices=tuple(dict.fromkeys(('all', *ARMS, *(a for group in VARIANT_ARMS.values() for a in group)))), default='all',
                         help='select one oracle arm or continuity condition; checkpoint includes generation cost')
     args = parser.parse_args()
+    if args.long_daily:
+        incompatible = {option: value for option, value in vars(args).items()
+                        if option not in {'suite', 'long_daily', 'experiment', 'arm'} and value is not None and value is not False}
+        if args.suite != 'main' or incompatible or args.experiment != 'all' or args.arm != 'all':
+            parser.error('--long-daily only accepts --suite main and does not use a live model')
+        return run_long_daily()
+    if args.natural_cache and (args.suite != 'main' or not args.working_view_prototype):
+        parser.error('--natural-cache requires --suite main --working-view')
+    if (args.cache_fixed_clock or args.cache_clock_after_history) and not args.natural_cache:
+        parser.error('--cache-fixed-clock and --cache-clock-after-history require --natural-cache')
+    if args.cache_native_history and not args.natural_cache:
+        parser.error('--cache-native-history requires --natural-cache')
+    if args.cache_archive_attachments and (not args.natural_cache or args.cache_native_history or args.cache_fixed_clock or args.cache_clock_after_history):
+        parser.error('--cache-archive-attachments requires --natural-cache without other cache treatments')
+    if args.cache_cross_turn and (not args.natural_cache or args.cache_fixed_clock or args.cache_clock_after_history
+                                  or args.cache_native_history or args.cache_archive_attachments):
+        parser.error('--cache-cross-turn requires --natural-cache without other cache treatments')
+    if args.cache_same_process and not args.cache_cross_turn:
+        parser.error('--cache-same-process requires --cache-cross-turn')
+    if args.cache_paced and not args.cache_same_process:
+        parser.error('--cache-paced requires --cache-same-process')
+    if args.cache_attachment_reference and not args.cache_cross_turn:
+        parser.error('--cache-attachment-reference requires --cache-cross-turn')
+    if args.cache_no_session_affinity and not args.cache_cross_turn:
+        parser.error('--cache-no-session-affinity requires --cache-cross-turn')
+    for option, target in (('--minimum-cache-hit-rate', args.minimum_cache_hit_rate),
+                           ('--minimum-steady-cache-hit-rate', args.minimum_steady_cache_hit_rate)):
+        if target is not None and (not args.natural_cache or not args.live or not 0 < target <= 100):
+            parser.error(f'{option} requires --natural-cache --live and a percentage in (0, 100]')
+    owned_cases = [case for enabled, case in (
+        (args.attachment_reference_readback, ('--attachment-reference-readback', run_attachment_reference_readback)),
+        (args.repeated_file_readback, ('--repeated-file-readback', run_repeated_file_readback)),
+        (args.persona_continuity, ('--persona-continuity', run_persona_continuity)),
+    ) if enabled]
+    if owned_cases:
+        if len(owned_cases) != 1:
+            parser.error('Choose a single owned Main case')
+        option, run_case = owned_cases[0]
+        if (args.suite != 'main' or args.working_view_prototype or args.checkpoint_pressure or args.natural_cache
+                or args.inspect_working_view or args.replay_checkpoint or args.explicit_preference
+                or args.natural_preferences or args.natural_recovery or args.preference_reader
+                or args.recall_pressure or args.task_preferences or args.recall_variant or args.fetch
+                or args.experiment != 'all' or args.case_ids or args.max_calls is not None or args.arm != 'all'):
+            parser.error(f'{option} only accepts --suite main and optional --live')
+        return run_case(args.live)
     if args.natural_preferences or args.natural_recovery:
         if (args.natural_preferences and args.natural_recovery) or args.suite!='main' or args.explicit_preference or args.preference_reader or args.inspect_working_view or args.replay_checkpoint or args.working_view_prototype or args.checkpoint_pressure or args.recall_pressure or args.task_preferences or args.recall_variant or args.fetch or args.experiment!='all' or args.case_ids or args.max_calls is not None or args.arm!='all':
             parser.error('--natural-preferences only accepts --suite main and optional --live')
@@ -972,7 +1735,18 @@ def main():
     if args.suite == 'main':
         if args.fetch or args.experiment != 'all' or args.case_ids or args.max_calls is not None or args.arm != 'all':
             parser.error('The frozen Main journey only accepts --suite main [--live]')
-        return run_main_journey(args.live, args.working_view_prototype, args.checkpoint_pressure)
+        return run_main_journey(args.live, args.working_view_prototype, args.checkpoint_pressure,
+                                natural_cache=args.natural_cache, cache_fixed_clock=args.cache_fixed_clock,
+                                cache_clock_after_history=args.cache_clock_after_history,
+                                cache_native_history=args.cache_native_history,
+                                cache_archive_attachments=args.cache_archive_attachments,
+                                cache_cross_turn=args.cache_cross_turn,
+                                cache_same_process=args.cache_same_process,
+                                cache_no_session_affinity=args.cache_no_session_affinity,
+                                cache_paced=args.cache_paced,
+                                cache_attachment_reference=args.cache_attachment_reference,
+                                minimum_cache_hit_rate=args.minimum_cache_hit_rate,
+                                minimum_steady_cache_hit_rate=args.minimum_steady_cache_hit_rate)
     if args.working_view_prototype:
         parser.error('--working-view-prototype requires --suite main')
     continuity = args.suite == 'continuity'

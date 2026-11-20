@@ -1,23 +1,28 @@
-//! Bounded, read-only Office text snapshots shared by file reads and attachments.
+//! Bounded, read-only document text snapshots shared by file reads and attachments.
 //! Never executes Office, extracts to disk, follows links or recalculates formulas.
 
 use std::path::Path;
 
 mod docx;
 mod package;
+mod pdf;
 mod xlsx;
 
 #[cfg(test)]
 pub(crate) use package::fixture as package_fixture;
+#[cfg(test)]
+pub(crate) use pdf::fixture as pdf_fixture;
 
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_TEXT_BYTES: usize = 16 * 1024;
 pub(crate) const DOCX_NOTICE: &str = "【DOCX 正文文字快照】仅含正文段落与表格文字；不含图片、文本框、页眉页脚、批注、脚注/尾注、自动编号或版式。复杂域与修订不解析。\n\n";
+pub(crate) const PDF_NOTICE: &str = "【PDF 文字层快照】按页读取可提取的文字。扫描图片和部分字体或表单内容可能缺失；版式、表格及阅读顺序以原件为准。\n\n";
 pub(crate) const XLSX_NOTICE: &str = "【XLSX 单元格值快照】按工作表和坐标列出保存的原始值及合并范围，不是屏幕显示；数字未按日期、百分比或货币格式换算。不含图表、图片、批注、样式或拼音注释；不计算公式、不访问外部链接。含公式或隐藏工作表/行/列的文件不读取。\n\n";
 
 #[derive(Clone, Copy)]
 pub(crate) enum DocumentFormat {
     Docx,
+    Pdf,
     Xlsx,
 }
 
@@ -25,6 +30,7 @@ impl DocumentFormat {
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "docx" => Some(Self::Docx),
+            "pdf" => Some(Self::Pdf),
             "xlsx" => Some(Self::Xlsx),
             _ => None,
         }
@@ -33,6 +39,7 @@ impl DocumentFormat {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Docx => "DOCX",
+            Self::Pdf => "PDF",
             Self::Xlsx => "XLSX",
         }
     }
@@ -45,6 +52,10 @@ impl DocumentFormat {
             Self::Docx => (
                 DOCX_NOTICE,
                 docx::extract(bytes, MAX_TEXT_BYTES - DOCX_NOTICE.len())?,
+            ),
+            Self::Pdf => (
+                PDF_NOTICE,
+                pdf::extract(bytes, MAX_TEXT_BYTES - PDF_NOTICE.len())?,
             ),
             Self::Xlsx => (
                 XLSX_NOTICE,

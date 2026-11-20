@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   getProjectNetworkApprovals,
   revokeProjectNetworkApproval,
   type ProjectNetworkApproval,
 } from '$lib/commands/project-network-approvals';
 import { useWorkspacesStore } from '$stores/workspaces';
+import { SettingsSection } from '../components/SettingsSection';
 
 function formatGrantedAt(unixSeconds: number): string {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -30,6 +31,7 @@ function formatActions(actions: ProjectNetworkApproval['actions']): string {
  * and renders only the sanitized projection returned by the backend.
  */
 export function ProjectNetworkApprovalsSettings() {
+  const revokeNoticeId = useId();
   const workspaces = useWorkspacesStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
   const activeWorkspace = useMemo(
@@ -95,93 +97,68 @@ export function ProjectNetworkApprovalsSettings() {
     }
   };
 
-  if (!activeWorkspace) {
+  if (!isProject || !activeWorkspace) {
     return (
       <div className="settings-page-content project-network-approvals-settings">
-        <section className="project-network-approvals-section">
-          <h3>请先打开一个项目</h3>
-          <p>项目联网权限只在项目工作区中可用。</p>
-        </section>
-      </div>
-    );
-  }
-
-  if (!isProject) {
-    return (
-      <div className="settings-page-content project-network-approvals-settings">
-        <section className="project-network-approvals-section" aria-labelledby="project-network-personal-title">
-          <p className="project-network-approvals-eyebrow">PROJECT NETWORK PERMISSIONS</p>
-          <h3 id="project-network-personal-title">个人空间没有项目联网授权</h3>
-          <p>联网委派的授权只属于具体项目，不会保存到 AngelBot 日常。打开一个项目后，可以在这里查看或撤销它的授权。</p>
-        </section>
+        <p className="project-network-approvals-muted">打开项目即可查看和撤销联网授权。</p>
       </div>
     );
   }
 
   return (
     <div className="settings-page-content project-network-approvals-settings">
-      <section className="project-network-approvals-section project-network-approvals-intro" aria-labelledby="project-network-overview-title">
-        <p className="project-network-approvals-eyebrow">PROJECT NETWORK PERMISSIONS</p>
-        <h3 id="project-network-overview-title">{activeWorkspace.name} 的联网授权</h3>
-        <p>这些授权仅用于主 Agent 派发的探索子代理。撤销后，后续联网操作会被阻止；已在传输中的结果也会在安全校验中被丢弃。</p>
-      </section>
-
-      <section className="project-network-approvals-section" aria-labelledby="project-network-list-title" aria-live="polite">
-        <header className="project-network-approvals-section-header">
-          <h3 id="project-network-list-title">已批准的访问范围</h3>
-          {!loading && <span>{approvals.length} 项</span>}
-        </header>
-
-        {loading && <p className="project-network-approvals-muted">正在读取此项目的授权…</p>}
+      <SettingsSection title={activeWorkspace.name} description="以下授权仅供此项目的探索子代理使用。">
+        {loading && <p className="project-network-approvals-muted" role="status">正在读取授权…</p>}
         {!loading && !error && approvals.length === 0 && (
-          <p className="project-network-approvals-muted">尚无联网授权。需要联网探索时，AngelBot 会先向你说明要访问的范围。</p>
+          <p className="project-network-approvals-muted" role="status">尚无联网授权。需要时会先确认访问范围。</p>
         )}
+        {!loading && approvals.length > 0 && <div className="settings-rows">
+          <p id={revokeNoticeId} className="project-network-approvals-muted settings-rows-note">撤销后会阻止新请求，并丢弃传输中的结果。</p>
+          {approvals.map((approval) => {
+            const primaryHost = approval.hosts[0] ?? '此范围';
+            const hostLabel = approval.hosts.length > 0 ? approval.hosts.join('、') : '无可访问主机';
 
-        {!loading && approvals.map((approval) => {
-          const primaryHost = approval.hosts[0] ?? '此范围';
-          const hostLabel = approval.hosts.length > 0 ? approval.hosts.join('、') : '无可访问主机';
-
-          return (
-            <article className="project-network-approval" key={approval.approvalRef} aria-label={`${hostLabel} 的联网授权`}>
-              <div className="project-network-approval-main">
-                <p className="project-network-approval-label">允许访问</p>
-                <div className="project-network-approval-hosts">
-                  {approval.hosts.map((host) => <code key={host} title={host}>{host}</code>)}
+            return (
+              <article className="project-network-approval" key={approval.approvalRef} aria-label={`${hostLabel} 的联网授权`}>
+                <div className="project-network-approval-main">
+                  <div className="project-network-approval-hosts">
+                    {approval.hosts.map((host) => <code key={host} title={host}>{host}</code>)}
+                  </div>
+                  <dl className="project-network-approval-facts">
+                    <div>
+                      <dt>批准时间</dt>
+                      <dd>{formatGrantedAt(approval.grantedAt)}</dd>
+                    </div>
+                    <div>
+                      <dt>允许操作</dt>
+                      <dd>{formatActions(approval.actions)}</dd>
+                    </div>
+                    <div>
+                      <dt>响应上限</dt>
+                      <dd>{formatResponseLimit(approval.maxResponseBytes)}</dd>
+                    </div>
+                    <div>
+                      <dt>重定向上限</dt>
+                      <dd>{approval.maxRedirects} 次</dd>
+                    </div>
+                  </dl>
                 </div>
-                <dl className="project-network-approval-facts">
-                  <div>
-                    <dt>批准时间</dt>
-                    <dd>{formatGrantedAt(approval.grantedAt)}</dd>
-                  </div>
-                  <div>
-                    <dt>允许操作</dt>
-                    <dd>{formatActions(approval.actions)}</dd>
-                  </div>
-                  <div>
-                    <dt>响应上限</dt>
-                    <dd>{formatResponseLimit(approval.maxResponseBytes)}</dd>
-                  </div>
-                  <div>
-                    <dt>重定向上限</dt>
-                    <dd>{approval.maxRedirects} 次</dd>
-                  </div>
-                </dl>
-              </div>
-              <button
-                type="button"
-                className="project-network-approval-revoke"
-                disabled={revokingRef !== null}
-                onClick={() => { void revoke(approval); }}
-                aria-label={`撤销 ${primaryHost} 的联网授权`}
-              >
-                {revokingRef === approval.approvalRef ? '正在撤销…' : '撤销授权'}
-              </button>
-            </article>
-          );
-        })}
-      </section>
-
-      {error && <p className="project-network-approvals-error" role="alert">{error}</p>}
+                <button
+                  type="button"
+                  className="project-network-approval-revoke"
+                  disabled={revokingRef !== null}
+                  onClick={() => { void revoke(approval); }}
+                  aria-label={`撤销 ${primaryHost} 的联网授权`}
+                  aria-describedby={revokeNoticeId}
+                >
+                  {revokingRef === approval.approvalRef ? '正在撤销…' : '撤销授权'}
+                </button>
+              </article>
+            );
+          })}
+        </div>}
+        {error && <p className="project-network-approvals-error" role="alert">{error}</p>}
+      </SettingsSection>
     </div>
   );
 }

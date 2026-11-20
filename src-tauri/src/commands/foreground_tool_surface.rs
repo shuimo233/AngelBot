@@ -32,6 +32,7 @@ pub(crate) struct ForegroundToolSet {
     /// The same host-resolved root that admitted the file handlers. A caller
     /// must not pair those handlers with a runner's default Documents root.
     pub(crate) file_root: Option<PathBuf>,
+    pub(crate) file_access_notice: Option<&'static str>,
     pub(crate) context_projector:
         Option<std::sync::Arc<dyn crate::agent::tool_context::ToolContextProjector>>,
 }
@@ -146,6 +147,7 @@ impl<'a> ForegroundToolSurface<'a> {
             registry,
             mcp_tool_revisions: Default::default(),
             file_root: None,
+            file_access_notice: None,
             context_projector: None,
         }
     }
@@ -162,13 +164,17 @@ impl<'a> ForegroundToolSurface<'a> {
         tool_name: &str,
     ) -> Result<ToolRegistry, String> {
         let mut registry = self.build_for_session(session_id.to_owned())?;
-        if tool_name == "delegate_network_exploration" {
+        if matches!(
+            tool_name,
+            "delegate_network_exploration" | crate::agent::delegate_work::CODEX_TOOL
+        ) {
             if let Ok(sandbox_root) = delegated_sandbox_root(self.state) {
-                let _ = self.install_pending_network_delegation_confirmation_at(
+                let _ = self.install_pending_delegation_confirmation_at(
                     &mut registry,
                     session_id,
                     message_id,
                     call_id,
+                    tool_name,
                     sandbox_root,
                 );
             }
@@ -188,12 +194,16 @@ impl<'a> ForegroundToolSurface<'a> {
         sandbox_root: PathBuf,
     ) -> Result<ToolRegistry, String> {
         let mut registry = self.build_for_session(session_id.to_owned())?;
-        if tool_name == "delegate_network_exploration" {
-            let _ = self.install_pending_network_delegation_confirmation_at(
+        if matches!(
+            tool_name,
+            "delegate_network_exploration" | crate::agent::delegate_work::CODEX_TOOL
+        ) {
+            let _ = self.install_pending_delegation_confirmation_at(
                 &mut registry,
                 session_id,
                 message_id,
                 call_id,
+                tool_name,
                 sandbox_root,
             );
         }
@@ -214,7 +224,24 @@ impl<'a> ForegroundToolSurface<'a> {
         }
         // Daily files reuse the same bounded file tools, never project commands
         // or delegated workspace authority.
-        let file_root = crate::commands::file::resolve_work_dir(self.state, Some(&session_id)).ok();
+        use crate::commands::file::{
+            PROJECT_ROOT_REDIRECTED, PROJECT_ROOT_UNAVAILABLE, PROJECT_ROOT_UNCONFIRMED,
+        };
+        let (file_root, file_access_notice) =
+            match crate::commands::file::resolve_work_dir(self.state, Some(&session_id)) {
+                Ok(root) => (Some(root), None),
+                Err(error) => {
+                    let notice = match error.as_str() {
+                        PROJECT_ROOT_UNCONFIRMED => PROJECT_ROOT_UNCONFIRMED,
+                        PROJECT_ROOT_REDIRECTED => PROJECT_ROOT_REDIRECTED,
+                        PROJECT_ROOT_UNAVAILABLE => {
+                            "项目目录已不可访问。请恢复原目录，或在工作台重新打开项目文件夹。"
+                        }
+                        _ => "当前文件目录不可用。请在工作台检查文件访问状态。",
+                    };
+                    (None, Some(notice))
+                }
+            };
         let workspace_files_available = file_root.is_some();
         crate::agent::handlers::register_desktop_handlers(
             &mut registry,
@@ -222,17 +249,20 @@ impl<'a> ForegroundToolSurface<'a> {
             self.state.desktop_adapter.clone(),
             workspace_files_available,
         );
-        if workspace_files_available {
+        if let Some(root) = file_root.as_ref() {
             crate::agent::handlers::register_workspace_file_handlers(&mut registry);
-            let project_scope = {
+            let workspace_kind: Option<String> = {
                 let conn = self.state.db.lock().map_err(|error| error.to_string())?;
-                !conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.id=?1 AND p.kind='personal')",
-                    [&session_id], |row| row.get::<_, bool>(0),
-                ).map_err(|error| error.to_string())?
+                conn.query_row(
+                    "SELECT p.kind FROM sessions s JOIN projects p ON p.id=s.project_id WHERE s.id=?1",
+                    [&session_id], |row| row.get(0),
+                ).optional().map_err(|error| error.to_string())?
             };
-            if !project_scope {
+            if workspace_kind.as_deref() == Some("personal") {
                 registry.unregister("run_project_command");
+            }
+            if workspace_kind.as_deref() == Some("project") {
+                registry.bind_project_root(root.clone());
             }
         }
         let mcp_tool_revisions = crate::commands::mcp::register_session_tools(
@@ -279,6 +309,7 @@ impl<'a> ForegroundToolSurface<'a> {
             registry,
             mcp_tool_revisions,
             file_root,
+            file_access_notice,
             context_projector,
         })
     }
@@ -286,14 +317,19 @@ impl<'a> ForegroundToolSurface<'a> {
     /// Same confirmation assembly with an explicit app-managed sandbox root.
     /// The narrow parameter keeps the durable reconstruction logic testable
     /// without making tests write into a user's application-data directory.
-    pub(crate) fn install_pending_network_delegation_confirmation_at(
+    pub(crate) fn install_pending_delegation_confirmation_at(
         &self,
         registry: &mut ToolRegistry,
         session_id: &str,
         message_id: &str,
         call_id: &str,
+        tool_name: &str,
         sandbox_root: PathBuf,
     ) -> Result<(), String> {
+        if tool_name == crate::agent::delegate_work::CODEX_TOOL && !self.state.delegation_available
+        {
+            return Err("Codex delegation runtime is unavailable".into());
+        }
         let (identity, binding) = {
             let conn = self
                 .state
@@ -305,7 +341,7 @@ impl<'a> ForegroundToolSurface<'a> {
                     .ok_or_else(|| "the delegation context is no longer available".to_string())?;
             let identity =
                 crate::agent::delegate_work::ForegroundRunIdentity::prepare_pending_confirmation(
-                    &conn, session_id, message_id, call_id, work_dir,
+                    &conn, session_id, message_id, call_id, tool_name, work_dir,
                 )
                 .map_err(|_| "the delegation context is no longer available".to_string())?;
             let (provider, model): (Option<String>, Option<String>) = conn
@@ -456,6 +492,82 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, unix))]
+    fn project_tools_recheck_the_root_at_dispatch() {
+        let state = crate::tests::test_app_state();
+        crate::db::migrate(&state.db.lock().unwrap()).unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let parent =
+            crate::commands::file::display_work_dir(&fixture.path().canonicalize().unwrap());
+        let root = std::path::Path::new(&parent).join("approved");
+        let outside = std::path::Path::new(&parent).join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("notes.txt"), "approved fixture").unwrap();
+        std::fs::write(outside.join("notes.txt"), "outside fixture").unwrap();
+        let opened = crate::commands::workspace::create_project_workspace_impl(
+            &state,
+            root.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let tools = ForegroundToolSurface::new(&state, None)
+            .build_for_session_with_mcp_revisions(opened.session.id.clone())
+            .unwrap();
+        assert_eq!(tools.file_access_notice, None);
+        let call = ToolCall::new("read_file".into(), json!({"path": "notes.txt"}));
+        assert!(
+            tools
+                .registry
+                .execute(&call, "approved", &root)
+                .result
+                .success
+        );
+
+        std::fs::remove_file(root.join("notes.txt")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        crate::tests::create_test_directory_link(&root, &outside);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            outside.canonicalize().unwrap()
+        );
+        let result = tools.registry.execute(&call, "redirected", &root);
+        let export = crate::commands::reply_export::session_file_snapshot(
+            &state,
+            &opened.session.id,
+            "notes.txt",
+        );
+        #[cfg(windows)]
+        std::fs::remove_dir(&root).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&root).unwrap();
+
+        assert!(!result.result.success);
+        assert!(export.unwrap_err().contains("已指向其他位置"));
+
+        let missing = ForegroundToolSurface::new(&state, None)
+            .build_for_session_with_mcp_revisions(opened.session.id.clone())
+            .unwrap();
+        assert!(!missing.registry.contains("read_file"));
+        assert!(missing.file_access_notice.unwrap().contains("不可访问"));
+        assert!(!missing.file_access_notice.unwrap().contains(&parent));
+        state.db.lock().unwrap().execute(
+            "UPDATE projects SET directory_confirmed=0 WHERE id=(SELECT project_id FROM sessions WHERE id=?1)",
+            [&opened.session.id],
+        ).unwrap();
+        let unconfirmed = ForegroundToolSurface::new(&state, None)
+            .build_for_session_with_mcp_revisions(opened.session.id)
+            .unwrap();
+        assert!(!unconfirmed.registry.contains("read_file"));
+        assert_eq!(
+            unconfirmed.file_access_notice,
+            Some(crate::commands::file::PROJECT_ROOT_UNCONFIRMED)
+        );
+    }
+
+    #[test]
     fn personal_results_use_normal_files_without_project_commands_or_delegation_root() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = state_with_pending_network_confirmation(directory.path());
@@ -586,6 +698,8 @@ mod tests {
     fn state_with_pending_network_confirmation(workspace: &std::path::Path) -> AppState {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
+        let project_root =
+            crate::commands::file::display_work_dir(&workspace.canonicalize().unwrap());
         conn.execute(
             "INSERT OR IGNORE INTO profile (id, updated_at) VALUES (1, 1)",
             [],
@@ -595,14 +709,14 @@ mod tests {
             "INSERT INTO projects
                 (id, name, path, created_at, kind, updated_at, active_session_id)
              VALUES ('project-network', 'Network project', ?1, 1, 'project', 1, NULL)",
-            params![workspace.to_string_lossy().to_string()],
+            params![project_root],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sessions
                 (id, title, created_at, updated_at, work_dir, project_id, agent_provider, agent_model)
              VALUES ('network-session', 'Network', 1, 1, ?1, 'project-network', 'deepseek', 'deepseek-v4')",
-            params![workspace.to_string_lossy().to_string()],
+            params![project_root],
         )
         .unwrap();
         conn.execute(

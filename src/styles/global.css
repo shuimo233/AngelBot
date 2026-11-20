@@ -23,6 +23,13 @@
   min-width: 0;
 }
 
+.workspace-activity-capsule--shortcut {
+  justify-content: flex-end;
+  padding: 0 var(--ui-space-2);
+  border: 0;
+  background: transparent;
+}
+
 .workspace-activity-capsule--error {
   border-color: color-mix(in srgb, var(--color-warning-border) 55%, var(--color-border));
   background: color-mix(in srgb, var(--color-warning-surface) 55%, var(--color-surface));
@@ -124,7 +131,7 @@ body,
 
 .app-shell--workbench {
   grid-template-areas: "sidebar main right";
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--right-panel-width, 320px);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr) auto;
 }
 
 .app-shell .sidebar {
@@ -330,6 +337,21 @@ body,
   flex-direction: column;
   gap: 14px;
 }
+
+.conversation-page {
+  align-self: center;
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: var(--ui-size-sm);
+  cursor: pointer;
+}
+.conversation-page:hover { color: var(--color-text); background: var(--color-surface-hover); }
+.conversation-page:focus-visible { outline: 2px solid var(--ui-focus); outline-offset: 2px; }
 
 .messages-empty {
   margin: auto;
@@ -1077,30 +1099,6 @@ body,
   flex-direction: row-reverse;
 }
 
-.message-avatar {
-  flex-shrink: 0;
-}
-
-.avatar {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.user-avatar {
-  background: var(--color-accent-fill);
-  color: var(--color-accent-contrast);
-}
-
-.bot-avatar {
-  background: var(--color-surface);
-}
-
 .message-content {
   display: flex;
   flex-direction: column;
@@ -1173,13 +1171,6 @@ body,
   border-top: 1px solid var(--color-border);
 }
 
-.completed-agent-final-answer blockquote {
-  margin: 10px 0;
-  padding: 2px 0 2px 10px;
-  border-left: 3px solid var(--color-border);
-  color: var(--color-text-secondary);
-}
-
 .completed-agent-final-answer table {
   width: 100%;
   margin: 10px 0;
@@ -1206,25 +1197,41 @@ body,
 
 .message-row.user .message-content {
   align-items: flex-end;
+  max-width: min(90%, 620px);
 }
 
-/* Per-message action button bar */
+.message-footer,
 .message-actions {
-  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--ui-space-1);
+  min-width: 0;
+}
+
+.message-footer { column-gap: var(--ui-space-2); }
+.message-row.user .message-footer { justify-content: flex-end; }
+
+.message-time {
+  color: var(--color-muted);
+  font-size: var(--ui-size-caption);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .message-actions .action-btn {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 4px;
-  height: 26px;
-  padding: 4px 8px;
+  min-height: 26px;
+  padding: 3px 6px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 6px;
   color: var(--color-muted);
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--ui-size-caption);
   font-weight: 500;
   font-family: inherit;
   white-space: nowrap;
@@ -1232,16 +1239,17 @@ body,
   transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
 
-.message-actions .action-btn:hover {
+.message-actions .action-btn:is(:hover, :active, [data-active="true"]):not(:disabled) {
   color: var(--color-text);
-  background: var(--color-surface);
-  border-color: var(--color-border);
+  background: var(--ui-hover);
 }
 
-.message-actions .action-btn.danger:hover {
-  color: #ef4444;
-  background: rgba(239, 68, 68, 0.08);
+.message-actions .action-btn.danger:is(:hover, :active):not(:disabled) {
+  color: var(--color-danger);
+  background: var(--ui-danger-soft);
 }
+
+.message-actions .action-btn:disabled { opacity: .55; cursor: not-allowed; }
 
 /* Edit a user turn in place, with the same clear submit/cancel hierarchy as
    the primary composer instead of icon-only controls. */
@@ -1267,9 +1275,7 @@ body,
   resize: vertical;
   background: transparent;
   color: var(--color-text);
-  font: inherit;
-  font-size: 15px;
-  line-height: 1.6;
+  font: var(--ui-chat-font-size)/1.6 var(--ui-chat-font-family);
 }
 
 .message-inline-editor-input:focus-visible {
@@ -1321,15 +1327,6 @@ body,
 .message-inline-editor-submit:disabled {
   cursor: not-allowed;
   opacity: 0.45;
-}
-
-.message-role-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--color-muted);
-  padding: 0 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
 }
 
 /* pi-web style: bordered message bubbles with role-based color hints */
@@ -1417,13 +1414,6 @@ body,
   color: var(--color-danger);
 }
 
-.message-time {
-  font-size: 10px;
-  color: var(--color-muted);
-  padding: 0 4px;
-  opacity: 0.7;
-}
-
 /* Composer textarea — pi-web style: grid layout with 8px gap, padding 12px, border-top 1px */
 .composer {
   flex-shrink: 0;
@@ -1432,9 +1422,6 @@ body,
   padding: 0;
   box-shadow: none;
 }
-
-.agent-run-controls { display: flex; align-items: center; gap: 8px; margin: 0 22px 8px; color: var(--color-muted); font-size: 12px; }
-.agent-run-controls button { min-height: 28px; padding: 0 8px; border: 1px solid var(--color-border); border-radius: 7px; background: var(--color-surface); color: var(--color-text); cursor: pointer; font: inherit; }
 
 /* Composer textarea — overridden by ComposerInput component inline styles */
 
@@ -2726,12 +2713,6 @@ body,
   padding-top: 12px;
   border-top: 1px solid var(--color-border-muted);
   text-align: left;
-}
-
-.messages-empty-section-title {
-  font-size: 12px;
-  color: var(--color-muted);
-  margin-bottom: 6px;
 }
 
 .messages-empty-list {

@@ -8,11 +8,110 @@
 use crate::vector;
 use crate::AppState;
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tauri::State;
+
+pub(crate) const MEMORY_CONTROLS_SETTING: &str = "memory_controls";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryControls {
+    pub use_long_term_memory: bool,
+    pub evolution_enabled: bool,
+}
+
+impl MemoryControls {
+    pub(crate) const OFF: Self = Self {
+        use_long_term_memory: false,
+        evolution_enabled: false,
+    };
+
+    pub(crate) fn can_learn(self) -> bool {
+        self.use_long_term_memory && self.evolution_enabled
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryControlUpdate {
+    use_long_term_memory: Option<bool>,
+    evolution_enabled: Option<bool>,
+}
+
+pub(crate) fn read_memory_controls(conn: &Connection) -> Result<Option<MemoryControls>, String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key=?1",
+        [MEMORY_CONTROLS_SETTING],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|err| format!("无法读取记忆开关: {err}"))?
+    .map(|value| serde_json::from_str(&value).map_err(|err| format!("记忆开关格式无效: {err}")))
+    .transpose()
+}
+
+pub(crate) fn write_memory_controls(
+    conn: &Connection,
+    controls: MemoryControls,
+) -> Result<(), String> {
+    let value = serde_json::to_string(&controls).map_err(|err| err.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        params![MEMORY_CONTROLS_SETTING, value, Utc::now().timestamp()],
+    )
+    .map_err(|err| format!("无法保存记忆开关: {err}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn initialize_memory_controls(
+    state: State<AppState>,
+    legacy: MemoryControls,
+) -> Result<MemoryControls, String> {
+    initialize_memory_controls_impl(&state, legacy)
+}
+
+pub(crate) fn initialize_memory_controls_impl(
+    state: &AppState,
+    legacy: MemoryControls,
+) -> Result<MemoryControls, String> {
+    let conn = state.db.lock().map_err(|err| err.to_string())?;
+    if let Some(controls) = read_memory_controls(&conn)? {
+        return Ok(controls);
+    }
+    write_memory_controls(&conn, legacy)?;
+    Ok(legacy)
+}
+
+#[tauri::command]
+pub fn set_memory_controls(
+    state: State<AppState>,
+    update: MemoryControlUpdate,
+) -> Result<MemoryControls, String> {
+    set_memory_controls_impl(&state, update)
+}
+
+pub(crate) fn set_memory_controls_impl(
+    state: &AppState,
+    update: MemoryControlUpdate,
+) -> Result<MemoryControls, String> {
+    let conn = state.db.lock().map_err(|err| err.to_string())?;
+    let current = read_memory_controls(&conn)?.unwrap_or(MemoryControls::OFF);
+    let controls = MemoryControls {
+        use_long_term_memory: update
+            .use_long_term_memory
+            .unwrap_or(current.use_long_term_memory),
+        evolution_enabled: update
+            .evolution_enabled
+            .unwrap_or(current.evolution_enabled),
+    };
+    write_memory_controls(&conn, controls)?;
+    Ok(controls)
+}
 
 /// Preserve the two owner-selected switches when a confirmation/retry creates
 /// an internal request without frontend preferences. Never copy user facts or
@@ -45,9 +144,18 @@ pub(crate) fn resolve_reply_memory_controls(
     }
     let saved_memory = stored.as_ref().and_then(|(_, memory, _)| *memory);
     let saved_learning = stored.as_ref().and_then(|(_, _, learning)| *learning);
-    let memory = requested_memory.or(saved_memory).unwrap_or(true);
-    let learning = requested_learning.or(saved_learning).unwrap_or(true);
-    if (requested_memory.is_some() || requested_learning.is_some())
+    let host_controls = read_memory_controls(conn)?;
+    let memory = host_controls
+        .map(|controls| controls.use_long_term_memory)
+        .or(requested_memory)
+        .or(saved_memory)
+        .unwrap_or(true);
+    let learning = host_controls
+        .map(|controls| controls.evolution_enabled)
+        .or(requested_learning)
+        .or(saved_learning)
+        .unwrap_or(true);
+    if (host_controls.is_some() || requested_memory.is_some() || requested_learning.is_some())
         && (saved_memory != Some(memory) || saved_learning != Some(learning))
     {
         let controls = serde_json::json!({"useLongTermMemory":memory,"evolutionEnabled":learning});
@@ -211,20 +319,37 @@ pub struct ForgetResult {
 // ============================================
 
 #[tauri::command]
-pub fn get_memories(state: State<AppState>) -> Result<Vec<Memory>, String> {
+pub fn get_memories(
+    state: State<AppState>,
+    include_replaced: Option<bool>,
+) -> Result<Vec<Memory>, String> {
+    get_memories_impl(&state, include_replaced.unwrap_or(false))
+}
+
+pub(crate) fn get_memories_impl(
+    state: &AppState,
+    include_replaced: bool,
+) -> Result<Vec<Memory>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    list_memories(&conn, include_replaced)
+}
+
+fn list_memories(
+    conn: &rusqlite::Connection,
+    include_replaced: bool,
+) -> Result<Vec<Memory>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, scope, category, content, importance, source,
                     frequency, last_mentioned, is_permanent, embedding,
-                    decay_factor, forget_stage, created_at, updated_at
+                    decay_factor, forget_stage, created_at, updated_at, superseded_by
              FROM memories
-             WHERE forget_stage != 'deleted' AND superseded_by IS NULL
+             WHERE forget_stage != 'deleted' AND (?1 OR superseded_by IS NULL)
              ORDER BY is_permanent DESC, importance DESC, updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([include_replaced], |r| {
             Ok(Memory {
                 id: r.get(0)?,
                 scope: r.get(1)?,
@@ -247,60 +372,12 @@ pub fn get_memories(state: State<AppState>) -> Result<Vec<Memory>, String> {
                     .get::<_, Option<i64>>(13)?
                     .unwrap_or_else(|| Utc::now().timestamp()),
                 content_hash: None,
-                superseded_by: None,
+                superseded_by: r.get(14)?,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
-}
-
-/// Internal version for use from handle_dev_command (accepts &AppState).
-pub fn get_memories_impl(state: &AppState) -> Result<Vec<serde_json::Value>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, scope, category, content, importance, source,
-                    frequency, last_mentioned, is_permanent, embedding,
-                    decay_factor, forget_stage, created_at, updated_at
-             FROM memories
-             WHERE forget_stage != 'deleted' AND superseded_by IS NULL
-             ORDER BY is_permanent DESC, importance DESC, updated_at DESC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<serde_json::Value> = stmt
-        .query_map([], |r| {
-            let is_perm: i32 = r.get::<_, Option<i32>>(8)?.unwrap_or(0);
-            let forget_stage: String = r
-                .get::<_, Option<String>>(11)?
-                .unwrap_or_else(|| "active".to_string());
-            let created_at: i64 = r
-                .get::<_, Option<i64>>(12)?
-                .unwrap_or_else(|| Utc::now().timestamp());
-            let updated_at: i64 = r
-                .get::<_, Option<i64>>(13)?
-                .unwrap_or_else(|| Utc::now().timestamp());
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?,
-                "scope": r.get::<_, String>(1)?,
-                "category": r.get::<_, String>(2)?,
-                "content": r.get::<_, String>(3)?,
-                "importance": r.get::<_, i32>(4)?,
-                "source": r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                "frequency": r.get::<_, Option<i32>>(6)?.unwrap_or(0),
-                "last_mentioned": r.get::<_, Option<i64>>(7)?,
-                "is_permanent": is_perm == 1,
-                "embedding": r.get::<_, Option<String>>(9)?,
-                "decay_factor": r.get::<_, Option<f64>>(10)?.unwrap_or(1.0),
-                "forget_stage": forget_stage,
-                "created_at": created_at,
-                "updated_at": updated_at,
-            }))
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
 }
 
 /// Internal version for use from handle_dev_command (accepts &AppState).
@@ -363,76 +440,126 @@ pub fn get_memory_stats_impl(state: &AppState) -> Result<serde_json::Value, Stri
 }
 
 #[tauri::command]
-pub fn save_memory(state: State<AppState>, memory: MemoryInput) -> Result<(), String> {
-    validate_direct_memory_write(&memory)?;
+pub fn save_memory(state: State<AppState>, memory: MemoryInput) -> Result<String, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    save_memory_impl(&conn, memory)
+}
+
+fn save_memory_impl(conn: &Connection, memory: MemoryInput) -> Result<String, String> {
+    validate_direct_memory_write(&memory)?;
+    save_confirmed_memory_record(conn, memory)
+}
+
+/// Shared storage for the explicit UI action and the approved memory tool.
+pub(crate) fn save_confirmed_memory_record(
+    conn: &Connection,
+    memory: MemoryInput,
+) -> Result<String, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let now = Utc::now().timestamp();
-    let is_permanent = memory.is_permanent.unwrap_or(false) as i32;
     let content_hash = compute_content_hash(&memory.scope, &memory.category, &memory.content);
-
-    // Check if this exact content already exists (by hash)
-    let existing: Option<String> = conn
+    // Match the actual record. Older agent edits could leave an outdated hash.
+    let existing = tx
         .query_row(
-            "SELECT id FROM memories WHERE content_hash = ?1",
-            params![&content_hash],
-            |r| r.get(0),
+            "SELECT id, forget_stage, superseded_by IS NOT NULL FROM memories
+             WHERE scope=?1 AND category=?2 AND content=?3 AND forget_stage!='deleted'
+             ORDER BY (superseded_by IS NULL AND forget_stage='active') DESC, updated_at DESC, id
+             LIMIT 1",
+            params![memory.scope, memory.category, memory.content],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )
-        .ok();
-
-    if let Some(existing_id) = existing {
-        // Dedup: update frequency instead of creating duplicate
-        conn.execute(
-            "UPDATE memories SET frequency = frequency + 1,
-             last_mentioned = ?1, updated_at = ?2 WHERE id = ?3",
-            params![now, now, existing_id],
-        )
+        .optional()
         .map_err(|e| e.to_string())?;
 
-        // Log to memory_history
-        let history_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
+    if let Some((id, stage, replaced)) = existing {
+        if replaced {
+            return Err("相同正文已有替代记录。请在长期记忆中核对替代关系。".into());
+        }
+        if stage != "active" {
+            return Err("相同正文已存在，但未参与召回。请在长期记忆中核对这条记录。".into());
+        }
+        tx.execute(
+            "UPDATE memories SET frequency=frequency+1, last_mentioned=?1, updated_at=?1,
+                 is_permanent=max(is_permanent, ?2) WHERE id=?3",
+            params![now, memory.is_permanent.unwrap_or(false), id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
             "INSERT INTO memory_history (id, memory_id, operation, details, created_at)
              VALUES (?1, ?2, 'dedup', ?3, ?4)",
             params![
-                history_id,
-                existing_id,
-                "Duplicate content detected, frequency incremented",
+                uuid::Uuid::new_v4().to_string(),
+                id,
+                "Duplicate content confirmed by user",
                 now
             ],
         )
         .map_err(|e| e.to_string())?;
-    } else {
-        // New unique memory
-        conn.execute(
-            r#"INSERT INTO memories (id, scope, category, content, importance, source,
-                                    frequency, last_mentioned, is_permanent, decay_factor,
-                                    forget_stage, content_hash, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 1.0, 'active', ?9, ?7, ?10)"#,
-            params![
-                memory.id,
-                memory.scope,
-                memory.category,
-                memory.content,
-                memory.importance,
-                memory.source,
-                now,
-                is_permanent,
-                &content_hash,
-                now
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-
-        // Log to memory_history
-        let history_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO memory_history (id, memory_id, operation, new_content, created_at)
-             VALUES (?1, ?2, 'create', ?3, ?4)",
-            params![history_id, memory.id, memory.content, now],
-        )
-        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(id);
     }
 
+    // Reclaim a stale hash or a deleted record's hash. The original row and
+    // its history remain intact. The new record comes from this explicit save.
+    release_stale_memory_hash(
+        &tx,
+        &content_hash,
+        &memory.scope,
+        &memory.category,
+        &memory.content,
+    )?;
+    tx.execute(
+        "INSERT INTO memories (id, scope, category, content, importance, source,
+                               frequency, last_mentioned, is_permanent, decay_factor,
+                               forget_stage, content_hash, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 1.0, 'active', ?9, ?7, ?7)",
+        params![
+            memory.id,
+            memory.scope,
+            memory.category,
+            memory.content,
+            memory.importance,
+            memory.source,
+            now,
+            memory.is_permanent.unwrap_or(false),
+            content_hash
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO memory_history (id, memory_id, operation, new_content, created_at)
+         VALUES (?1, ?2, 'create', ?3, ?4)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            memory.id,
+            memory.content,
+            now
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(memory.id)
+}
+
+fn release_stale_memory_hash(
+    conn: &Connection,
+    hash: &str,
+    scope: &str,
+    category: &str,
+    content: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE memories SET content_hash=NULL WHERE content_hash=?1
+           AND (forget_stage='deleted' OR scope<>?2 OR category<>?3 OR content<>?4)",
+        params![hash, scope, category, content],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -458,20 +585,74 @@ fn validate_direct_memory_write(memory: &MemoryInput) -> Result<(), String> {
 
 #[tauri::command]
 pub fn delete_memory(state: State<AppState>, id: String) -> Result<(), String> {
+    delete_memory_impl(&state, &id)
+}
+
+pub(crate) fn delete_memory_impl(state: &AppState, id: &str) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM memories WHERE id = ?1", params![id])
+    delete_memory_in_conn(&conn, id)
+}
+
+fn delete_memory_in_conn(conn: &Connection, id: &str) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let now = Utc::now().timestamp();
+    // Unlink predecessors before deleting their replacement. A predecessor
+    // remains outside recall even if an older version recorded it as active
+    // or summarized.
+    tx.execute(
+        "INSERT INTO memory_history (id, memory_id, operation, created_at)
+         SELECT lower(hex(randomblob(16))), id, 'replacement_deleted', ?2
+         FROM memories WHERE superseded_by = ?1 AND id <> ?1",
+        params![id, now],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE memories
+         SET superseded_by = NULL,
+             forget_stage = CASE WHEN forget_stage IN ('active', 'summarized') THEN 'paused' ELSE forget_stage END,
+             updated_at = ?2
+         WHERE superseded_by = ?1",
+        params![id, now],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memory_history WHERE memory_id = ?1", [id])
         .map_err(|e| e.to_string())?;
-    Ok(())
+    tx.execute("DELETE FROM memory_index WHERE memory_id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memories WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> Result<(), String> {
+    update_memory_record(conn, &req.id, &req.content, Some(&req))
+}
+
+pub(crate) fn update_memory_content_impl(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+) -> Result<(), String> {
+    update_memory_record(conn, id, content, None)
+}
+
+fn update_memory_record(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    settings: Option<&UpdateMemoryRequest>,
+) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Err("记忆正文不能为空。".into());
+    }
     let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let conn = &transaction;
     let now = Utc::now().timestamp();
     let existing = conn
         .query_row(
-            "SELECT scope, category, content, importance, is_permanent FROM memories WHERE id = ?1",
-            params![&req.id],
+            "SELECT scope, category, content, importance, is_permanent FROM memories
+             WHERE id = ?1 AND superseded_by IS NULL AND forget_stage != 'deleted'",
+            [id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -482,9 +663,44 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
                 ))
             },
         )
-        .map_err(|e| e.to_string())?;
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "找不到可修改的记忆。".to_string())?;
 
-    if existing.2 != req.content {
+    let (scope, category, importance, is_permanent) = settings.map_or(
+        (
+            existing.0.as_str(),
+            existing.1.as_str(),
+            existing.3,
+            existing.4,
+        ),
+        |req| {
+            (
+                req.scope.as_str(),
+                req.category.as_str(),
+                req.importance,
+                req.is_permanent as i32,
+            )
+        },
+    );
+
+    let content_hash = compute_content_hash(scope, category, content);
+    if existing.0 != scope || existing.1 != category || existing.2 != content {
+        let duplicate: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories WHERE id<>?1 AND scope=?2
+             AND category=?3 AND content=?4 AND forget_stage!='deleted')",
+                params![id, scope, category, content],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if duplicate {
+            return Err("已有相同正文的记忆，请核对现有记录或使用替代。".into());
+        }
+        release_stale_memory_hash(conn, &content_hash, scope, category, content)?;
+    }
+
+    if existing.2 != content {
         let has_vector_table: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='memory_vectors' AND type='table')",
             [], |row| row.get(0),
@@ -493,7 +709,7 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
             let rowid = conn
                 .query_row(
                     "SELECT rowid FROM memory_vector_map WHERE memory_id=?1",
-                    [&req.id],
+                    [id],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()
@@ -503,7 +719,6 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
             }
         }
     }
-    let content_hash = compute_content_hash(&req.scope, &req.category, &req.content);
     let changed = conn
         .execute(
             "UPDATE memories
@@ -512,14 +727,14 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
                  embedding = CASE WHEN content <> ?3 THEN NULL ELSE embedding END
              WHERE id = ?8",
             params![
-                &req.scope,
-                &req.category,
-                &req.content,
-                req.importance,
-                req.is_permanent as i32,
+                scope,
+                category,
+                content,
+                importance,
+                is_permanent,
                 &content_hash,
                 now,
-                &req.id
+                id
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -530,20 +745,13 @@ fn update_memory_impl(conn: &rusqlite::Connection, req: UpdateMemoryRequest) -> 
 
     let details = format!(
         "scope:{}->{}, category:{}->{}, importance:{}->{}, permanent:{}->{}",
-        existing.0,
-        req.scope,
-        existing.1,
-        req.category,
-        existing.3,
-        req.importance,
-        existing.4,
-        req.is_permanent as i32
+        existing.0, scope, existing.1, category, existing.3, importance, existing.4, is_permanent
     );
     let history_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO memory_history (id, memory_id, operation, previous_content, new_content, details, created_at)
          VALUES (?1, ?2, 'update', ?3, ?4, ?5, ?6)",
-        params![history_id, &req.id, existing.2, &req.content, details, now],
+        params![history_id, id, existing.2, content, details, now],
     )
     .map_err(|e| e.to_string())?;
 
@@ -598,7 +806,7 @@ pub fn decay_memories(state: State<AppState>) -> Result<i32, String> {
         .prepare(
             "SELECT id, frequency, last_mentioned, decay_factor
              FROM memories
-             WHERE is_permanent = 0 AND forget_stage = 'active'",
+             WHERE is_permanent = 0 AND forget_stage = 'active' AND superseded_by IS NULL",
         )
         .map_err(|e| e.to_string())?;
 
@@ -660,7 +868,7 @@ pub fn get_memories_to_forget(
                     decay_factor, forget_stage, created_at, updated_at
              FROM memories
              WHERE is_permanent = 0
-               AND forget_stage IN ('active', 'summarized')
+               AND forget_stage IN ('active', 'summarized') AND superseded_by IS NULL
                AND (frequency * decay_factor) < ?1
              ORDER BY (frequency * decay_factor) ASC",
         )
@@ -726,6 +934,80 @@ pub fn archive_memory(state: State<AppState>, id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
+pub fn set_memory_paused(state: State<AppState>, id: String, paused: bool) -> Result<(), String> {
+    set_memory_paused_impl(&state, &id, paused)
+}
+
+pub(crate) fn set_memory_paused_impl(
+    state: &AppState,
+    id: &str,
+    paused: bool,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    set_memory_paused_in_conn(&conn, id, paused)
+}
+
+fn set_memory_paused_in_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    paused: bool,
+) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT forget_stage FROM memories WHERE id = ?1 AND superseded_by IS NULL",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (before, after, operation) = if paused {
+        ("active", "paused", "pause")
+    } else {
+        ("paused", "active", "resume")
+    };
+    match current.as_deref() {
+        Some(stage) if stage == after => return Ok(()),
+        Some(stage) if stage == before => {}
+        _ => return Err("这条记忆的状态已变化，请重新打开后核对。".into()),
+    }
+    let now = Utc::now().timestamp();
+    tx.execute(
+        "UPDATE memories SET forget_stage = ?1, updated_at = ?2 WHERE id = ?3",
+        params![after, now, id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO memory_history (id, memory_id, operation, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![uuid::Uuid::new_v4().to_string(), id, operation, now],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+pub(crate) fn forget_memory_in_conn(conn: &Connection, id: &str) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let now = Utc::now().timestamp();
+    let content: String = tx
+        .query_row(
+            "UPDATE memories SET forget_stage='summarized', updated_at=?1
+         WHERE id=?2 AND forget_stage='active' AND superseded_by IS NULL RETURNING content",
+            params![now, id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "找不到可标记为遗忘的活跃记忆。".to_string())?;
+    tx.execute(
+        "INSERT INTO memory_history (id, memory_id, operation, previous_content, created_at)
+         VALUES (?1, ?2, 'forget', ?3, ?4)",
+        params![uuid::Uuid::new_v4().to_string(), id, content, now],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn permanently_delete_memory(state: State<AppState>, id: String) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
@@ -746,7 +1028,7 @@ pub fn cleanup_archived_memories(
 
     let deleted = conn
         .execute(
-            "UPDATE memories SET forget_stage = 'deleted', updated_at = ?1 WHERE forget_stage = 'archived' AND updated_at < ?1",
+            "UPDATE memories SET forget_stage = 'deleted', updated_at = ?1 WHERE forget_stage = 'archived' AND superseded_by IS NULL AND updated_at < ?1",
             params![Utc::now().timestamp(), cutoff],
         )
         .map_err(|e| e.to_string())?;
@@ -802,31 +1084,47 @@ pub fn find_relevant_memories(
         (f32_vec, 128)
     };
 
-    // Try KNN via sqlite-vec first
-    if let Ok(knn_results) = crate::vector_store::find_nearest(&conn, &query_f32, k) {
+    find_active_memory_vectors(&conn, &query_f32, k, sim_threshold)
+}
+
+fn find_active_memory_vectors(
+    conn: &Connection,
+    query_f32: &[f32],
+    k: usize,
+    sim_threshold: f64,
+) -> Result<Vec<SimilarityResult>, String> {
+    // Try KNN via sqlite-vec first; the vector index may still contain inactive rows.
+    if let Ok(knn_results) = crate::vector_store::find_nearest(conn, query_f32, k) {
         if !knn_results.is_empty() {
             // Map rowids to memory IDs
             let rowids: Vec<i64> = knn_results.iter().map(|r| r.rowid).collect();
-            if let Ok(mapping) = crate::vector_store::rowids_to_memory_ids(&conn, &rowids) {
-                let results: Vec<SimilarityResult> = knn_results
-                    .iter()
-                    .filter_map(|r| {
-                        mapping
-                            .iter()
-                            .find(|(rid, _)| *rid == r.rowid)
-                            .map(|(_, mem_id)| {
-                                // Convert L2 distance to similarity score (closer = higher similarity)
-                                // d ∈ [0, ∞), sim = 1 / (1 + d) maps to (0, 1]
-                                let similarity = 1.0 / (1.0 + r.distance as f64);
-                                SimilarityResult {
-                                    memory_id: mem_id.clone(),
-                                    similarity,
-                                    should_activate: similarity >= sim_threshold,
-                                }
-                            })
-                    })
-                    .collect();
-                return Ok(results);
+            if let Ok(mapping) = crate::vector_store::rowids_to_memory_ids(conn, &rowids) {
+                let mut active = conn
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND scope='global'
+                     AND forget_stage='active' AND superseded_by IS NULL)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let mut results = Vec::new();
+                for r in &knn_results {
+                    let Some((_, mem_id)) = mapping.iter().find(|(rid, _)| *rid == r.rowid) else {
+                        continue;
+                    };
+                    if active
+                        .query_row([mem_id], |row| row.get::<_, bool>(0))
+                        .map_err(|e| e.to_string())?
+                    {
+                        let similarity = 1.0 / (1.0 + r.distance as f64);
+                        results.push(SimilarityResult {
+                            memory_id: mem_id.clone(),
+                            similarity,
+                            should_activate: similarity >= sim_threshold,
+                        });
+                    }
+                }
+                if !results.is_empty() {
+                    return Ok(results);
+                }
             }
         }
     }
@@ -835,7 +1133,8 @@ pub fn find_relevant_memories(
     let mut stmt = conn
         .prepare(
             "SELECT id, embedding FROM memories
-             WHERE forget_stage = 'active' AND embedding IS NOT NULL
+             WHERE scope = 'global' AND forget_stage = 'active' AND superseded_by IS NULL
+               AND embedding IS NOT NULL
              LIMIT 1000",
         )
         .map_err(|e| e.to_string())?;
@@ -1130,7 +1429,7 @@ pub fn process_forgetting_stage(
     // Get current memory
     let (current_content, _current_stage): (String, String) = conn
         .query_row(
-            "SELECT content, forget_stage FROM memories WHERE id = ?1",
+            "SELECT content, forget_stage FROM memories WHERE id = ?1 AND superseded_by IS NULL AND forget_stage NOT IN ('paused', 'deleted')",
             params![memory_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1212,7 +1511,7 @@ pub fn find_relevant_memories_by_time(
         .prepare(
             "SELECT id, frequency, last_mentioned, importance
              FROM memories
-             WHERE forget_stage = 'active' AND is_permanent = 0",
+             WHERE forget_stage = 'active' AND is_permanent = 0 AND superseded_by IS NULL",
         )
         .map_err(|e| e.to_string())?;
 
@@ -1255,6 +1554,14 @@ pub fn run_batch_forgetting(
     delete_threshold: Option<i32>,
 ) -> Result<BatchForgetResult, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    run_batch_forgetting_in_conn(&conn, archive_threshold, delete_threshold)
+}
+
+fn run_batch_forgetting_in_conn(
+    conn: &rusqlite::Connection,
+    archive_threshold: Option<i32>,
+    delete_threshold: Option<i32>,
+) -> Result<BatchForgetResult, String> {
     let now = Utc::now().timestamp();
     let archive_days = archive_threshold.unwrap_or(30); // Archive after 30 days
     let delete_days = delete_threshold.unwrap_or(90); // Delete after 90 days
@@ -1272,7 +1579,7 @@ pub fn run_batch_forgetting(
         .prepare(
             "SELECT id, frequency, last_mentioned, decay_factor, content
              FROM memories
-             WHERE is_permanent = 0 AND forget_stage = 'active'",
+             WHERE is_permanent = 0 AND forget_stage = 'active' AND superseded_by IS NULL",
         )
         .map_err(|e| e.to_string())?;
 
@@ -1345,7 +1652,7 @@ pub fn run_batch_forgetting(
     let archived_count = conn
         .execute(
             "UPDATE memories SET forget_stage = 'archived', updated_at = ?1
-             WHERE forget_stage = 'summarized' AND updated_at < ?2",
+             WHERE forget_stage = 'summarized' AND superseded_by IS NULL AND updated_at < ?2",
             params![now, archive_cutoff],
         )
         .map_err(|e| e.to_string())?;
@@ -1356,7 +1663,7 @@ pub fn run_batch_forgetting(
     let deleted_count = conn
         .execute(
             "UPDATE memories SET forget_stage = 'deleted', updated_at = ?1
-             WHERE forget_stage = 'archived' AND updated_at < ?2",
+             WHERE forget_stage = 'archived' AND superseded_by IS NULL AND updated_at < ?2",
             params![now, delete_cutoff],
         )
         .map_err(|e| e.to_string())?;
@@ -1586,6 +1893,11 @@ fn automatic_review_inputs(
 }
 
 pub(crate) fn automatic_evolution_due(conn: &rusqlite::Connection, session_id: &str) -> bool {
+    if !read_memory_controls(conn)
+        .is_ok_and(|controls| controls.is_none_or(MemoryControls::can_learn))
+    {
+        return false;
+    }
     let Ok((_, state)) = automatic_review_state(conn, session_id) else {
         return false;
     };
@@ -2276,13 +2588,13 @@ pub fn check_evolution_due(state: State<AppState>) -> Result<serde_json::Value, 
 // Memory Dedup & Conflict Commands
 // ============================================
 
-/// Result of memory conflict detection.
+/// A related record for manual review.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ConflictResult {
+pub struct MemoryReviewCandidate {
     pub memory_id: String,
     pub content: String,
-    pub category: String,
-    pub similarity: f64,
+    pub source: String,
+    pub updated_at: i64,
 }
 
 /// Record from the memory_history audit log.
@@ -2301,90 +2613,97 @@ pub struct MemoryHistoryEntry {
     pub created_at: i64,
 }
 
-/// Detect memories that may conflict with a given content string.
-/// Uses vector similarity to find semantically similar but not identical memories.
-#[tauri::command]
-pub fn detect_memory_conflicts(
+/// Find recent related records in the same scope and category using local text matching.
+#[tauri::command(rename_all = "snake_case")]
+pub fn find_related_memories(
     state: State<AppState>,
-    content: String,
-    threshold: Option<f64>,
-) -> Result<Vec<ConflictResult>, String> {
-    let threshold = threshold.unwrap_or(0.85);
+    memory_id: String,
+) -> Result<Vec<MemoryReviewCandidate>, String> {
+    find_related_memories_impl(&state, &memory_id)
+}
+
+pub(crate) fn find_related_memories_impl(
+    state: &AppState,
+    memory_id: &str,
+) -> Result<Vec<MemoryReviewCandidate>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    find_related_memories_in_conn(&conn, memory_id)
+}
 
-    // Use the existing find_relevant_memories logic to get similar memories
-    let similar = crate::llm::embedding::create_embedding_config_from_env();
-    let query_embedding = if similar.enabled {
-        // Use real embedding API if available
-        let provider = crate::llm::create_embedding_provider();
-        if let Some(p) = provider {
-            p.embed(&content)
-                .map(|v| v.into_iter().map(|f| f as f64).collect())
-                .unwrap_or_else(|_| crate::vector::text_to_embedding(&content, 128))
-        } else {
-            crate::vector::text_to_embedding(&content, 128)
-        }
-    } else {
-        crate::vector::text_to_embedding(&content, 128)
-    };
-
+fn find_related_memories_in_conn(
+    conn: &rusqlite::Connection,
+    memory_id: &str,
+) -> Result<Vec<MemoryReviewCandidate>, String> {
+    let (scope, category, content): (String, String, String) = conn
+        .query_row(
+            "SELECT scope, category, substr(content, 1, 4096) FROM memories
+         WHERE id = ?1 AND forget_stage = 'active' AND superseded_by IS NULL",
+            [memory_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or("请从一条仍可召回的记忆发起检查。")?;
+    let matcher = crate::fts::MemoryQuery::new(&content);
     let mut stmt = conn
         .prepare(
-            "SELECT id, content, category, embedding
-             FROM memories
-             WHERE forget_stage = 'active' AND embedding IS NOT NULL
-             LIMIT 100",
+            "SELECT id, substr(content, 1, 4096) FROM memories
+         WHERE scope = ?1 AND category = ?2 AND id <> ?3
+           AND forget_stage = 'active' AND superseded_by IS NULL
+         ORDER BY updated_at DESC, id LIMIT 100",
         )
         .map_err(|e| e.to_string())?;
-
-    let mut results: Vec<ConflictResult> = Vec::new();
     let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-            ))
+        .query_map(params![scope, category, memory_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|e| e.to_string())?;
-
+    let mut matches = Vec::new();
     for row in rows {
-        if let Ok((id, mem_content, category, embedding_blob)) = row {
-            if mem_content == content {
-                continue; // Skip identical content
-            }
-            let stored_embedding: Vec<f64> =
-                bincode::deserialize(&embedding_blob).unwrap_or_default();
-            let similarity = crate::vector::cosine_similarity(&query_embedding, &stored_embedding);
-            if similarity >= threshold {
-                results.push(ConflictResult {
-                    memory_id: id,
-                    content: mem_content,
-                    category,
-                    similarity,
-                });
-            }
+        let (id, preview) = row.map_err(|e| e.to_string())?;
+        if let Some(score) = matcher.score(&preview) {
+            matches.push((score, id));
         }
     }
-
-    // Sort by similarity descending
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
-
-    Ok(results)
+    matches.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    let mut read = conn
+        .prepare("SELECT content, source, updated_at FROM memories WHERE id = ?1")
+        .map_err(|e| e.to_string())?;
+    matches
+        .into_iter()
+        .take(8)
+        .map(|(_, id)| {
+            read.query_row([&id], |row| {
+                Ok(MemoryReviewCandidate {
+                    memory_id: id.clone(),
+                    content: row.get(0)?,
+                    source: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())
+        })
+        .collect()
 }
 
 /// Get the change history for a specific memory.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn get_memory_history(
     state: State<AppState>,
     memory_id: String,
+) -> Result<Vec<MemoryHistoryEntry>, String> {
+    get_memory_history_impl(&state, &memory_id)
+}
+
+pub(crate) fn get_memory_history_impl(
+    state: &AppState,
+    memory_id: &str,
 ) -> Result<Vec<MemoryHistoryEntry>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             "SELECT id, memory_id, operation, previous_content, new_content, details, created_at
-             FROM memory_history WHERE memory_id = ?1 ORDER BY created_at DESC",
+             FROM memory_history WHERE memory_id = ?1 ORDER BY created_at DESC, rowid DESC",
         )
         .map_err(|e| e.to_string())?;
 
@@ -2406,51 +2725,120 @@ pub fn get_memory_history(
         .map_err(|e| e.to_string())
 }
 
-/// Merge two related memories by marking source as superseded by target.
-#[tauri::command]
-pub fn merge_memories(
-    state: State<AppState>,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceMemoryRequest {
     source_id: String,
+    source_content: String,
     target_id: String,
+    target_content: String,
+}
+
+/// Retain the original record while excluding it from future recall.
+#[tauri::command]
+pub fn replace_memory(state: State<AppState>, req: ReplaceMemoryRequest) -> Result<(), String> {
+    replace_memory_impl(&state, req)
+}
+
+pub(crate) fn replace_memory_impl(
+    state: &AppState,
+    req: ReplaceMemoryRequest,
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    replace_memory_in_conn(&conn, req)
+}
+
+fn replace_memory_in_conn(
+    conn: &rusqlite::Connection,
+    req: ReplaceMemoryRequest,
+) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let now = Utc::now().timestamp();
+    let changed = tx
+        .execute(
+            "UPDATE memories AS source SET superseded_by = ?1, forget_stage = 'paused', updated_at = ?2
+         WHERE source.id = ?3 AND source.id <> ?1 AND source.content = ?4
+           AND source.forget_stage IN ('active', 'paused') AND source.superseded_by IS NULL
+           AND EXISTS (SELECT 1 FROM memories AS target
+                       WHERE target.id = ?1 AND target.content = ?5
+                         AND target.scope = source.scope AND target.category = source.category
+                         AND target.forget_stage = 'active' AND target.superseded_by IS NULL)",
+            params![
+                req.target_id,
+                now,
+                req.source_id,
+                req.source_content,
+                req.target_content
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err(
+            "两条记忆必须不同、处于相同范围和类别，且与核对时的内容一致。请重新检查。".into(),
+        );
+    }
+    for (id, details) in [
+        (&req.source_id, format!("已由 {} 替代", req.target_id)),
+        (&req.target_id, format!("已替代 {}", req.source_id)),
+    ] {
+        tx.execute(
+            "INSERT INTO memory_history (id, memory_id, operation, details, created_at)
+             VALUES (?1, ?2, 'supersede', ?3, ?4)",
+            params![uuid::Uuid::new_v4().to_string(), id, details, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
 
-    // Mark source as superseded
-    conn.execute(
-        "UPDATE memories SET superseded_by = ?1, updated_at = ?2 WHERE id = ?3",
-        params![&target_id, now, &source_id],
-    )
-    .map_err(|e| e.to_string())?;
+/// Undo the recorded link while keeping the restored record out of recall.
+#[tauri::command]
+pub fn restore_replaced_memory(
+    state: State<AppState>,
+    id: String,
+    replacement_id: String,
+) -> Result<(), String> {
+    restore_replaced_memory_impl(&state, &id, &replacement_id)
+}
 
-    // Log to memory_history for both memories
-    let history_id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
+pub(crate) fn restore_replaced_memory_impl(
+    state: &AppState,
+    id: &str,
+    replacement_id: &str,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    restore_replaced_memory_in_conn(&conn, id, replacement_id)
+}
+
+fn restore_replaced_memory_in_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    replacement_id: &str,
+) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let now = Utc::now().timestamp();
+    let changed = tx
+        .execute(
+            "UPDATE memories SET superseded_by = NULL, forget_stage = 'paused', updated_at = ?1
+         WHERE id = ?2 AND superseded_by = ?3 AND forget_stage != 'deleted'",
+            params![now, id, replacement_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("这条记忆的替代状态已变化，请刷新后核对。".into());
+    }
+    tx.execute(
         "INSERT INTO memory_history (id, memory_id, operation, details, created_at)
-         VALUES (?1, ?2, 'merge', ?3, ?4)",
+         VALUES (?1, ?2, 'restore_replaced', ?3, ?4)",
         params![
-            history_id,
-            source_id,
-            format!("Merged into {}", target_id),
+            uuid::Uuid::new_v4().to_string(),
+            id,
+            format!("已撤销由 {replacement_id} 替代，原记录已暂停召回"),
             now
         ],
     )
     .map_err(|e| e.to_string())?;
-
-    let history_id2 = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO memory_history (id, memory_id, operation, details, created_at)
-         VALUES (?1, ?2, 'merge', ?3, ?4)",
-        params![
-            history_id2,
-            target_id,
-            format!("Absorbed {}", source_id),
-            now
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 // ============================================
@@ -2601,6 +2989,203 @@ mod tests {
     }
 
     #[test]
+    fn memory_review_pauses_recall_and_replaces_only_matching_records() {
+        use crate::fts::{recall_active_memories, MemoryRecallMode};
+
+        let (_tmp, conn) = setup_db();
+        for (id, scope, stage, content) in [
+            ("current", "global", "active", "release notes in Markdown"),
+            ("old", "global", "active", "release notes in HTML"),
+            (
+                "local",
+                "project-1",
+                "active",
+                "release notes in plain text",
+            ),
+            ("archived", "global", "archived", "release notes in PDF"),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, scope, category, content, importance, source, forget_stage, created_at, updated_at)
+                 VALUES (?1, ?2, 'preference', ?3, 5, 'user', ?4, 1, 1)",
+                params![id, scope, content, stage],
+            ).unwrap();
+        }
+        let recall_count = |mode| {
+            recall_active_memories(&conn, "release notes", 8, mode)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(recall_count(MemoryRecallMode::Context), 2);
+        let related = find_related_memories_in_conn(&conn, "current").unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].memory_id, "old");
+        assert_eq!(related[0].source, "user");
+
+        set_memory_paused_in_conn(&conn, "old", true).unwrap();
+        set_memory_paused_in_conn(&conn, "old", true).unwrap();
+        assert_eq!(recall_count(MemoryRecallMode::Context), 1);
+        assert_eq!(recall_count(MemoryRecallMode::Explicit), 1);
+        assert!(find_related_memories_in_conn(&conn, "current")
+            .unwrap()
+            .is_empty());
+        set_memory_paused_in_conn(&conn, "old", false).unwrap();
+        assert_eq!(recall_count(MemoryRecallMode::Context), 2);
+
+        let replace = |source: &str, content: &str| {
+            replace_memory_in_conn(
+                &conn,
+                ReplaceMemoryRequest {
+                    source_id: source.into(),
+                    source_content: content.into(),
+                    target_id: "current".into(),
+                    target_content: "release notes in Markdown".into(),
+                },
+            )
+        };
+        assert!(replace("local", "release notes in plain text").is_err());
+        assert!(replace("archived", "release notes in PDF").is_err());
+        assert!(replace("current", "release notes in Markdown").is_err());
+        assert!(replace("old", "stale review").is_err());
+        replace("old", &related[0].content).unwrap();
+        assert_eq!(recall_count(MemoryRecallMode::Context), 1);
+        assert_eq!(recall_count(MemoryRecallMode::Explicit), 1);
+        assert!(set_memory_paused_in_conn(&conn, "old", false).is_err());
+        let retained: (String, String) = conn
+            .query_row(
+                "SELECT content, superseded_by FROM memories WHERE id = 'old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("release notes in HTML".into(), "current".into()));
+        assert!(!list_memories(&conn, false)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "old"));
+        let replaced = list_memories(&conn, true)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == "old")
+            .unwrap();
+        assert_eq!(replaced.superseded_by.as_deref(), Some("current"));
+        assert_eq!(replaced.forget_stage, "paused");
+
+        // Records replaced before this version can still have a legacy forgetting stage.
+        conn.execute(
+            "UPDATE memories SET forget_stage = 'active', last_mentioned = 1 WHERE id = 'old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, scope, category, content, importance, forget_stage, superseded_by, created_at, updated_at)
+             VALUES ('legacy-archived', 'global', 'preference', 'earlier record', 5, 'archived', 'current', 1, 1)",
+            [],
+        ).unwrap();
+        let forgotten = run_batch_forgetting_in_conn(&conn, None, None).unwrap();
+        assert_eq!(forgotten.summarized, 0);
+        assert_eq!(forgotten.deleted, 1); // Only the unrelated archived fixture.
+        assert!(restore_replaced_memory_in_conn(&conn, "old", "stale-target").is_err());
+        assert!(restore_replaced_memory_in_conn(&conn, "archived", "current").is_err());
+        restore_replaced_memory_in_conn(&conn, "old", "current").unwrap();
+        let restored = list_memories(&conn, false)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == "old")
+            .unwrap();
+        assert_eq!(restored.forget_stage, "paused");
+        assert_eq!(restored.content, related[0].content);
+        assert!(restored.superseded_by.is_none());
+        assert_eq!(recall_count(MemoryRecallMode::Context), 1);
+        assert_eq!(recall_count(MemoryRecallMode::Explicit), 1);
+        set_memory_paused_in_conn(&conn, "old", false).unwrap();
+        assert_eq!(recall_count(MemoryRecallMode::Context), 2);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn deleting_replacement_removes_its_history_and_keeps_predecessors_paused() {
+        let (_tmp, conn) = setup_db();
+        conn.execute_batch(
+            "INSERT INTO memories (id, scope, category, content, created_at, updated_at)
+             VALUES ('old', 'global', 'fact', 'synthetic old', 1, 1),
+                    ('summary', 'global', 'fact', 'synthetic summary', 1, 1),
+                    ('target', 'global', 'fact', 'synthetic target', 2, 2);
+             UPDATE memories SET superseded_by='target' WHERE id='old';
+             UPDATE memories SET superseded_by='target', forget_stage='summarized' WHERE id='summary';
+             INSERT INTO memory_index (id, memory_id)
+             VALUES ('old-index', 'old'), ('target-index', 'target');
+             INSERT INTO memory_history (id, memory_id, operation, new_content, created_at)
+             VALUES ('own', 'old', 'create', 'synthetic old', 1),
+                    ('sensitive', 'target', 'create', 'synthetic private history', 2);",
+        )
+        .unwrap();
+        delete_memory_in_conn(&conn, "target").unwrap();
+        delete_memory_in_conn(&conn, "target").unwrap();
+
+        let rows = list_memories(&conn, true).unwrap();
+        assert_eq!(rows.len(), 2);
+        for id in ["old", "summary"] {
+            let predecessor = rows.iter().find(|memory| memory.id == id).unwrap();
+            assert_eq!(predecessor.forget_stage, "paused");
+            assert_eq!(predecessor.superseded_by, None);
+        }
+        let history: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE memory_id='target'),
+                        COUNT(*) FILTER (WHERE memory_id='old')
+                 FROM memory_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(history, (0, 2));
+        let index: String = conn
+            .query_row("SELECT memory_id FROM memory_index", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(index, "old");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_index", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn host_memory_controls_override_stale_requests_and_session_metadata() {
+        let (_tmp, conn) = setup_db();
+        conn.execute(
+            "INSERT INTO sessions (id, title, created_at, updated_at) VALUES ('s', 'session', 1, 1)",
+            [],
+        ).unwrap();
+        resolve_reply_memory_controls(&conn, "s", Some(true), Some(true)).unwrap();
+        write_memory_controls(&conn, MemoryControls::OFF).unwrap();
+        assert_eq!(
+            resolve_reply_memory_controls(&conn, "s", None, None).unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_reply_memory_controls(&conn, "s", Some(true), Some(true)).unwrap(),
+            (false, false)
+        );
+        write_memory_controls(
+            &conn,
+            MemoryControls {
+                use_long_term_memory: true,
+                evolution_enabled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_reply_memory_controls(&conn, "s", None, None).unwrap(),
+            (true, false)
+        );
+    }
+
+    #[test]
     fn reply_memory_controls_survive_restart_and_partial_requests_without_erasing_metadata() {
         let (tmp, conn) = setup_db();
         conn.execute("INSERT INTO sessions(id,title,created_at,updated_at,metadata) VALUES ('controls','test',1,1,?1)",
@@ -2679,6 +3264,175 @@ mod tests {
             validate_direct_memory_write(&direct_memory_input("auto_evolution", true)).is_err()
         );
         assert!(validate_direct_memory_write(&direct_memory_input("user", false)).is_err());
+    }
+
+    #[test]
+    fn memory_edits_detect_legacy_duplicates_and_reclaim_stale_hashes() {
+        let (_tmp, conn) = setup_db();
+        let original = direct_memory_input("user", true);
+        save_memory_impl(&conn, direct_memory_input("user", true)).unwrap();
+        conn.execute("INSERT INTO memories(id,scope,category,content,importance,source,created_at,updated_at) VALUES('legacy','global','knowledge','Legacy duplicate target',3,'user',1,1)", []).unwrap();
+        assert!(
+            update_memory_content_impl(&conn, &original.id, "Legacy duplicate target")
+                .unwrap_err()
+                .contains("已有相同正文")
+        );
+        conn.execute(
+            "UPDATE memories SET content_hash=?1 WHERE id='legacy'",
+            [compute_content_hash(
+                "global",
+                "knowledge",
+                "New unique content",
+            )],
+        )
+        .unwrap();
+        update_memory_content_impl(&conn, &original.id, "New unique content").unwrap();
+        let legacy: (String, Option<String>) = conn
+            .query_row(
+                "SELECT content,content_hash FROM memories WHERE id='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, ("Legacy duplicate target".into(), None));
+    }
+
+    #[test]
+    fn memory_writes_roll_back_when_the_history_insert_fails() {
+        let (_tmp, conn) = setup_db();
+        let original = direct_memory_input("user", true);
+        save_memory_impl(&conn, direct_memory_input("user", true)).unwrap();
+        conn.execute_batch("CREATE TEMP TRIGGER reject_memory_history BEFORE INSERT ON memory_history BEGIN SELECT RAISE(ABORT, 'test history unavailable'); END;").unwrap();
+        let mut different = direct_memory_input("user", true);
+        different.id = "new".into();
+        different.content = "New knowledge".into();
+        assert!(save_memory_impl(&conn, different)
+            .unwrap_err()
+            .contains("test history unavailable"));
+        assert!(save_memory_impl(&conn, direct_memory_input("user", true)).is_err());
+        assert!(update_memory_content_impl(&conn, &original.id, "Updated knowledge").is_err());
+        assert!(forget_memory_in_conn(&conn, &original.id).is_err());
+        let state: (String, String, i64, String) = conn
+            .query_row(
+                "SELECT content,forget_stage,frequency,source FROM memories WHERE id=?1",
+                [&original.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (original.content, "active".into(), 0, "user".into()));
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM memory_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn memory_vector_search_excludes_inactive_replaced_and_session_records() {
+        unsafe {
+            crate::vector_store::load_extension_globally();
+        }
+        let (_tmp, conn) = setup_db();
+        crate::vector_store::init_vector_table(&conn).unwrap();
+        let embedding = bincode::serialize(&vec![0.25f64; 1536]).unwrap();
+        for (id, scope, stage, replacement) in [
+            ("active", "global", "active", None),
+            ("paused", "global", "paused", None),
+            ("replaced", "global", "active", Some("active")),
+            ("session", "session", "active", None),
+        ] {
+            conn.execute("INSERT INTO memories(id,scope,category,content,importance,forget_stage,superseded_by,embedding,created_at,updated_at) VALUES(?1,?2,'fact',?1,5,?3,?4,?5,1,1)", params![id, scope, stage, replacement, embedding]).unwrap();
+            let rowid = crate::vector_store::get_or_create_rowid(&conn, id).unwrap();
+            crate::vector_store::upsert_embedding(&conn, rowid, &[0.25; 1536]).unwrap();
+        }
+        let query = [0.25; 1536];
+        assert_eq!(
+            crate::vector_store::find_nearest(&conn, &query, 8)
+                .unwrap()
+                .len(),
+            4
+        );
+        for fallback in [false, true] {
+            if fallback {
+                conn.execute("DELETE FROM memory_vectors", []).unwrap();
+            }
+            let results = find_active_memory_vectors(&conn, &query, 8, 0.7).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].memory_id, "active");
+        }
+    }
+
+    #[test]
+    fn readding_memory_does_not_report_success_for_paused_or_replaced_records() {
+        let (_tmp, conn) = setup_db();
+        let input = || direct_memory_input("user", true);
+        assert_eq!(save_memory_impl(&conn, input()).unwrap(), "memory-1");
+        let mut duplicate = input();
+        duplicate.id = "duplicate".into();
+        assert_eq!(save_memory_impl(&conn, duplicate).unwrap(), "memory-1");
+        set_memory_paused_in_conn(&conn, "memory-1", true).unwrap();
+        assert!(save_memory_impl(&conn, input())
+            .unwrap_err()
+            .contains("未参与召回"));
+        let mut replacement = input();
+        replacement.id = "replacement".into();
+        replacement.content = "Release notes should list highlights".into();
+        save_memory_impl(&conn, replacement).unwrap();
+        conn.execute(
+            "UPDATE memories SET superseded_by='replacement' WHERE id='memory-1'",
+            [],
+        )
+        .unwrap();
+        assert!(save_memory_impl(&conn, input())
+            .unwrap_err()
+            .contains("替代记录"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT frequency FROM memories WHERE id='memory-1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn saving_a_stale_hash_uses_current_content_and_keeps_history() {
+        let (_tmp, conn) = setup_db();
+        save_memory_impl(&conn, direct_memory_input("user", true)).unwrap();
+        conn.execute(
+            "UPDATE memories SET content='Corrected release instructions' WHERE id='memory-1'",
+            [],
+        )
+        .unwrap();
+        let mut original = direct_memory_input("user", true);
+        original.id = "new-source".into();
+        assert_eq!(save_memory_impl(&conn, original).unwrap(), "new-source");
+        assert_eq!(
+            conn.query_row(
+                "SELECT content FROM memories WHERE id='memory-1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Corrected release instructions"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM memory_history WHERE operation='create'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]

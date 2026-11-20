@@ -346,6 +346,38 @@ button.lg {
   opacity: 0.5;
 }
 
+.ui-radio-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px;
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-subtle);
+}
+
+.ui-radio-choices .ui-radio-choice { position: relative; display: block; min-width: 0; }
+.ui-radio-choice input[type='radio'] { position: absolute; width: 1px; height: 1px; margin: 0; padding: 0; clip-path: inset(50%); }
+.ui-radio-choice > span {
+  display: block;
+  min-height: 30px;
+  padding: 5px var(--ui-space-2);
+  border-radius: calc(var(--ui-radius-control) - 2px);
+  color: var(--color-text-secondary);
+  font-size: var(--ui-size-sm);
+  font-weight: var(--ui-weight-title);
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.ui-radio-choice input:checked + span { background: var(--ui-accent-soft); color: var(--ui-accent-text); }
+.ui-radio-choice input:not(:checked, :disabled) + span:hover { background: var(--ui-hover); color: var(--color-text); }
+.ui-radio-choice input:focus-visible + span { outline: 2px solid var(--ui-focus); outline-offset: -2px; }
+.ui-radio-choice input:disabled + span { opacity: .55; cursor: default; }
+
 .ui-dialog-overlay {
   position: fixed;
   inset: 0;

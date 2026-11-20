@@ -1,7 +1,7 @@
-import { useEffect, useId, useRef, useState } from 'react';
-import { getWorkspaceAutomationOverview, type WorkspaceAutomationStatus } from '$lib/commands/automation';
-import { subscribeAutomationUpdates } from '$lib/automation-events';
+import { useId } from 'react';
+import type { WorkspaceAutomationStatus } from '$lib/commands/automation';
 import { useNavigationStore } from '$stores/navigation';
+import { useWorkspaceAutomationOverview } from '$stores/workspaceAutomationOverview';
 import './WorkspaceReminders.css';
 
 const MAX_REMINDERS = 3;
@@ -106,12 +106,6 @@ function displayTime(timestamp: number, now: Date): string {
     : `${date.toLocaleDateString([], { month: 'numeric', day: 'numeric' })} ${time}`;
 }
 
-interface ReminderSnapshot {
-  workspaceId: string;
-  automations: WorkspaceAutomationStatus[];
-  truncated: boolean;
-}
-
 export interface WorkspaceRemindersProps {
   workspaceId: string | null | undefined;
   defaultOpen?: boolean;
@@ -120,54 +114,15 @@ export interface WorkspaceRemindersProps {
 
 /** Read-only automation recall for the one Main conversation; never schedules work. */
 export function WorkspaceReminders({ workspaceId, defaultOpen = false, compact = false }: WorkspaceRemindersProps) {
-  const [snapshot, setSnapshot] = useState<ReminderSnapshot | null>(null);
-  const [failedWorkspaceId, setFailedWorkspaceId] = useState<string | null>(null);
-  const refreshRef = useRef<() => void>(() => {});
+  const { overview: currentSnapshot, failed: refreshFailed, refresh } = useWorkspaceAutomationOverview(workspaceId);
   const setPage = useNavigationStore((state) => state.setPage);
   const openAutomation = useNavigationStore((state) => state.openAutomation);
   const headingId = useId();
 
-  useEffect(() => {
-    let disposed = false;
-    let latestRequest = 0;
-    setSnapshot(null);
-    setFailedWorkspaceId(null);
-    refreshRef.current = () => {};
-    if (!workspaceId) return;
-
-    const refresh = async () => {
-      const request = ++latestRequest;
-      try {
-        const overview = await getWorkspaceAutomationOverview(workspaceId);
-        if (!disposed && request === latestRequest) {
-          setSnapshot({ workspaceId, automations: overview.items, truncated: overview.truncated });
-          setFailedWorkspaceId(null);
-        }
-      } catch {
-        // Keep known results visible while a refresh fails; chat remains usable.
-        if (!disposed && request === latestRequest) setFailedWorkspaceId(workspaceId);
-      }
-    };
-
-    refreshRef.current = () => { void refresh(); };
-    void refresh();
-    const unsubscribe = subscribeAutomationUpdates(() => { void refresh(); });
-    window.addEventListener('focus', refresh);
-    return () => {
-      disposed = true;
-      refreshRef.current = () => {};
-      unsubscribe();
-      window.removeEventListener('focus', refresh);
-    };
-  }, [workspaceId]);
-
-  // Hide the previous space synchronously, before the next effect runs.
   if (!workspaceId) return null;
-  const currentSnapshot = snapshot?.workspaceId === workspaceId ? snapshot : null;
-  const refreshFailed = failedWorkspaceId === workspaceId;
   if (!currentSnapshot && !refreshFailed) return null;
   const now = new Date();
-  const items = scopedAutomations(currentSnapshot?.automations ?? [], workspaceId);
+  const items = scopedAutomations(currentSnapshot?.items ?? [], workspaceId);
   const pending = pendingAutomations(items, workspaceId);
   const triggered = pickTodayTriggeredAutomations(items, now, workspaceId);
   const results = items.filter((item) => item.latestRun || isValidTimestamp(item.lastSkippedAt))
@@ -272,7 +227,7 @@ export function WorkspaceReminders({ workspaceId, defaultOpen = false, compact =
         {currentSnapshot?.truncated && <p className="workspace-reminders-note">当前仅显示部分事项；完整记录请查看自动化页。</p>}
         <div className="workspace-reminders-actions">
           <button type="button" onClick={() => setPage('tasks')}>查看自动化页</button>
-          <button type="button" onClick={() => refreshRef.current()}>刷新</button>
+          <button type="button" onClick={refresh}>刷新</button>
         </div>
       </div>
     </details>

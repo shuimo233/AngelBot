@@ -67,7 +67,12 @@ describe('MessageActions', () => {
     expect(save).toHaveBeenCalledTimes(4);
     rerender(<MessageActions message={reply} isStreaming />);
     expect(screen.queryByText('保存回复…')).not.toBeInTheDocument();
-    expect(screen.getByText('复制')).toBeVisible();
+    expect(screen.queryByRole('button', { name: '复制' })).not.toBeInTheDocument();
+    rerender(<MessageActions message={{ ...reply, content: '' }} isStreaming />);
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    rerender(<MessageActions message={{ ...reply, content: '最终回复' }} />);
+    expect(screen.getByRole('button', { name: '复制' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '保存回复…' })).toBeVisible();
   });
 
   it('uses a labeled editor with cancel and resend actions for user messages', async () => {
@@ -146,6 +151,9 @@ describe('MessageActions', () => {
       const changed = { ...original, content: 'new streaming content' };
       rerender(<MessageActions message={changed} onCopy={onCopy} isStreaming />);
       expect(screen.queryByText('已复制')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '复制' })).not.toBeInTheDocument();
+      expect(write).toHaveBeenCalledTimes(1);
+      rerender(<MessageActions message={changed} onCopy={onCopy} />);
       write.mockResolvedValueOnce();
       await act(async () => fireEvent.click(screen.getByRole('button', { name: '复制' })));
       expect(write).toHaveBeenLastCalledWith(changed.content);
@@ -175,8 +183,7 @@ describe('MessageActions', () => {
       rerender(<MessageActions message={other} onCopy={onCopy} disabled />);
       expect(screen.getByRole('button', { name: '复制' })).toBeDisabled();
       rerender(<MessageActions message={{ ...other, content: ' \n' }} onCopy={onCopy} isStreaming />);
-      expect(screen.getByRole('button', { name: '复制' })).toBeDisabled();
-      fireEvent.click(screen.getByRole('button', { name: '复制' }));
+      expect(screen.queryByRole('button', { name: '复制' })).not.toBeInTheDocument();
       expect(onCopy).toHaveBeenCalledTimes(2);
       if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard);
       rerender(<MessageActions message={other} onCopy={onCopy} />);

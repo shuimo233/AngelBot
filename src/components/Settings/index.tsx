@@ -3,6 +3,7 @@ import { SettingsRouter } from './SettingsRouter';
 import type { SettingsPage } from './types';
 import { hasUnsavedApiConfig, useSettingsStore } from '$stores/settings';
 import { useDialogFocus } from '$lib/useDialogFocus';
+import { InlineNotice } from '../../ui';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -11,7 +12,7 @@ interface SettingsModalProps {
 }
 
 export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: SettingsModalProps) {
-  const [activePage, setActivePage] = useState<SettingsPage>('personality');
+  const [activePage, setActivePage] = useState<SettingsPage>(initialPage);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState('');
   const [closeRequested, setCloseRequested] = useState(false);
@@ -23,6 +24,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
   const activeApiConfig = useSettingsStore((s) => s.activeApiConfig);
   const discardApiConfigDraft = useSettingsStore((s) => s.discardApiConfigDraft);
   const profile = useSettingsStore((s) => s.profile);
+  const activeProfile = useSettingsStore((s) => s.activeProfile);
   const apiConfigLoadError = useSettingsStore((s) => s.apiConfigLoadError);
   const savedApiConfig = useRef(apiConfig);
   const savedProfile = useRef(profile);
@@ -30,7 +32,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
   activePageRef.current = activePage;
   const openGeneration = useRef(0);
   const unsaved = hasUnsavedApiConfig(apiConfig, activeApiConfig)
-    || JSON.stringify(profile) !== JSON.stringify(savedProfile.current);
+    || JSON.stringify(profile) !== JSON.stringify(activeProfile);
   const requiresExplicitSave = activePage === 'personality' || activePage === 'api';
   const requestClose = useCallback(() => {
     if (saveState === 'saving' || saveState === 'error' || unsaved) setCloseRequested(true);
@@ -48,8 +50,9 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
       setCloseRequested(false);
       setSaveState('idle');
       setSaveError('');
-      loadProfile();
-      savedProfile.current = useSettingsStore.getState().profile;
+      const { profile: draft, activeProfile } = useSettingsStore.getState();
+      if (draft === activeProfile) loadProfile();
+      savedProfile.current = useSettingsStore.getState().activeProfile;
       loadApiConfig();
     }
     return () => { ++openGeneration.current; };
@@ -106,6 +109,22 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
 
   if (!isOpen) return null;
 
+  const saveHint = saveState === 'error'
+    ? activePage === 'api' && apiConfigLoadError
+      ? `无法确认模型配置已生效。${apiConfigLoadError}`
+      : `${activePage === 'api' ? '模型配置' : '性格修改'}保存未能确认成功${saveError ? `：${saveError}` : '，请检查后重试'}`
+    : '';
+
+  const saveAction = requiresExplicitSave && (
+    <button
+      className={`settings-save-btn ${saveState === 'saved' ? 'success' : ''}`}
+      onClick={() => { void handleSave(); }}
+      disabled={saveState === 'saving'}
+    >
+      {saveState === 'saved' ? '已保存' : saveState === 'saving' ? '保存中…' : saveState === 'error' ? '重试保存' : '保存'}
+    </button>
+  );
+
   return (
     <div className="settings-overlay" onClick={requestClose}>
       <div
@@ -114,7 +133,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-dialog-title"
-        aria-describedby="settings-save-hint"
+        aria-describedby={saveHint ? 'settings-save-hint' : undefined}
         tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
@@ -126,36 +145,15 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
             </svg>
           </button>
           <h2 id="settings-dialog-title" className="settings-header-title">设置</h2>
-          <span id="settings-save-hint" className={`settings-save-hint${saveState === 'error' ? ' is-error' : ''}`} role={saveState === 'error' ? 'alert' : undefined}>
-            {saveState === 'error'
-              ? activePage === 'api' && apiConfigLoadError
-                ? `无法确认模型配置已生效。${apiConfigLoadError}`
-                : `${activePage === 'api' ? '模型配置' : '性格修改'}保存未能确认成功${saveError ? `：${saveError}` : '，请检查后重试'}`
-              : activePage === 'api' ? '模型与凭据修改需保存' : activePage === 'personality' ? '性格修改需保存' : activePage === 'webSearch' ? '联网搜索配置需在页面内保存' : '此页设置即时生效'}
-          </span>
-          {requiresExplicitSave && (
-            <button
-              className={`settings-save-btn ${saveState === 'saved' ? 'success' : ''}`}
-              onClick={() => { void handleSave(); }}
-              disabled={saveState === 'saving'}
-            >
-              {saveState === 'saved' ? (
-                <>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="20 6 9 17 4 12" />
-                  </svg>
-                  已保存
-                </>
-              ) : saveState === 'saving' ? '保存中…' : saveState === 'error' ? '重试保存' : '保存'}
-            </button>
-          )}
+          {saveHint && <InlineNotice id="settings-save-hint" className="settings-save-error" tone="danger">{saveHint}</InlineNotice>}
+          {activePage !== 'api' && saveAction}
         </div>
         {closeRequested && <div className="settings-leave-prompt" role="alert">
           <p>{saveState === 'saving'
             ? '正在保存，完成后将核对是否可以关闭。关闭设置不会取消已提交的保存。'
             : saveState === 'error'
               ? '本次保存未能确认成功。请先核对配置；关闭不会自动重试保存。'
-              : '还有未保存的模型或性格修改，离开前请保存，或明确放弃修改。'}</p>
+              : '还有未保存的模型或性格修改。'}</p>
           <div>
             <button type="button" onClick={() => setCloseRequested(false)}>继续编辑</button>
             <button type="button" disabled={saveState === 'saving'} onClick={() => {
@@ -166,7 +164,7 @@ export function SettingsModal({ isOpen, initialPage = 'personality', onClose }: 
             }}>放弃未保存修改并关闭</button>
           </div>
         </div>}
-        <SettingsRouter activePage={activePage} onNavigate={setActivePage} />
+        <SettingsRouter activePage={activePage} onNavigate={setActivePage} apiSaveAction={activePage === 'api' ? saveAction : null} />
       </div>
     </div>
   );

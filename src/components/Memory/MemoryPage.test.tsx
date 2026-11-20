@@ -5,7 +5,9 @@ import { MemoryPage } from './MemoryPage';
 import { getMemories, type RustMemory } from '$lib/commands/memory';
 
 vi.mock('$lib/commands/memory', () => ({ getMemories: vi.fn() }));
-vi.mock('../Settings/pages/MemoryGovernanceSettings', () => ({ MemoryGovernanceSettings: () => <p>已有记忆管理</p> }));
+vi.mock('../Settings/pages/MemoryGovernanceSettings', () => ({
+  MemoryGovernanceSettings: ({ focusedMemoryId }: { focusedMemoryId?: string }) => <p>{focusedMemoryId ?? '已有记忆管理'}</p>,
+}));
 const base: RustMemory = { id: 'pref', scope: 'global', category: 'preference', content: '先说结论', importance: 4, source: 'user', frequency: 0, last_mentioned: null, is_permanent: true, embedding: null, decay_factor: 1, forget_stage: 'active', created_at: 1, updated_at: 1 };
 
 it('distinguishes personal memory from saved reference content and keeps the existing management path', async () => {
@@ -28,4 +30,14 @@ it('does not show a first-use guide for a pending or failed read', async () => {
   expect(screen.getByRole('status')).toHaveTextContent('正在读取');
   expect(await screen.findByRole('alert')).toHaveTextContent('无法读取');
   expect(screen.queryByText('还没有可显示的长期记忆')).not.toBeInTheDocument();
+});
+
+it('opens the exact memory even when two entries have the same wording', async () => {
+  vi.mocked(getMemories).mockResolvedValue([base, { ...base, id: 'other-pref', scope: 'project' }]);
+  const user = userEvent.setup();
+  render(<MemoryPage />);
+  const actions = await screen.findAllByRole('button', { name: '查看与更正' });
+  await user.click(actions[1]);
+  expect(screen.getByText('other-pref')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '返回记忆概览' })).toHaveFocus();
 });

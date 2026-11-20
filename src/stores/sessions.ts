@@ -3,6 +3,7 @@ import type { Session } from '$types';
 import { getSessions, createSession as apiCreate, deleteSession as apiDelete } from '$lib/commands';
 import { updateSessionTitle as apiUpdateTitle, updateSessionModel as apiUpdateModel } from '$lib/commands/session';
 import { useSettingsStore } from '$stores/settings';
+import { useMessagesStore } from './messages';
 
 interface SessionsState {
   sessions: Session[];
@@ -116,6 +117,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
 
   deleteSession: async (id: string) => {
     await apiDelete(id);
+    useMessagesStore.getState().forgetInput(id);
     set((state) => {
       const sessions = state.sessions.filter((s) => s.id !== id);
       return {

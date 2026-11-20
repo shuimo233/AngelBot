@@ -30,6 +30,46 @@ CONFIRMED_TEXT = "Native UIA confirmed replacement — 中文"
 FIXTURE_STARTUP_TIMEOUT = 60.0
 
 
+@contextlib.contextmanager
+def desktop_runtime_directory(prefix: str, keep_data: bool = False) -> Iterator[Path]:
+    if keep_data:
+        yield Path(tempfile.mkdtemp(prefix=prefix))
+        return
+
+    directory = tempfile.TemporaryDirectory(prefix=prefix)
+    runtime = Path(directory.name)
+    owned_path = runtime.resolve()
+
+    def cleanup() -> None:
+        # WebView2 can release its profile lock shortly after the app exits.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if runtime.resolve() != owned_path:
+                    raise OSError("Owned desktop runtime path changed before cleanup.")
+                directory.cleanup()
+                return
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 32:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.2, remaining))
+
+    try:
+        yield runtime
+    except BaseException as run_error:
+        try:
+            cleanup()
+        except OSError as cleanup_error:
+            # Keep the test failure primary while retaining cleanup evidence.
+            raise run_error from cleanup_error
+        raise
+    else:
+        cleanup()
+
+
 def build_cargo_binary(*, library_test: bool) -> Path:
     command = ["cargo", "test" if library_test else "build", "--offline", "--manifest-path", "src-tauri/Cargo.toml"]
     command.extend(["--lib", "--no-run"] if library_test else ["--bin", "angelbot"])

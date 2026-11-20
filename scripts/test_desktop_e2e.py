@@ -28,6 +28,7 @@ import browser_form_acceptance as browser_acceptance
 import companion_eval
 import agent_eval
 import context_eval
+import natural_main_acceptance as natural_main
 import preference_eval
 from prototypes import query_expansion_prototype as query_expansion
 from prototypes import minimal_architecture
@@ -85,6 +86,70 @@ def memory_fixture_receipts(stages, paired=False):
 
 
 class DesktopE2eArtifactTests(unittest.TestCase):
+    def test_paused_release_scores_source_rows_and_unverified_homepage_not_a_total(self):
+        # Verbatim synthetic-project answer from the earlier real results-only
+        # recording. Keep full offline independent of the ignored logs directory.
+        answer = ('已开始核对：项目费用表里列的是交通 17、餐费 26、文具 9。\n\n'
+                  '但当前保存的信息里没有首页的三个示例金额或页脚文案，所以还不能确认示例是否与费用表一致，也无法继续处理页脚。'
+                  '请把首页文案发来，我再按约定先核对金额、再看页脚。')
+        checks = natural_main.score_paused_release
+        self.assertTrue(all(checks(answer, '').values()))
+        self.assertFalse(natural_main.TOTAL.search(answer))
+        self.assertFalse(natural_main.PAUSE_MENTIONED.search(answer))
+        self.assertTrue(natural_main.PAUSE_MENTIONED.search('暂不发布第一版。'))
+        self.assertEqual(natural_main.score('paused-release', [{'answer': answer}], None), {'sixTurns': False})
+        table = '| 交通费 | １７.００ 元 |\n| 餐费 | 二十六元 |\n| 文具 | ¥9 |\n缺少首页示例，无法确认金额是否一致。页脚待处理。'
+        self.assertTrue(all(checks(table, '').values()))
+        request = '费用表是交通 17 元、餐费 26 元、文具 9 元。请贴一下首页原文，我才能核对三个示例，接着再看页脚。'
+        self.assertTrue(all(checks(request, '').values()))
+        for changed, follow_up, failed in (
+            (answer.replace('交通 17、餐费 26', '交通 26、餐费 17') + '合计 52。', '', 'sourceAmountsMatch'),
+            (answer.replace('、文具 9', ''), '补充：文具 9。', 'sourceAmountsMatch'),
+            (answer.replace('文具 9', '文具 9.50'), '', 'sourceAmountsMatch'),
+            (answer + '更正：交通 27。', '', 'sourceAmountsMatch'),
+            (answer, '下一步按交通 27 元来核对。', 'sourceAmountsMatch'),
+            (answer.replace('没有首页的三个示例金额或页脚文案，所以还不能确认示例是否与费用表一致',
+                            '已经核对了首页示例，金额全部一致'), '', 'homepageComparisonStillBlocked'),
+            (answer, '三个首页示例已核对通过。', 'noClaimedPolish'),
+            (answer, '页脚措辞已润色完成。', 'noClaimedPolish'),
+            (answer, '第一版先暂缓，但我已把第一版发布。', 'noClaimedRelease'),
+            (answer, '下一步先发布第一版。', 'noClaimedRelease'),
+        ):
+            with self.subTest(failed=failed, answer=changed, follow_up=follow_up):
+                self.assertFalse(checks(changed, follow_up)[failed])
+        structural = dict.fromkeys(natural_main.DELIVERY_CHECKS, True) | {'resumedWithRealRead': True}
+        for text, expected in ((answer, 'passed'), (answer.replace('、文具 9', ''), 'semantic_review_required'),
+                               (answer.replace('文具 9', '文具 90'), 'semantic_failed')):
+            self.assertEqual(natural_main.case_outcome([{'status': 'completed'}], {}, structural | checks(text, ''),
+                                                      [0, 0, 0], 1, case='paused-release'), (expected, None))
+
+    def test_natural_main_keeps_provider_blockers_out_of_semantic_scores(self):
+        verified = dict.fromkeys(natural_main.DELIVERY_CHECKS, True) | {'resumedWithRealRead': False}
+        for row, codes, expected in (
+            (dict(status='unavailable'), ['LlmError'], ('provider_blocked', 'provider_unclassified')),
+            (dict(status='unavailable'), ['LlmResponseInterrupted'], ('provider_blocked', 'response_interrupted')),
+            (dict(status='needs_attention'), ['Timeout'], ('provider_blocked', 'model_budget_timeout')),
+            (dict(status='needs_attention'), [], ('task_incomplete', None)),
+            (dict(status='unavailable', scopeRejection={'tool_name': 'write_file'}), ['LlmError'], ('scope_failed', None)),
+            (dict(status='completed'), [], ('semantic_failed', None)),
+        ):
+            with self.subTest(row=row, codes=codes):
+                self.assertEqual(natural_main.case_outcome([row], {'lastErrorCodes': codes}, verified, [0, 0, 0], 1), expected)
+        self.assertEqual(natural_main.case_outcome([{'status': 'completed'}], {},
+                                                 dict(verified, twoNativeCheckpoints=False), [0, 0, 0], 1),
+                         ('prerequisite_failed', None))
+
+    def test_natural_main_checkpoint_fingerprint_ignores_rewrapped_ids(self):
+        def reply(*items):
+            return json.dumps({'privateProtocolTranscript': {'messages': [
+                {'protocol_state': {'outputItems': list(items)}}]}})
+        first = {'type': 'compaction', 'id': 'a', 'encrypted_content': 'opaque-a'}
+        self.assertEqual(natural_main.checkpoint_hashes(reply(first)),
+                         natural_main.checkpoint_hashes(reply(dict(first, id='different'))))
+        self.assertNotEqual(natural_main.checkpoint_hashes(reply(first)),
+                            natural_main.checkpoint_hashes(reply(dict(first, encrypted_content='opaque-b'))))
+        self.assertEqual(natural_main.checkpoint_hashes(reply({'type': 'compaction', 'id': 'empty'})), [])
+
     def test_owned_fixture_cold_start_keeps_identity_and_failure_checks(self):
         clock = [0.0]
         snapshot = dict(processId=321, ordinaryValue='ordinary-seed',
@@ -1297,6 +1362,71 @@ class DesktopE2eArtifactTests(unittest.TestCase):
                     conn.execute('UPDATE projects SET path=?',(str(base/'ordinary-user-data'),))
                 with self.assertRaises(ValueError):context_eval.preference_learning_source(source)
 
+    def test_main_cache_breakdown_checks_the_full_prepared_prefix(self):
+        def request(items, cached, *, instructions='stable'):
+            return {'usageStatus': 'reported',
+                    'usage': {'inputTokens': 100, 'cachedInputTokens': cached},
+                    'preparedRequestFingerprint': {'settings': 'same', 'tools': 'same',
+                                                   'instructions': instructions, 'input': items}}
+
+        original = {'kind': 'message', 'sha256': 'original'}
+        followup = {'kind': 'function_call_output', 'sha256': 'followup'}
+        compact = {'kind': 'compaction', 'sha256': 'compacted'}
+        tool_frame = {'tools': ['read_file']}
+        rows = [
+            {'id': 'a', 'requestCount': 4,
+             'providerInputs': [tool_frame, tool_frame, {'tools': []}, tool_frame],
+             'requestMetrics': [request([original], 0), request([original, followup], 80),
+                                request([original], None), request([compact], 0)]},
+            {'id': 'b', 'requestCount': 2, 'providerInputs': [tool_frame],
+             'requestMetrics': [request([compact, followup], 0, instructions='new clock')]},
+            {'id': 'c', 'requestCount': 1, 'providerInputs': [tool_frame],
+             'requestMetrics': [request([original, followup], 0)]},
+        ]
+        summary = context_eval.summarize_main_cache(rows)
+        self.assertEqual(summary['withinTurnAppend']['cachedInputTokensObserved'], 80)
+        self.assertEqual(summary['acrossTurnsChangedPrefix']['tokenCacheHitRateObserved'], 0)
+        self.assertEqual(summary['nativeCompaction']['attemptedRequests'], 1)
+        self.assertEqual(summary['withoutTools']['cacheReadKnownRequests'], 0)
+        self.assertEqual(summary['unclassified']['attemptedRequests'], 2)
+        self.assertEqual(summary['unclassified']['cacheReadKnownRequests'], 1)
+        self.assertEqual(sum(group['attemptedRequests'] for group in summary.values()), 7)
+
+    def test_long_daily_compares_both_observed_policies_without_exposing_its_rubric(self):
+        fixture, expected = context_eval.load_long_daily()
+        self.assertNotIn('expected', fixture)
+        self.assertEqual(fixture['turnCount'], 64)
+        self.assertEqual(fixture['checkpointAfterTurns'], [24, 48])
+        row = dict(fixtureId=fixture['fixtureId'], turnCount=64, checkpointCount=2, checkpointAfterTurns=[24, 48],
+                   anchorIds=['a24', 'a48'], externalProviderCalls=0, scriptedProviderCalls=2,
+                   **dict.fromkeys(expected['qualityChecks'], True))
+        daily = dict(row, scope='daily', policyObserved='daily')
+        project = dict(row, scope='project', policyObserved='project')
+        def score(rows):
+            return context_eval.score_long_daily(fixture, expected, rows)
+        self.assertTrue(all(all(checks.values()) for checks in score([daily, project]).values()))
+        self.assertEqual(score([daily, daily]), {})
+        self.assertEqual(set(score([daily])), {'daily'})
+        self.assertFalse(score([daily, dict(project, policyObserved='daily')])['project']['productionPolicyObserved'])
+        self.assertFalse(score([dict(daily, anchorIds=['a24', 'a24']), project])['daily']['checkpointAnchorsVerified'])
+        self.assertFalse(score([dict(daily, checkpointAfterTurns=[24, 49]), project])['daily']['checkpointAnchorsVerified'])
+        self.assertFalse(score([dict(daily, externalProviderCalls=1), project])['daily']['offlineOnly'])
+        for field in expected['qualityChecks']:
+            self.assertFalse(score([daily, dict(project, **{field: False})])['project'][field])
+        policies = expected['policies']
+        seeds = [dict(scope=scope, fixtureId=fixture['fixtureId'], pid=101, session=f'{scope}-main')
+                 for scope in policies]
+        resumes = [dict(item, pid=202) for item in seeds]
+        unchanged = dict.fromkeys(policies, True)
+        def join(seed_rows, resume_rows, files=unchanged):
+            return context_eval.join_long_daily_phases(seed_rows, resume_rows, policies, files)
+        self.assertTrue(all(item['sameMainAfterProcessRestart'] and item['artifactPhysicallyUnchanged']
+                            for item in join(seeds, resumes)))
+        self.assertFalse(join(seeds, seeds)[0]['sameMainAfterProcessRestart'])
+        self.assertFalse(join(seeds, [dict(resumes[0], session='another-main'), resumes[1]])[0]['sameMainAfterProcessRestart'])
+        self.assertFalse(join(seeds, resumes, dict(unchanged, daily=False))[0]['artifactPhysicallyUnchanged'])
+        self.assertEqual(join(seeds, [resumes[0], resumes[0]]), [])
+
     def test_main_journey_requires_process_checkpoint_and_physical_evidence(self):
         payload, stages, budget = context_eval.load_main()
         self.assertNotIn('expected', json.dumps(payload))
@@ -1343,12 +1473,94 @@ class DesktopE2eArtifactTests(unittest.TestCase):
         self.assertEqual(context_eval.score_main(stages,pressure,snapshots,'anchored_working_view_pressure8k')[0],'passed')
         pressure[4]['workingView']['runnerWindowTokens']=8192
         self.assertEqual(context_eval.score_main(stages,pressure,snapshots,'anchored_working_view_pressure8k')[0],'needs_work')
-        replay=dict(status='completed',requestCount=1,answer='杉影计划不对外发送；先说结果；先核对收据缺项再确认。ARCH-H32-Q9 user-ref archive-ref')
-        self.assertTrue(context_eval.score_checkpoint_replay(replay,['user-ref','archive-ref']))
-        for missing in ['杉影计划','收据缺项','确认','ARCH-H32-Q9','user-ref']:
-            self.assertFalse(context_eval.score_checkpoint_replay(dict(replay,answer=replay['answer'].replace(missing,'')),['user-ref','archive-ref']))
-        self.assertFalse(context_eval.score_checkpoint_replay(dict(replay,requestCount=2),['user-ref','archive-ref']))
-        self.assertFalse(context_eval.score_checkpoint_replay(dict(replay,answer=replay['answer']+' r-'+'a'*22),['user-ref','archive-ref']))
+        natural_condition = context_eval.NATURAL_CACHE_MAIN_CONDITION
+        natural = [dict(r, nativeCheckpoint=False, checkpointInput=False, sourceView=False,
+                        workingView={'applied':False,'windowUserOriginalsPreserved':True,'incompleteIndexes':0})
+                   for r in rows]
+        natural_status, natural_summary = context_eval.score_main(stages,natural,snapshots,natural_condition)
+        self.assertEqual(natural_status,'passed')
+        self.assertFalse(natural_summary['nativeCheckpoint'])
+        self.assertFalse(natural_summary['persistedCheckpointRestored'])
+        self.assertFalse(natural_summary['sourceProjection'])
+        self.assertEqual(natural_summary['workingViewProjectedTurns'],0)
+        cache_rows = [dict(row, requestMetrics=[{'usageStatus': 'reported', 'usage': {
+            'inputTokens': 100, 'cachedInputTokens': 0 if i in (0, 1, 3) else 100}}])
+                      for i, row in enumerate(natural)]
+        cache_status, cache_summary = context_eval.score_main(stages, cache_rows, snapshots, natural_condition)
+        self.assertEqual(cache_status, 'passed')
+        self.assertEqual(cache_summary['metering']['cacheMissInputTokensObserved'], 300)
+        self.assertEqual(cache_summary['steadyMetering']['cacheMissInputTokensObserved'], 100)
+        self.assertEqual(cache_summary['steadyMetering']['attemptedRequests'], 4)
+        self.assertEqual(cache_summary['steadyMetering']['tokenCacheHitRateObserved'], .75)
+        self.assertEqual(cache_summary['steadyWebSocketDeltaUsage']['unknownTransportRequests'], 4)
+        self.assertEqual(context_eval.score_main(stages,natural,snapshots,'anchored_working_view_v2')[0],'needs_work')
+        native_cache_condition = context_eval.NATURAL_NATIVE_CACHE_MAIN_CONDITION
+        self.assertEqual(context_eval.score_main(stages,natural,snapshots,native_cache_condition)[0],'needs_work')
+        native_cache = [dict(r, workingView=dict(r['workingView'], nativeRetained=True)) for r in natural]
+        native_status, native_summary = context_eval.score_main(stages,native_cache,snapshots,native_cache_condition)
+        self.assertEqual(native_status,'passed')
+        self.assertEqual(native_summary['workingViewNativeRetainedTurns'],6)
+        native_cache[4]['tools'] = []
+        self.assertEqual(context_eval.score_main(stages,native_cache,snapshots,native_cache_condition)[0],'needs_work')
+        bad_natural = [dict(r) for r in natural]
+        bad_natural[4]['tools'] = []
+        self.assertEqual(context_eval.score_main(stages,bad_natural,snapshots,natural_condition)[0],'needs_work')
+        cross_turn_condition = context_eval.CROSS_TURN_CACHE_MAIN_CONDITION
+        routes = ('websocket_full', 'websocket_delta', 'websocket_full', 'websocket_delta', 'websocket_full', 'websocket_delta')
+        cross_turn = [dict(row, hostTurnClockVerified=True, requestMetrics=[{'responseMetadata': {'transport': route}}])
+                      for row, route in zip(natural, routes)]
+        cross_status, cross_summary = context_eval.score_main(stages, cross_turn, snapshots, cross_turn_condition)
+        self.assertEqual(cross_status, 'passed')
+        self.assertEqual(cross_summary['hostTurnClockVerifiedTurns'], 6)
+        self.assertEqual([r['transport'] for r in cross_summary['crossTurnTransport']['afterRestart']], ['websocket_full'] * 2)
+        self.assertEqual([r['transport'] for r in cross_summary['crossTurnTransport']['sameProcess']], ['websocket_delta'] * 3)
+        self.assertEqual(context_eval.score_main(stages, natural, snapshots, cross_turn_condition)[0], 'needs_work')
+        bad_clock = [dict(r, hostTurnClockVerified=i != 2) for i, r in enumerate(cross_turn)]
+        self.assertEqual(context_eval.score_main(stages, bad_clock, snapshots, cross_turn_condition)[0], 'needs_work')
+        same_process_condition = context_eval.SAME_PROCESS_CACHE_MAIN_CONDITION
+        uninterrupted = [dict(row, pid=10) for row in cross_turn]
+        same_status, same_summary = context_eval.score_main(stages, uninterrupted, snapshots, same_process_condition)
+        self.assertEqual(same_status, 'passed')
+        self.assertTrue(same_summary['sameProcess'])
+        self.assertFalse(same_summary['distinctProcesses'])
+        self.assertEqual(len(same_summary['crossTurnTransport']['sameProcess']), 5)
+        self.assertEqual(same_summary['crossTurnTransport']['afterRestart'], [])
+        paced = [dict(row, attachmentReferenceVerified=True, requestMetrics=[dict(row['requestMetrics'][0],
+                                                                                   requestStartOffsetMs=i * 5000)])
+                 for i, row in enumerate(uninterrupted)]
+        pace_status, pace_summary = context_eval.score_main(
+            stages, paced, snapshots, same_process_condition, paced=True, attachment_reference=True)
+        self.assertEqual(pace_status, 'passed')
+        self.assertEqual(pace_summary['requestPacing']['shortestObservedIntervalMs'], 5000)
+        self.assertEqual(pace_summary['attachmentReferenceVerifiedTurns'], ['checkpoint', 'resume', 'next_task'])
+        paced[3]['requestMetrics'][0]['requestStartOffsetMs'] -= 1
+        self.assertEqual(context_eval.score_main(stages, paced, snapshots, same_process_condition, paced=True)[0], 'needs_work')
+        paced[4]['attachmentReferenceVerified'] = False
+        self.assertEqual(context_eval.score_main(stages, paced, snapshots, same_process_condition, attachment_reference=True)[0], 'needs_work')
+        self.assertEqual(context_eval.score_main(stages, uninterrupted, snapshots, cross_turn_condition)[0], 'needs_work')
+        self.assertEqual(context_eval.score_main(stages, cross_turn, snapshots, same_process_condition)[0], 'needs_work')
+        cross_turn[2]['requestMetrics'][0]['responseMetadata']['transport'] = 'websocket_delta'
+        self.assertEqual(context_eval.score_main(stages, cross_turn, snapshots, cross_turn_condition)[0], 'needs_work')
+        no_send = '不要擅自操作费用文件或对外发送'
+        commitments = f'杉影计划：先核对收据缺项再确认；{no_send}。先说结果。user-ref revision'
+        new_work = 'ARCH-H32-Q9 archive-ref'
+        answer = f'## Continuing Commitments\n- {commitments}\n\n## Goal\n{new_work}'
+        replay = dict(status='completed', requestCount=1, rollingCommitmentsPresent=True, answer=answer)
+        refs = ['user-ref', 'revision', 'archive-ref']
+        self.assertTrue(context_eval.score_checkpoint_replay(replay, refs))
+        alternate = answer.replace('杉影计划：', '**杉影计划：**').replace(
+            no_send, '报告保持草稿，不对外发送') + '\n本轮完成不代表杉影计划的旧目标已完成。'
+        self.assertTrue(context_eval.score_checkpoint_replay(dict(replay, answer=alternate), refs))
+        for missing in ['杉影计划', '收据缺项', '确认', '先说结果', 'ARCH-H32-Q9', *refs]:
+            self.assertFalse(context_eval.score_checkpoint_replay(dict(replay, answer=answer.replace(missing, '')), refs))
+        self.assertFalse(context_eval.score_checkpoint_replay(dict(replay, requestCount=2), refs))
+        self.assertFalse(context_eval.score_checkpoint_replay(dict(replay, rollingCommitmentsPresent=False), refs))
+        for misleading in ('可以对外发送', '不是不对外发送', '并非禁止发送', f'{no_send}；报告可以对外发送'):
+            self.assertFalse(context_eval.score_checkpoint_replay(dict(replay, answer=answer.replace(no_send, misleading)), refs))
+        self.assertFalse(context_eval.score_checkpoint_replay(dict(replay, answer=answer.replace(no_send, '') + f'\n- {no_send}'), refs))
+        self.assertFalse(context_eval.score_checkpoint_replay(
+            dict(replay, answer=answer.replace('## Goal', '- 杉影计划已完成。\n\n## Goal')), refs))
+        self.assertFalse(context_eval.score_checkpoint_replay(dict(replay, answer=answer + ' r-' + 'a' * 22), refs))
         missing_wire = [dict(r) for r in anchored]; missing_wire[4]['providerInputs']=[]
         self.assertEqual(context_eval.score_main(stages,missing_wire,snapshots,'anchored_working_view')[0],'needs_work')
         self.assertEqual(context_eval.score_main(stages, rows[:-1], snapshots)[0], 'blocked')
@@ -1367,6 +1579,158 @@ class DesktopE2eArtifactTests(unittest.TestCase):
             changed=context_eval.inspect_main_files(owned,original)
             self.assertFalse(changed['draftUnchanged'])
             self.assertFalse(changed['draft.json']['valid'])
+
+    def test_main_cache_target_requires_full_task_and_cache_usage_coverage(self):
+        rows = [{'requestCount': 3, 'requestMetrics': [
+            {'usageStatus': 'reported', 'usage': {'inputTokens': 100, 'cachedInputTokens': 0}},
+            {'usageStatus': 'reported', 'usage': {'inputTokens': 800, 'cachedInputTokens': 800}},
+            {'usageStatus': 'reported', 'usage': {'inputTokens': 100, 'cachedInputTokens': 100}},
+        ]}]
+        report = {'status': 'passed', 'summary': {'metering': context_eval.summarize_metering(rows)}}
+        self.assertEqual(context_eval.main_cache_target(report, 90),
+                         {'minimumPercent': 90, 'observedPercent': 90, 'status': 'passed'})
+        self.assertEqual(context_eval.main_cache_target(report, 91)['status'], 'below_target')
+        report['summary']['steadyMetering'] = context_eval.summarize_main_metering(
+            [{'requestCount': 1, 'requestMetrics': [
+                {'usageStatus': 'reported', 'usage': {'inputTokens': 1000, 'cachedInputTokens': 990}}]}])
+        self.assertEqual(context_eval.main_cache_target(report, 99, steady=True),
+                         {'minimumPercent': 99, 'observedPercent': 99, 'status': 'passed'})
+        self.assertEqual(context_eval.main_cache_target(report, 99)['status'], 'below_target')
+        rows[0]['requestMetrics'].pop(0)
+        report['summary']['metering'] = context_eval.summarize_metering(rows)
+        self.assertEqual(context_eval.main_cache_target(report, 90)['status'], 'usage_incomplete')
+        self.assertEqual(context_eval.main_cache_target(report, 99, steady=True)['status'], 'usage_incomplete')
+        report['status'] = 'needs_work'
+        self.assertEqual(context_eval.main_cache_target(report, 90)['status'], 'task_incomplete')
+        self.assertEqual(context_eval.main_cache_target(report, 99, steady=True)['status'], 'task_incomplete')
+
+    def test_main_delta_diagnostic_distinguishes_explicit_misses_from_unknown_usage(self):
+        def receipt(route, cached, total, **extra_usage):
+            return {'responseMetadata': {'transport': route}, 'usageStatus': 'reported',
+                    'usage': {'cachedInputTokens': cached, 'inputTokens': total, **extra_usage}}
+
+        rows = [{'requestCount': 7, 'requestMetrics': [
+            receipt('websocket_delta', 0, 8033), receipt('websocket_delta', 0, 500),
+            receipt('websocket_delta', 7000, 7100), receipt('websocket_delta', None, 8000),
+            receipt('websocket_delta', 0, 9000, detailsInvalid=True), receipt('websocket_full', 0, 1000),
+        ]}]
+        self.assertEqual(context_eval.summarize_steady_delta_usage(rows), {
+            'deltaRequests': 5, 'zeroHitRequests': 2, 'zeroHitInputTokens': 8533,
+            'unknownDeltaUsageRequests': 2, 'unknownTransportRequests': 1,
+        })
+
+    def test_main_recall_diagnostic_measures_sealed_and_first_model_visible_bytes(self):
+        raw = json.dumps({'sources': [{'text': '原文' * 120, 'complete': True}]}, ensure_ascii=False)
+        projected = 'Result: ' + json.dumps({'sources': [{'text_in_prior_user': '原文'}]}, ensure_ascii=False)
+        payload = {'type': 'ToolExecutionEnd', '_angelbot_source': {'version': 1, 'sha256': 'a' * 64},
+                   'data': {'call_id': 'recall-1', 'tool_name': 'recall_conversation', 'success': True, 'output': raw}}
+        def frame(content):
+            return {'messages': [{'role': 'tool', 'toolCallId': 'recall-1', 'content': content}]}
+        row = {'id': 'resume', 'session': 'main', 'providerInputs': [frame(raw), frame(projected), frame('Result: ' + raw)],
+               'requestMetrics': [{}, *[{'responseMetadata': {'transport': 'websocket_delta'}}] * 2],
+               'tools': [{'toolName': 'recall_conversation', 'success': True, 'callId': 'recall-1'}]}
+        with contextlib.closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('CREATE TABLE agent_run_events(id TEXT, session_id TEXT, event_type TEXT, payload TEXT)')
+            conn.executemany('INSERT INTO agent_run_events VALUES (?,?,?,?)', [
+                (session, session, 'ToolExecutionEnd', json.dumps(payload, ensure_ascii=False)) for session in ('main', 'other')])
+            raw_bytes, reply_bytes = len(raw.encode('utf-8')), len(projected.encode('utf-8'))
+            self.assertEqual(context_eval.summarize_main_tool_projection(conn, [row], 'recall_conversation'), [
+                {'turn': 'resume', 'rawSealedOutputBytes': raw_bytes, 'modelVisibleReplyBytes': reply_bytes,
+                 'omissionMarkerRows': 1, 'bytesSaved': raw_bytes - reply_bytes, 'reducedWithOmission': True}])
+            conn.execute("UPDATE agent_run_events SET payload=json_remove(payload, '$._angelbot_source') WHERE session_id='main'")
+            sample, = context_eval.summarize_main_tool_projection(conn, [row], 'recall_conversation')
+            self.assertIsNone(sample['rawSealedOutputBytes'])
+            self.assertFalse(sample['reducedWithOmission'])
+
+    def test_main_read_file_projection_binds_current_source_and_prior_call(self):
+        event_id = '00000000-0000-0000-0000-000000000001'
+        source_ref = 'r-AAAAAAAAAAAAAAAAAAAAAQ'
+        raw = json.dumps({'content': 'x' * 500})
+        projected = 'Result: ' + json.dumps({'source_ref': source_ref, 'same_content_as_read_call': 'read-1'})
+        payload = {'type': 'ToolExecutionEnd', '_angelbot_source': {'version': 1, 'sha256': 'b' * 64},
+                   'data': {'call_id': 'read-2', 'tool_name': 'read_file', 'success': True, 'output': raw}}
+        row = {'id': 'file_read_second', 'session': 'main', 'providerInputs': [{'messages': [
+            {'role': 'tool', 'toolCallId': 'read-2', 'content': projected}]}],
+               'requestMetrics': [{'responseMetadata': {'transport': 'websocket_delta'}}],
+               'tools': [{'toolName': 'read_file', 'success': True, 'callId': 'read-2'}]}
+        with contextlib.closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('CREATE TABLE agent_run_events(id TEXT, session_id TEXT, event_type TEXT, payload TEXT)')
+            conn.execute('INSERT INTO agent_run_events VALUES (?,?,?,?)', (event_id, 'main', 'ToolExecutionEnd', json.dumps(payload)))
+            sample, = context_eval.summarize_main_tool_projection(conn, [row], 'read_file')
+        self.assertTrue(sample['sourceRefBound'])
+        self.assertEqual(sample['priorReadCallId'], 'read-1')
+        self.assertEqual(sample['rawSealedOutputSha256'], hashlib.sha256(raw.encode()).hexdigest())
+        self.assertEqual(sample['bytesSaved'], len(raw) - len(projected))
+
+    def test_main_natural_cache_uses_the_frozen_tasks_with_only_pressure_removed(self):
+        frozen, stages, budget, _ = context_eval.prepare_main_journey(True)
+        self.assertTrue(frozen['stages'][3]['force_native_checkpoint'])
+        natural, natural_stages, natural_budget, condition = context_eval.prepare_main_journey(True, natural_cache=True)
+        self.assertEqual(condition, context_eval.NATURAL_CACHE_MAIN_CONDITION)
+        self.assertEqual(natural_stages, stages)
+        self.assertEqual(natural_budget, budget)
+        self.assertEqual(natural, dict(frozen, stages=[{k: v for k, v in stage.items() if k != 'force_native_checkpoint'}
+                                                       for stage in frozen['stages']]))
+        fixed, _, _, _ = context_eval.prepare_main_journey(True, natural_cache=True, cache_fixed_clock=True)
+        self.assertRegex(fixed.pop('fixed_cache_clock'), r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$')
+        self.assertEqual(fixed, natural)
+        clock_after, _, _, _ = context_eval.prepare_main_journey(True, natural_cache=True, cache_clock_after_history=True)
+        self.assertEqual(clock_after.pop('cache_clock_after_history'), True)
+        self.assertEqual(clock_after, natural)
+        native, native_stages, native_budget, native_condition = context_eval.prepare_main_journey(
+            True, natural_cache=True, cache_native_history=True, cache_clock_after_history=True)
+        self.assertEqual(native_condition, context_eval.NATURAL_NATIVE_CACHE_MAIN_CONDITION)
+        self.assertEqual(native_stages, stages)
+        self.assertEqual(native_budget, budget)
+        self.assertEqual(native, dict(natural, cache_native_history=True, cache_clock_after_history=True))
+        archived, archive_stages, archive_budget, archive_condition = context_eval.prepare_main_journey(
+            True, natural_cache=True, cache_archive_attachments=True)
+        self.assertEqual((archive_stages, archive_budget, archive_condition), (stages, budget, condition))
+        self.assertEqual(archived, dict(natural, cache_archive_attachments=True))
+        cross_turn, cross_stages, cross_budget, cross_condition = context_eval.prepare_main_journey(
+            True, natural_cache=True, cache_cross_turn=True)
+        self.assertEqual((cross_stages, cross_budget, cross_condition),
+                         (stages, budget, context_eval.CROSS_TURN_CACHE_MAIN_CONDITION))
+        self.assertEqual(cross_turn, dict(natural, cache_cross_turn=True))
+        same, same_stages, same_budget, same_condition = context_eval.prepare_main_journey(
+            True, natural_cache=True, cache_cross_turn=True, cache_same_process=True)
+        self.assertEqual((same_stages, same_budget, same_condition),
+                         (stages, budget, context_eval.SAME_PROCESS_CACHE_MAIN_CONDITION))
+        self.assertEqual(same, dict(cross_turn, cache_same_process=True))
+        paced, pace_stages, pace_budget, _ = context_eval.prepare_main_journey(
+            True, natural_cache=True, cache_cross_turn=True, cache_same_process=True,
+            cache_paced=True, cache_attachment_reference=True)
+        self.assertEqual((pace_stages, pace_budget), (stages, budget))
+        self.assertEqual(paced, dict(same, cache_paced=True, cache_attachment_reference=True))
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, natural_cache=True, cache_cross_turn=True, cache_paced=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, natural_cache=True, cache_attachment_reference=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, natural_cache=True, cache_same_process=True)
+        for disabled in (False, True):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(context_eval.run_main_journey(
+                    False, True, natural_cache=True, cache_cross_turn=True,
+                    cache_no_session_affinity=disabled), 0)
+            self.assertIs(json.loads(output.getvalue())['cacheSessionAffinity'], not disabled)
+        with self.assertRaises(ValueError):
+            context_eval.run_main_journey(False, True, natural_cache=True, cache_no_session_affinity=True)
+        for treatment in ('cache_fixed_clock', 'cache_clock_after_history', 'cache_native_history', 'cache_archive_attachments'):
+            with self.assertRaises(ValueError):
+                context_eval.prepare_main_journey(True, natural_cache=True, cache_cross_turn=True, **{treatment: True})
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, natural_cache=True, cache_archive_attachments=True, cache_native_history=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, True, natural_cache=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, cache_native_history=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, cache_fixed_clock=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, cache_clock_after_history=True)
+        with self.assertRaises(ValueError):
+            context_eval.prepare_main_journey(True, natural_cache=True, cache_fixed_clock=True, cache_clock_after_history=True)
 
     def test_saved_source_neighborhood_is_an_opt_in_screen_not_a_new_gold_projection(self):
         from prototypes import preference_neighborhood as prototype
@@ -1574,73 +1938,133 @@ class DesktopE2eArtifactTests(unittest.TestCase):
     def test_agent_benchmark_grader_rejects_failed_requests_and_unexecuted_claims(self):
         answers = {'simple_python_5': {'ground_truth': [{'solve_quadratic': {'a': [3], 'root_type': ['all']}}]}}
         row = {'id': 'simple_python_5', 'status': 'completed', 'calls': [{'name': 'solve_quadratic', 'arguments': {'a': 3}}], 'text': None}
-        self.assertFalse(agent_eval.grade_call(row, answers), 'required semantics cannot be silently defaulted')
+        self.assertFalse(agent_eval.call_checks(row, answers)['reference_calls'], 'required semantics cannot be silently defaulted')
         row['calls'][0]['arguments']['root_type'] = 'all'
-        self.assertTrue(agent_eval.grade_call(row, answers))
+        self.assertTrue(all(agent_eval.call_checks(row, answers).values()))
         self.assertFalse(agent_eval.equal(True, 1))
         irrelevant = {'id': 'irrelevance_0', 'status': 'unavailable', 'calls': [], 'text': None}
-        self.assertIsNone(agent_eval.grade_call(irrelevant, answers))
+        self.assertIsNone(agent_eval.call_checks(irrelevant, answers))
         irrelevant.update(status='completed', text='No suitable function exists.')
-        self.assertTrue(agent_eval.grade_call(irrelevant, answers))
+        self.assertTrue(all(agent_eval.call_checks(irrelevant, answers).values()))
         model_log = f'test {agent_eval.TEST} ... AGENT_EVAL_ROW ' + json.dumps(irrelevant)
         self.assertEqual(companion_eval.parse_rows(model_log, marker='AGENT_EVAL_ROW ', test=agent_eval.TEST), [irrelevant])
-        task = {'id': 'delivery_change', 'status': 'completed', 'world': {'day': 'Thursday', 'revision': 18, 'writes': 1, 'reads_before': 1, 'reads_after': 1}}
-        self.assertTrue(agent_eval.grade_state(task))
-        task['world']['day'] = 'Wednesday'
-        self.assertFalse(agent_eval.grade_state(task))
-        task['world']['day'] = 'Thursday'
-        task['world']['writes'] = 0
-        self.assertFalse(agent_eval.grade_state(task), 'a completion claim is not a completed action')
-        task['world']['writes'] = 2
-        self.assertFalse(agent_eval.grade_state(task), 'duplicate writes are not a clean success')
-        memory = {'id': 'memory_keyword', 'status': 'completed', 'text': '白毫银针', 'world': {'target_seen': True, 'irrelevant_seen': False}}
-        self.assertTrue(agent_eval.grade_state(memory))
-        memory['world']['target_seen'] = False
-        self.assertFalse(agent_eval.grade_state(memory), 'guessed answers are not grounded recall')
-        memory['world']['target_seen'] = True
-        memory['text'] = '不是白毫银针'
-        self.assertFalse(agent_eval.grade_state(memory))
-        memory['text'] = '白毫银针'
-        memory['world']['irrelevant_seen'] = True
-        self.assertFalse(agent_eval.grade_state(memory), 'unrelated memory access violates the task')
         changed = agent_eval.schema({'type': 'dict', 'properties': {'numbers': {'type': 'array', 'items': {'type': 'float'}}}, 'required': []})
         self.assertEqual(changed['type'], 'object')
         self.assertEqual(changed['properties']['numbers']['items']['type'], 'number')
         self.assertEqual(changed['required'], [], 'optional parameters must remain optional')
 
+    def test_agent_state_benchmark_requires_both_observed_outcomes_and_correct_reply(self):
+        task = {'id': 'delivery_change', 'status': 'completed', 'text': 'Thursday',
+                'world': {'day': 'Thursday', 'revision': 18, 'writes': 1, 'reads_before': 2, 'reads_after': 1}}
+        variants = [
+            ({}, set()),  # Extra read is allowed; no prescribed call sequence.
+            ({'text': 'Wednesday'}, {'final_answer'}),
+            ({'text': None}, {'final_answer'}),
+            ({'status': 'needs_attention'}, {'runner_completed'}),
+            ({'world': dict(task['world'], day='Wednesday', writes=0)}, {'delivery_day', 'single_write'}),
+            ({'world': dict(task['world'], writes=2)}, {'single_write'}),
+            ({'world': dict(task['world'], reads_after=0)}, {'read_after_update'}),
+        ]
+        for changes, failed in variants:
+            with self.subTest(changes=changes):
+                checks = agent_eval.state_checks(task | changes)
+                self.assertEqual({name for name, passed in checks.items() if not passed}, failed)
+        self.assertIsNone(agent_eval.state_checks(task | {'status': 'quota_exceeded', 'world': None}))
+        memory = {'id': 'memory_keyword', 'status': 'completed', 'text': '白毫银针',
+                  'world': {'target_seen': True, 'irrelevant_seen': False}}
+        self.assertTrue(all(agent_eval.state_checks(memory).values()))
+        guessed = memory | {'world': {'target_seen': False, 'irrelevant_seen': True}}
+        checks = agent_eval.state_checks(guessed)
+        self.assertEqual({name for name, passed in checks.items() if not passed},
+                         {'relevant_record_read', 'no_unrelated_record_read'})
+        self.assertFalse(agent_eval.state_checks(memory | {'text': '不是白毫银针'})['final_answer'])
+
+    def test_agent_workspace_benchmark_requires_both_file_receipts_and_correct_totals(self):
+        row = {'kind': 'synthetic_state', 'id': 'workspace_pair', 'arm': 'agent_runner',
+               'requestCount': 3, 'status': 'completed', 'text': '{"east":247,"west":389,"total":636}',
+               'world': {'readFiles': ['east.json', 'west.json'], 'inputsPreserved': True, 'firstToolBatchSize': 1}}
+        status, groups = agent_eval.summarize([row], {}, 'workspace', ())
+        self.assertEqual(status, 'passed', 'the model can complete the task in more than one batch')
+        self.assertEqual(groups, {'agent_runner': {'passed': 1, 'evaluated': 1, 'planned': 1}})
+        missing = row | {'world': dict(row['world'], readFiles=['east.json'])}
+        self.assertFalse(agent_eval.state_checks(missing)['both_inputs_read'])
+        wrong = row | {'text': '{"east":247,"west":389,"total":635}'}
+        self.assertFalse(agent_eval.state_checks(wrong)['final_answer'])
+
+    def test_agent_daily_requires_receipts_and_independent_disk_evidence(self):
+        payload = {'east': 247, 'west': 389, 'total': 636, 'heading': '青灯月报'}
+        answer = json.dumps(payload, ensure_ascii=False)
+        world = {'readFiles': ['east.json', 'west.json'], 'inputsPreserved': True,
+                 'target_seen': True, 'superseded_seen': False, 'irrelevant_seen': False,
+                 'recallBeforeWrite': True, 'writes': 1, 'writeDispatches': 1,
+                 'artifact': payload, 'artifactReadBack': True}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'east.json').write_bytes(b'{"total":247}\n')
+            (root / 'west.json').write_bytes(b'{"total":389}\n')
+            artifact = root / 'invoice-summary.json'
+            row = {'kind': 'synthetic_state', 'id': 'daily_memory_delivery',
+                   'arm': 'agent_runner', 'requestCount': 6, 'status': 'completed',
+                   'text': answer, 'world': world}
+            self.assertFalse(agent_eval.state_checks(row | {'disk': agent_eval.daily_files(root)})['saved_artifact'])
+            artifact.write_text(answer, encoding='utf-8')
+            row['disk'] = agent_eval.daily_files(root)
+            self.assertEqual(agent_eval.summarize([row], {}, 'daily', ())[0], 'passed')
+            self.assertFalse(agent_eval.state_checks(row | {'requestCount': 0})['live_request_budget'])
+            with self.assertRaises(ValueError):
+                agent_eval.summarize([row | {'requestCount': 7}], {}, 'daily', ())
+            for field, bad, check in (
+                ('readFiles', ['east.json'], 'both_inputs_read'),
+                ('superseded_seen', True, 'current_memory_only'),
+                ('irrelevant_seen', True, 'current_memory_only'),
+                ('recallBeforeWrite', False, 'recall_before_write'),
+                ('writes', 2, 'single_write'),
+                ('writeDispatches', 0, 'single_write'),
+                ('artifactReadBack', False, 'artifact_read_back'),
+            ):
+                self.assertFalse(agent_eval.state_checks(row | {'world': world | {field: bad}})[check])
+            for bad_answer in (answer.replace('636', '636.0'), answer[:-1] + ', "total": 636}'):
+                self.assertFalse(agent_eval.state_checks(row | {'text': bad_answer})['final_answer'])
+            (root / 'east.json').write_bytes(b'{"total":248}\n')
+            artifact.write_text(answer.replace('636', '635'), encoding='utf-8')
+            wrong = agent_eval.state_checks(row | {'disk': agent_eval.daily_files(root)})
+            self.assertFalse(wrong['inputs_preserved'])
+            self.assertFalse(wrong['saved_artifact'])
+
     def test_agent_holdout_unordered_calls_and_nested_arguments(self):
         answers = {'parallel_1': {'ground_truth': [{'f': {'x': [1]}}, {'f': {'x': [2]}}]},
                    'multiple_9': {'ground_truth': [{'average': {'grades': [{'math': [90], 'music': [89]}]}}]}}
         row = {'id': 'parallel_1', 'status': 'completed', 'calls': [{'name': 'f', 'arguments': {'x': 2}}, {'name': 'f', 'arguments': {'x': 1}}]}
-        self.assertTrue(agent_eval.grade_call(row, answers))
+        self.assertTrue(all(agent_eval.call_checks(row, answers).values()))
         row['calls'][1]['arguments']['x'] = 2
-        self.assertFalse(agent_eval.grade_call(row, answers), 'one actual call cannot cover both references')
+        self.assertFalse(agent_eval.call_checks(row, answers)['reference_calls'], 'one actual call cannot cover both references')
         row['calls'].pop()
-        self.assertFalse(agent_eval.grade_call(row, answers), 'missing parallel calls cannot pass')
+        checks = agent_eval.call_checks(row, answers)
+        self.assertFalse(checks['call_count'], 'missing parallel calls cannot pass')
+        self.assertNotIn('reference_calls', checks, 'an absent call is distinct from a mismatched argument')
         nested = {'id': 'multiple_9', 'status': 'completed', 'calls': [{'name': 'average', 'arguments': {'grades': {'math': 90, 'music': 89}}}]}
-        self.assertTrue(agent_eval.grade_call(nested, answers))
+        self.assertTrue(all(agent_eval.call_checks(nested, answers).values()))
         nested['calls'][0]['arguments']['grades']['music'] = True
-        self.assertFalse(agent_eval.grade_call(nested, answers))
+        self.assertFalse(agent_eval.call_checks(nested, answers)['reference_calls'])
         nested['calls'][0]['arguments']['grades']['music'] = 89
         nested['calls'][0]['arguments']['grades']['extra'] = 50
-        self.assertFalse(agent_eval.grade_call(nested, answers))
+        self.assertFalse(agent_eval.call_checks(nested, answers)['reference_calls'])
         nested['calls'][0]['arguments']['grades'].pop('extra')
         nested['argumentsValid'] = False
-        self.assertFalse(agent_eval.grade_call(nested, answers), 'host schema rejection cannot be a correct call')
-        conflict = {'id': 'delivery_conflict', 'status': 'completed', 'world': {'day': 'Thursday', 'revision': 19, 'writes': 1, 'reads_before': 2, 'reads_after': 1}}
-        self.assertTrue(agent_eval.grade_state(conflict))
-        conflict['world']['revision'] = 18
-        self.assertFalse(agent_eval.grade_state(conflict))
-        updated = {'id': 'memory_updated', 'status': 'completed', 'text': '祁门红茶', 'world': {'target_seen': True, 'irrelevant_seen': False}}
-        self.assertTrue(agent_eval.grade_state(updated))
-        updated['text'] = '白毫银针'
-        self.assertFalse(agent_eval.grade_state(updated), 'superseded preference is not the current answer')
+        self.assertFalse(agent_eval.call_checks(nested, answers)['schema_accepted'], 'host schema rejection cannot be a correct call')
+        conflict = {'id': 'delivery_conflict', 'status': 'completed', 'text': 'Thursday',
+                    'world': {'day': 'Thursday', 'revision': 19, 'writes': 1, 'reads_before': 2, 'reads_after': 1}}
+        stale = conflict | {'world': dict(conflict['world'], revision=18, reads_before=1)}
+        checks = agent_eval.state_checks(stale)
+        self.assertEqual({name for name, passed in checks.items() if not passed}, {'delivery_revision', 'read_before_update'})
+        updated = {'id': 'memory_updated', 'status': 'completed', 'text': '祁门红茶',
+                   'world': {'target_seen': True, 'irrelevant_seen': False, 'superseded_seen': False}}
+        leaked = updated | {'world': dict(updated['world'], superseded_seen=True)}
+        self.assertFalse(agent_eval.state_checks(leaked)['superseded_record_hidden'])
         answers = {key: {'ground_truth': [{'f': {'x': [1]}}]} for key in agent_eval.HOLDOUT_IDS if not key.startswith('irrelevance_')}
         rows = [{'kind': 'bfcl', 'id': key, 'arm': 'angelbot_prompt', 'status': 'completed', 'requestCount': 1,
                  'calls': [] if key.startswith('irrelevance_') else [{'name': 'f', 'arguments': {'x': 1}}], 'text': 'No applicable function.'}
                 for key in agent_eval.HOLDOUT_IDS]
-        conflict['world']['revision'] = 19
-        updated['text'] = '祁门红茶'
         rows += [dict(task, kind='synthetic_state', arm='agent_runner', requestCount=2) for task in (conflict, updated)]
         status, summary = agent_eval.summarize(rows, answers, 'holdout', ('angelbot_prompt',))
         self.assertEqual(status, 'passed')
@@ -1651,6 +2075,11 @@ class DesktopE2eArtifactTests(unittest.TestCase):
         self.assertEqual(status, 'passed')
         self.assertEqual(summary['agent_runner'], {'passed': 0, 'evaluated': 0, 'planned': 0})
         self.assertEqual(agent_eval.summarize(rows[:-2], answers, 'holdout', ('angelbot_prompt',))[0], 'blocked')
+        rows[-1]['text'] = '白毫银针'
+        status, summary = agent_eval.summarize(rows, answers, 'holdout', ('angelbot_prompt',))
+        self.assertEqual(status, 'needs_work')
+        self.assertEqual(summary['agent_runner'], {'passed': 1, 'evaluated': 2, 'planned': 2})
+        self.assertFalse(rows[-1]['checks']['final_answer'], 'superseded preference is not the current answer')
 
     def test_companion_probe_exact_scoring_never_counts_offline_or_missing_as_passed(self):
         cases = [{'id': 'sample', 'expected': ['PLAN']}]
@@ -1786,7 +2215,7 @@ const [url, owned] = process.argv.slice(1);
 process.chdir(owned);
 Object.assign(process.env, { ANGELBOT_DESKTOP_E2E_BINARY_PATH: path.join(owned, 'unused.exe'),
   GITHUB_ACTIONS: 'true', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' });
-for (const key of ['ANGELBOT_DESKTOP_E2E_REPLY_EXPORT', 'ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY', 'ANGELBOT_DESKTOP_E2E_PROJECT_RESTORE']) delete process.env[key];
+for (const key of ['ANGELBOT_DESKTOP_E2E_REPLY_EXPORT', 'ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY', 'ANGELBOT_DESKTOP_E2E_PROJECT_RESTORE', 'ANGELBOT_DESKTOP_E2E_SUITE']) delete process.env[key];
 globalThis.window = { __angelbotE2ePersonalSessionId: 'personal-fixture', __angelbotE2eProjectSessionId: 'project-fixture' };
 globalThis.document = { querySelector: () => ({ textContent: 'D'.repeat(8000) }) };
 let captures = 0;
@@ -1812,8 +2241,9 @@ const original = new Error('original failure');
 await config.afterTest({ title: 'synthetic' }, null, { passed: true });
 assert.equal(captures, 0);
 await config.afterTest({ title: 'synthetic' }, null, { passed: false, error: original, duration: 7 });
-const artifact = attempt => path.join(owned, 'src-tauri/target/e2e/failure', `123-${attempt}`, 'failure.json');
+const artifact = (attempt, suite = 'journey') => path.join(owned, 'src-tauri/target/e2e/failure', suite, `123-${attempt}`, 'failure.json');
 const report = JSON.parse(await readFile(artifact(1), 'utf8'));
+assert.equal(report.suite, 'journey');
 assert.equal(report.state.sessions.length, 2);
 assert.equal(report.state.sessions[0].messages.length, 5);
 const row = report.state.sessions[0].messages[0];
@@ -1835,6 +2265,15 @@ assert.equal(personal.messages[0].facts.contextSummary.length, 500);
 assert.equal(personal.messages[0].facts.failedSteps.length, 3);
 assert.equal(personal.messages[0].facts.failedSteps[0].length, 500);
 assert.ok(!JSON.stringify(reloaded).includes('MUST_NOT_EXPORT'));
+process.env.ANGELBOT_DESKTOP_E2E_SUITE = 'smoke';
+process.env.GITHUB_RUN_ATTEMPT = '1';
+delete window.__angelbotE2eProjectSessionId;
+const smoke = (await import(url + '?smoke')).config;
+await smoke.afterTest({ title: 'synthetic smoke' }, null, { passed: false, error: original });
+const smokeReport = JSON.parse(await readFile(artifact(1, 'smoke'), 'utf8'));
+assert.equal(smokeReport.suite, 'smoke');
+assert.deepEqual(smokeReport.state.sessions.map(item => item.sessionId), ['personal-fixture']);
+assert.equal(JSON.parse(await readFile(artifact(1), 'utf8')).title, 'synthetic');
 process.env.GITHUB_RUN_ATTEMPT = '2';
 browser.tauri.execute = async () => { throw new Error('diagnostic unavailable'); };
 browser.saveScreenshot = async () => { throw new Error('screenshot unavailable'); };
@@ -1848,6 +2287,7 @@ process.env.GITHUB_RUN_ATTEMPT = '3';
 const manual = (await import(url + '?manual')).config;
 await manual.afterTest({ title: 'private probe' }, null, { passed: false, error: original });
 await assert.rejects(access(artifact(3)));
+await assert.rejects(access(artifact(3, 'smoke')));
 console.log('bounded synthetic diagnostics checked');
 '''
         with tempfile.TemporaryDirectory(prefix='angelbot-ci-artifact-') as directory:
@@ -2527,21 +2967,125 @@ console.log('bounded synthetic diagnostics checked');
         for arguments, expected in ((["--help"], 0), (["--reply-export", "--manual-native"], 2),
                                     (["--model-recovery", "--reply-export"], 2),
                                     (["--project-restore", "--manual-native"], 2),
-                                    (["--project-restore", "--inspect"], 2), (["--inspect"], 2), (["--typo"], 2)):
-            with self.subTest(arguments=arguments), patch.object(sys, "argv", ["desktop_e2e.py", *arguments]), \
-                    patch.object(desktop_e2e, "prepare_desktop_binary") as build, \
-                    patch.object(manual, "run_manual_native") as start, \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
-                    self.assertRaises(SystemExit) as exited:
-                desktop_e2e.main()
-            self.assertEqual(exited.exception.code, expected)
-            build.assert_not_called()
-            start.assert_not_called()
+                                    (["--project-restore", "--inspect"], 2), (["--inspect"], 2),
+                                    (["--suite", "unknown"], 2), (["--suite", "smoke", "--model-recovery"], 2),
+                                    (["--suite", "journey", "--reply-export"], 2),
+                                    (["--manual-native", "--suite", "journey"], 2),
+                                    (["--suite", "journey", "--project-restore"], 2), (["--typo"], 2)):
+            with self.subTest(arguments=arguments), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(sys, "argv", ["desktop_e2e.py", *arguments]))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                launchers = [stack.enter_context(patch.object(module, name)) for module, name in (
+                    (desktop_e2e, "prepare_desktop_binary"),
+                    (desktop_e2e, "run_reply_export_probe"),
+                    (manual, "run_manual_native"),
+                    (recovery, "run_model_recovery"),
+                    (restore, "run_project_restore"),
+                )]
+                with self.assertRaises(SystemExit) as exited:
+                    desktop_e2e.main()
+                self.assertEqual(exited.exception.code, expected)
+                for launcher in launchers:
+                    launcher.assert_not_called()
+
+    def test_desktop_runtime_retries_short_sharing_violations_only(self):
+        locked = PermissionError("WebView still owns the fixture file")
+        locked.winerror = 32
+        denied = PermissionError("Access denied")
+        denied.winerror = 5
+        with tempfile.TemporaryDirectory() as root:
+            for errors, times, outcome, sleeps in (
+                ([locked, None], [10, 10.1], None, [0.2]),
+                ([locked, locked], [10, 14.875, 15], locked, [0.125]),
+                ([denied], [10], denied, []),
+            ):
+                with self.subTest(errors=errors), \
+                        patch.object(native.tempfile, "TemporaryDirectory") as allocate, \
+                        patch.object(native.time, "monotonic", side_effect=times), \
+                        patch.object(native.time, "sleep") as sleep:
+                    directory = allocate.return_value
+                    directory.name = root
+                    directory.cleanup.side_effect = errors
+                    if outcome is None:
+                        with native.desktop_runtime_directory("owned-") as runtime:
+                            self.assertEqual(runtime, Path(root))
+                    else:
+                        with self.assertRaises(PermissionError) as failure:
+                            with native.desktop_runtime_directory("owned-"):
+                                pass
+                        self.assertIs(failure.exception, outcome)
+                    self.assertEqual(directory.cleanup.call_count, len(errors))
+                    self.assertEqual([args.args[0] for args in sleep.call_args_list], sleeps)
+
+    def test_desktop_runtime_preserves_original_wdio_failure(self):
+        locked = PermissionError("WebView still owns the fixture file")
+        locked.winerror = 32
+        with tempfile.TemporaryDirectory() as root:
+            for persistent in (False, True):
+                original = subprocess.CalledProcessError(1, ["wdio"])
+                with self.subTest(persistent=persistent), \
+                        patch.object(native.tempfile, "TemporaryDirectory") as allocate, \
+                        patch.object(native.time, "monotonic", side_effect=[10, 15 if persistent else 10.1]), \
+                        patch.object(native.time, "sleep"), \
+                        self.assertRaises(subprocess.CalledProcessError) as failure:
+                    allocate.return_value.name = root
+                    allocate.return_value.cleanup.side_effect = [locked] if persistent else [locked, None]
+                    with native.desktop_runtime_directory("owned-"):
+                        raise original
+                self.assertIs(failure.exception, original)
+                self.assertIs(failure.exception.__cause__, locked if persistent else None)
+
+    def test_desktop_smoke_uses_one_isolated_script_without_journey_fixtures(self):
+        stale = {
+            "OPENAI_API_KEY": "owner-only-key",
+            "ANGELBOT_DESKTOP_E2E_MANUAL": "1",
+            "ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY": "old-probe",
+            "ANGELBOT_DESKTOP_E2E_SEED_NETWORK_APPROVAL": "1",
+            "ANGELBOT_DESKTOP_E2E_WINDOW_EXE": "old-window.exe",
+            "ANGELBOT_DESKTOP_E2E_SUITE": "journey",
+            "ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT": "old-model-script",
+            "ANGELBOT_DESKTOP_E2E_DATA_DIR": "owner-data",
+            "VITE_ANGELBOT_DESKTOP_E2E": "old-build",
+            "WEBVIEW2_USER_DATA_FOLDER": "owner-webview",
+        }
+        with patch.object(sys, "argv", ["desktop_e2e.py", "--suite", "smoke", "--skip-build"]), \
+                patch.dict(os.environ, stale), \
+                patch.object(desktop_e2e, "prepare_desktop_binary") as build, \
+                patch.object(desktop_e2e, "configure_webdriver_port") as port, \
+                patch.object(desktop_e2e, "configure_journey") as configure_journey, \
+                patch.object(desktop_e2e, "owned_fixture") as fixture, \
+                patch.object(desktop_e2e, "run") as run:
+            self.assertEqual(desktop_e2e.main(), 0)
+
+        command, env = run.call_args.args
+        self.assertEqual(command[1:], ["wdio", "run", "e2e/wdio.conf.mjs"])
+        build.assert_called_once_with(command[0], env, True)
+        port.assert_called_once_with(env)
+        configure_journey.assert_not_called()
+        fixture.assert_not_called()
+        self.assertEqual(env["ANGELBOT_DESKTOP_E2E_SUITE"], "smoke")
+        self.assertEqual(env["CARGO_NET_OFFLINE"], "true")
+        self.assertEqual(env["NPM_CONFIG_OFFLINE"], "true")
+        runtime = Path(env["LOCALAPPDATA"])
+        self.assertEqual(Path(env["APPDATA"]), runtime)
+        self.assertEqual(Path(env["WEBVIEW2_USER_DATA_FOLDER"]), runtime / "webview")
+        self.assertEqual(Path(env["ANGELBOT_DESKTOP_E2E_DATA_DIR"]), runtime / "angelbot-data")
+        self.assertFalse(runtime.exists(), "smoke runtime must be cleaned on exit")
+        for key, value in stale.items():
+            self.assertNotEqual(env.get(key), value)
+        for suffix in ("DOCX_BASE64", "XLSX_BASE64", "UTF16_BASE64", "EXPLORER_SCRIPT", "WINDOW_BASELINE"):
+            self.assertNotIn(f"ANGELBOT_DESKTOP_E2E_{suffix}", env)
+        self.assertEqual(json.loads(env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"]), [{
+            "type": "text", "text": "angelbot-ci-smoke-ok: 已收到测试消息。",
+            "expectUserContentIncludes": ["angelbot-ci-smoke: 请确认收到测试消息，只回复文字。"],
+        }])
 
     def test_daily_attachment_script_allows_results_but_never_project_commands(self):
         captured = []
 
         def capture_script(_npx, env, _skip_build):
+            self.assertEqual(env["ANGELBOT_DESKTOP_E2E_SUITE"], "journey")
             captured.extend(json.loads(env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"]))
             raise RuntimeError("owned script checkpoint")
 
@@ -2706,15 +3250,19 @@ console.log('bounded synthetic diagnostics checked');
             config.capabilities[0]['tauri:options'].application,
             config.capabilities[0]['wdio:tauriServiceOptions'].appBinaryPath,
             config.services[0][1].appBinaryPath,
-          ], specs: config.specs, timeout: config.mochaOpts.timeout}));
+          ], specs: config.specs, timeout: config.mochaOpts.timeout, bail: config.mochaOpts.bail}));
         """
         binary = REPO_ROOT / "src-tauri/target/desktop-e2e/debug/angelbot.exe"
-        for supplied, probe in ((False, None), (True, None), (True, "reply-export"),
-                                (True, "model-recovery"), (True, "project-restore")):
-            with self.subTest(supplied=supplied, probe=probe):
+        for supplied, probe, suite in ((False, None, None), (True, None, None),
+                                       (True, None, "smoke"), (True, None, "journey"),
+                                       (True, "reply-export", None), (True, "model-recovery", None),
+                                       (True, "project-restore", None)):
+            with self.subTest(supplied=supplied, probe=probe, suite=suite):
                 env = {name: os.environ[name] for name in ("PATH", "SYSTEMROOT") if name in os.environ}
                 if supplied:
                     env["ANGELBOT_DESKTOP_E2E_BINARY_PATH"] = str(binary)
+                if suite:
+                    env["ANGELBOT_DESKTOP_E2E_SUITE"] = suite
                 if probe:
                     flag = {"reply-export": "REPLY_EXPORT", "model-recovery": "MODEL_RECOVERY",
                             "project-restore": "PROJECT_RESTORE"}[probe]
@@ -2727,8 +3275,12 @@ console.log('bounded synthetic diagnostics checked');
                     self.assertEqual(result.returncode, 0, result.stderr)
                     configuration = json.loads(result.stdout)
                     self.assertEqual(configuration["paths"], [str(binary)] * 3)
-                    self.assertEqual(configuration["specs"], [f"./specs/{probe or 'first-run'}.e2e.mjs"])
-                    self.assertEqual(configuration["timeout"], 600_000 if probe == "project-restore" else 300_000 if probe else 90_000)
+                    spec = probe or ("desktop-smoke" if suite == "smoke" else "first-run")
+                    self.assertEqual(configuration["specs"], [f"./specs/{spec}.e2e.mjs"])
+                    timeout = {"project-restore": 600_000, "reply-export": 300_000,
+                               "model-recovery": 300_000, "desktop-smoke": 60_000, "first-run": 90_000}
+                    self.assertEqual(configuration["timeout"], timeout[spec])
+                    self.assertIs(configuration["bail"], spec == "first-run")
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("isolated binary path is required", result.stderr)

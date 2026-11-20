@@ -8,6 +8,8 @@ import {
   type WebSearchProvider,
 } from '$lib/commands/web-search';
 import { ToggleField } from '../components/ToggleField';
+import { SettingsRow, SettingsSection } from '../components/SettingsSection';
+import { Button, Input, Select } from '../../../ui';
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error';
 
@@ -169,187 +171,146 @@ export function WebSearchSettings() {
 
   return (
     <div className="settings-page-content web-search-settings">
-      <section className="web-search-section web-search-intro" aria-labelledby="web-search-overview-title">
-        <p className="web-search-eyebrow">WEB SEARCH</p>
-        <h3 id="web-search-overview-title">按需联网搜索</h3>
-        <p>为 AngelBot 单独配置搜索服务。它不会继承模型 API 的地址或凭据。</p>
-        <dl className="web-search-status">
-          <div>
-            <dt>当前服务</dt>
-            <dd>{savedProvider?.label ?? '尚未配置'}</dd>
-          </div>
-          <div>
-            <dt>可用状态</dt>
-            <dd data-enabled={config?.enabled ? 'true' : 'false'}>
-              {config?.enabled ? '已启用' : config ? '已关闭' : '尚未配置'}
-            </dd>
-          </div>
-        </dl>
-      </section>
-
-      <section className="web-search-section" aria-labelledby="web-search-provider-heading">
-        <header className="web-search-section-header">
-          <h3 id="web-search-provider-heading">服务商与连接</h3>
-          <p>保存配置会启用联网搜索；之后可随时在下方关闭。</p>
-        </header>
-
-        <div className="web-search-field">
-          <label htmlFor="web-search-provider">搜索服务商</label>
-          <select
-            id="web-search-provider"
-            value={provider}
-            disabled={loading || toggling || saveState === 'saving'}
-            onChange={(event) => handleProviderChange(event.target.value as WebSearchProvider)}
-          >
-            {PROVIDERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-          </select>
-        </div>
-
-        {isSelfHosted ? (
+      <SettingsSection title="服务商与连接" status={loading ? '读取中…' : config && savedProvider
+        ? `${savedProvider.label} · ${config.enabled ? '已启用' : '已关闭'}` : '尚未配置'}>
+        <div className="settings-rows web-search-form">
           <div className="web-search-field">
-            <label htmlFor="web-search-searxng-endpoint">SearXNG 服务地址</label>
-            <input
-              id="web-search-searxng-endpoint"
-              type="url"
-              value={endpoint}
-              placeholder="https://search.example.com"
-              autoComplete="url"
+            <label htmlFor="web-search-provider">搜索服务商</label>
+            <Select
+              id="web-search-provider"
+              value={provider}
               disabled={loading || toggling || saveState === 'saving'}
-              onChange={(event) => {
-                setEndpoint(event.target.value);
-                setSaveState('idle');
-              }}
-              aria-describedby="web-search-searxng-help"
-            />
-            <small id="web-search-searxng-help">使用你的自托管 SearXNG 的完整 http(s) 地址；不需要 API Key。</small>
+              onChange={(event) => handleProviderChange(event.target.value as WebSearchProvider)}
+            >
+              {PROVIDERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+            </Select>
           </div>
-        ) : (
-          <>
-            <div className="web-search-field">
-              <label htmlFor="web-search-trusted-endpoint">受信任的服务地址</label>
-              <input id="web-search-trusted-endpoint" value={selectedProvider.trustedEndpoint ?? ''} readOnly />
-              <small>此地址由 AngelBot 固定，避免 API Key 被发送到自定义或未知服务。</small>
-            </div>
-            <div className="web-search-field">
-              <label htmlFor="web-search-api-key">API Key</label>
-              <div className="web-search-inline-field">
-                <input
-                  id="web-search-api-key"
-                  type={showApiKey ? 'text' : 'password'}
-                  value={apiKey}
-                  placeholder={apiKeyConfigured ? '已安全保存；重新保存时请输入 API Key' : '输入 API Key'}
-                  autoComplete="new-password"
-                  disabled={loading || toggling || saveState === 'saving'}
-                  onChange={(event) => {
-                    setApiKey(event.target.value);
-                    setSaveState('idle');
-                  }}
-                  aria-describedby="web-search-key-help"
-                />
-                <button
-                  type="button"
-                  className="web-search-secondary-action"
-                  disabled={loading || toggling || saveState === 'saving'}
-                  onClick={() => setShowApiKey((visible) => !visible)}
-                  aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
-                >
-                  {showApiKey ? '隐藏' : '显示'}
-                </button>
-              </div>
-              <small id="web-search-key-help">
-                {apiKeyConfigured
-                  ? '已保存的密钥不会显示。出于安全考虑，保存这个服务商时需要再次输入 API Key。'
-                  : '保存后密钥仅写入系统凭据库，不会写入项目、对话或普通配置文件。'}
-              </small>
-            </div>
-          </>
-        )}
 
-        <div className="web-search-actions">
-          <button
-            type="button"
-            className="web-search-save-action"
-            disabled={!canSave || saveState === 'saving'}
-            onClick={() => { void handleSave(); }}
-          >
-            {saveState === 'saving' ? '保存中…' : saveState === 'saved' ? '已保存配置' : '保存搜索配置'}
-          </button>
-          {saveState === 'error' && <span className="web-search-action-error" role="alert">保存失败</span>}
-        </div>
-      </section>
-
-      <section className="web-search-section" aria-labelledby="web-search-access-heading">
-        <header className="web-search-section-header">
-          <h3 id="web-search-access-heading">访问控制</h3>
-          <p>这个开关只影响联网搜索，不会改变模型 API 或其他工具的权限。</p>
-        </header>
-        <ToggleField
-          label="允许使用联网搜索"
-          description={loading
-            ? '正在读取当前配置…'
-            : !config
-              ? '请先保存一个搜索服务商。'
-              : !toggleMatchesSavedConfig
-                ? '请先保存服务商或 SearXNG 地址的更改。'
-                : config.enabled
-                  ? '关闭后，主智能体不能使用这个搜索服务。'
-                  : '开启后，主智能体可以在获准时使用这个搜索服务。'}
-          checked={config?.enabled ?? false}
-          disabled={loading || toggling || saveState === 'saving' || !toggleMatchesSavedConfig}
-          onChange={(enabled) => { void handleEnabledChange(enabled); }}
-        />
-        <div className="web-search-remove" aria-live="polite">
-          <div>
-            <h4>移除当前配置</h4>
-            <p>会删除当前服务的密钥和本地配置；之后需要重新配置才能联网搜索。</p>
-          </div>
-          {removeConfirmation ? (
-            <div className="web-search-remove-actions">
-              <button
-                type="button"
-                className="web-search-secondary-action"
-                disabled={removing}
-                onClick={() => setRemoveConfirmation(false)}
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                className="web-search-danger-action"
-                disabled={removing}
-                onClick={() => { void handleRemove(); }}
-              >
-                {removing ? '正在移除…' : '确认移除配置'}
-              </button>
+          {isSelfHosted ? (
+            <div className="web-search-field">
+              <label htmlFor="web-search-searxng-endpoint">SearXNG 服务地址</label>
+              <Input
+                id="web-search-searxng-endpoint"
+                type="url"
+                value={endpoint}
+                placeholder="https://search.example.com"
+                autoComplete="url"
+                disabled={loading || toggling || saveState === 'saving'}
+                onChange={(event) => {
+                  setEndpoint(event.target.value);
+                  setSaveState('idle');
+                }}
+                aria-describedby="web-search-searxng-help"
+              />
+              <small id="web-search-searxng-help">填写完整的 HTTP(S) 地址，不需要 API Key。</small>
             </div>
           ) : (
-            <button
-              type="button"
-              className="web-search-danger-action"
-              disabled={!config || loading || toggling || saveState === 'saving'}
-              onClick={() => {
-                setRemoveConfirmation(true);
-                setRemoved(false);
-                setError(null);
-              }}
-            >
-              移除配置
-            </button>
+            <>
+              <div className="web-search-field">
+                <label htmlFor="web-search-trusted-endpoint">受信任的服务地址</label>
+                <Input id="web-search-trusted-endpoint" value={selectedProvider.trustedEndpoint ?? ''} readOnly />
+              </div>
+              <div className="web-search-field">
+                <label htmlFor="web-search-api-key">API Key</label>
+                <div className="web-search-inline-field">
+                  <Input
+                    id="web-search-api-key"
+                    type={showApiKey ? 'text' : 'password'}
+                    value={apiKey}
+                    placeholder={apiKeyConfigured ? '已保存 · 输入新密钥' : '输入 API Key'}
+                    autoComplete="new-password"
+                    disabled={loading || toggling || saveState === 'saving'}
+                    onChange={(event) => {
+                      setApiKey(event.target.value);
+                      setSaveState('idle');
+                    }}
+                    aria-describedby="web-search-key-help"
+                  />
+                  <Button
+                    disabled={loading || toggling || saveState === 'saving'}
+                    onClick={() => setShowApiKey((visible) => !visible)}
+                    aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                  >
+                    {showApiKey ? '隐藏' : '显示'}
+                  </Button>
+                </div>
+                <small id="web-search-key-help">
+                  {apiKeyConfigured
+                    ? '重新保存时需输入密钥。'
+                    : '密钥仅保存在系统凭据库。'}
+                </small>
+              </div>
+            </>
           )}
-          {removed && <span className="web-search-remove-success">已移除当前联网搜索配置。</span>}
+
+          <div className="settings-action-line web-search-actions" aria-live="polite">
+            <p className="settings-muted">保存时启用联网搜索。</p>
+            <Button
+              variant="primary"
+              busy={saveState === 'saving'}
+              disabled={!canSave}
+              onClick={() => { void handleSave(); }}
+            >
+              {saveState === 'saving' ? '保存中…' : saveState === 'saved' ? '已保存配置' : '保存搜索配置'}
+            </Button>
+          </div>
         </div>
-      </section>
+        {error && saveState === 'error' && <p className="web-search-error" role="alert">{error}</p>}
+      </SettingsSection>
 
-      <section className="web-search-section web-search-privacy" aria-labelledby="web-search-privacy-heading">
-        <h3 id="web-search-privacy-heading">隐私与批准</h3>
-        <ul>
-          <li>密钥只保存在操作系统凭据库，设置页面不会回显它。</li>
-          <li>Tavily、Brave Search 和 Exa 只能使用上方显示的受信任地址；只有无密钥的 SearXNG 可以指定自托管地址。</li>
-          <li>关闭开关会撤销主智能体的搜索能力。开启后，实际联网请求仍遵循当前任务的批准和权限范围。</li>
-        </ul>
-      </section>
-
-      {error && <p className="web-search-error" role="alert">{error}</p>}
+      <SettingsSection title="访问控制">
+        <div className="settings-rows">
+          <ToggleField
+            label="允许使用联网搜索"
+            description={loading
+              ? '正在读取当前配置…'
+              : !config
+                ? '请先保存一个搜索服务商。'
+                : !toggleMatchesSavedConfig
+                  ? '请先保存服务商或 SearXNG 地址的更改。'
+                  : '搜索时按任务权限执行。'}
+            checked={config?.enabled ?? false}
+            disabled={loading || toggling || saveState === 'saving' || !toggleMatchesSavedConfig}
+            onChange={(enabled) => { void handleEnabledChange(enabled); }}
+          />
+          <SettingsRow title="移除当前配置" description={removed
+            ? <p className="settings-row-description" role="status">已移除当前联网搜索配置。</p>
+            : '删除服务配置和密钥。'}>
+            {removeConfirmation ? (
+              <>
+                <Button
+                  size="small"
+                  disabled={removing}
+                  onClick={() => setRemoveConfirmation(false)}
+                >
+                  取消
+                </Button>
+                <Button
+                  size="small"
+                  variant="danger"
+                  busy={removing}
+                  onClick={() => { void handleRemove(); }}
+                >
+                  {removing ? '正在移除…' : '确认移除配置'}
+                </Button>
+              </>
+            ) : (
+              <Button
+                size="small"
+                disabled={!config || loading || toggling || saveState === 'saving'}
+                onClick={() => {
+                  setRemoveConfirmation(true);
+                  setRemoved(false);
+                  setError(null);
+                }}
+              >
+                移除配置
+              </Button>
+            )}
+          </SettingsRow>
+        </div>
+        {error && saveState !== 'error' && <p className="web-search-error" role="alert">{error}</p>}
+      </SettingsSection>
     </div>
   );
 }

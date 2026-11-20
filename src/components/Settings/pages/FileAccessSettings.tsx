@@ -2,6 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { useSessionsStore } from '$stores/sessions';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { getSessionFileAccess, type SessionFileAccess } from '$lib/commands/file';
+import { Button } from '../../../ui';
+import { SettingsRow, SettingsSection } from '../components/SettingsSection';
+import './PermissionSettings.css';
 
 /** Workspace-owned file policy. Internal sessions never choose their own root. */
 export function FileAccessSettings() {
@@ -27,31 +30,27 @@ export function FileAccessSettings() {
   }, [activeSessionId, activeWorkspace?.kind, activeWorkspace?.directoryConfirmed]);
 
   if (!activeSessionId || !activeWorkspace) {
-    return <div className="settings-page-content">请先打开一个工作区以查看文件访问范围。</div>;
+    return <div className="settings-page-content"><p className="permission-copy">打开工作区后可查看文件范围。</p></div>;
   }
 
   const isProject = activeWorkspace.kind === 'project';
-  const rootPath = access?.workDir ?? activeWorkspace.rootPath;
+  const rootPath = access?.workDir ?? (isProject ? activeWorkspace.rootPath : undefined);
+  const needsConfirmation = isProject && activeWorkspace.directoryConfirmed === false;
 
   return (
-    <div className="settings-page-content file-access-settings">
-      <section className="file-access-card">
-        <p className="file-access-eyebrow">WORKSPACE FILE ACCESS</p>
-        <h3>{isProject ? `${activeWorkspace.name} 的文件范围` : 'AngelBot 日常不连接项目文件'}</h3>
-        {isProject ? (
-          <>
-            <p>项目目录在创建工作区时确定。主 Agent 与其内部子代理只能在此项目范围内写入，不能由会话重新定向。</p>
-            <div className="file-access-root"><span>项目根目录</span><code>{rootPath ?? '正在读取…'}</code><b>{activeWorkspace.directoryConfirmed === false ? '待确认，尚未授权' : '可读写'}</b></div>
-            {activeWorkspace.directoryConfirmed === false && <button type="button" onClick={() => window.dispatchEvent(new CustomEvent('open-settings', { detail: 'data' }))}>批量确认恢复目录</button>}
-          </>
-        ) : (
-          <>
-            <p>日常对话可将生成的文件保存在 AngelBot 自有结果区，默认保留，可预览、另存与备份；不会读取或写入项目目录，也不授予命令执行权限。处理已有文件可显式附加资料，需要项目范围时再打开项目。</p>
-            <div className="file-access-root"><span>日常结果区</span><code>{access?.workDir ?? '正在读取…'}</code><b>仅此目录可读写</b></div>
-          </>
-        )}
-      </section>
-      {error && <p className="file-access-error" role="alert">{error}</p>}
+    <div className="settings-page-content">
+      <SettingsSection title={activeWorkspace.name}
+        description={isProject ? '项目写入限于根目录。' : '处理其他文件时，可在对话中附加文件或打开项目。'}>
+        <div className="settings-rows permission-file-scope">
+          <SettingsRow title={isProject ? '项目根目录' : '日常结果区'} description={rootPath || (error ? '未能读取目录' : '正在读取…')}>
+            {needsConfirmation ? <>
+              <span className="permission-status" data-state="pending">尚未授权</span>
+              <Button size="small" onClick={() => window.dispatchEvent(new CustomEvent('open-settings', { detail: 'data' }))}>确认恢复目录</Button>
+            </> : rootPath && <span className="permission-status">{isProject ? '可读写' : '仅此目录可读写'}</span>}
+          </SettingsRow>
+        </div>
+        {error && <p className="permission-error" role="alert">{error}</p>}
+      </SettingsSection>
     </div>
   );
 }

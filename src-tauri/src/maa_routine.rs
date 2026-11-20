@@ -1002,13 +1002,17 @@ mod native {
         serde_json::from_slice(&bytes).map_err(|_| "辅助程序启动信息无效".into())
     }
 
+    fn supported_version(version: &str) -> bool {
+        let version = version.trim_start_matches('v');
+        version.starts_with("6.18.") || version == "6.22.0"
+    }
+
     fn validate_version(install: &Install) -> Result<(), String> {
         let version = powershell("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); (Get-Item -LiteralPath $env:ANGELBOT_MAA_INSPECT_PATH).VersionInfo.ProductVersion | ConvertTo-Json -Compress", &install.exe)?;
-        if !version
-            .as_str()
-            .is_some_and(|v| v.trim_start_matches('v').starts_with("6.18."))
-        {
-            return Err("当前按需控制已核验 MAA 6.18；其他版本请先做兼容性验收".into());
+        if !version.as_str().is_some_and(supported_version) {
+            return Err(
+                "当前按需控制已核验 MAA 6.18 系列及 6.22.0，其他版本请先做兼容性验收".into(),
+            );
         }
         Ok(())
     }
@@ -1313,6 +1317,17 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn version_allowlist_includes_only_validated_releases() {
+            for version in ["6.18.0", "v6.18.4", "6.22.0", "v6.22.0"] {
+                assert!(supported_version(version), "{version}");
+            }
+            for version in ["", "6.21.4", "6.22.0-beta.1", "6.22.1", "7.0.0"] {
+                assert!(!supported_version(version), "{version}");
+            }
+        }
+
         #[test]
         fn local_post_headers_are_strict_and_bounded() {
             assert_eq!(

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getWorkspaceAutomationOverview, type WorkspaceAutomationOverview, type WorkspaceAutomationStatus } from '$lib/commands/automation';
@@ -343,12 +343,36 @@ describe('WorkspaceReminders', () => {
     intervalSpy.mockRestore();
   });
 
+  it('同一空间的聊天头部和工作台共享读取，最后一个视图关闭后才解绑', async () => {
+    getOverviewMock.mockResolvedValueOnce(overview([automation()])).mockResolvedValueOnce(overview([
+      automation({ title: '后续提醒' }),
+    ]));
+    const views = (showCompact: boolean) => <>
+      {showCompact && <WorkspaceReminders key="header" workspaceId="personal" compact />}
+      <WorkspaceReminders key="panel" workspaceId="personal" defaultOpen />
+    </>;
+    const { rerender, unmount } = render(views(true));
+    await screen.findByText('记得喝水');
+    expect(getOverviewMock).toHaveBeenCalledOnce();
+    rerender(views(false));
+    await act(async () => { fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT)); });
+    expect(screen.getByText('后续提醒')).toBeInTheDocument();
+    expect(getOverviewMock).toHaveBeenCalledTimes(2);
+    unmount();
+    await act(async () => { fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT)); });
+    expect(getOverviewMock).toHaveBeenCalledTimes(2);
+  });
+
   it('切换空间立即隐藏旧数据，并忽略上一空间迟到的响应', async () => {
     const oldRequest = deferred<WorkspaceAutomationOverview>();
     getOverviewMock.mockReturnValueOnce(oldRequest.promise).mockResolvedValueOnce(overview([
       automation({ id: 'project', title: '项目提醒', workspaceId: 'project' }),
     ]));
     const { rerender } = render(<WorkspaceReminders workspaceId="personal" />);
+    await waitFor(() => expect(getOverviewMock).toHaveBeenCalledWith('personal'));
+    fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
+    fireEvent.focus(window);
+    expect(getOverviewMock).toHaveBeenCalledTimes(1);
     rerender(<WorkspaceReminders workspaceId="project" />);
     await screen.findByText('项目提醒');
 
@@ -367,17 +391,21 @@ describe('WorkspaceReminders', () => {
     expect(getOverviewMock).toHaveBeenCalledOnce();
   });
 
-  it('同空间重叠刷新只采纳最新响应，旧请求失败不会抹掉新数据', async () => {
+  it('同空间并发提示只追加一次刷新，首轮失败也不会丢掉刷新', async () => {
     const first = deferred<WorkspaceAutomationOverview>();
     const second = deferred<WorkspaceAutomationOverview>();
     getOverviewMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     render(<WorkspaceReminders workspaceId="personal" />);
+    await waitFor(() => expect(getOverviewMock).toHaveBeenCalledOnce());
     fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
+    fireEvent.focus(window);
+    expect(getOverviewMock).toHaveBeenCalledOnce();
 
+    await act(async () => { first.reject(new Error('IPC failed')); });
+    expect(getOverviewMock).toHaveBeenCalledTimes(2);
     await act(async () => { second.resolve(overview([automation({ title: '最新提醒' })])); });
     expect(screen.getByText('最新提醒')).toBeInTheDocument();
-    await act(async () => { first.reject(new Error('old IPC failed')); });
-    expect(screen.getByText('最新提醒')).toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('opens the exact result in the dashboard without changing the current workspace or invoking work', async () => {
@@ -395,6 +423,7 @@ describe('WorkspaceReminders', () => {
     const request = deferred<WorkspaceAutomationOverview>();
     getOverviewMock.mockReturnValueOnce(request.promise);
     const { unmount } = render(<WorkspaceReminders workspaceId="personal" />);
+    await waitFor(() => expect(getOverviewMock).toHaveBeenCalledOnce());
     unmount();
     fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
     fireEvent.focus(window);

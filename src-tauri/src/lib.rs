@@ -19,6 +19,7 @@ mod child_process_tree;
 mod commands;
 mod db;
 mod desktop_control;
+mod desktop_pet;
 mod document_text;
 mod file_watcher;
 mod fts;
@@ -294,6 +295,7 @@ fn build_delegation_pump(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayMenuAction {
     ShowWindow,
+    ToggleDesktopPet,
     Quit,
     Ignore,
 }
@@ -301,6 +303,7 @@ enum TrayMenuAction {
 fn tray_menu_action(id: &str) -> TrayMenuAction {
     match id {
         "show" => TrayMenuAction::ShowWindow,
+        "desktop-pet" => TrayMenuAction::ToggleDesktopPet,
         "quit" => TrayMenuAction::Quit,
         _ => TrayMenuAction::Ignore,
     }
@@ -313,6 +316,10 @@ mod tests {
     #[test]
     fn tray_menu_action_maps_known_menu_ids() {
         assert_eq!(tray_menu_action("show"), TrayMenuAction::ShowWindow);
+        assert_eq!(
+            tray_menu_action("desktop-pet"),
+            TrayMenuAction::ToggleDesktopPet
+        );
         assert_eq!(tray_menu_action("quit"), TrayMenuAction::Quit);
         assert_eq!(tray_menu_action("unknown"), TrayMenuAction::Ignore);
     }
@@ -516,6 +523,31 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    fn dev_http_memory_controls_seed_once_and_patch_only_the_requested_switch() {
+        let state = test_app_state();
+        db::migrate(&state.db.lock().unwrap()).unwrap();
+        let off = serde_json::json!({"useLongTermMemory": false, "evolutionEnabled": false});
+        let on = serde_json::json!({"useLongTermMemory": true, "evolutionEnabled": true});
+        for legacy in [&off, &on] {
+            let result = handle_dev_command(
+                "initialize_memory_controls",
+                &serde_json::json!({"legacy": legacy}),
+                &state,
+            );
+            assert_eq!(result["data"], off);
+        }
+        let result = handle_dev_command(
+            "set_memory_controls",
+            &serde_json::json!({"update": {"evolutionEnabled": true}}),
+            &state,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["data"]["useLongTermMemory"], false);
+        assert_eq!(result["data"]["evolutionEnabled"], true);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
     fn dev_http_learned_habits_share_the_owner_memory_store() {
         let state = test_app_state();
         {
@@ -579,7 +611,7 @@ mod tests {
                     &serde_json::json!({"sessionId":"owned-session","content":"owned instruction","mode":mode}),
                     &state
                 )["ok"],
-                true
+                false
             );
         }
         assert_eq!(
@@ -687,6 +719,27 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn dev_http_foreground_contracts_preserve_snapshots_and_continuation_shapes() {
+        const TEST: &str =
+            "tests::dev_http_foreground_contracts_preserve_snapshots_and_continuation_shapes";
+        const PROBE: &str = "ANGELBOT_PRIVATE_DEV_HTTP_CONTINUATION_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env("ANGELBOT_PRIVATE_VERIFY_CONFIG_DIR", directory.path())
+                .env(PROBE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        std::fs::write(commands::api_config::get_config_path(), "{invalid settings").unwrap();
+
         for wrapped in [false, true] {
             let state = test_app_state();
             let request_args = |request: serde_json::Value| {
@@ -809,18 +862,19 @@ mod tests {
                     "INSERT INTO task_runs (id, session_id, message_id, goal, status, plan,
                     resumable, continuation_context, created_at, updated_at)
                  VALUES ('task', 'session', 'assistant', 'Original task', 'needs_attention',
-                    '[]', 1, 'No operation has run.', 1, 2);
-                 ALTER TABLE projects RENAME TO unavailable_projects;",
+                    '[]', 1, 'No operation has run.', 1, 2);",
                 )
                 .unwrap();
             }
-            // Fail local context preparation after foreground reservation, before any
-            // model or credentials are accessed. Continuation must still not persist
-            // its internal prompt as another user turn, even when that slice fails.
+            // Preparation rejects this malformed local config before admitting
+            // a replacement leaf. The existing task remains available to retry.
             let result = handle_dev_command("continue_agent_task", &args, &state);
             assert_eq!(
                 result,
-                serde_json::json!({"ok": false, "error": "no such table: projects"})
+                serde_json::json!({
+                    "ok": false,
+                    "error": "模型暂时不可用。请检查模型设置，恢复连接后返回此任务继续。"
+                })
             );
             let conn = state.db.lock().unwrap();
             let user_turns: i64 = conn
@@ -831,14 +885,18 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(user_turns, 1);
-            let incorrect_goals: i64 = conn
+            let task: (String, String, i64, i64) = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM task_runs WHERE goal != 'Original task'",
+                    "SELECT goal, status, resumable, (SELECT COUNT(*) FROM task_runs)
+                     FROM task_runs WHERE message_id = 'assistant'",
                     [],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
-            assert_eq!(incorrect_goals, 0);
+            assert_eq!(
+                task,
+                ("Original task".into(), "needs_attention".into(), 1, 1)
+            );
             let leaf: String = conn
                 .query_row(
                     "SELECT leaf_message_id FROM sessions WHERE id = 'session'",
@@ -846,10 +904,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_ne!(
-                leaf, "assistant",
-                "the request must reserve and recover a new slice"
-            );
+            assert_eq!(leaf, "assistant");
             drop(conn);
             assert_eq!(
                 handle_dev_command(
@@ -1044,6 +1099,16 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
     use rusqlite::params;
 
     match cmd {
+        "get_desktop_pet" => {
+            serde_json::json!({"ok": true, "data": {"enabled": false, "supported": false}})
+        }
+        "set_desktop_pet"
+        | "desktop_pet_hide"
+        | "desktop_pet_open_main"
+        | "desktop_pet_reset_position"
+        | "desktop_pet_start_drag" => {
+            serde_json::json!({"ok": false, "error": "桌宠仅在 Windows 桌面版可用。"})
+        }
         "interrupt_agent" | "submit_in_progress_command" | "pause_agent" | "resume_agent" => {
             // Match the typed frontend's camelCase contract and use the same
             // run-local signals as native IPC, including during model waits.
@@ -1071,11 +1136,15 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                             args.get("mode").cloned().ok_or("invalid control mode")?,
                         )
                         .map_err(|_| "invalid control mode")?;
-                        commands::steering::submit_in_progress_command_impl(
-                            &state.steering,
-                            session_id,
-                            content,
-                            mode,
+                        let reply_id = args.get("replyId").and_then(serde_json::Value::as_str);
+                        tauri::async_runtime::block_on(
+                            commands::steering::submit_in_progress_command_impl(
+                                &state.steering,
+                                session_id,
+                                content,
+                                mode,
+                                reply_id,
+                            ),
                         )?;
                         Ok(serde_json::Value::Null)
                     }
@@ -1212,6 +1281,22 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .map(|_| serde_json::json!({"ok": true}))
                 .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
+        "save_composer_draft" => {
+            let Some(session_id) = args.get("sessionId").and_then(|value| value.as_str()) else {
+                return serde_json::json!({"ok": false, "error": "缺少草稿会话。"});
+            };
+            let Some(revision) = args.get("revision").and_then(|value| value.as_i64()) else {
+                return serde_json::json!({"ok": false, "error": "缺少草稿版本。"});
+            };
+            let Some(draft_text) = args.get("text").and_then(|value| value.as_str()) else {
+                return serde_json::json!({"ok": false, "error": "缺少草稿文字。"});
+            };
+            commands::composer_draft::save_composer_draft_impl(
+                state, session_id, revision, draft_text,
+            )
+            .map(|saved| serde_json::json!({"ok": true, "data": saved}))
+            .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
+        }
         "delete_session" => {
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
             commands::session::delete_session_impl(state, id)
@@ -1266,10 +1351,10 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                             .map_err(|error| format!("invalid {cmd} request: {error}"))?;
                     commands::message::edit_and_resend_message_impl(state, None, request).await
                 } else {
-                    let request: commands::message::ContinueAgentTaskRequest =
+                    let request: commands::message::ContinueAgentTaskInput =
                         serde_json::from_value(args.clone())
                             .map_err(|error| format!("invalid {cmd} request: {error}"))?;
-                    commands::message::continue_agent_task_impl(state, None, request).await
+                    commands::message::continue_agent_task_from_input(state, None, request).await
                 }
             });
             match result {
@@ -1297,6 +1382,32 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .project_session(session_id)
             {
                 Ok(messages) => serde_json::json!({"ok": true, "data": messages}),
+                Err(error) => serde_json::json!({"ok": false, "error": error}),
+            }
+        }
+        "get_message_page" => {
+            let result = serde_json::from_value(args.clone())
+                .map_err(|_| "消息分页请求无效。".to_owned())
+                .and_then(|request| {
+                    commands::foreground_run_store::message_page::get_message_page_impl(
+                        state, request,
+                    )
+                });
+            match result {
+                Ok(page) => serde_json::json!({"ok": true, "data": page}),
+                Err(error) => serde_json::json!({"ok": false, "error": error}),
+            }
+        }
+        "search_conversation_page" => {
+            let result = serde_json::from_value(args.clone())
+                .map_err(|_| "会话搜索请求无效。".to_owned())
+                .and_then(|request| {
+                    commands::foreground_run_store::conversation_search::search_conversation_page_impl(
+                        &state.db, request,
+                    )
+                });
+            match result {
+                Ok(page) => serde_json::json!({"ok": true, "data": page}),
                 Err(error) => serde_json::json!({"ok": false, "error": error}),
             }
         }
@@ -1341,31 +1452,13 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
             // Accept that shape here as well, while retaining compatibility
             // with existing direct dev-HTTP callers.
             let args = args.get("req").unwrap_or(&args);
-            let req = commands::message::ResolveAgentConfirmationRequest {
-                session_id: args
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                message_id: args
-                    .get("messageId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                call_id: args
-                    .get("callId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                decision: args
-                    .get("decision")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                preview_id: args
-                    .get("previewId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
+            let req: commands::message::InteractiveContinuation<
+                commands::message::ResolveAgentConfirmationRequest,
+            > = match serde_json::from_value(args.clone()) {
+                Ok(req) => req,
+                Err(error) => {
+                    return serde_json::json!({"ok": false, "error": format!("invalid {cmd} request: {error}")})
+                }
             };
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1597,6 +1690,9 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
             // accept a destination path or pretend a browser download saved it.
             serde_json::json!({"ok": false, "error": "文件另存需要在 AngelBot 桌面窗口中选择位置。"})
         }
+        "open_daily_results_folder" => {
+            serde_json::json!({"ok": false, "error": "请在 Windows 桌面版打开日常结果目录。"})
+        }
         "preview_browser_cleanup" => crate::browser_storage::cleanup::preview(state)
             .map(|data| serde_json::json!({"ok": true, "data": data}))
             .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error})),
@@ -1678,7 +1774,28 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 "temperature": config.temperature,
                 "has_api_key": false,
                 "credential_source": "none",
+                "auth_mode": config.auth_mode,
+                "protocol": config.protocol,
+                "plan_status_error": (config.auth_mode == crate::llm::ModelAuthMode::ChatgptPlan)
+                    .then_some("浏览器开发模式无法读取 ChatGPT 授权，请在桌面应用中检查。"),
             }})
+        }
+        "chatgpt_plan_status" => serde_json::json!({
+            "ok": false, "error": "浏览器开发模式无法读取 ChatGPT 授权，请在桌面应用中检查。"
+        }),
+        "initialize_memory_controls" => {
+            serde_json::from_value(args.get("legacy").cloned().unwrap_or_default())
+                .map_err(|error| error.to_string())
+                .and_then(|legacy| commands::memory::initialize_memory_controls_impl(state, legacy))
+                .map(|data| serde_json::json!({"ok": true, "data": data}))
+                .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
+        }
+        "set_memory_controls" => {
+            serde_json::from_value(args.get("update").cloned().unwrap_or_default())
+                .map_err(|error| error.to_string())
+                .and_then(|update| commands::memory::set_memory_controls_impl(state, update))
+                .map(|data| serde_json::json!({"ok": true, "data": data}))
+                .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
         }
         "get_learned_preferences" => commands::memory::get_learned_preferences_impl(state)
             .map(|v| serde_json::json!({"ok": true, "data": v}))
@@ -1689,8 +1806,57 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
         )
         .map(|_| serde_json::json!({"ok": true, "data": null}))
         .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
-        "get_memories" => commands::memory::get_memories_impl(state)
+        "get_memories" => commands::memory::get_memories_impl(
+            state,
+            args.get("includeReplaced")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .map(|v| serde_json::json!({"ok": true, "data": v}))
+        .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "delete_memory" => args
+            .get("id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| "需要记忆 ID。".to_string())
+            .and_then(|id| commands::memory::delete_memory_impl(state, id))
+            .map(|_| serde_json::json!({"ok": true, "data": null}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "set_memory_paused" => args
+            .get("id")
+            .and_then(|id| id.as_str())
+            .zip(args.get("paused").and_then(|paused| paused.as_bool()))
+            .ok_or_else(|| "需要记忆 ID 和暂停状态。".to_string())
+            .and_then(|(id, paused)| commands::memory::set_memory_paused_impl(state, id, paused))
+            .map(|_| serde_json::json!({"ok": true, "data": null}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "find_related_memories" => args
+            .get("memory_id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| "需要记忆 ID。".to_string())
+            .and_then(|id| commands::memory::find_related_memories_impl(state, id))
             .map(|v| serde_json::json!({"ok": true, "data": v}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "get_memory_history" => args
+            .get("memory_id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| "需要记忆 ID。".to_string())
+            .and_then(|id| commands::memory::get_memory_history_impl(state, id))
+            .map(|v| serde_json::json!({"ok": true, "data": v}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "replace_memory" => serde_json::from_value(args.get("req").cloned().unwrap_or_default())
+            .map_err(|e| e.to_string())
+            .and_then(|req| commands::memory::replace_memory_impl(state, req))
+            .map(|_| serde_json::json!({"ok": true, "data": null}))
+            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "restore_replaced_memory" => args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .zip(args.get("replacementId").and_then(|v| v.as_str()))
+            .ok_or_else(|| "需要记忆 ID 和替代记录 ID。".to_string())
+            .and_then(|(id, replacement_id)| {
+                commands::memory::restore_replaced_memory_impl(state, id, replacement_id)
+            })
+            .map(|_| serde_json::json!({"ok": true, "data": null}))
             .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
         "get_memory_stats" => commands::memory::get_memory_stats_impl(state)
             .map(|v| serde_json::json!({"ok": true, "data": v}))
@@ -1704,6 +1870,30 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .and_then(|conn| commands::activity::get_activity_impl(&conn, limit))
                 .map(|entries| serde_json::json!({"ok": true, "data": entries}))
                 .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
+        }
+        "dismiss_workspace_task_reminders" => {
+            let workspace_id = args
+                .get("workspaceId")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let session_id = args
+                .get("sessionId")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            serde_json::from_value::<Vec<String>>(
+                args.get("reminderIds").cloned().unwrap_or_default(),
+            )
+            .map_err(|_| "任务提醒请求格式无效。".to_owned())
+            .and_then(|ids| {
+                commands::workspace_activity::dismiss_workspace_task_reminders_impl(
+                    state,
+                    workspace_id,
+                    session_id,
+                    &ids,
+                )
+            })
+            .map(|()| serde_json::json!({"ok": true, "data": null}))
+            .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
         }
         "get_workspace_activity_projection" => {
             let workspace_id = args
@@ -1906,9 +2096,27 @@ fn handle_dev_command(cmd: &str, args: &serde_json::Value, state: &AppState) -> 
                 .map(|_| serde_json::json!({"ok": true}))
                 .unwrap_or_else(|error| serde_json::json!({"ok": false, "error": error}))
         }
-        "get_automation_dashboard" => commands::automation::get_automation_dashboard_impl(state)
-            .map(|v| serde_json::json!({"ok": true, "data": v}))
-            .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
+        "get_automation_dashboard" => {
+            let pending = args
+                .get("pendingRequests")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value::<Vec<commands::automation::AutomationRunRequest>>(
+                        value.clone(),
+                    )
+                })
+                .transpose();
+            pending
+                .map_err(|error| error.to_string())
+                .and_then(|pending| {
+                    commands::automation::get_automation_dashboard_with_requests(
+                        state,
+                        pending.as_deref().unwrap_or_default(),
+                    )
+                })
+                .map(|v| serde_json::json!({"ok": true, "data": v}))
+                .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}))
+        }
         "get_automations" => commands::automation::get_automations_impl(state)
             .map(|v| serde_json::json!({"ok": true, "data": v}))
             .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e})),
@@ -2296,20 +2504,19 @@ pub fn run() {
     // reply before the UI loads. Older already-visible replies keep their
     // content and become attention-only, never automatic replays. Delegated
     // attempts recover separately through the single delegation pump below.
-    if let Err(error) = commands::foreground_run_store::recover_interrupted_runs_in_conn(
+    let foreground_recovered = commands::foreground_run_store::recover_interrupted_runs_in_conn(
         &mut conn,
         chrono::Utc::now().timestamp(),
-    ) {
-        eprintln!("[Startup] foreground recovery failed: {error}");
-    }
-    if let Err(error) =
+    )
+    .map_err(|error| eprintln!("[Startup] foreground recovery failed: {error}"))
+    .is_ok();
+    let automation_recovered =
         commands::automation::recover_interrupted_agent_automation_dispatches_in_conn(
             &mut conn,
             chrono::Utc::now().timestamp(),
         )
-    {
-        eprintln!("[Startup] automation foreground recovery failed: {error}");
-    }
+        .map_err(|error| eprintln!("[Startup] automation foreground recovery failed: {error}"))
+        .is_ok();
     if let Err(error) =
         commands::delegated_delivery_follow_up::recover_interrupted_reviewed_delivery_follow_ups_in_conn(
             &mut conn,
@@ -2337,6 +2544,14 @@ pub fn run() {
         }
     }
 
+    let automation_clock = automation_clock::AutomationClock::prepare(
+        &mut conn,
+        foreground_recovered && automation_recovered,
+        std::env::args_os().any(|arg| arg == commands::settings::AUTOSTART_ARGUMENT),
+        chrono::Utc::now().timestamp(),
+        &mut runtime_health,
+    );
+
     // Resolve deployment opt-in before either the debug compatibility thread
     // or the delegated host is started.  This avoids a race where `.env` would
     // be loaded by the debug thread after the production host checked it.
@@ -2360,7 +2575,12 @@ pub fn run() {
     let delegation_pump = delegation_startup.pump;
     let delegation_available = delegation_startup.enabled;
 
-    let app_builder = tauri::Builder::default()
+    let app_builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let app_builder = app_builder
+        .manage(desktop_pet::DesktopPet::new(app_data_dir))
+        .on_window_event(desktop_pet::on_window_event);
+    let app_builder = app_builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -2387,16 +2607,25 @@ pub fn run() {
             desktop_adapter: desktop_control::create_runtime_adapter(),
             desktop_action_previews: Default::default(),
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(desktop_pet::scoped_invoke(tauri::generate_handler![
+            desktop_pet::get_desktop_pet,
+            desktop_pet::set_desktop_pet,
+            desktop_pet::desktop_pet_start_drag,
+            desktop_pet::desktop_pet_open_main,
+            desktop_pet::desktop_pet_reset_position,
+            desktop_pet::desktop_pet_hide,
             commands::session::create_session,
             commands::session::get_sessions,
             commands::session::delete_session,
+            commands::composer_draft::save_composer_draft,
             commands::session::update_session_model,
             commands::session::update_session_title,
             commands::session::get_context_usage,
             commands::session::get_history_sessions,
             commands::message::send_message,
             commands::message::get_messages,
+            commands::foreground_run_store::message_page::get_message_page,
+            commands::foreground_run_store::conversation_search::search_conversation_page,
             commands::reply_export::save_message_reply,
             commands::reply_export::save_session_file,
             commands::foreground_text_attachments::extract_document_text,
@@ -2428,6 +2657,8 @@ pub fn run() {
             commands::mcp::list_mcp_tools,
             commands::mcp::refresh_mcp_tools,
             commands::memory::get_memories,
+            commands::memory::initialize_memory_controls,
+            commands::memory::set_memory_controls,
             commands::memory::get_learned_preferences,
             commands::memory::dismiss_learned_preference,
             commands::memory::save_memory,
@@ -2438,6 +2669,7 @@ pub fn run() {
             commands::memory::get_memories_to_forget,
             commands::memory::set_memory_permanent,
             commands::memory::archive_memory,
+            commands::memory::set_memory_paused,
             commands::memory::permanently_delete_memory,
             commands::memory::cleanup_archived_memories,
             commands::memory::find_relevant_memories,
@@ -2455,14 +2687,16 @@ pub fn run() {
             commands::memory::accept_evolution_proposal,
             commands::memory::reject_evolution_proposal,
             commands::memory::check_evolution_due,
-            commands::memory::detect_memory_conflicts,
+            commands::memory::find_related_memories,
             commands::memory::get_memory_history,
-            commands::memory::merge_memories,
+            commands::memory::replace_memory,
+            commands::memory::restore_replaced_memory,
             commands::memory::get_profile,
             commands::memory::save_profile,
             commands::runtime_health::get_runtime_health,
             commands::activity::get_activity,
             commands::workspace_activity::get_workspace_activity_projection,
+            commands::workspace_activity::dismiss_workspace_task_reminders,
             commands::task_understanding_view::get_workspace_task_understanding,
             commands::settings::get_scheduled_tasks,
             commands::settings::save_scheduled_task,
@@ -2507,6 +2741,7 @@ pub fn run() {
             commands::file::read_session_file,
             commands::file::write_session_file,
             commands::file::list_work_dir,
+            commands::file::open_daily_results_folder,
             commands::file::get_work_dir,
             commands::file::set_work_dir,
             commands::file::get_session_file_access,
@@ -2573,8 +2808,8 @@ pub fn run() {
             commands::skill::register_skill,
             commands::skill::skill_has_action,
             commands::skill::get_skill_ids,
-        ])
-        .setup(|app| {
+        ]))
+        .setup(move |app| {
             if let Some(state) = app.try_state::<AppState>() {
                 let _ = state.delegated_model_factory.install(app.handle().clone());
                 // Retired MCP keyring entries are queued in SQLite when a
@@ -2607,6 +2842,18 @@ pub fn run() {
             }
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
+            #[cfg(windows)]
+            let pet = tauri::menu::CheckMenuItem::with_id(
+                app,
+                "desktop-pet",
+                "桌宠",
+                true,
+                false,
+                None::<&str>,
+            )?;
+            #[cfg(windows)]
+            let menu = Menu::with_items(app, &[&show, &pet, &quit])?;
+            #[cfg(not(windows))]
             let menu = Menu::with_items(app, &[&show, &quit])?;
             let mut tray = TrayIconBuilder::new().menu(&menu).tooltip("AngelBot");
             if let Some(icon) = app.default_window_icon() {
@@ -2626,14 +2873,17 @@ pub fn run() {
                         app.exit(0);
                     }
                     TrayMenuAction::ShowWindow => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        let _ = desktop_pet::show_main(app);
+                    }
+                    TrayMenuAction::ToggleDesktopPet => {
+                        #[cfg(windows)]
+                        desktop_pet::toggle_from_tray(app);
                     }
                     TrayMenuAction::Ignore => {}
                 })
                 .build(app)?;
+            #[cfg(windows)]
+            desktop_pet::install(app.handle(), pet);
 
             #[cfg(debug_assertions)]
             {
@@ -2644,9 +2894,11 @@ pub fn run() {
                     window.open_devtools();
                 }
             }
-            // All startup recovery, managed state and fallible window/tray
-            // setup must succeed before due work may be admitted.
-            automation_clock::AutomationClock::install(app.handle());
+            // Preparing durable state does not dispatch work. All fallible
+            // window/tray setup must still succeed before the first scan.
+            if let Some(clock) = automation_clock {
+                clock.install(app.handle());
+            }
             Ok(())
         });
 
@@ -2687,6 +2939,8 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                #[cfg(windows)]
+                desktop_pet::flush(app);
                 if let Some(state) = app.try_state::<AppState>() {
                     state.mcp_manager.stop_all();
                 }

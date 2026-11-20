@@ -19,7 +19,7 @@ describe('WorkflowStatusBar', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getMemoryStats).mockResolvedValue(EMPTY_STATS);
-    useSettingsStore.setState({ profile: { name: 'Test', bio: 'Bio' } as never });
+    useSettingsStore.setState({ activeProfile: { name: 'Test', bio: 'Bio' } as never });
     useMessagesStore.setState({ messages: [] });
   });
 

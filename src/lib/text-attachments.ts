@@ -7,7 +7,7 @@ export const MAX_TEXT_ATTACHMENT_BYTES = 16 * 1024;
 export const MAX_TEXT_ATTACHMENTS_BYTES = 32 * 1024;
 export const MAX_DOCUMENT_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_TEXT_SOURCE_BYTES = MAX_TEXT_ATTACHMENT_BYTES * 2 + 4;
-export const TEXT_ATTACHMENT_EXTENSIONS = ['txt', 'md', 'csv', 'tsv', 'json', 'log', 'yaml', 'yml', 'docx', 'xlsx'];
+export const TEXT_ATTACHMENT_EXTENSIONS = ['txt', 'md', 'csv', 'tsv', 'json', 'log', 'yaml', 'yml', 'docx', 'xlsx', 'pdf'];
 export const TEXT_ATTACHMENT_ACCEPT = TEXT_ATTACHMENT_EXTENSIONS.map((extension) => `.${extension}`).join(',');
 
 export function textAttachmentBytes(text: string): number {
@@ -21,7 +21,7 @@ function validateName(name: string): void {
   const dot = name.lastIndexOf('.');
   const extension = name.slice(dot + 1).toLowerCase();
   if (dot <= 0 || !name.slice(0, dot).trim() || !TEXT_ATTACHMENT_EXTENSIONS.includes(extension)) {
-    throw new Error('支持 UTF-8、带 BOM 的 UTF-16 文本、DOCX 正文和 XLSX 单元格值；图片、PDF、旧版 Word/Excel 暂不支持。');
+    throw new Error('支持 UTF-8、带 BOM 的 UTF-16 文本、DOCX 正文、XLSX 单元格值和 PDF 文字层；图片及旧版 Word/Excel 暂不支持。');
   }
 }
 
@@ -54,12 +54,12 @@ function readFile(file: File): Promise<ArrayBuffer> {
 }
 
 function isDocument(name: string): boolean {
-  return /\.(docx|xlsx)$/i.test(name);
+  return /\.(docx|xlsx|pdf)$/i.test(name);
 }
 
 function validateFileSize(name: string, size: number): void {
   if (isDocument(name)) {
-    if (size > MAX_DOCUMENT_FILE_BYTES) throw new Error('DOCX/XLSX 原文件不能超过 4 MiB。');
+    if (size > MAX_DOCUMENT_FILE_BYTES) throw new Error('DOCX、XLSX、PDF 原文件不能超过 4 MiB。');
   } else if (size > MAX_TEXT_SOURCE_BYTES) {
     throw new Error('文本原文件过大；解码后的文字每个最多 16 KiB，不会截断内容。');
   }
@@ -75,7 +75,7 @@ function base64(bytes: ArrayBuffer): string {
 }
 
 // Only use after name validation: never echo an invalid name containing a path
-// or control characters. Office IPC already normalizes its fixed safe errors.
+// or control characters. Document IPC normalizes its fixed safe errors.
 function fileReadError(name: string, error: unknown): Error {
   const reason = error instanceof Error ? error.message : '无法读取文件，请重新选择。';
   return new Error(`无法添加“${name}”：${reason}`);

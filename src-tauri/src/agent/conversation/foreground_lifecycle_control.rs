@@ -12,7 +12,7 @@ use super::lifecycle::{BeforeToolCallResult, ToolCallContext, ToolLifecycleHook}
 
 /// Owns external dispatch reservations and terminal durability for one run.
 ///
-/// The existing tool hook reserves actual MCP dispatches in the same journal;
+/// The tool hook reserves MCP and project command dispatches in the same journal;
 /// ordinary progress remains best-effort. Callers stream through
 /// `AgentEventEmitter`, persist the reply/projection, then call
 /// `commit_terminal`. A failed commit keeps terminal events hidden and leaves
@@ -83,7 +83,7 @@ impl ForegroundLifecycleControl {
 
 impl ToolLifecycleHook for ForegroundLifecycleControl {
     fn before_tool_call(&self, ctx: &ToolCallContext) -> BeforeToolCallResult {
-        if !ctx.tool_name.starts_with("mcp_") {
+        if ctx.tool_name != "run_project_command" && !ctx.tool_name.starts_with("mcp_") {
             return BeforeToolCallResult::default();
         }
         let reserved = match (ctx.session_id.as_deref(), ctx.tool_call.id.as_deref()) {
@@ -102,9 +102,8 @@ impl ToolLifecycleHook for ForegroundLifecycleControl {
         };
         BeforeToolCallResult {
             block: !reserved,
-            reason: (!reserved).then(|| {
-                "无法安全记录外部工具调用，本次未派发。请检查本地存储后再发起。".to_string()
-            }),
+            reason: (!reserved)
+                .then(|| "无法保存工具派发记录，本次未派发。请检查本地存储后再发起。".to_string()),
         }
     }
 }

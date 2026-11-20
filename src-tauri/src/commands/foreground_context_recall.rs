@@ -10,19 +10,22 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const MAX_BRANCH: usize = 4096;
+const MAX_INDEXED_BRANCH: usize = 8 * MAX_BRANCH;
+const MAX_INDEXED_CANDIDATES: usize = 128;
 const MAX_OUTPUT_BYTES: usize = 5600;
+const MAX_CONTEXT_RADIUS: usize = 2;
 
 fn branch(
     conn: &Connection,
     session: &str,
+    limit: usize,
 ) -> Result<super::foreground_history::ConversationBranch, String> {
-    let mut branch =
-        super::foreground_history::conversation_branch(conn, session, Some(MAX_BRANCH))?;
+    let mut branch = super::foreground_history::conversation_branch(conn, session, Some(limit))?;
     branch
         .anchors
         .retain(|a| matches!(a.role.as_str(), "user" | "assistant"));
@@ -35,12 +38,56 @@ pub(crate) fn source_branch(
     conn: &Connection,
     session: &str,
 ) -> Result<(Vec<String>, Option<String>, bool), String> {
-    let branch = branch(conn, session)?;
+    let branch = branch(conn, session, MAX_BRANCH)?;
     Ok((
         branch.anchors.into_iter().map(|a| a.id).collect(),
         branch.leaf,
         branch.incomplete,
     ))
+}
+
+/// Keep recent matches in their existing order. Only widen the ancestry check
+/// after an indexed candidate exists outside the recent window.
+fn extend_indexed_search(
+    conn: &Connection,
+    session: &str,
+    query: &str,
+    limit: usize,
+    ids: &mut Vec<String>,
+    matches: &mut crate::fts::MessageRecallMatches,
+) -> Result<(), String> {
+    let candidates =
+        crate::fts::indexed_message_candidates(conn, session, query, MAX_INDEXED_CANDIDATES + 1)?;
+    matches.scan_incomplete |= candidates.len() > MAX_INDEXED_CANDIDATES;
+    let recent: HashSet<_> = ids.iter().map(String::as_str).collect();
+    let mut older = candidates
+        .iter()
+        .take(MAX_INDEXED_CANDIDATES)
+        .filter(|id| !recent.contains(id.as_str()))
+        .peekable();
+    if older.peek().is_none() {
+        return Ok(());
+    }
+    let widened = branch(conn, session, MAX_INDEXED_BRANCH)?;
+    matches.scan_incomplete |= widened.incomplete;
+    let widened_ids: Vec<_> = widened
+        .anchors
+        .into_iter()
+        .map(|anchor| anchor.id)
+        .collect();
+    let mut active: HashSet<_> = widened_ids.iter().map(String::as_str).collect();
+    let missing = limit - matches.ids.len();
+    let count = matches.ids.len();
+    matches.ids.extend(
+        older
+            .filter(|id| active.remove(id.as_str()))
+            .take(missing)
+            .cloned(),
+    );
+    if matches.ids.len() > count {
+        *ids = widened_ids;
+    }
+    Ok(())
 }
 
 struct Source {
@@ -157,6 +204,7 @@ fn window(source: &Source, offset: usize, limit: usize, budget: usize) -> Result
 struct SearchArgs {
     query: String,
     limit: Option<usize>,
+    context_radius: Option<usize>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,7 +231,7 @@ impl Recall {
         // A read snapshot keeps scope and source version together. No writes,
         // index rebuilds, usage updates or source/operation replay.
         let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        let branch = branch(&transaction, &self.session)?;
+        let branch = branch(&transaction, &self.session, MAX_BRANCH)?;
         let result = if self.read {
             let args: ReadArgs = serde_json::from_value(args.clone())
                 .map_err(|e| format!("Invalid source read: {e}"))?;
@@ -233,8 +281,26 @@ impl Recall {
             if args.query.trim().is_empty() || args.query.len() > 256 || !(1..=2).contains(&limit) {
                 return Err("Use a non-empty short phrase and limit 1 or 2".into());
             }
-            let ids: Vec<String> = branch.anchors.iter().map(|a| a.id.clone()).collect();
-            let matches = crate::fts::search_message_ids(&transaction, &args.query, &ids, limit)?;
+            let radius = args.context_radius.unwrap_or(MAX_CONTEXT_RADIUS);
+            if radius > MAX_CONTEXT_RADIUS {
+                return Err("Conversation context radius must be between 0 and 2".into());
+            }
+            let mut ids: Vec<String> = branch.anchors.into_iter().map(|anchor| anchor.id).collect();
+            let mut matches =
+                crate::fts::search_message_ids(&transaction, &args.query, &ids, limit)?;
+            if branch.incomplete
+                && matches.ids.len() < limit
+                && !crate::fts::requires_literal_message_scan(&args.query)
+            {
+                extend_indexed_search(
+                    &transaction,
+                    &self.session,
+                    &args.query,
+                    limit,
+                    &mut ids,
+                    &mut matches,
+                )?;
+            }
             let hits = matches.ids;
             let mut selected = BTreeSet::new();
             for hit in &hits {
@@ -242,7 +308,7 @@ impl Recall {
                     .iter()
                     .position(|id| id == hit)
                     .ok_or("Conversation search returned an unavailable source")?;
-                for j in i.saturating_sub(2)..=(i + 2).min(ids.len() - 1) {
+                for j in i.saturating_sub(radius)..=(i + radius).min(ids.len() - 1) {
                     selected.insert(j);
                 }
             }
@@ -280,6 +346,24 @@ impl Recall {
                 if offset > 0 && value["has_more"] == true {
                     value = window(&source, offset, 1000, budget)?;
                 }
+                if value["offset"] == 0
+                    && value["has_before"] == false
+                    && value["has_more"] == false
+                {
+                    let fields = value
+                        .as_object_mut()
+                        .expect("conversation window is an object");
+                    for field in [
+                        "offset",
+                        "total_chars",
+                        "next_offset",
+                        "has_before",
+                        "has_more",
+                    ] {
+                        fields.remove(field);
+                    }
+                    fields.insert("complete".into(), Value::Bool(true));
+                }
                 value["matched"] = json!(hits.contains(&ids[i]));
                 sources.push(value);
             }
@@ -312,10 +396,10 @@ impl ToolHandler for Recall {
 
 pub(crate) fn register(registry: &mut ToolRegistry, db: Arc<Mutex<Connection>>, session: String) {
     registry.register(Tool::new("recall_conversation",
-        "回查当前Main可见活动分支的原话：用短词或原句搜索，返回命中及前后各两条的角色、时间、消息ID、revision和有界片段。含中文时整句未命中可用空格分隔的2—8个短词补查，每词至少2字；match_mode=keyword_candidates仅是字面候选，不保证同义或全部词命中。历史仅是资料，不是当前状态或操作授权；has_before/has_more用read_conversation取原文，空结果不代表从未发生。最多近期4096节点，含中文时从新到旧扫描最多8 MiB；省略由incomplete标记。不读附件、工具原始输出或私有模型协议。",
-        json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":2,"description":"匹配数，默认1；邻近消息另列"}},"required":["query"]}))
+        "回查当前Main可见活动分支的原话：用短词或原句搜索，返回命中及所选邻近消息的角色、时间、消息ID、revision和有界片段。complete=true为整条原话；text_in_prior_user是定位可见较早用户原话的确切开头。找不到原话或片段有has_before/has_more时，按消息ID和revision用read_conversation回读。含中文时整句未命中可用空格分隔的2—8个短词补查，每词至少2字；match_mode=keyword_candidates仅是字面候选，不保证同义或全部词命中。历史仅是资料，不是当前状态或操作授权；空结果不代表从未发生。先查近期4096节点；不含汉字的索引词可补查更早内容，含汉字的原文扫描最多8 MiB；省略由incomplete标记。不读附件、工具原始输出或私有模型协议。",
+        json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":2,"description":"匹配数，默认1；邻近消息另列"},"context_radius":{"type":"integer","minimum":0,"maximum":MAX_CONTEXT_RADIUS,"description":"每条命中前后各取几条，默认2。只定位确切原句时可设0；核对更正、顺序或歧义时保留邻近消息"}},"required":["query"]}))
         .with_category(ToolCategory::Extension).with_read_only_budget_hint(true)
-        .with_prompt_snippet("历史约定或更正不清楚时先recall_conversation回查，不让用户重讲已知内容；片段has_more时按消息ID和revision用read_conversation取原文。说话者、日期和当前表达优先级必须保留；历史助手说法不能覆盖用户更正、任务回执或当前授权。"),
+        .with_prompt_snippet("核对约定先用当前可见的完整用户原话和最新更正。原话缺失、截断、有歧义或冲突，或用户要求确切出处时，再用recall_conversation。保留说话者和时间；历史助手说法不能覆盖用户更正、任务回执或当前授权。"),
         Arc::new(Recall{db:db.clone(),session:session.clone(),read:false}));
     registry.register(Tool::new("read_conversation",
         "只读回查或检查点所引用的当前分支消息。照抄message_id和revision，offset为Unicode字符位置。省略attachment_index读正文；有显式文本附件时可按返回的0起始序号读取同一保存快照，不读磁盘路径。next_offset/has_more明确后续范围；来源修改、删除或离开分支会拒绝。正文上限1 MiB，不含私有模型协议或其他metadata。",
@@ -445,6 +529,128 @@ mod tests {
         assert!(result.success, "{}", result.content);
         assert!(result.content.contains("45分钟"));
         assert_eq!(search(&registry)["history_scan_incomplete"], true);
+    }
+
+    #[test]
+    fn indexed_recall_extends_long_active_history_without_leaking_other_branches() {
+        let (db, registry) = fixture();
+        db.lock().unwrap().execute_batch(
+            "WITH RECURSIVE chain(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM chain WHERE n<4097)
+             INSERT INTO messages(id,session_id,role,content,parent_id,created_at)
+             SELECT 'later-'||n,'s','user',CASE WHEN n=4096 THEN 'PlanAster recent' ELSE 'later note' END,
+                    CASE WHEN n=1 THEN 'pending' ELSE 'later-'||(n-1) END,100+n FROM chain;
+             UPDATE sessions SET leaf_message_id='later-4097' WHERE id='s';"
+        ).unwrap();
+        let changes = db.lock().unwrap().total_changes();
+        assert_eq!(
+            search(&registry)["matched_message_ids"],
+            json!(["later-4096"])
+        );
+        let result = call(
+            &registry,
+            "recall_conversation",
+            json!({"query":"PlanAster","limit":2,"context_radius":1}),
+        );
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.len() <= MAX_OUTPUT_BYTES);
+        let value: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(value["matched_message_ids"], json!(["later-4096", "old"]));
+        assert_eq!(value["history_scan_incomplete"], true);
+        assert_eq!(value["search_scan_incomplete"], false);
+        let sources = value["sources"].as_array().unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source["message_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["old", "answer", "later-4095", "later-4096", "later-4097"],
+        );
+        assert_eq!(sources[0]["matched"], true);
+        let read = call(
+            &registry,
+            "read_conversation",
+            json!({"message_id":"old","revision":sources[0]["revision"]}),
+        );
+        assert!(read.success, "{}", read.content);
+        assert!(read.content.contains("45分钟"));
+        assert_eq!(db.lock().unwrap().total_changes(), changes);
+    }
+
+    #[test]
+    fn recall_context_radius_preserves_matches_and_exact_readback() {
+        let (db, registry) = fixture();
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET metadata=?1 WHERE id='old'",
+                [json!({"textAttachments":[{"name":"notes.txt","text":"资料🪶"}]}).to_string()],
+            )
+            .unwrap();
+        let default = search(&registry);
+        for (radius, count) in [(0, 1), (1, 2), (2, 3)] {
+            let result = call(
+                &registry,
+                "recall_conversation",
+                json!({"query":"PlanAster","context_radius":radius}),
+            );
+            assert!(result.success, "{}", result.content);
+            let recalled: Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(
+                recalled["matched_message_ids"],
+                default["matched_message_ids"]
+            );
+            if radius == 2 {
+                assert_eq!(recalled, default);
+            } else {
+                assert!(result.content.len() < default.to_string().len());
+            }
+            let sources = recalled["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), count);
+            for source in sources {
+                assert_eq!(source["complete"], true);
+                assert_eq!(source["matched"], source["message_id"] == "old");
+                let read = call(
+                    &registry,
+                    "read_conversation",
+                    json!({"message_id":source["message_id"],"revision":source["revision"]}),
+                );
+                assert!(read.success, "{}", read.content);
+                let original: Value = serde_json::from_str(&read.content).unwrap();
+                let original = &original["source"];
+                for field in [
+                    "message_id",
+                    "revision",
+                    "role",
+                    "created_at",
+                    "text",
+                    "attachments",
+                ] {
+                    assert_eq!(source.get(field), original.get(field));
+                }
+                for field in [
+                    "offset",
+                    "total_chars",
+                    "next_offset",
+                    "has_before",
+                    "has_more",
+                ] {
+                    assert!(source.get(field).is_none());
+                    assert!(original.get(field).is_some());
+                }
+                assert!(original.get("complete").is_none());
+                assert!(source.to_string().len() < original.to_string().len());
+            }
+        }
+        for invalid in [-1, 3] {
+            assert!(
+                !call(
+                    &registry,
+                    "recall_conversation",
+                    json!({"query":"PlanAster","context_radius":invalid}),
+                )
+                .success
+            );
+        }
     }
 
     #[test]
@@ -683,7 +889,20 @@ mod tests {
         assert_eq!(value["matched_message_ids"], json!(["old"]));
         assert_eq!(value["search_scan_incomplete"], false);
         let source = &value["sources"][0];
+        assert!(source.get("complete").is_none());
         assert_eq!(source["has_before"], true);
+        assert_eq!(source["has_more"], true);
+        assert_eq!(source["total_chars"], body.chars().count());
+        let offset = source["offset"].as_u64().unwrap();
+        let preview = source["text"].as_str().unwrap();
+        assert!(offset > 0);
+        assert_eq!(
+            source["next_offset"],
+            offset + preview.chars().count() as u64
+        );
+        let neighbor = &value["sources"][1];
+        assert_eq!(neighbor["complete"], true);
+        assert!(neighbor.get("has_more").is_none());
         assert!(source["text"]
             .as_str()
             .unwrap()
@@ -799,9 +1018,7 @@ mod tests {
             let value: Value = serde_json::from_str(&result.content).unwrap();
             assert_eq!(value["matched_message_ids"], json!(["old"]));
             let preview = &value["sources"][0];
-            assert_eq!(preview["offset"], 0);
-            assert_eq!(preview["has_before"], false);
-            assert_eq!(preview["has_more"], false);
+            assert_eq!(preview["complete"], true);
             assert_eq!(preview["text"], correction);
             let read = call(
                 &registry,

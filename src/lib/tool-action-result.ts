@@ -51,11 +51,13 @@ export function toolActionReceipt(
   if (!result) return null;
   if (result.confirmationStatus === 'pending' || result.confirmationStatus === 'rejected'
     || result.confirmationStatus === 'cancelled') return null;
-  if (toolName.startsWith('mcp_') && isResultUnknown(result)) {
+  if ((toolName === 'run_project_command' || toolName.startsWith('mcp_')) && isResultUnknown(result)) {
     return {
       status: 'result_unknown',
       label: '结果未知',
-      explanation: '外部操作可能已部分生效；请先检查目标应用或服务，再决定是否发起新操作。不要重复批准或自动重试。',
+      explanation: toolName === 'run_project_command'
+        ? '命令可能已经改变工作区。请先核对文件和运行结果，再决定是否发起新的命令。'
+        : '外部操作可能已部分生效；请先检查目标应用或服务，再决定是否发起新操作。不要重复批准或自动重试。',
     };
   }
   // A refused image is an observation failure, never a verified action. Reuse

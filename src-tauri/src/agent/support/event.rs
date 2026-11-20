@@ -258,6 +258,14 @@ pub enum ErrorCode {
     LlmError,
     /// Provider identified an exhausted usage quota, not an inferred rate limit.
     LlmQuotaExceeded,
+    /// Provider transport failed, without exposing private error details.
+    LlmTransportError,
+    LlmAuthentication,
+    LlmPermissionDenied,
+    LlmRateLimited,
+    LlmServiceUnavailable,
+    LlmTimedOut,
+    LlmResponseInterrupted,
     /// Tool execution failed
     ToolError,
     /// Context length exceeded
@@ -277,6 +285,13 @@ impl ErrorCode {
         match self {
             ErrorCode::LlmError => "LLM_ERROR",
             ErrorCode::LlmQuotaExceeded => "LLM_QUOTA_EXCEEDED",
+            ErrorCode::LlmTransportError => "LLM_TRANSPORT_ERROR",
+            ErrorCode::LlmAuthentication => "LLM_AUTHENTICATION",
+            ErrorCode::LlmPermissionDenied => "LLM_PERMISSION_DENIED",
+            ErrorCode::LlmRateLimited => "LLM_RATE_LIMITED",
+            ErrorCode::LlmServiceUnavailable => "LLM_SERVICE_UNAVAILABLE",
+            ErrorCode::LlmTimedOut => "LLM_TIMED_OUT",
+            ErrorCode::LlmResponseInterrupted => "LLM_RESPONSE_INTERRUPTED",
             ErrorCode::ToolError => "TOOL_ERROR",
             ErrorCode::ContextLengthExceeded => "CONTEXT_LENGTH_EXCEEDED",
             ErrorCode::Timeout => "TIMEOUT",
@@ -306,28 +321,11 @@ pub struct DurableEventEmitter {
 pub struct AgentRunJournal {
     db: Arc<Mutex<rusqlite::Connection>>,
     run_id: String,
-    next_sequence: Mutex<i64>,
 }
 
 impl AgentRunJournal {
     pub fn new(db: Arc<Mutex<rusqlite::Connection>>, run_id: String) -> Self {
-        let next_sequence = db
-            .lock()
-            .ok()
-            .and_then(|conn| {
-                conn.query_row(
-                    "SELECT COALESCE(MAX(sequence) + 1, 0) FROM agent_run_events WHERE run_id = ?1",
-                    rusqlite::params![&run_id],
-                    |row| row.get(0),
-                )
-                .ok()
-            })
-            .unwrap_or(0);
-        Self {
-            db,
-            run_id,
-            next_sequence: Mutex::new(next_sequence),
-        }
+        Self { db, run_id }
     }
 
     /// Persist one lifecycle fact. Callers that form a durability barrier must
@@ -360,12 +358,20 @@ impl AgentRunJournal {
                 Ok::<_, String>((event_type, payload))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut next = self
-            .next_sequence
-            .lock()
-            .map_err(|error| error.to_string())?;
         let mut conn = self.db.lock().map_err(|error| error.to_string())?;
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // Independent lifecycle callers may journal the same run. Allocate from
+        // the durable tail inside the write transaction, never an instance-local
+        // counter. IMMEDIATE also fences callers using another connection.
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let next: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM agent_run_events WHERE run_id = ?1",
+                [&self.run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
         for (offset, (event_type, payload)) in serialized.iter().enumerate() {
             let id = uuid::Uuid::new_v4().to_string();
             let created_at = chrono::Utc::now().timestamp();
@@ -373,7 +379,7 @@ impl AgentRunJournal {
                 id: &id,
                 run_id: &self.run_id,
                 session_id,
-                sequence: *next + offset as i64,
+                sequence: next + offset as i64,
                 event_type,
                 payload,
                 created_at,
@@ -386,7 +392,7 @@ impl AgentRunJournal {
                         id,
                         &self.run_id,
                         session_id,
-                        *next + offset as i64,
+                        next + offset as i64,
                         event_type,
                         payload,
                         created_at,
@@ -395,7 +401,6 @@ impl AgentRunJournal {
                 .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
-        *next += events.len() as i64;
         Ok(())
     }
 }
@@ -794,6 +799,7 @@ mod tests {
     #[test]
     fn test_error_code() {
         assert_eq!(ErrorCode::LlmError.as_str(), "LLM_ERROR");
+        assert_eq!(ErrorCode::LlmTransportError.as_str(), "LLM_TRANSPORT_ERROR");
         assert_eq!(ErrorCode::ToolError.as_str(), "TOOL_ERROR");
     }
 
@@ -866,5 +872,107 @@ mod tests {
             vec![(0, "AgentStart".to_string()), (1, "TurnEnd".to_string())]
         );
         assert_eq!(transport.events_for("session-1").len(), 2);
+    }
+
+    #[test]
+    fn journals_allocate_atomic_batches_across_independent_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("events.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE agent_run_events (
+                 id TEXT PRIMARY KEY, run_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                 sequence INTEGER NOT NULL, event_type TEXT NOT NULL,
+                 payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 UNIQUE(run_id, sequence));",
+        )
+        .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let workers: Vec<_> = (0..6)
+            .map(|worker| {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let journal = AgentRunJournal::new(Arc::new(Mutex::new(conn)), "run-1".into());
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let turn_id = format!("turn-{worker}");
+                    barrier.wait();
+                    journal
+                        .append_batch(
+                            "session-1",
+                            &[
+                                AgentEvent::TurnStart {
+                                    turn_id: turn_id.clone(),
+                                    session_id: "session-1".into(),
+                                    message: "synthetic".into(),
+                                },
+                                AgentEvent::TurnEnd {
+                                    turn_id,
+                                    success: true,
+                                    tool_calls_count: 0,
+                                },
+                            ],
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let rows: Vec<(i64, String, String)> = conn
+            .prepare(
+                "SELECT sequence,event_type,json_extract(payload,'$.data.turn_id')
+             FROM agent_run_events ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 12);
+        for (batch, pair) in rows.chunks_exact(2).enumerate() {
+            assert_eq!(pair[0].0, (batch * 2) as i64);
+            assert_eq!(pair[1].0, (batch * 2 + 1) as i64);
+            assert_eq!(pair[0].1, "TurnStart");
+            assert_eq!(pair[1].1, "TurnEnd");
+            assert_eq!(pair[0].2, pair[1].2, "a terminal batch must not interleave");
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER reject_terminal BEFORE INSERT ON agent_run_events
+            WHEN NEW.event_type='TurnEnd' BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;",
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let journal = AgentRunJournal::new(db.clone(), "run-1".into());
+        let terminal = [
+            AgentEvent::TurnStart {
+                turn_id: "failed-batch".into(),
+                session_id: "session-1".into(),
+                message: "synthetic".into(),
+            },
+            AgentEvent::TurnEnd {
+                turn_id: "failed-batch".into(),
+                success: true,
+                tool_calls_count: 0,
+            },
+        ];
+        assert!(journal.append_batch("session-1", &terminal).is_err());
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM agent_run_events", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            12
+        );
+        conn.execute_batch("DROP TRIGGER reject_terminal;").unwrap();
+        drop(conn);
+        journal.append_batch("session-1", &terminal).unwrap();
+        assert_eq!(db.lock().unwrap().query_row(
+            "SELECT min(sequence) FROM agent_run_events WHERE json_extract(payload,'$.data.turn_id')='failed-batch'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 12, "a failed batch must neither persist a prefix nor consume sequence numbers");
     }
 }

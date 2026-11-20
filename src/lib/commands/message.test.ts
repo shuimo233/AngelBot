@@ -1,9 +1,67 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Message } from '$types';
-import { extractDocumentText, normalizeMessageContract, preflightPendingDesktopAction, saveMessageReply, type DesktopActionPreview } from './message';
+import { continueAgentTask, editAndResendMessage, extractDocumentText, normalizeMessageContract, preflightPendingDesktopAction, resolveAgentConfirmation, saveMessageReply, searchConversationPage, sendMessage, type DesktopActionPreview } from './message';
+
 import { invoke, isTauriRuntime } from '../invoke';
 
 vi.mock('../invoke', () => ({ invoke: vi.fn(), isTauriRuntime: vi.fn() }));
+
+it('searches a session using a flat keyword and cursor payload', async () => {
+  const page = { results: [{ id: 'reply', text: '资料/计划.md', role: 'assistant', createdAt: 1 }], nextBeforeId: 'reply' };
+  vi.mocked(invoke).mockResolvedValueOnce(page).mockResolvedValueOnce({ results: [], nextBeforeId: null });
+  await expect(searchConversationPage({ sessionId: 's', query: '资料/计划.md' })).resolves.toEqual(page);
+  expect(invoke).toHaveBeenLastCalledWith('search_conversation_page', { sessionId: 's', query: '资料/计划.md' });
+  await expect(searchConversationPage({ sessionId: 's', query: '资料/计划.md', beforeId: 'reply' }))
+    .resolves.toEqual({ results: [], nextBeforeId: null });
+  expect(invoke).toHaveBeenLastCalledWith('search_conversation_page', { sessionId: 's', query: '资料/计划.md', beforeId: 'reply' });
+});
+
+describe('persona supplement foreground payload', () => {
+  it('sends the same optional interaction contract to both fresh continuation commands', async () => {
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockResolvedValue({ id: 'reply', sessionId: 's', role: 'assistant', content: 'reply', createdAt: 1 });
+    const target = { sessionId: 's', messageId: 'reply' };
+    const interaction = { personality: { name: 'Mira', supplement: '' },
+      preferences: { responseLanguage: 'en-US', useLongTermMemory: false, evolutionEnabled: false } };
+    const approval = { ...target, callId: 'image-call', decision: 'approved' as const, previewId: 'attested-preview', interaction };
+    await resolveAgentConfirmation(approval);
+    expect(invoke).toHaveBeenLastCalledWith('resolve_agent_confirmation', { req: approval });
+    await continueAgentTask({ ...target, interaction });
+    expect(invoke).toHaveBeenLastCalledWith('continue_agent_task', { req: { ...target, interaction } });
+    await continueAgentTask(target);
+    expect(invoke).toHaveBeenLastCalledWith('continue_agent_task', { req: target });
+    await continueAgentTask({ ...target, resultsOnly: true, interaction });
+    expect(invoke).toHaveBeenLastCalledWith('continue_agent_task', { req: { ...target, resultsOnly: true, interaction } });
+  });
+
+  it('carries only confirmed notes on send/resend, including an explicit empty value', async () => {
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockResolvedValue({ id: 'reply', sessionId: 's', role: 'assistant', content: 'reply', createdAt: 1 });
+    for (const supplement of ['', '喜欢星空与热茶']) {
+      const personality = { name: 'Mira', supplement };
+      await sendMessage({ sessionId: 's', role: 'user', content: '工作问题', personality });
+      await editAndResendMessage({ sessionId: 's', messageId: 'u', content: '另一个问题', personality });
+      for (const [, payload] of vi.mocked(invoke).mock.calls.slice(-2)) {
+        const serialized = JSON.parse(JSON.stringify(payload));
+        expect(serialized.req.personality).toEqual(personality);
+      }
+    }
+    vi.mocked(invoke).mockReset();
+  });
+});
+
+it('keeps explicit attachment reference mode in the foreground IPC request', async () => {
+  vi.mocked(invoke).mockReset();
+  vi.mocked(invoke).mockResolvedValue({ id: 'reply', sessionId: 's', role: 'assistant', content: 'reply', createdAt: 1 });
+  const attachments = [
+    { name: 'reference.txt', text: 'exact reference', referenceOnly: true },
+    { name: 'inline.txt', text: 'exact inline' },
+  ] as const;
+  await sendMessage({ sessionId: 's', role: 'user', content: '查阅附件', textAttachments: [...attachments] });
+  expect(invoke).toHaveBeenCalledWith('send_message', {
+    req: expect.objectContaining({ textAttachments: attachments }),
+  });
+});
 
 describe('saveMessageReply', () => {
   it('requires the native picker, checks receipts and projects only fixed error explanations', async () => {

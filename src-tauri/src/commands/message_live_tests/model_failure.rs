@@ -150,6 +150,7 @@ pub(super) async fn send_after_known_effect(
         provider: resolved_model.provider.as_ref(),
         agent_config,
         request: &request,
+        admitted_user_message_id: run.parent_message_id.as_deref(),
         history_before_created_at: run.history_before_created_at,
         budget: ForegroundContextBudget {
             estimated_tool_count: ESTIMATED_TOOL_COUNT,

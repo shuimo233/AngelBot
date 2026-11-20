@@ -23,6 +23,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod conversation_search;
+pub(crate) mod message_page;
+
 #[derive(Clone)]
 pub(crate) struct ForegroundRunStore {
     db: Arc<Mutex<Connection>>,
@@ -149,6 +152,15 @@ impl ForegroundRunStore {
             &input.content,
             &input.text_attachments,
         )?;
+        let has_attachment_reference = input
+            .text_attachments
+            .iter()
+            .any(|file| file.reference_only);
+        if has_attachment_reference
+            && !foreground_text_attachments::valid_reference_message_id(&input.user_message_id)
+        {
+            return Err("文本附件引用需要有效的消息标识。".into());
+        }
         let last_created_at = tx
             .query_row(
                 "SELECT MAX(created_at) FROM messages WHERE session_id = ?1",
@@ -238,6 +250,24 @@ impl ForegroundRunStore {
                 ],
             )
             .map_err(|e| e.to_string())?;
+            if has_attachment_reference {
+                let reference = super::foreground_context_recall::checkpoint_reference(
+                    &tx,
+                    &input.session_id,
+                    &input.user_message_id,
+                )?;
+                let revision = reference
+                    .as_ref()
+                    .and_then(|source| source["revision"].as_str())
+                    .ok_or("无法保存本轮的文本附件引用。")?;
+                tx.execute(
+                    "UPDATE messages SET metadata=json_set(metadata, '$.textAttachmentSource',
+                        json_object('message_id', ?1, 'revision', ?2))
+                     WHERE id=?1 AND session_id=?3",
+                    params![input.user_message_id, revision, input.session_id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             tx.execute(
                 "UPDATE sessions SET leaf_message_id = ?1, updated_at = ?2 WHERE id = ?3",
                 params![&input.user_message_id, now, &input.session_id],
@@ -278,6 +308,29 @@ impl ForegroundRunStore {
             history_before_created_at,
             text_attachments: input.text_attachments,
         }))
+    }
+
+    /// Save the same trusted wall time that the first model request receives.
+    /// Keep attachments and other metadata on the admitted user row intact.
+    pub(crate) fn record_turn_clock(
+        &self,
+        run: &ForegroundRun,
+        clock: crate::agent::prompt::TurnClock,
+    ) -> Result<(), String> {
+        let conn = self.db.lock().map_err(|e| e.to_string())?;
+        let changed = conn
+            .execute(
+                "UPDATE messages SET metadata=json_set(COALESCE(metadata, '{}'), '$.hostTurnClock', ?1)
+                 WHERE id=?2 AND session_id=?3 AND role='user' AND is_provisional=0
+                   AND EXISTS(SELECT 1 FROM messages reply WHERE reply.id=?4 AND reply.session_id=?3
+                      AND reply.parent_id=messages.id AND reply.role='assistant' AND reply.is_provisional=1)",
+                params![clock.to_rfc3339(), run.parent_message_id, run.session_id, run.reply_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("无法保存本轮的时间上下文。".into());
+        }
+        Ok(())
     }
 
     /// Promote a prepared assistant reply and commit its entire replay/task
@@ -741,7 +794,8 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
              WHERE session_id = ?1
                AND created_at = ?2
                AND success != 1
-               AND COALESCE(tool_output, '') LIKE '%Confirmation required%'",
+               AND (tool_output GLOB 'Confirmation required*'
+                    OR tool_output GLOB 'Error: Confirmation required*')",
         )
         .map_err(|e| e.to_string())?;
     let mut superseded_call_ids = statement
@@ -782,7 +836,8 @@ pub(crate) fn terminalize_pending_confirmation_in_tx(
                AND created_at = ?3
                AND COALESCE(call_id, id) = ?4
                AND success != 1
-               AND COALESCE(tool_output, '') LIKE '%Confirmation required%'",
+               AND (tool_output GLOB 'Confirmation required*'
+                    OR tool_output GLOB 'Error: Confirmation required*')",
             params![cancellation_output, session_id, message_created_at, call_id],
         )
         .map_err(|e| e.to_string())?;
@@ -981,7 +1036,8 @@ fn promote_interrupted_run(
                  json_extract(payload, '$.type')='ExternalToolDispatchReserved'
                  AND json_type(payload, '$.data.call_id')='text'
                  AND length(json_extract(payload, '$.data.call_id'))>0
-                 AND substr(json_extract(payload, '$.data.tool_name'), 1, 4)='mcp_'
+                 AND (json_extract(payload, '$.data.tool_name')='run_project_command'
+                      OR substr(json_extract(payload, '$.data.tool_name'), 1, 4)='mcp_')
                ELSE 0 END)",
             params![run_id, session_id],
             |row| row.get::<_, bool>(0),
@@ -996,32 +1052,28 @@ fn promote_interrupted_run(
         tx.query_row(
             "SELECT CASE WHEN json_valid(payload) THEN
                  CASE WHEN json_extract(payload, '$.type') = 'Error'
-                      THEN CASE json_extract(payload, '$.data.code')
-                        WHEN 'LlmError' THEN 1
-                        WHEN 'LlmQuotaExceeded' THEN 2
-                        ELSE 0 END
-                      ELSE 0 END
-                 ELSE 0 END
+                    AND json_type(payload, '$.data.code') = 'text'
+                    THEN json_extract(payload, '$.data.code') END
+                 END
              FROM agent_run_events
              WHERE run_id = ?1 AND session_id = ?2 AND event_type = 'Error'
              ORDER BY sequence DESC LIMIT 1",
             params![run_id, session_id],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()
         .map_err(|error| error.to_string())?
-        .unwrap_or(0)
+        .flatten()
+        .as_deref()
+        .and_then(crate::llm::LlmFailureKind::from_event_code)
     } else {
-        0
+        None
     };
     let content = if external_reserved {
-        "此前已准备派发外部工具，目标可能已经改变。任务状态已安全保留，请先检查实际结果，再发起新的请求；不会自动重试。"
-    } else if model_failure == 2 {
-        crate::llm::LlmFailureKind::QuotaExceeded
-            .visible_notice()
-            .expect("quota category has a fixed notice")
-    } else if model_failure == 1 {
-        "模型请求未能完成。任务状态已安全保留，请检查模型连接后继续。"
+        "此前的工具操作可能已开始。任务状态已安全保留，请先检查实际结果，再发起新的请求。系统不会自动重试。"
+    } else if let Some(kind) = model_failure {
+        kind.visible_notice()
+            .unwrap_or("模型请求未能完成。任务状态已安全保留，请检查模型连接后继续。")
     } else {
         "主 Agent 本轮未能完成。任务状态已安全保留，你可以继续此会话。"
     };
@@ -1074,14 +1126,7 @@ impl ForegroundRunStore {
 }
 
 fn project_session_from_conn(conn: &Connection, session_id: &str) -> Result<Vec<Message>, String> {
-    let leaf_id: Option<String> = conn
-        .query_row(
-            "SELECT leaf_message_id FROM sessions WHERE id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let Some(leaf_id) = leaf_id else {
+    let Some(leaf_id) = session_leaf_id(conn, session_id)? else {
         return Ok(Vec::new());
     };
     let has_provisional = conn.query_row(
@@ -1113,31 +1158,7 @@ fn project_session_from_conn(conn: &Connection, session_id: &str) -> Result<Vec<
         FROM ancestors ORDER BY ancestry_depth DESC"
     )).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![leaf_id], |r| {
-            Ok(Message {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                role: r.get(2)?,
-                content: r.get(3)?,
-                text_attachments: foreground_text_attachments::from_metadata(
-                    r.get::<_, Option<String>>(7)?.as_deref(),
-                )
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        7,
-                        rusqlite::types::Type::Text,
-                        error.into(),
-                    )
-                })?,
-                created_at: r.get(4)?,
-                parent_id: r.get(5)?,
-                is_deleted: None,
-                tool_calls: parse_inline_tool_calls(r.get::<_, Option<String>>(6)?.as_deref()),
-                tool_results: None,
-                task_run: None,
-                task_facts: None,
-            })
-        })
+        .query_map(params![leaf_id], read_projected_message)
         .map_err(|e| e.to_string())?;
     let mut messages = rows
         .collect::<Result<Vec<_>, _>>()
@@ -1146,6 +1167,37 @@ fn project_session_from_conn(conn: &Connection, session_id: &str) -> Result<Vec<
     hydrate_task_runs_from_db(conn, &mut messages)?;
     hydrate_task_facts_from_db(conn, &mut messages)?;
     Ok(messages)
+}
+
+fn session_leaf_id(conn: &Connection, session_id: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT leaf_message_id FROM sessions WHERE id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn read_projected_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        role: row.get(2)?,
+        content: row.get(3)?,
+        text_attachments: foreground_text_attachments::from_metadata(
+            row.get::<_, Option<String>>(7)?.as_deref(),
+        )
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, error.into())
+        })?,
+        created_at: row.get(4)?,
+        parent_id: row.get(5)?,
+        is_deleted: None,
+        tool_calls: parse_inline_tool_calls(row.get::<_, Option<String>>(6)?.as_deref()),
+        tool_results: None,
+        task_run: None,
+        task_facts: None,
+    })
 }
 
 #[cfg(test)]
@@ -1524,6 +1576,133 @@ mod tests {
     }
 
     #[test]
+    fn reference_attachments_keep_stable_projection_and_exact_active_branch_reads() {
+        use crate::commands::{foreground_context_recall, foreground_history};
+        use serde_json::json;
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,title,created_at,updated_at) VALUES('s','attachments',1,1)",
+            [],
+        )
+        .unwrap();
+        let store = ForegroundRunStore::new(Arc::new(Mutex::new(conn)));
+        let attachments = vec![
+            TextAttachment {
+                name: "inline.txt".into(),
+                text: "inline-canary".into(),
+                reference_only: false,
+            },
+            TextAttachment {
+                name: "archive.txt".into(),
+                text: "私有🪶
+精确尾部"
+                    .into(),
+                reference_only: true,
+            },
+        ];
+        let mut turn = BeginForegroundTurn {
+            session_id: "s".into(),
+            user_message_id: "u".into(),
+            reply_id: "a".into(),
+            role: "user".into(),
+            text_attachments: attachments.clone(),
+            content: "原始用户要求".into(),
+            user_turn: ForegroundUserTurn::Append,
+            now: 10,
+        };
+        for invalid_id in [String::new(), "x".repeat(129)] {
+            let mut invalid = turn.clone();
+            invalid.user_message_id = invalid_id;
+            assert!(store.begin(invalid).is_err());
+        }
+        let run = store.begin(turn.clone()).unwrap();
+        assert_eq!(run.text_attachments, attachments);
+        let (projection, revision) = {
+            let conn = store.db.lock().unwrap();
+            let reference = foreground_context_recall::checkpoint_reference(&conn, "s", "u")
+                .unwrap()
+                .unwrap();
+            let metadata: String = conn
+                .query_row("SELECT metadata FROM messages WHERE id='u'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let projection =
+                foreground_text_attachments::render_stored(&turn.content, "user", Some(&metadata))
+                    .unwrap();
+            let (rendered, manifest) = projection.rsplit_once('\n').unwrap();
+            assert!(rendered.starts_with(&turn.content));
+            assert!(rendered.contains("inline-canary"));
+            assert!(!projection.contains("私有"));
+            assert!(!projection.contains("精确尾部"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(manifest).unwrap(),
+                json!({"message_id":"u","revision":reference["revision"],"attachments":[
+                    {"attachment_index":1,"name":"archive.txt","total_chars":8}
+                ]})
+            );
+            let history = foreground_history::hydrate_llm_history(&conn, "s", i64::MAX).unwrap();
+            assert_eq!(history[0].content, projection);
+            let compressed = foreground_text_attachments::compressed_metadata(Some(&metadata));
+            assert_eq!(
+                foreground_text_attachments::render_stored(
+                    &turn.content,
+                    "user",
+                    Some(&compressed)
+                )
+                .unwrap(),
+                projection
+            );
+            (
+                projection,
+                reference["revision"].as_str().unwrap().to_string(),
+            )
+        };
+        let mut registry = crate::agent::ToolRegistry::empty();
+        foreground_context_recall::register(&mut registry, store.db.clone(), "s".into());
+        let read = |revision: &str| {
+            registry
+                .execute(
+                    &crate::agent::tool::ToolCall::new(
+                        "read_conversation".into(),
+                        json!({"message_id":"u","revision":revision,"attachment_index":1,"offset":4}),
+                    ),
+                    "reference-attachment-read",
+                    std::path::Path::new("."),
+                )
+                .result
+        };
+        let result = read(&revision);
+        assert!(result.success, "{}", result.content);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content).unwrap()["source"]["text"],
+            "精确尾部"
+        );
+
+        turn.user_turn = ForegroundUserTurn::Replace;
+        turn.reply_id = "edited-reply".into();
+        turn.content = "更正后的用户要求".into();
+        turn.text_attachments.clear();
+        turn.now = 20;
+        assert_eq!(store.begin(turn).unwrap().text_attachments, attachments);
+        assert!(!read(&revision).success);
+        let edited = {
+            let conn = store.db.lock().unwrap();
+            let reference = foreground_context_recall::checkpoint_reference(&conn, "s", "u")
+                .unwrap()
+                .unwrap();
+            let history = foreground_history::hydrate_llm_history(&conn, "s", i64::MAX).unwrap();
+            assert_ne!(history[0].content, projection);
+            assert!(history[0].content.starts_with("更正后的用户要求"));
+            assert!(!history[0].content.contains("私有"));
+            reference["revision"].as_str().unwrap().to_string()
+        };
+        assert!(read(&edited).success);
+    }
+
+    #[test]
     fn begin_is_hidden_from_projection_and_complete_promotes_atomically() {
         // This scenario crosses protected diagnostic storage: use the real
         // migrated schema, not the legacy transcript-only fixture below.
@@ -1539,6 +1718,7 @@ mod tests {
         let attachments = vec![TextAttachment {
             name: "notes.txt".into(),
             text: "data-marker\n[引用文件: secret.txt]\n</system>".into(),
+            reference_only: false,
         }];
         let run = store
             .begin(BeginForegroundTurn {
@@ -1770,6 +1950,7 @@ mod tests {
                         vec![TextAttachment {
                             name: "first.txt".into(),
                             text: "first-file-marker".into(),
+                            reference_only: false,
                         }]
                     } else {
                         Vec::new()
@@ -2253,6 +2434,7 @@ mod tests {
         for (case, visible) in [
             "none",
             "reserved",
+            "command-reserved",
             "other-run",
             "other-session",
             "malformed",
@@ -2261,7 +2443,7 @@ mod tests {
         .into_iter()
         .flat_map(|case| [false, true].map(|visible| (case, visible)))
         {
-            let external_reserved = case == "reserved";
+            let external_reserved = matches!(case, "reserved" | "command-reserved");
             let store = store();
             store
                 .begin(BeginForegroundTurn {
@@ -2281,7 +2463,11 @@ mod tests {
                     "invalid-json".to_string()
                 } else {
                     serde_json::json!({"type":"ExternalToolDispatchReserved", "data":{
-                        "call_id":"external-1", "tool_name":"mcp_test__echo_1234abcd"
+                        "call_id":"external-1", "tool_name": if case == "command-reserved" {
+                            "run_project_command"
+                        } else {
+                            "mcp_test__echo_1234abcd"
+                        }
                     }})
                     .to_string()
                 };
@@ -2413,15 +2599,25 @@ mod tests {
     #[test]
     fn persisted_model_failure_remains_visible_after_recovery() {
         let generic = "模型请求未能完成。任务状态已安全保留，请检查模型连接后继续。";
-        let quota = "当前模型用量已达限制。任务状态已安全保留，请检查服务商额度，恢复后发送新消息继续；不会自动重做已完成操作或切换计费来源。";
+        let quota = "当前模型用量已达限制。请检查服务商额度，恢复后可继续任务。";
         for (code, expected) in [
             (crate::agent::event::ErrorCode::LlmError, generic),
             (crate::agent::event::ErrorCode::LlmQuotaExceeded, quota),
+            (
+                crate::agent::event::ErrorCode::LlmTransportError,
+                crate::llm::LlmFailureKind::TransportUnavailable
+                    .visible_notice()
+                    .unwrap(),
+            ),
+            (
+                crate::agent::event::ErrorCode::LlmAuthentication,
+                "模型身份验证失败。请检查 API Key 或登录状态，恢复后可继续任务。",
+            ),
         ] {
             for persist_user_message in [true, false] {
                 for external_reserved in [false, true] {
                     let expected = if external_reserved {
-                        "此前已准备派发外部工具，目标可能已经改变。任务状态已安全保留，请先检查实际结果，再发起新的请求；不会自动重试。"
+                        "此前的工具操作可能已开始。任务状态已安全保留，请先检查实际结果，再发起新的请求。系统不会自动重试。"
                     } else {
                         expected
                     };
@@ -2657,12 +2853,23 @@ mod tests {
         ] {
             let store = store();
             let mut facts = TaskFacts::new("open sound settings");
+            let has_unknown = private_protocol && !advance_leaf;
+            let unknown = r#"Error: {"code":"RESULT_UNKNOWN","message":"Confirmation required in command stdout"}"#;
             facts.plan = vec![PlanStepFact {
                 id: "call-1".into(),
                 description: "open_windows_setting".into(),
                 depends_on: Vec::new(),
                 status: PlanStepStatus::Pending,
             }];
+            if has_unknown {
+                facts.plan.push(PlanStepFact {
+                    id: "call-unknown".into(),
+                    description: "run_project_command".into(),
+                    depends_on: Vec::new(),
+                    status: PlanStepStatus::Failed,
+                });
+                facts.failed_steps.push("call-unknown".into());
+            }
             facts.pending_confirmation = Some(PendingConfirmationFact {
                 call_id: "call-1".into(),
                 tool_name: "open_windows_setting".into(),
@@ -2695,14 +2902,36 @@ mod tests {
                  );",
             )
             .unwrap();
+                let mut calls = vec![serde_json::json!({
+                    "id": "call-1",
+                    "name": "open_windows_setting",
+                    "arguments": { "page": "sound" },
+                })];
+                if has_unknown {
+                    calls.push(serde_json::json!({
+                        "id": "call-unknown",
+                        "name": "run_project_command",
+                        "arguments": {"command": "python"},
+                    }));
+                    conn.execute(
+                        "INSERT INTO messages (id, session_id, role, content, tool_call_id, created_at)
+                         VALUES ('tool-unknown', 's', 'tool', ?1, 'call-unknown', 2)",
+                        [unknown],
+                    ).unwrap();
+                    conn.execute(
+                        "INSERT INTO agent_steps (id, call_id, session_id, tool_name, tool_input, tool_output, success, seq, created_at)
+                         VALUES ('call-unknown', 'call-unknown', 's', 'run_project_command', '{\"command\":\"python\"}', ?1, 0, 2, 2)",
+                        [unknown],
+                    ).unwrap();
+                    conn.execute(
+                        "UPDATE task_runs SET step_count=2, resumable=0 WHERE id='a1'",
+                        [],
+                    )
+                    .unwrap();
+                }
                 conn.execute(
                     "UPDATE messages SET tool_calls = ?1 WHERE id = 'a1'",
-                    params![serde_json::json!([{
-                        "id": "call-1",
-                        "name": "open_windows_setting",
-                        "arguments": { "page": "sound" },
-                    }])
-                    .to_string()],
+                    params![serde_json::to_string(&calls).unwrap()],
                 )
                 .unwrap();
                 conn.execute(
@@ -2738,6 +2967,27 @@ mod tests {
                     });
                     transcript[1].content =
                         "Confirmation required before executing side-effect tool.".into();
+                    if has_unknown {
+                        transcript[0]
+                            .tool_calls
+                            .as_mut()
+                            .unwrap()
+                            .push(crate::llm::ToolCall {
+                                id: "call-unknown".into(),
+                                name: "run_project_command".into(),
+                                arguments: serde_json::json!({"command": "python"}),
+                            });
+                        transcript[0].protocol_state.as_mut().unwrap().output_items.push(
+                            serde_json::json!({
+                                "type": "function_call", "id": "fc_2", "call_id": "call-unknown",
+                                "name": "run_project_command", "arguments": "{\"command\":\"python\"}"
+                            }),
+                        );
+                        let mut tool = transcript[1].clone();
+                        tool.tool_call_id = Some("call-unknown".into());
+                        tool.content = unknown.into();
+                        transcript.push(tool);
+                    }
                     conn.execute(
                         "UPDATE messages SET metadata = ?1 WHERE id = 'a1'",
                         params![private_transcript_metadata(&transcript).unwrap()],
@@ -2755,6 +3005,23 @@ mod tests {
                     )
                     .unwrap();
                 }
+            }
+
+            if has_unknown {
+                let projected = store.project_session("s").unwrap();
+                let reply = projected.iter().find(|message| message.id == "a1").unwrap();
+                let results = reply.tool_results.as_ref().unwrap();
+                let pending = results
+                    .iter()
+                    .find(|result| result.call_id == "call-1")
+                    .unwrap();
+                assert_eq!(pending.confirmation_status.as_deref(), Some("pending"));
+                let receipt = results
+                    .iter()
+                    .find(|result| result.call_id == "call-unknown")
+                    .unwrap();
+                assert_eq!(receipt.output, unknown);
+                assert!(!receipt.confirmation_required && receipt.confirmation_status.is_none());
             }
 
             if advance_leaf {
@@ -2849,10 +3116,26 @@ mod tests {
                 crate::commands::foreground_history::hydrate_llm_history(&conn, "s", 4).unwrap();
             let tool_history = model_history
                 .iter()
-                .find(|message| message.role == "tool")
+                .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
                 .expect("the original tool result remains part of model history");
             assert_eq!(tool_history.content, SUPERSEDED_CONFIRMATION_OUTPUT);
             assert!(!tool_history.content.contains("Confirmation required"));
+            if has_unknown {
+                let saved: (String, String) = conn
+                    .query_row(
+                        "SELECT tool_output, (SELECT content FROM messages WHERE id='tool-unknown')
+                     FROM agent_steps WHERE id='call-unknown'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(saved, (unknown.into(), unknown.into()));
+                let receipt = model_history
+                    .iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some("call-unknown"))
+                    .unwrap();
+                assert_eq!(receipt.content, unknown);
+            }
             let stored_facts: TaskFacts = conn
                 .query_row(
                     "SELECT facts_json FROM task_run_facts WHERE task_run_id = 'a1'",

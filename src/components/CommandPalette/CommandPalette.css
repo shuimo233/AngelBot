@@ -188,5 +188,5 @@
 @media (max-width: 640px) {
   .command-palette-overlay { padding: 58px 10px 10px; }
   .command-palette { max-height: calc(100vh - 68px); }
-  .command-palette-footer-note { display: none; }
+  .command-palette-footer-note:not(.command-palette-limit) { display: none; }
 }

@@ -68,10 +68,8 @@ describe('McpServersSettings', () => {
     expect(screen.getByText('未连接')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'AngelBot 日常' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: '启用 Filesystem' })).toBeChecked();
-    expect(screen.getByText(/MCP 服务不会自动继承 AngelBot 的模型密钥/)).toBeInTheDocument();
-    expect(screen.getByText(/请勿将密钥写入命令或参数/)).toBeInTheDocument();
     expect(screen.getByText(/首次连接可能下载并运行第三方包/)).toBeInTheDocument();
-    expect(screen.getByText('环境变量：尚未配置')).toBeInTheDocument();
+    expect(screen.getByText('尚未配置')).toBeInTheDocument();
     expect(startMcpServer).not.toHaveBeenCalled();
   });
 
@@ -80,7 +78,7 @@ describe('McpServersSettings', () => {
     render(<McpServersSettings />);
     expect(await screen.findByText('按需连接 · 目录已准备')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'AngelBot 日常' })).toBeChecked();
-    expect(screen.getByText(/停止连接会结束进程但保留目录/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^停止$/ })).not.toBeInTheDocument();
     expect(startMcpServer).not.toHaveBeenCalled();
     expect(refreshMcpTools).not.toHaveBeenCalled();
   });
@@ -103,16 +101,15 @@ describe('McpServersSettings', () => {
 
     expect(screen.getByPlaceholderText('npx.cmd')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('-y @modelcontextprotocol/server-...')).toBeInTheDocument();
-    expect(screen.getByText('Windows 下使用 npx 时，命令填写 npx.cmd；-y 和包名填写在参数栏。')).toBeInTheDocument();
+    expect(screen.getByText(/用 npx\.cmd/)).toHaveTextContent('参数填 -y 和包名');
 
-    await user.click(screen.getByRole('button', { name: /网页操作（Playwright）/ }));
     await user.click(screen.getByRole('button', { name: '填入浏览器配置' }));
     expect(screen.getByRole('textbox', { name: '名称' })).toHaveValue('Playwright 浏览器');
     expect(screen.getByRole('textbox', { name: '命令' })).toHaveValue('npx.cmd');
     await waitFor(() => expect(screen.getByRole('textbox', { name: '参数' })).toHaveValue(browserDraft.args));
     expect(prepareBrowserMcp).toHaveBeenCalledWith('personal-main');
     expect(screen.getByText(/不随备份/)).toBeInTheDocument();
-    expect(screen.getByText(/不是系统、文件或网络安全沙箱/)).toBeInTheDocument();
+    expect(screen.getByText(/不隔离系统、文件或网络/)).toBeInTheDocument();
     expect(screen.getByText(/Node.js 20/)).toBeInTheDocument();
     expect(saveMcpServer).not.toHaveBeenCalled();
     expect(startMcpServer).not.toHaveBeenCalled();
@@ -196,8 +193,8 @@ describe('McpServersSettings', () => {
     expect(screen.getByRole('checkbox', { name: 'AngelBot 日常' })).toBeChecked();
 
     await user.click(screen.getByRole('button', { name: '编辑 File Tools' }));
-    expect(screen.getByText('修改命令或参数会停止服务并清除已有工作区授权；保存后需重新授权并连接检查。')).toBeInTheDocument();
-    expect(screen.getByText('路径包含空格时可用英文双引号包裹。')).toBeInTheDocument();
+    expect(screen.getByText(/改动命令或参数后，服务会停止/)).toHaveTextContent('需重新授权并检查连接');
+    expect(screen.getByText(/含空格的路径用英文双引号/)).toBeInTheDocument();
     await user.type(screen.getByRole('textbox', { name: '参数' }), ' "D:\\My Files"');
     await user.click(screen.getByRole('button', { name: '保存修改' }));
 
@@ -223,6 +220,7 @@ describe('McpServersSettings', () => {
     expect(value).toHaveValue('');
     expect(screen.getByText('SERVICE_TOKEN')).toBeInTheDocument();
     expect(screen.getByText('已安全保存')).toBeInTheDocument();
+    expect(screen.getByText(/服务需单独配置密钥/)).toHaveTextContent('请勿将密钥写入命令或参数');
     expect(screen.queryByText('secret-once')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '完成' }));
     expect(screen.getByText('未连接')).toBeInTheDocument();
@@ -234,7 +232,7 @@ describe('McpServersSettings', () => {
     vi.mocked(getMcpServers).mockResolvedValue([{ ...server, envKeys: ['SERVICE_TOKEN'] }]);
     render(<McpServersSettings />);
 
-    expect(await screen.findByText('环境变量：SERVICE_TOKEN（已安全保存）')).toBeInTheDocument();
+    expect(await screen.findByText('SERVICE_TOKEN（已安全保存）')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '配置 Filesystem 的环境变量' }));
     await user.click(screen.getByRole('button', { name: '替换环境变量 SERVICE_TOKEN' }));
     expect(screen.getByRole('textbox', { name: '变量名' })).toHaveValue('SERVICE_TOKEN');
@@ -281,15 +279,15 @@ describe('McpServersSettings', () => {
     render(<McpServersSettings />);
 
     expect(await screen.findByText('凭据不可用')).toBeInTheDocument();
-    expect(screen.getByText('环境变量：凭据不可用')).toBeInTheDocument();
+    expect(screen.getByText('系统凭据库读取失败')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '连接并检查' })).toBeDisabled();
     expect(screen.getByRole('checkbox', { name: 'AngelBot 日常' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: '修复 Filesystem 的环境变量' }));
-    expect(screen.getByRole('alert')).toHaveTextContent('无法读取此服务在系统凭据库中的环境变量');
+    expect(screen.getByRole('alert')).toHaveTextContent('无法读取系统凭据库中的环境变量');
     expect(screen.queryByRole('textbox', { name: '变量名' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '重置凭据' }));
     expect(clearMcpEnv).not.toHaveBeenCalled();
-    expect(screen.getByText(/旧值无法从此处找回/)).toBeInTheDocument();
+    expect(screen.getByText(/删除全部变量（不可恢复）/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '确认重置凭据' }));
 
     await waitFor(() => expect(clearMcpEnv).toHaveBeenCalledWith('filesystem'));
@@ -323,7 +321,7 @@ describe('McpServersSettings', () => {
 
     await waitFor(() => expect(startMcpServer).toHaveBeenCalledWith('filesystem'));
     expect(refreshMcpTools).toHaveBeenCalledWith('filesystem');
-    expect(await screen.findByText('已发现 1 个工具；下次发送已授权工作区的消息时可供 AngelBot 使用。')).toBeInTheDocument();
+    expect(await screen.findByText('已发现 1 个工具，可供获准的工作区使用。')).toBeInTheDocument();
     expect(screen.getByText('list_files')).toBeInTheDocument();
     expect(saveMcpServer).not.toHaveBeenCalled();
   });

@@ -3,6 +3,33 @@
 //! This bundles everything needed to build a personalized system prompt.
 //! Maps to the pi ecosystem pattern: SOUL.md (personality) + USER.md (profile/preferences).
 
+/// Display labels only, with no recursive, script or high-priority macro evaluation.
+pub fn expand_persona_labels(text: &str, persona_name: &str, user_name: &str) -> String {
+    let persona_name = if persona_name.trim().is_empty() {
+        "AngelBot"
+    } else {
+        persona_name
+    };
+    let user_name = if user_name.trim().is_empty() {
+        "用户"
+    } else {
+        user_name
+    };
+    let persona_name: String = persona_name.chars().take(128).collect();
+    let user_name: String = user_name.chars().take(128).collect();
+    text.split_inclusive("}}")
+        .map(|part| {
+            if let Some(prefix) = part.strip_suffix("{{char}}") {
+                format!("{}{}", prefix, persona_name)
+            } else if let Some(prefix) = part.strip_suffix("{{user}}") {
+                format!("{}{}", prefix, user_name)
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect()
+}
+
 /// Personality trait dimensions (-5 to +5)
 #[derive(Debug, Clone)]
 pub struct PersonalityTraits {
@@ -18,7 +45,7 @@ pub struct PersonalityTraits {
     pub dependence: i32,
     /// 边界感: -5 = 保持距离, +5 = 亲密
     pub intimacy: i32,
-    /// 耐心程度: -5 = 没耐心, +5 = 超级耐心
+    /// 讲解节奏: -5 = 聚焦卡点, +5 = 循序渐进
     pub patience: i32,
 }
 
@@ -123,6 +150,8 @@ pub struct AgentConfig {
     pub persona_greeting: String,
     /// Free-form description of the persona
     pub persona_description: String,
+    /// User-confirmed persona context; never user facts or tool authority.
+    pub persona_supplement: String,
     /// 7-dimension personality traits
     pub traits: PersonalityTraits,
     /// User profile (name, background, etc.)
@@ -196,6 +225,7 @@ impl Default for AgentConfig {
             persona_name: String::new(),
             persona_greeting: String::new(),
             persona_description: String::new(),
+            persona_supplement: String::new(),
             traits: PersonalityTraits::default(),
             profile: None,
             preferences: UserPreferences::default(),
@@ -217,7 +247,8 @@ impl Default for AgentConfig {
 }
 
 /// Trait labels for Chinese description conversion
-/// Mirrors src/lib/presets.ts TRAIT_LABELS
+/// Corresponds to src/lib/presets.ts TRAIT_LABELS; use adjectives here so
+/// intensity prefixes also read naturally in the prompt.
 const TRAIT_LABELS: [(&str, &str, &str); 7] = [
     ("tone", "温柔", "冷淡"),
     ("verbosity", "沉默", "话痨"),
@@ -225,7 +256,7 @@ const TRAIT_LABELS: [(&str, &str, &str); 7] = [
     ("humor", "无趣", "幽默"),
     ("dependence", "独立", "粘人"),
     ("intimacy", "保持距离", "亲密"),
-    ("patience", "没耐心", "超级耐心"),
+    ("patience", "直接", "耐心"),
 ];
 
 impl PersonalityTraits {
@@ -277,12 +308,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persona_labels_expand_once_without_evaluating_unknown_macros() {
+        assert_eq!(
+            expand_persona_labels("{{char}} 帮助 {{user}}；{{script}}", "Mira", ""),
+            "Mira 帮助 用户；{{script}}"
+        );
+        assert_eq!(
+            expand_persona_labels("{{char}} {{user}}", "{{user}}", "阿青"),
+            "{{user}} 阿青"
+        );
+    }
+
+    #[test]
     fn test_default_traits_neutral() {
         // Default traits have patience=5 (mirrors presets.ts default)
         let traits = PersonalityTraits::default();
         let desc = traits.to_description();
-        // patience=5 gives "非常超级耐心"
-        assert!(desc.contains("超级耐心"));
+        assert_eq!(desc, "非常耐心");
+        let direct = PersonalityTraits {
+            patience: -5,
+            ..traits
+        };
+        assert_eq!(direct.to_description(), "非常直接");
 
         // All-zero traits should give "中性"
         let neutral = PersonalityTraits {

@@ -59,6 +59,8 @@ pub enum ChangePipelineError {
     MaterializationUnavailable,
     #[error("canonical write outcome is unknown; inspect existing effects before any retry")]
     MaterializationIndeterminate,
+    #[error("another reviewed change is being applied to this workspace")]
+    WorkspaceBusy,
     #[error("delegated Change storage failed")]
     Storage,
     #[error("delegated Change workflow rejected the request")]
@@ -553,6 +555,25 @@ impl ChangePipeline {
                 },
             )
             .map_err(|_| ChangePipelineError::WorktreeUnavailable)?;
+        let executor: String = self
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT executor FROM delegations WHERE id=?1",
+                    [&delivery.identity.delegation_id],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(|_| ChangePipelineError::Storage)?
+            .map_err(|_| ChangePipelineError::Storage)?;
+        if executor == "codex_cli"
+            && !delivery.evidence_refs.iter().any(|reference| {
+                reference.strip_prefix(super::workspace_isolation::CODEX_DIFF_REF)
+                    == Some(artifact.diff_hash.as_str())
+            })
+        {
+            return Err(ChangePipelineError::ReviewNotPassed);
+        }
         let artifact = self
             .workflow
             .capture_artifact(&artifact)
@@ -722,22 +743,47 @@ impl ChangePipeline {
         if unresolved {
             return Err(ChangePipelineError::MaterializationIndeterminate);
         }
-        let confirmation = self
-            .workflow
-            .confirm_change(
-                &prepared.scope,
-                &prepared.change_set_id,
-                approve,
-                ttl_secs,
-                now,
-            )
-            .map_err(|_| ChangePipelineError::Workflow)?;
-        if !approve {
-            return Err(ChangePipelineError::MaterializationUnavailable);
+        let handoff = self
+            .handoffs
+            .load(&prepared.delivery_id)
+            .map_err(|_| ChangePipelineError::Storage)?
+            .ok_or(ChangePipelineError::Workflow)?;
+        if handoff.work_package_id != prepared.work_package_id
+            || handoff.implementation_attempt_id != prepared.attempt_id
+            || handoff.change_set_id.as_deref() != Some(prepared.change_set_id.as_str())
+            || handoff.artifact_id.as_deref() != Some(prepared.artifact_id.as_str())
+            || handoff.base_revision.as_deref() != Some(prepared.base_revision.as_str())
+        {
+            return Err(ChangePipelineError::Workflow);
         }
-        self.handoffs
-            .mark_confirmation_pending(&prepared.delivery_id, &confirmation.id, now)
-            .map_err(|_| ChangePipelineError::Storage)?;
+        let confirmation_id = match handoff.status {
+            ChangeHandoffStatus::Ready => {
+                let confirmation = self
+                    .workflow
+                    .confirm_change(
+                        &prepared.scope,
+                        &prepared.change_set_id,
+                        approve,
+                        ttl_secs,
+                        now,
+                    )
+                    .map_err(|_| ChangePipelineError::Workflow)?;
+                if !approve {
+                    return Err(ChangePipelineError::MaterializationUnavailable);
+                }
+                self.handoffs
+                    .mark_confirmation_pending(&prepared.delivery_id, &confirmation.id, now)
+                    .map_err(|_| ChangePipelineError::Storage)?;
+                confirmation.id
+            }
+            // An explicit new call may follow a busy/pre-write failure. Reuse
+            // the exact approval; Materializer rechecks its original expiry and
+            // bindings. Never issue another approval or replay unknown effects.
+            ChangeHandoffStatus::ConfirmationPending if approve => handoff
+                .confirmation_id
+                .ok_or(ChangePipelineError::Workflow)?,
+            _ => return Err(ChangePipelineError::Workflow),
+        };
         let identity = self.worktree_identity(&prepared.attempt_id)?;
         let locator = Arc::new(ManifestCanonicalWorkspaceLocator::new(
             self.provider.clone(),
@@ -751,7 +797,7 @@ impl ChangePipeline {
             .materialize(
                 &materializer,
                 prepared.scope.clone(),
-                confirmation.id,
+                confirmation_id,
                 &prepared.artifact_id,
                 prepared.base_revision.clone(),
                 now,
@@ -759,6 +805,9 @@ impl ChangePipeline {
             .map_err(|error| match error {
                 ChangeWorkflowError::Materialization(MaterializationError::Indeterminate) => {
                     ChangePipelineError::MaterializationIndeterminate
+                }
+                ChangeWorkflowError::Materialization(MaterializationError::WorkspaceBusy) => {
+                    ChangePipelineError::WorkspaceBusy
                 }
                 _ => ChangePipelineError::MaterializationUnavailable,
             })?;
@@ -1076,6 +1125,20 @@ mod tests {
         ChangePipeline,
         PreparedChange,
     ) {
+        let (canonical, storage, pipeline, prepared) = prepare_candidate_fixture(root, None);
+        (canonical, storage, pipeline, prepared.unwrap())
+    }
+
+    // Some(true) changes the candidate after the independent reviewer saw it.
+    fn prepare_candidate_fixture(
+        root: Option<&Path>,
+        codex_candidate_changed_after_review: Option<bool>,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ChangePipeline,
+        Result<PreparedChange, ChangePipelineError>,
+    ) {
         let canonical = root.map_or_else(tempdir, tempfile::tempdir_in).unwrap();
         fs::create_dir_all(canonical.path().join("src")).unwrap();
         fs::write(canonical.path().join("src/feature.txt"), "original\n").unwrap();
@@ -1125,6 +1188,41 @@ mod tests {
             SharedDb::new(conn)
         });
         seed_change_delivery(&db);
+        let mut candidate_delivery = delivery();
+        if codex_candidate_changed_after_review.is_some() {
+            let capability = WorktreeCapability {
+                read_roots: vec![".".into()],
+                write_roots: vec![".".into()],
+                operation: WorktreeOperation::Write,
+                lease_epoch: 1,
+                collaboration_key: "workspace_change".into(),
+            };
+            let (_, digest) = provider
+                .inspect_executor_candidate(&identity, capability)
+                .unwrap();
+            assert!(provider
+                .executor_review_patch(&identity, &digest)
+                .unwrap()
+                .contains("+updated"));
+            let reference = format!(
+                "{}{digest}",
+                super::super::workspace_isolation::CODEX_DIFF_REF
+            );
+            candidate_delivery.evidence_refs.push(reference);
+            db.with_conn(|conn| -> rusqlite::Result<()> {
+                conn.execute(
+                    "UPDATE delegations SET executor='codex_cli' WHERE id='delegation_change'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE delegation_deliveries SET payload_json=?1 WHERE id='delivery_change'",
+                    [serde_json::to_string(&candidate_delivery).unwrap()],
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        }
         ResourceBindingRepository::new(db.clone())
             .create(&NewResourceBinding {
                 identity: ResourceBindingIdentity {
@@ -1188,7 +1286,7 @@ mod tests {
         );
 
         let subject = ReviewSubject::from_delivery(
-            &delivery(),
+            &candidate_delivery,
             "make a bounded change",
             "change",
             "implementer",
@@ -1225,15 +1323,40 @@ mod tests {
             )
             .unwrap();
 
-        let prepared = pipeline
-            .prepare(&parent_scope, "delivery_change", NOW)
-            .expect("a passed independent review must prepare a change handoff");
+        if codex_candidate_changed_after_review == Some(true) {
+            pipeline
+                .provider
+                .write_candidate(&access, "src/feature.txt", b"replaced after review\n", 1024)
+                .unwrap();
+        }
+        let prepared = pipeline.prepare(&parent_scope, "delivery_change", NOW);
         assert_eq!(
             fs::read_to_string(canonical.path().join("src/feature.txt")).unwrap(),
             "original\n",
             "preparing a reviewed candidate must not write the canonical workspace"
         );
         (canonical, storage, pipeline, prepared)
+    }
+
+    #[test]
+    fn codex_review_receipt_binds_the_exact_patch_before_any_project_write() {
+        for changed in [false, true] {
+            let (_canonical, _storage, pipeline, prepared) =
+                prepare_candidate_fixture(None, Some(changed));
+            if changed {
+                assert!(matches!(
+                    prepared,
+                    Err(ChangePipelineError::ReviewNotPassed)
+                ));
+                continue;
+            }
+            let prepared = prepared.unwrap();
+            let receipt: (String, bool) = pipeline.db.with_conn(|conn| conn.query_row(
+                "SELECT verifier_attempt_id, reviewed_diff_hash=diff_hash FROM delegation_review_artifacts WHERE id=?1 AND verdict='passed'",
+                [&prepared.artifact_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            )).unwrap().unwrap();
+            assert_eq!(receipt, ("reviewer_change".into(), true));
+        }
     }
 
     #[test]
@@ -1251,6 +1374,259 @@ mod tests {
         );
     }
 
+    fn sibling_materialize_request(
+        db: &SharedDb,
+        original: &super::super::materializer::MaterializeRequest,
+        scope: WorkPackageScope,
+    ) -> super::super::materializer::MaterializeRequest {
+        use super::super::{
+            work_package::{CandidateArtifact, NewWorkPackage},
+            worker_policy::{TaskShape, WorkerProfile},
+        };
+        let (package, change, confirmation) = db
+            .with_conn_mut(|conn| {
+                let package = WorkPackageRepository::create(
+                    conn,
+                    NewWorkPackage {
+                        scope: scope.clone(),
+                        task_shape: TaskShape::Change,
+                        worker_profile: WorkerProfile::Implementer,
+                        scope_digest: format!("scope_{}", uuid::Uuid::new_v4().simple()),
+                        capability_scope_ref: "approved".into(),
+                        capability_expires_at: 1000,
+                    },
+                )
+                .unwrap();
+                let candidate = WorkPackageRepository::replace_candidates(
+                    conn,
+                    &scope,
+                    &package.id,
+                    0,
+                    vec![CandidateArtifact {
+                        relative_ref: "src/feature.txt".into(),
+                        evidence_refs: vec![],
+                    }],
+                )
+                .unwrap();
+                let change = WorkPackageRepository::create_change_set(
+                    conn,
+                    &scope,
+                    &package.id,
+                    &candidate.id,
+                    &original.observed_base_revision,
+                    vec![],
+                )
+                .unwrap();
+                let confirmation =
+                    WorkPackageRepository::confirm(conn, &scope, &change.id, true, 3600, NOW)
+                        .unwrap();
+                (package, change, confirmation)
+            })
+            .unwrap();
+        let mut artifact = original.artifact.clone();
+        artifact.id = format!("artifact_{}", package.id);
+        artifact.work_package_id = package.id;
+        artifact.scope_digest = package.scope_digest;
+        artifact.change_set_id = None;
+        super::super::materializer::MaterializeRequest {
+            scope,
+            confirmation_id: confirmation.id,
+            artifact: artifact.bind_change_set(&change).unwrap(),
+            observed_base_revision: original.observed_base_revision.clone(),
+            now: NOW,
+        }
+    }
+
+    #[test]
+    fn canonical_materialization_reserves_workspace_before_git_without_blocking_other_projects() {
+        use super::super::{
+            materializer::MaterializeRequest,
+            workspace_isolation::{GitCommandOutput, GitCommandRunner},
+        };
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc, Mutex,
+        };
+        use std::time::Duration;
+
+        struct GatedGit {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            gate: AtomicBool,
+            calls: AtomicUsize,
+            base: String,
+        }
+        impl GitCommandRunner for GatedGit {
+            fn run(&self, _: &Path, args: &[String]) -> std::io::Result<GitCommandOutput> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if args[0] == "rev-parse" && !self.gate.swap(true, Ordering::SeqCst) {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+                Ok(GitCommandOutput {
+                    status: Some(0),
+                    stdout: if args[0] == "rev-parse" {
+                        self.base.as_bytes().to_vec()
+                    } else {
+                        vec![]
+                    },
+                })
+            }
+        }
+        let fixture = tempdir().unwrap();
+        let (canonical, _storage, pipeline, prepared) =
+            prepared_change_fixture(Some(fixture.path()));
+        let confirmation = pipeline
+            .workflow
+            .confirm_change(&prepared.scope, &prepared.change_set_id, true, 3600, NOW)
+            .unwrap();
+        let request = MaterializeRequest {
+            scope: prepared.scope,
+            confirmation_id: confirmation.id,
+            artifact: pipeline
+                .workflow
+                .artifacts
+                .load_ready(&prepared.artifact_id)
+                .unwrap(),
+            observed_base_revision: prepared.base_revision,
+            now: NOW,
+        };
+        let sibling = sibling_materialize_request(&pipeline.db, &request, request.scope.clone());
+        let other = sibling_materialize_request(
+            &pipeline.db,
+            &request,
+            WorkPackageScope {
+                workspace_key: "workspace_other".into(),
+                ..request.scope.clone()
+            },
+        );
+        let other_root = tempdir().unwrap();
+        let root = canonical.path().to_path_buf();
+        let independent_root = other_root.path().to_path_buf();
+        let locator = Arc::new(move |scope: &WorkPackageScope| {
+            Ok(if scope.workspace_key == "workspace_other" {
+                independent_root.clone()
+            } else {
+                root.clone()
+            })
+        });
+        let (entered, checkpoint) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let git = Arc::new(GatedGit {
+            entered,
+            release: Mutex::new(resumed),
+            gate: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            base: request.artifact.base_commit.clone(),
+        });
+        let first = Materializer::new(pipeline.db.clone(), git.clone(), locator.clone());
+        let original_confirmation = request.confirmation_id.clone();
+        let worker = std::thread::spawn(move || first.materialize(request));
+        checkpoint.recv_timeout(Duration::from_secs(10)).unwrap();
+        let reserved: i64 = pipeline.db.with_conn(|conn| conn.query_row(
+            "SELECT count(*) FROM delegation_materialization_receipts WHERE confirmation_id=?1 AND status='applying'",
+            [&original_confirmation], |row| row.get(0),
+        )).unwrap().unwrap();
+        let connection = Connection::open(fixture.path().join("data.db")).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        let second = Materializer::new(SharedDb::new(connection), git.clone(), locator);
+        let before = git.calls.load(Ordering::SeqCst);
+        let blocked = second.materialize(sibling.clone());
+        let after = git.calls.load(Ordering::SeqCst);
+        let independent = second.materialize(other);
+        release.send(()).unwrap();
+        let first_result = worker.join().unwrap();
+        assert_eq!(reserved, 1, "reserve before checking a mutable checkout");
+        assert_eq!(blocked, Err(MaterializationError::WorkspaceBusy));
+        assert_eq!(
+            before, after,
+            "a busy workspace must perform no Git operation"
+        );
+        assert_eq!(independent.unwrap().status, MaterializationStatus::Applied);
+        assert_eq!(first_result.unwrap().status, MaterializationStatus::Applied);
+        let untouched: (i64, String) = pipeline.db.with_conn(|conn| conn.query_row(
+            "SELECT (SELECT count(*) FROM delegation_materialization_receipts WHERE confirmation_id=?1),status FROM work_package_confirmations WHERE id=?1",
+            [&sibling.confirmation_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        )).unwrap().unwrap();
+        assert_eq!(
+            untouched,
+            (0, "approved".into()),
+            "busy is not a failed or consumed approval"
+        );
+    }
+
+    #[test]
+    fn busy_handoff_reuses_exact_approval_only_after_workspace_is_resolved() {
+        use super::super::materializer::MaterializeRequest;
+        let (canonical, _storage, pipeline, prepared) = prepared_change_fixture(None);
+        let template = MaterializeRequest {
+            scope: prepared.scope.clone(),
+            confirmation_id: "not-yet-confirmed".into(),
+            artifact: pipeline
+                .workflow
+                .artifacts
+                .load_ready(&prepared.artifact_id)
+                .unwrap(),
+            observed_base_revision: prepared.base_revision.clone(),
+            now: NOW,
+        };
+        let blocker = sibling_materialize_request(&pipeline.db, &template, prepared.scope.clone());
+        // A previously persisted, independently approved write in this project.
+        pipeline.db.with_conn(|conn| conn.execute(
+            "INSERT INTO delegation_materialization_receipts
+             (id,confirmation_id,change_set_id,work_package_id,scope_digest,artifact_id,base_commit,
+              reviewed_commit_sha,reviewed_diff_hash,changed_paths_json,status,created_at,updated_at)
+             VALUES ('blocking-receipt',?1,?2,?3,?4,?5,?6,?7,?8,'[]','applying',?9,?9)",
+            params![blocker.confirmation_id,blocker.artifact.change_set_id,blocker.artifact.work_package_id,
+                blocker.artifact.scope_digest,blocker.artifact.id,blocker.artifact.base_commit,
+                blocker.artifact.commit_sha,blocker.artifact.diff_hash,NOW],
+        )).unwrap().unwrap();
+        assert!(matches!(
+            pipeline.confirm_and_materialize(&prepared, true, 3600, NOW),
+            Err(ChangePipelineError::WorkspaceBusy)
+        ));
+        let waiting = pipeline
+            .handoffs
+            .load(&prepared.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(waiting.status, ChangeHandoffStatus::ConfirmationPending);
+        assert_eq!(
+            fs::read_to_string(canonical.path().join("src/feature.txt")).unwrap(),
+            "original\n"
+        );
+        pipeline.db.with_conn(|conn| conn.execute(
+            "UPDATE delegation_materialization_receipts SET status='unknown' WHERE id='blocking-receipt'", [],
+        )).unwrap().unwrap();
+        assert!(matches!(
+            pipeline.confirm_and_materialize(&prepared, true, 7200, NOW + 1),
+            Err(ChangePipelineError::MaterializationIndeterminate)
+        ));
+        // Fixture-only resolution of a known non-executed write; production
+        // never clears an unknown receipt or retries it automatically.
+        pipeline.db.with_conn(|conn| conn.execute(
+            "UPDATE delegation_materialization_receipts SET status='refused' WHERE id='blocking-receipt'", [],
+        )).unwrap().unwrap();
+        let receipt = pipeline
+            .confirm_and_materialize(&prepared, true, 7200, NOW + 2)
+            .unwrap();
+        assert_eq!(receipt.status, MaterializationStatus::Applied);
+        assert_eq!(Some(receipt.confirmation_id), waiting.confirmation_id);
+        let approvals: (i64, i64) = pipeline.db.with_conn(|conn| conn.query_row(
+            "SELECT count(*),max(expires_at) FROM work_package_confirmations WHERE work_package_id=?1",
+            [&prepared.work_package_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        )).unwrap().unwrap();
+        assert_eq!(
+            approvals,
+            (1, NOW + 3600),
+            "waiting must not renew or duplicate authority"
+        );
+    }
+
     #[test]
     fn materialization_failures_keep_exact_receipts_and_never_replay() {
         use super::super::{
@@ -1262,6 +1638,7 @@ mod tests {
         struct FaultGit {
             conflict: bool,
             picks: AtomicUsize,
+            seal_before_readback: Option<SharedDb>,
         }
         impl GitCommandRunner for FaultGit {
             fn run(&self, cwd: &Path, args: &[String]) -> std::io::Result<GitCommandOutput> {
@@ -1285,13 +1662,19 @@ mod tests {
                 if self.picks.load(Ordering::SeqCst) > 0
                     && args.first().is_some_and(|arg| arg == "rev-parse")
                 {
+                    if let Some(db) = &self.seal_before_readback {
+                        db.with_conn(|conn| conn.execute(
+                            "UPDATE delegation_materialization_receipts SET status='unknown',error_class='synthetic_interruption' WHERE status='applying'", [],
+                        )).unwrap().unwrap();
+                        return ProcessGitCommandRunner.run(cwd, args);
+                    }
                     return Err(std::io::Error::other("synthetic lost readback"));
                 }
                 ProcessGitCommandRunner.run(cwd, args)
             }
         }
 
-        for conflict in [true, false] {
+        for (conflict, seal) in [(true, false), (false, false), (false, true)] {
             let (canonical, _storage, pipeline, prepared) = prepared_change_fixture(None);
             let confirmation = pipeline
                 .workflow
@@ -1305,6 +1688,7 @@ mod tests {
             let runner = Arc::new(FaultGit {
                 conflict,
                 picks: AtomicUsize::new(0),
+                seal_before_readback: seal.then(|| pipeline.db.clone()),
             });
             let root = canonical.path().to_path_buf();
             let locator = Arc::new(move |_: &WorkPackageScope| Ok(root.clone()));
@@ -1334,11 +1718,22 @@ mod tests {
                 saved.1.as_deref(),
                 Some(if conflict {
                     "cherry_pick_conflict"
+                } else if seal {
+                    "synthetic_interruption"
                 } else {
                     "post_apply_head_unavailable"
                 })
             );
-            assert!(materializer.materialize(request).is_err());
+            assert!(materializer.materialize(request.clone()).is_err());
+            if !conflict {
+                let sibling =
+                    sibling_materialize_request(&pipeline.db, &request, request.scope.clone());
+                assert_eq!(
+                    materializer.materialize(sibling),
+                    Err(MaterializationError::Indeterminate),
+                    "a new work package cannot bypass an unknown write in the same project"
+                );
+            }
             assert_eq!(runner.picks.load(Ordering::SeqCst), 1);
             assert_eq!(
                 fs::read_to_string(canonical.path().join("src/feature.txt"))

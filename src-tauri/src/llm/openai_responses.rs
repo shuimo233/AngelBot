@@ -1,5 +1,6 @@
 //! Stateless Responses adapter. Credentials and OAuth refresh live behind the
-//! credential seam; no request is retried here, especially after external tools.
+//! credential seam; only pre-delivery connection recovery is shared with other
+//! model adapters. Delivered requests, streams and external tools are not replayed.
 //!
 //! Protocol references (checked 2026-10-04):
 //! https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations
@@ -9,35 +10,41 @@
 //! https://developers.openai.com/api/docs/guides/streaming-responses
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::auth::ModelCredentialSource;
 use super::protocol::{MAX_CONTINUATION_BYTES, MAX_CONTINUATION_ITEMS};
 use super::{
-    LlmFailure, LlmFailureKind, LlmProvider, LlmResponse, Message, ModelAuthMode, ModelProtocol,
-    ProtocolContinuation, ProviderConfig, ProviderUsage, StopReason, ThinkingEffort,
-    ThinkingSettings, ToolCall, ToolSchema,
+    transport, LlmFailure, LlmFailureKind, LlmProtocolStage, LlmProvider, LlmResponse, Message,
+    ModelAuthMode, ModelProtocol, ProtocolContinuation, ProviderConfig, ProviderUsage, StopReason,
+    ThinkingEffort, ThinkingSettings, ToolCall, ToolSchema,
 };
 
 const PLAN_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const TOOL_NAMESPACE: &str = "angelbot";
 const MAX_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ERROR_BYTES: usize = 256 * 1024;
 use super::{MAX_TOOL_IMAGES, MAX_TOOL_IMAGE_TOTAL_BYTES as MAX_TOOL_IMAGE_BYTES};
 const INVALID_RESPONSE: &str = "Responses 返回的协议数据无效；未提交工具调用。";
 const INVALID_HISTORY: &str = "Responses 对话历史中的工具调用顺序或私有续接数据无效。";
+
+#[path = "openai_responses_websocket.rs"]
+mod websocket;
+pub(super) use websocket::{SessionPool, SessionSlot};
 
 #[cfg(test)]
 #[derive(Default)]
 struct CacheComparisonState {
     enabled: bool,
+    implicit_breakpoint: bool,
     previous_response_id: Option<String>,
     latest: Option<super::ProviderCacheDiagnostics>,
 }
@@ -45,17 +52,6 @@ struct CacheComparisonState {
 fn invalid_response_at(stage: &'static str) -> String {
     // Stages are static allowlisted labels, never remote field values.
     format!("{INVALID_RESPONSE} 校验阶段：{stage}。")
-}
-
-fn request_transport_error(error: reqwest::Error) -> String {
-    let kind = if error.is_timeout() {
-        "请求超时"
-    } else if error.is_connect() {
-        "连接建立失败（网络、代理或 TLS）"
-    } else {
-        "请求发送中断"
-    };
-    format!("Responses {kind}；不会自动重试，请确认先前外部操作的状态。")
 }
 
 pub struct OpenAiResponsesProvider {
@@ -68,7 +64,10 @@ pub struct OpenAiResponsesProvider {
     max_tokens: u32,
     temperature: f64,
     native_context_threshold: usize,
+    foreground_websocket: Option<SessionSlot>,
+    websocket_use_http: AtomicBool,
     last_usage: Mutex<Option<ProviderUsage>>,
+    session_affinity: Option<HeaderValue>,
     #[cfg(test)]
     last_request_fingerprint: Mutex<Option<super::ProviderRequestFingerprint>>,
     #[cfg(test)]
@@ -78,6 +77,41 @@ pub struct OpenAiResponsesProvider {
 }
 
 impl OpenAiResponsesProvider {
+    pub(super) fn with_foreground_websocket(mut self, slot: SessionSlot) -> Self {
+        if self.auth_mode == ModelAuthMode::ChatgptPlan && self.endpoint.as_str() == PLAN_ENDPOINT {
+            self.foreground_websocket = Some(slot);
+        }
+        self
+    }
+
+    pub(super) fn with_session_affinity(mut self, session_id: &str) -> Self {
+        if self.foreground_websocket.is_some()
+            && self.auth_mode == ModelAuthMode::ChatgptPlan
+            && self.endpoint.as_str() == PLAN_ENDPOINT
+        {
+            let scope = self.credentials.credential_ref();
+            let mut digest = Sha256::new();
+            digest.update(b"angelbot:plan-session-affinity:v1");
+            digest.update((scope.len() as u64).to_be_bytes());
+            digest.update(scope.as_bytes());
+            digest.update(session_id.as_bytes());
+            // Codex uses this header for ChatGPT cache affinity across
+            // connections. It does not carry any Responses continuation ID.
+            let mut affinity = HeaderValue::from_str(&format!("angelbot-{:x}", digest.finalize()))
+                .expect("hex cache affinity is a valid header");
+            affinity.set_sensitive(true);
+            self.session_affinity = Some(affinity);
+        }
+        self
+    }
+
+    fn apply_session_affinity(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.session_affinity {
+            Some(affinity) => request.header("session-id", affinity.clone()),
+            None => request,
+        }
+    }
+
     pub fn new(
         config: &ProviderConfig,
         credentials: Arc<dyn ModelCredentialSource>,
@@ -99,8 +133,8 @@ impl OpenAiResponsesProvider {
         let client = reqwest::Client::builder()
             // Never forward bearer credentials to a redirect target.
             .redirect(reqwest::redirect::Policy::none())
-            // Disable even reqwest's default protocol-NACK retries. A caller
-            // must decide explicitly whether a whole model turn is safe to retry.
+            // Disable protocol-NACK retries; only the shared pre-connect gate
+            // may retry, never a whole model turn or a delivered request.
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(600))
@@ -120,7 +154,10 @@ impl OpenAiResponsesProvider {
                 .saturating_mul(70)
                 / 100)
                 .max(1),
+            foreground_websocket: None,
+            websocket_use_http: AtomicBool::new(false),
             last_usage: Mutex::new(None),
+            session_affinity: None,
             #[cfg(test)]
             last_request_fingerprint: Mutex::new(None),
             #[cfg(test)]
@@ -128,6 +165,18 @@ impl OpenAiResponsesProvider {
             #[cfg(test)]
             cache_comparison: Mutex::new(CacheComparisonState::default()),
         })
+    }
+
+    #[cfg(test)]
+    fn set_test_cache_state(&self, state: CacheComparisonState) -> bool {
+        if self.endpoint.as_str() != PLAN_ENDPOINT || self.auth_mode != ModelAuthMode::ChatgptPlan {
+            return false;
+        }
+        *self
+            .cache_comparison
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = state;
+        true
     }
 
     fn request_body(
@@ -157,7 +206,17 @@ impl OpenAiResponsesProvider {
                 .cache_comparison
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if state.enabled {
+            if state.implicit_breakpoint {
+                let item = body["input"]
+                    .get_mut(0)
+                    .filter(|item| item["role"] == "developer" && item["content"].is_string())
+                    .ok_or("Implicit breakpoint probe requires a leading developer text item")?;
+                let text = item["content"].take();
+                item["content"] = json!([{
+                    "type":"input_text", "text":text,
+                    "prompt_cache_breakpoint":{"mode":"explicit"},
+                }]);
+            } else if state.enabled {
                 if let Some(id) = &state.previous_response_id {
                     body["prompt_cache_options"] = json!({"comparison_response_id":id});
                 }
@@ -249,6 +308,20 @@ impl OpenAiResponsesProvider {
         thinking: Option<&ThinkingSettings>,
         delta_sender: Option<UnboundedSender<String>>,
     ) -> Result<LlmResponse, LlmFailure> {
+        let websocket_slot = self
+            .foreground_websocket
+            .as_ref()
+            .filter(|_| !self.websocket_use_http.load(Ordering::Relaxed));
+        let mut websocket_session = match websocket_slot {
+            Some(session) => Some(session.lock().await),
+            None => None,
+        };
+        if self.websocket_use_http.load(Ordering::Relaxed) {
+            websocket_session = None;
+        }
+        // Hold the socket outside the shared slot while the credential is read.
+        // An invalid credential or a cancelled request then closes the socket.
+        let mut websocket_state = websocket_session.as_deref_mut().map(std::mem::take);
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(test)]
         let previous_organization = self
@@ -268,7 +341,11 @@ impl OpenAiResponsesProvider {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
         }
-        let body = self.request_body(messages, tools, thinking)?;
+        let body = self
+            .request_body(messages, tools, thinking)
+            .map_err(|error| {
+                LlmFailure::from(error).at_protocol_stage(LlmProtocolStage::PrepareRequest, None)
+            })?;
         #[cfg(test)]
         {
             *self
@@ -276,30 +353,70 @@ impl OpenAiResponsesProvider {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(request_fingerprint(&body)?);
         }
+        let authorization = if self.auth_mode != ModelAuthMode::None {
+            // Resolve on EVERY request. Refresh failures stop before inference;
+            // this adapter neither retries inference nor changes billing mode.
+            let token = self.credentials.bearer_token().await.map_err(|_| {
+                LlmFailure::from(if self.auth_mode == ModelAuthMode::ChatgptPlan {
+                    "ChatGPT 登录凭据读取或刷新失败，请检查连接状态或重新登录；本次请求未发送。"
+                } else {
+                    "Responses API 凭据读取失败；本次请求未发送。"
+                })
+                .at_protocol_stage(LlmProtocolStage::LoadCredentials, None)
+            })?;
+            if token.trim().is_empty() {
+                return Err(
+                    LlmFailure::from("Responses 缺少有效登录凭据；本次请求未发送。")
+                        .at_protocol_stage(LlmProtocolStage::LoadCredentials, None),
+                );
+            }
+            let mut authorization =
+                HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                    LlmFailure::from("Responses 登录凭据格式无效；本次请求未发送。")
+                        .at_protocol_stage(LlmProtocolStage::LoadCredentials, None)
+                })?;
+            authorization.set_sensitive(true);
+            Some(authorization)
+        } else {
+            None
+        };
+        if let (Some(slot), Some(session), Some(mut state), Some(authorization)) = (
+            websocket_slot,
+            websocket_session.as_deref_mut(),
+            websocket_state.take(),
+            authorization.as_ref(),
+        ) {
+            let reply = websocket::request(
+                self,
+                slot,
+                &mut state,
+                authorization,
+                &body,
+                self.response_parser(messages, tools),
+                delta_sender.as_ref(),
+            )
+            .await?;
+            *session = state;
+            if let Some(reply) = reply {
+                return Ok(reply);
+            }
+            // A transport refusal is remembered only by this execution. The
+            // next turn can reconnect if the network or endpoint has recovered.
+            self.websocket_use_http.store(true, Ordering::Relaxed);
+        }
+        drop(websocket_session);
         let mut request = self
             .client
             .post(self.endpoint.clone())
             .header("Accept", "text/event-stream")
             .json(&body);
-        if self.auth_mode != ModelAuthMode::None {
-            // Resolve on EVERY request. Refresh failures stop before inference;
-            // this adapter neither retries inference nor changes billing mode.
-            let token = self.credentials.bearer_token().await.map_err(|_| {
-                if self.auth_mode == ModelAuthMode::ChatgptPlan {
-                    "ChatGPT 登录凭据读取或刷新失败，请检查连接状态或重新登录；本次请求未发送。"
-                } else {
-                    "Responses API 凭据读取失败；本次请求未发送。"
-                }
-            })?;
-            if token.trim().is_empty() {
-                return Err("Responses 缺少有效登录凭据；本次请求未发送。".into());
-            }
-            let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| "Responses 登录凭据格式无效；本次请求未发送。")?;
-            authorization.set_sensitive(true);
+        if let Some(authorization) = authorization {
             request = request.header(AUTHORIZATION, authorization);
         }
-        let mut response = request.send().await.map_err(request_transport_error)?;
+        let request = self.apply_session_affinity(request);
+        let mut response = super::transport::send_model_request(request)
+            .await
+            .map_err(|error| transport::request_failure(error, "Responses"))?;
         // Opt-in synthetic browser acceptance only. Record the actual wire
         // offer, never messages, arguments, credentials or schema contents.
         #[cfg(test)]
@@ -346,8 +463,59 @@ impl OpenAiResponsesProvider {
                     failure.diagnostic
                 );
             }
-            failure
+            failure.at_protocol_stage(LlmProtocolStage::ResponseValidation, Some(status))
         };
+        let mut parser = self.response_parser(messages, tools);
+        // Some actual plan responses omit Content-Type. Reuse the same SSE
+        // decoder and completion validation, but reject non-SSE framing rather
+        // than treating a successful HTTP status or arbitrary body as output.
+        parser.strict_framing = missing_content_type;
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            transport_error(transport::response_read_failure(error, "Responses"))
+        })? {
+            parser
+                .feed_classified(&chunk, delta_sender.as_ref())
+                .map_err(&transport_error)?;
+            if let Some(completed) = parser.completed.take() {
+                #[cfg(test)]
+                let completed = {
+                    let mut completed = completed;
+                    let metadata = &mut completed.metadata;
+                    metadata.transport = Some("http".into());
+                    metadata.request_id = response_headers.0.clone();
+                    metadata.organization_fingerprint = response_headers.1.clone();
+                    metadata.organization_matches_previous = previous_organization
+                        .as_ref()
+                        .zip(metadata.organization_fingerprint.as_ref())
+                        .map(|(a, b)| a == b);
+                    metadata.details_invalid |= response_headers.2;
+                    completed
+                };
+                return self.accept_completed(completed).map_err(|error| {
+                    LlmFailure::from(error)
+                        .at_protocol_stage(LlmProtocolStage::ResponseValidation, Some(status))
+                });
+            }
+        }
+        let diagnostic = if missing_content_type && parser.total_bytes == 0 {
+            "Responses 返回空响应；未提交工具调用。".into()
+        } else {
+            parser
+                .finish()
+                .err()
+                .unwrap_or_else(|| "Responses missing response.completed".into())
+        };
+        Err(transport_error(LlmFailure {
+            kind: LlmFailureKind::ResponseInterrupted,
+            diagnostic,
+        }))
+    }
+
+    fn response_parser(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+    ) -> ResponsesStream {
         let allowed_tools = tools
             .unwrap_or_default()
             .iter()
@@ -359,55 +527,13 @@ impl OpenAiResponsesProvider {
             self.auth_mode,
             allowed_tools,
         );
-        // Some actual plan responses omit Content-Type. Reuse the same SSE
-        // decoder and completion validation, but reject non-SSE framing rather
-        // than treating a successful HTTP status or arbitrary body as output.
-        parser.strict_framing = missing_content_type;
         parser.prior_call_ids = messages
             .iter()
             .filter_map(|message| message.tool_calls.as_ref())
             .flatten()
             .map(|call| call.id.clone())
             .collect();
-        while let Some(chunk) = response.chunk().await.map_err(|error| {
-            let kind = if error.is_timeout() {
-                "读取超时"
-            } else {
-                "读取中断"
-            };
-            transport_error(
-                format!("Responses 事件流{kind}；未提交工具调用，不会自动重试外部操作。").into(),
-            )
-        })? {
-            parser
-                .feed_classified(&chunk, delta_sender.as_ref())
-                .map_err(&transport_error)?;
-            if let Some(completed) = parser.completed.take() {
-                #[cfg(test)]
-                let completed = {
-                    let mut completed = completed;
-                    let metadata = &mut completed.metadata;
-                    metadata.request_id = response_headers.0.clone();
-                    metadata.organization_fingerprint = response_headers.1.clone();
-                    metadata.organization_matches_previous = previous_organization
-                        .as_ref()
-                        .zip(metadata.organization_fingerprint.as_ref())
-                        .map(|(a, b)| a == b);
-                    metadata.details_invalid |= response_headers.2;
-                    completed
-                };
-                return self.accept_completed(completed).map_err(Into::into);
-            }
-        }
-        if missing_content_type && parser.total_bytes == 0 {
-            return Err(transport_error(
-                "Responses 返回空响应；未提交工具调用。".into(),
-            ));
-        }
         parser
-            .finish()
-            .map_err(|error| transport_error(error.into()))?;
-        Err("Responses 事件流结束但没有 response.completed；未提交工具调用。".into())
     }
 
     fn accept_completed(&self, completed: CompletedResponse) -> Result<LlmResponse, String> {
@@ -445,18 +571,18 @@ impl LlmProvider for OpenAiResponsesProvider {
 
     #[cfg(test)]
     fn enable_cache_comparison(&self) -> bool {
-        if self.endpoint.as_str() != PLAN_ENDPOINT || self.auth_mode != ModelAuthMode::ChatgptPlan {
-            return false;
-        }
-        let mut state = self
-            .cache_comparison
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *state = CacheComparisonState {
+        self.set_test_cache_state(CacheComparisonState {
             enabled: true,
             ..Default::default()
-        };
-        true
+        })
+    }
+
+    #[cfg(test)]
+    fn enable_implicit_cache_breakpoint(&self) -> bool {
+        self.set_test_cache_state(CacheComparisonState {
+            implicit_breakpoint: true,
+            ..Default::default()
+        })
     }
 
     #[cfg(test)]
@@ -879,12 +1005,22 @@ pub(crate) fn native_context_shape(
     ))
 }
 
+pub(crate) fn plan_history_can_replay(
+    messages: &[Message],
+    model: &str,
+    credential_ref: &str,
+) -> bool {
+    encode_messages(messages, model, credential_ref, ModelAuthMode::ChatgptPlan).is_ok()
+}
+
 fn encode_messages(
     messages: &[Message],
     model: &str,
     credential_ref: &str,
     mode: ModelAuthMode,
 ) -> Result<(Vec<Value>, Vec<String>), String> {
+    use crate::agent::prompt::TurnClock;
+
     let mut input = Vec::new();
     let mut instructions = Vec::new();
     let mut call_ids = HashSet::new();
@@ -907,9 +1043,22 @@ fn encode_messages(
                 })
         })
         .unwrap_or(0);
+    let latest_clock = if active_start > 0 {
+        messages
+            .iter()
+            .rposition(|message| TurnClock::from_message(message).is_some())
+    } else {
+        None
+    };
     for (index, message) in messages.iter().enumerate() {
-        if index < active_start && !matches!(message.role.as_str(), "system" | "developer") {
-            continue;
+        if index < active_start {
+            match message.role.as_str() {
+                "system" => {}
+                "developer"
+                    if Some(index) == latest_clock
+                        || TurnClock::from_message(message).is_none() => {}
+                _ => continue,
+            }
         }
         if message.role != "assistant"
             && (message.protocol_state.is_some() || message.tool_calls.is_some())
@@ -1021,7 +1170,6 @@ fn encode_messages(
 struct CompletedResponse {
     response: LlmResponse,
     usage: Option<ProviderUsage>,
-    #[cfg(test)]
     response_id: String,
     #[cfg(test)]
     cache_diagnostics: Option<super::ProviderCacheDiagnostics>,
@@ -1232,7 +1380,6 @@ fn parse_completed(
             protocol,
         },
         usage,
-        #[cfg(test)]
         response_id: response["id"].as_str().unwrap().into(), // validated above
         #[cfg(test)]
         cache_diagnostics: cache_diagnostics(response.get("prompt_cache_diagnostics")),
@@ -1358,7 +1505,7 @@ impl ResponsesStream {
         let line = std::str::from_utf8(&line)
             .map_err(|_| "Responses SSE 包含无效 UTF-8；未提交工具调用。")?;
         let line = if first_line {
-            line.strip_prefix('\u{feff}').unwrap_or(line)
+            line.strip_prefix('﻿').unwrap_or(line)
         } else {
             line
         };
@@ -1404,14 +1551,20 @@ impl ResponsesStream {
         }
         let event: Value = serde_json::from_slice(&data)
             .map_err(|_| "Responses SSE 事件 JSON 无效；未提交工具调用。")?;
+        self.consume_json_event(&event, event_name.as_deref(), sender)
+    }
+
+    fn consume_json_event(
+        &mut self,
+        event: &Value,
+        event_name: Option<&str>,
+        sender: Option<&UnboundedSender<String>>,
+    ) -> Result<(), LlmFailure> {
         let kind = event
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_response_at("事件 type"))?;
-        if event_name
-            .as_deref()
-            .is_some_and(|name| !name.is_empty() && name != kind)
-        {
+        if event_name.is_some_and(|name| !name.is_empty() && name != kind) {
             return Err(invalid_response_at("事件名称").into());
         }
         if self.terminal {
@@ -1562,7 +1715,7 @@ impl ResponsesStream {
             }
             "error" => {
                 return Err(structured_failure(
-                    event.get("error").unwrap_or(&event),
+                    event.get("error").unwrap_or(event),
                     None,
                 ))
             }
@@ -1599,8 +1752,13 @@ impl ResponsesStream {
 
 async fn read_http_error(mut response: reqwest::Response) -> LlmFailure {
     let status = response.status().as_u16();
-    let mut failure = match read_error_body(&mut response).await {
-        Ok(bytes) => {
+    let mut failure = match tokio::time::timeout(
+        Duration::from_secs(5),
+        transport::read_error_body(&mut response),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => {
             let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             let mut failure =
                 structured_failure(value.get("error").unwrap_or(&value), Some(status));
@@ -1616,7 +1774,7 @@ async fn read_http_error(mut response: reqwest::Response) -> LlmFailure {
                 .push_str(&format!(" 错误形态：{shape}。"));
             failure
         }
-        Err(_) => structured_failure(&Value::Null, Some(status)),
+        _ => structured_failure(&Value::Null, Some(status)),
     };
     // Admission may return only {detail:...}. Preserve its numeric status, not
     // remote text/headers, and never infer that 401 has confirmed revocation.
@@ -1625,20 +1783,6 @@ async fn read_http_error(mut response: reqwest::Response) -> LlmFailure {
         failure.diagnostic
     );
     failure
-}
-
-async fn read_error_body(response: &mut reqwest::Response) -> Result<Vec<u8>, &'static str> {
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if bytes.len() + chunk.len() <= MAX_ERROR_BYTES => {
-                bytes.extend_from_slice(&chunk)
-            }
-            Ok(Some(_)) => return Err("正文超过诊断上限"),
-            Ok(None) => return Ok(bytes),
-            Err(_) => return Err("正文读取中断"),
-        }
-    }
 }
 
 async fn read_non_sse_error(mut response: reqwest::Response) -> LlmFailure {
@@ -1659,41 +1803,46 @@ async fn read_non_sse_error(mut response: reqwest::Response) -> LlmFailure {
         Some(_) => "其他",
         None => "缺失",
     };
-    let diagnostic = |kind: &str| {
-        format!("Responses 未返回 SSE 事件流（HTTP {status}，响应类型：{media_type}，正文类别：{kind}）；未提交工具调用。")
+    let problem = |kind: &str| {
+        LlmFailure::from(format!("Responses 未返回 SSE 事件流（HTTP {status}，响应类型：{media_type}，正文类别：{kind}）；未提交工具调用。"))
+            .at_protocol_stage(LlmProtocolStage::ResponseType, Some(status))
     };
-    let bytes =
-        match tokio::time::timeout(Duration::from_secs(5), read_error_body(&mut response)).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(kind)) => return diagnostic(kind).into(),
-            Err(_) => return diagnostic("正文读取超时").into(),
-        };
+    let bytes = match tokio::time::timeout(
+        Duration::from_secs(5),
+        transport::read_error_body(&mut response),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(kind)) => return problem(kind),
+        Err(_) => return problem("正文读取超时"),
+    };
     if bytes.is_empty() {
-        return diagnostic("空响应").into();
+        return problem("空响应");
     }
     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
             // A JSON error can use a successful HTTP status. Preserve the same
             // allowlisted recovery as non-2xx errors, never its raw message.
             let mut failure = structured_failure(error, Some(status));
-            failure.diagnostic = format!("{} {}", diagnostic("JSON 错误"), failure.diagnostic);
+            failure.diagnostic =
+                format!("{} {}", problem("JSON 错误").diagnostic, failure.diagnostic);
             return failure;
         }
-        return diagnostic(
+        return problem(
             if value.get("object").and_then(Value::as_str) == Some("response") {
                 "JSON Response（非流式）"
             } else {
                 "JSON"
             },
-        )
-        .into();
+        );
     }
     let start = bytes
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
         .unwrap_or(bytes.len());
     let prefix = &bytes[start..];
-    diagnostic(
+    problem(
         if prefix.starts_with(b"event:") || prefix.starts_with(b"data:") {
             "SSE 格式（响应类型不匹配）"
         } else if prefix.starts_with(b"<") {
@@ -1702,7 +1851,6 @@ async fn read_non_sse_error(mut response: reqwest::Response) -> LlmFailure {
             "无法识别"
         },
     )
-    .into()
 }
 
 fn structured_error(error: &Value, status: Option<u16>) -> String {
@@ -1731,12 +1879,7 @@ fn structured_error(error: &Value, status: Option<u16>) -> String {
 }
 
 fn structured_failure(error: &Value, status: Option<u16>) -> LlmFailure {
-    let kind = match error.get("code").and_then(Value::as_str) {
-        Some("subscription_sharing_usage_limit_exceeded" | "insufficient_quota") => {
-            LlmFailureKind::QuotaExceeded
-        }
-        _ => LlmFailureKind::Unclassified,
-    };
+    let kind = transport::api_failure_kind(error, status);
     let mut diagnostic = structured_error(error, status);
     // The plan route recommends preserving code/param for rejected requests.
     // Only fixed protocol identifiers leave the adapter, never remote text or
@@ -1767,7 +1910,14 @@ fn structured_failure(error: &Value, status: Option<u16>) -> LlmFailure {
     {
         diagnostic.push_str(&format!(" param={param}。"));
     }
-    LlmFailure { kind, diagnostic }
+    LlmFailure { kind, diagnostic }.at_protocol_stage(
+        if status.is_some_and(|s| !(200..300).contains(&s)) {
+            LlmProtocolStage::RequestRejected
+        } else {
+            LlmProtocolStage::ProviderReportedFailure
+        },
+        status,
+    )
 }
 
 #[cfg(test)]

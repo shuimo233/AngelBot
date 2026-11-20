@@ -1,0 +1,12 @@
+.reply-file-delivery {
+  display: grid;
+  gap: var(--ui-space-2);
+  margin: var(--ui-space-3) 0 0;
+  padding: var(--ui-space-2) 0 0;
+  border-block-start: 1px solid var(--color-border-muted);
+  list-style: none;
+}
+
+.reply-file-delivery li { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--ui-space-1) var(--ui-space-3); }
+.reply-file-delivery li > span { color: var(--color-text-secondary); font-size: var(--ui-size-sm); }
+.reply-file-delivery .message-file-link { min-width: 0; overflow-wrap: anywhere; }

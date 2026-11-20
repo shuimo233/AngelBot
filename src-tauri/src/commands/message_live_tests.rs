@@ -35,6 +35,8 @@ mod native_context;
 mod preference_benchmark;
 #[path = "message_live_tests/query_expansion_prototype.rs"]
 mod query_expansion_prototype;
+#[path = "message_live_tests/results_only_acceptance.rs"]
+mod results_only_acceptance;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +90,8 @@ async fn probe_model_readiness(
             Err(_) => ModelProbeStatus::TimedOut,
             Ok(Err(failure)) => match failure.kind {
                 crate::llm::LlmFailureKind::QuotaExceeded => ModelProbeStatus::QuotaExceeded,
-                crate::llm::LlmFailureKind::Unclassified => ModelProbeStatus::Unavailable,
+                crate::llm::LlmFailureKind::TimedOut => ModelProbeStatus::TimedOut,
+                _ => ModelProbeStatus::Unavailable,
             },
             Ok(Ok(response)) => {
                 let (response, protocol) = response.into_parts();
@@ -162,11 +165,11 @@ async fn model_probe_is_single_call_without_tools_or_private_output() {
             assert_eq!(messages[0].content, "Reply exactly OK.");
             assert!(tools.is_none() && thinking.is_none());
             match self.0 {
-                1 | 2 => Err(LlmFailure {
-                    kind: if self.0 == 1 {
-                        LlmFailureKind::QuotaExceeded
-                    } else {
-                        LlmFailureKind::Unclassified
+                1 | 2 | 7 => Err(LlmFailure {
+                    kind: match self.0 {
+                        1 => LlmFailureKind::QuotaExceeded,
+                        7 => LlmFailureKind::TransportUnavailable,
+                        _ => LlmFailureKind::Unclassified,
                     },
                     diagnostic: "Bearer private-probe-secret insufficient_quota".into(),
                 }),
@@ -204,6 +207,7 @@ async fn model_probe_is_single_call_without_tools_or_private_output() {
         (4, "unavailable"),
         (5, "unavailable"),
         (6, "unavailable"),
+        (7, "unavailable"),
     ] {
         let provider = Probe(kind, AtomicUsize::new(0));
         let report = probe_model_readiness(&provider, Duration::from_millis(1)).await;
@@ -238,7 +242,14 @@ fn configured_model_completes_bounded_file_task() {
     if std::env::var("ANGELBOT_LIVE_MODEL_JOURNEY").as_deref() == Ok("cache-comparison") {
         println!(
             "\nCACHE_COMPARISON_REPORT {}",
-            agent_benchmarks::configured_cache_comparison()
+            agent_benchmarks::configured_cache_comparison(false)
+        );
+        return;
+    }
+    if std::env::var("ANGELBOT_LIVE_MODEL_JOURNEY").as_deref() == Ok("cache-exact-repeat") {
+        println!(
+            "\nCACHE_EXACT_REPEAT_REPORT {}",
+            agent_benchmarks::configured_cache_comparison(true)
         );
         return;
     }

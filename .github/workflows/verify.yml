@@ -66,10 +66,14 @@ jobs:
           npm_config_offline: 'true'
         run: python scripts/verify.py full
 
-  desktop-e2e:
-    name: Windows desktop smoke test
+  desktop-suite:
+    name: Windows desktop ${{ matrix.suite }}
     runs-on: windows-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [smoke, journey]
 
     steps:
       - uses: actions/checkout@v4
@@ -102,14 +106,32 @@ jobs:
       - name: Fetch locked Rust dependencies
         run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
 
-      - name: Run isolated desktop smoke test
-        run: npm run test:desktop
+      - name: Run isolated desktop ${{ matrix.suite }}
+        run: python scripts/desktop_e2e.py --suite ${{ matrix.suite }}
 
       - name: Preserve bounded synthetic failure evidence
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: desktop-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: src-tauri/target/e2e/failure/${{ github.run_id }}-${{ github.run_attempt }}/
+          name: desktop-${{ matrix.suite }}-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: src-tauri/target/e2e/failure/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 7
+
+  # Keep the existing protected-branch check and require both native suites.
+  desktop-e2e:
+    name: Windows desktop smoke test
+    needs: desktop-suite
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require smoke and journey to pass
+        env:
+          DESKTOP_RESULT: ${{ needs.desktop-suite.result }}
+        run: test "$DESKTOP_RESULT" = success
+
+  installer-candidate:
+    name: Deliver verified installer
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [full, desktop-e2e]
+    uses: ./.github/workflows/installer-candidate.yml

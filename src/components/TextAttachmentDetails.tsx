@@ -7,7 +7,9 @@ import './TextAttachmentDetails.css';
 export function TextAttachmentDetails({ file }: { file: TextAttachment }) {
   const [expanded, setExpanded] = useState<TextAttachment | null>(null);
   const extension = file.name.split('.').at(-1)?.toLowerCase();
-  const kind = extension === 'docx' ? 'DOCX 正文文字' : extension === 'xlsx' ? 'XLSX 单元格值' : '文本快照';
+  const kind = extension === 'docx' ? 'DOCX 正文文字'
+    : extension === 'xlsx' ? 'XLSX 单元格值'
+    : extension === 'pdf' ? 'PDF 文字层' : '文本快照';
   return (
     <details className="text-attachment-details" open={expanded === file}
       onToggle={(event) => setExpanded(event.currentTarget.open ? file : null)}>

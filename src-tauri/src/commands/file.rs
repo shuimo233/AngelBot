@@ -347,6 +347,38 @@ fn resolve_with_root_policy(
     Ok(joined)
 }
 
+pub(super) const PROJECT_ROOT_UNAVAILABLE: &str = "项目目录已不可访问。";
+pub(super) const PROJECT_ROOT_REDIRECTED: &str =
+    "项目目录已指向其他位置。请恢复原目录，或在工作台打开要使用的文件夹。";
+pub(super) const PROJECT_ROOT_UNCONFIRMED: &str =
+    "项目目录尚未确认，请在设置的数据备份页批量确认恢复目录。";
+
+/// A confirmed project stores the canonical path selected by the user.
+/// Resolving it again must not turn a new junction into an implicit grant.
+pub(crate) fn validate_confirmed_project_root(root: &Path) -> Result<(), String> {
+    let unavailable = || PROJECT_ROOT_UNAVAILABLE.to_owned();
+    if !root.is_absolute() {
+        return Err(unavailable());
+    }
+    let resolved = root.canonicalize().map_err(|_| unavailable())?;
+    if !resolved.is_dir() {
+        return Err(unavailable());
+    }
+    if Path::new(&display_work_dir(root)) != Path::new(&display_work_dir(&resolved)) {
+        return Err(PROJECT_ROOT_REDIRECTED.to_owned());
+    }
+    Ok(())
+}
+
+fn confirmed_project_root(root: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let path = root
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| PROJECT_ROOT_UNCONFIRMED.to_owned())?;
+    let root = std::path::PathBuf::from(path);
+    validate_confirmed_project_root(&root)?;
+    Ok(root)
+}
+
 /// Resolve the effective work directory.
 /// Workspace-owned sessions resolve only their workspace root. Legacy sessions
 /// retain the old fallback while data is being migrated. Personal result files
@@ -367,13 +399,7 @@ pub(crate) fn resolve_delegation_workspace_root(
     match workspace {
         Some((Some(kind), _, _)) if kind == "personal" => Ok(None),
         Some((Some(kind), root, _)) if kind == "project" => {
-            let root = root.filter(|path| !path.is_empty()).ok_or_else(|| {
-                "项目目录尚未确认，请在设置的数据备份页批量确认恢复目录。".to_owned()
-            })?;
-            let root = std::path::PathBuf::from(root);
-            root.exists()
-                .then_some(Some(root))
-                .ok_or_else(|| "项目目录已不可访问。".to_owned())
+            confirmed_project_root(root.as_deref()).map(Some)
         }
         Some((Some(_), _, _)) => Err("未知工作区类型不具有委派权限。".to_owned()),
         Some((None, _, work_dir)) => {
@@ -405,6 +431,25 @@ pub(crate) fn personal_files_root(
     conn: &rusqlite::Connection,
 ) -> Result<std::path::PathBuf, String> {
     app_owned_directory(conn, "results")
+}
+
+#[command]
+pub fn open_daily_results_folder(state: tauri::State<'_, crate::AppState>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let folder = {
+            let conn = state.db.lock().map_err(|error| error.to_string())?;
+            personal_files_root(&conn)?
+        };
+        crate::desktop_control::WindowsDesktopAdapter::reveal_in_explorer(&folder, true)
+            .map_err(|error| format!("无法打开日常结果目录。{error}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Err("请在 Windows 桌面版打开日常结果目录。".into())
+    }
 }
 
 /// Callers provide a fixed host-owned directory name, never a model path.
@@ -462,17 +507,7 @@ fn resolve_work_dir_from_connection(
                 return personal_files_root(conn);
             }
             if kind == "project" {
-                let root = root
-                    .as_ref()
-                    .filter(|path| !path.is_empty())
-                    .ok_or_else(|| {
-                        "项目目录尚未确认，请在设置的数据备份页批量确认恢复目录。".to_owned()
-                    })?;
-                let root = std::path::PathBuf::from(root);
-                return root
-                    .exists()
-                    .then_some(root)
-                    .ok_or_else(|| "项目目录已不可访问。".to_owned());
+                return confirmed_project_root(root.as_deref());
             }
             // Unknown kinds are fail-closed rather than inheriting a global root.
             return Err("未知工作区类型不具有文件访问权限。".to_owned());
@@ -524,7 +559,7 @@ fn resolve_work_dir_from_connection(
 ///
 /// Absolute paths are accepted only when they resolve inside the workspace.
 /// This keeps direct UI, dev HTTP, and Main-Agent reads on the same canonical
-/// traversal and symlink-safe boundary. Office files return an explicitly
+/// traversal and symlink-safe boundary. Supported documents return an explicitly
 /// labelled bounded text snapshot, never the binary package or rendered view.
 pub fn read_file_core(work_dir: &Path, path: &str) -> Result<String, String> {
     read_file_snapshot_core(work_dir, path).map(|snapshot| snapshot.content)
@@ -655,7 +690,9 @@ pub fn write_file_core(work_dir: &Path, path: &str, content: &str) -> Result<(),
     if DocumentFormat::from_path(Path::new(trimmed)).is_some()
         || DocumentFormat::from_path(&resolved).is_some()
     {
-        return Err("DOCX/XLSX 只能读取文字快照，不能用文本写入覆盖 Office 文件；请将结果保存为 Markdown、TXT 或 CSV。".into());
+        return Err(
+            "DOCX、XLSX、PDF 只能读取文字快照。请将文本结果保存为 Markdown、TXT 或 CSV。".into(),
+        );
     }
     std::fs::write(&resolved, content).map_err(|e| e.to_string())
 }
@@ -869,34 +906,85 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, unix))]
     fn project_workspace_keeps_its_delegation_root() {
+        let state = crate::tests::test_app_state();
+        crate::db::migrate(&state.db.lock().unwrap()).unwrap();
+        let fixture = tempdir().unwrap();
+        let parent = display_work_dir(&fixture.path().canonicalize().unwrap());
+        let root = Path::new(&parent).join("project");
+        let selection = Path::new(&parent).join("selection");
+        std::fs::create_dir(&root).unwrap();
+        crate::tests::create_test_directory_link(&selection, &root);
+        let opened = crate::commands::workspace::create_project_workspace_impl(
+            &state,
+            selection.to_str().unwrap().to_owned(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Once selected, the project is bound to the canonical target even if
+        // the path used in the folder picker no longer exists.
+        #[cfg(windows)]
+        std::fs::remove_dir(&selection).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&selection).unwrap();
+        let conn = state.db.lock().unwrap();
+        let resolved = resolve_delegation_workspace_root(&conn, &opened.session.id)
+            .unwrap()
+            .expect("project workspace must keep delegation available");
+
+        assert_eq!(resolved, root);
+    }
+
+    #[test]
+    #[cfg(any(windows, unix))]
+    fn confirmed_project_root_cannot_redirect_after_creation() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
-        let root = tempdir().unwrap();
-        let root_path = root.path().to_string_lossy().to_string();
+        let fixture = tempdir().unwrap();
+        let parent = display_work_dir(&fixture.path().canonicalize().unwrap());
+        let root = Path::new(&parent).join("approved");
+        let outside = Path::new(&parent).join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let stored = display_work_dir(&root);
         conn.execute(
-            "INSERT INTO projects (id, name, path, created_at, kind, updated_at, active_session_id)
-             VALUES ('project-1', 'Project', ?1, 1, 'project', 1, NULL)",
-            rusqlite::params![root_path],
+            "INSERT INTO projects (id, name, path, created_at, kind, updated_at)
+             VALUES ('project-1', 'Project', ?1, 1, 'project', 1)",
+            [&stored],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sessions (id, title, created_at, updated_at, context_version, work_dir, project_id)
              VALUES ('project-main', '', 1, 1, 0, ?1, 'project-1')",
-            rusqlite::params![root_path],
+            [&stored],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE projects SET active_session_id = 'project-main' WHERE id = 'project-1'",
-            [],
-        )
-        .unwrap();
+        assert!(resolve_work_dir_from_connection(&conn, Some("project-main")).is_ok());
+        assert!(resolve_delegation_workspace_root(&conn, "project-main").is_ok());
 
-        let resolved = resolve_delegation_workspace_root(&conn, "project-main")
-            .unwrap()
-            .expect("project workspace must keep delegation available");
+        std::fs::remove_dir(&root).unwrap();
+        crate::tests::create_test_directory_link(&root, &outside);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            outside.canonicalize().unwrap(),
+            "the test link must resolve to the other directory"
+        );
+        let files = resolve_work_dir_from_connection(&conn, Some("project-main"));
+        let delegation = resolve_delegation_workspace_root(&conn, "project-main");
+        #[cfg(windows)]
+        std::fs::remove_dir(&root).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&root).unwrap();
 
-        assert_eq!(resolved, root.path());
+        assert!(files.is_err(), "file access inherited a redirected root");
+        assert!(
+            delegation.is_err(),
+            "delegation inherited a redirected root"
+        );
     }
 
     #[test]
@@ -1143,16 +1231,16 @@ mod tests {
     }
 
     #[test]
-    fn office_reads_are_bounded_and_text_writes_cannot_destroy_packages() {
+    fn document_reads_are_bounded_and_text_writes_cannot_destroy_originals() {
         let dir = tempdir().unwrap();
-        for name in ["notes.DOCX", "expenses.xlsx"] {
+        for name in ["notes.DOCX", "expenses.xlsx", "report.pdf"] {
             let path = dir.path().join(name);
             let bytes = b"original Office package";
             std::fs::write(&path, bytes).unwrap();
             assert!(read_file_core(dir.path(), name).is_err());
             assert!(write_file_core(dir.path(), name, "replacement")
                 .unwrap_err()
-                .contains("不能用文本写入"));
+                .contains("只能读取文字快照"));
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             std::fs::File::create(&path)
                 .unwrap()
@@ -1164,6 +1252,8 @@ mod tests {
         }
         assert!(write_file_core(dir.path(), "new.docx", "not an Office package").is_err());
         assert!(!dir.path().join("new.docx").exists());
+        assert!(write_file_core(dir.path(), "new.pdf", "not a PDF document").is_err());
+        assert!(!dir.path().join("new.pdf").exists());
     }
 
     #[test]

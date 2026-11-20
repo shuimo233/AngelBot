@@ -104,5 +104,5 @@ export const TRAIT_LABELS: Record<keyof typeof defaultTraits, { left: string; ri
   humor: { left: '无趣', right: '幽默' },
   dependence: { left: '独立', right: '粘人' },
   intimacy: { left: '保持距离', right: '亲密' },
-  patience: { left: '没耐心', right: '超级耐心' },
+  patience: { left: '聚焦卡点', right: '循序渐进' },
 };

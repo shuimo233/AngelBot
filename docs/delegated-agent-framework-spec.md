@@ -259,6 +259,12 @@ WorkPackage (goal + frozen scope/policy)
 - **Implemented** For delegated Change, the Materializer is the sole canonical
   writer. It checks immutable confirmation, scope/base and the reviewed artifact,
   serializes application and records an independently checked applied receipt.
+  Before checkout inspection, the existing receipt is reserved transactionally
+  across all packages with the same trusted workspace key; Git runs outside the
+  DB lock. Busy work dispatches no canonical write and retains the competing candidate.
+  An explicit follow-up reuses the same pending approval without extending its
+  expiry. Unknown receipts block new packages too and cannot be overwritten by
+  late completion; no automatic retry or unknown-result cleanup is introduced.
 - **Implemented (contract)** A confirmation becomes invalid on CandidateSet/diff change,
   scope/workspace/profile/network-policy expansion, base-revision drift,
   verification/strategy change, increased risk or any external side effect.

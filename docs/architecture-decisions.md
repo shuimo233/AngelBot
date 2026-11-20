@@ -17,6 +17,8 @@
 
 Per-workspace input steering follows a Pi-style queue, but durable Work Packages, Attempts, leases, and candidates form a separate recoverable state machine. SQLite persists the control plane; in-flight work is inspected after restart rather than blindly resumed.
 
+Lifecycle event batches allocate their sequence from the durable run tail inside the same SQLite write transaction. Independent journal instances and connections do not own separate counters; a failed batch neither exposes a persisted prefix nor consumes sequence numbers. This deepens the existing journal rather than adding another event bus or state authority.
+
 ## ADR-0002
 
 **Project mutation uses a Git-backed Workspace Repository**
@@ -31,6 +33,8 @@ Per-workspace input steering follows a Pi-style queue, but durable Work Packages
 ### Consequences
 
 Candidate work occurs in isolated worktrees from private checkpoint refs. Materialization checks a State Anchor and is serialized per Workspace; drift triggers re-read, rebase, and review rather than a silent overwrite.
+
+The existing materialization receipt reserves the Workspace in a write transaction before mutable checkout checks or Git dispatch. An `applying` receipt blocks competing packages as busy; an `unknown` receipt retains the recovery barrier across packages and restarts. Git executes outside the database lock. A known refusal and approval invalidation commit together; a late result cannot replace an already sealed unknown outcome. Explicit follow-up after a busy result reuses only the exact pending approval and its original expiry, never renews authority or schedules an automatic retry.
 
 ## ADR-0003
 
@@ -71,6 +75,8 @@ Workspace enablement and task leases are separate. Tool manifest or command chan
 
 长期记忆读取关闭时，Main 的 `recall_memories`、`traverse_graph` 和 `check_constraint` 同时退出本回合的工具目录与执行注册表，不能通过显式工具调用绕过关闭状态。设置页查看／清理和用户明确批准的记忆写入仍沿原入口；操作权限、作用域和当前任务条件不依赖长期记忆开关，也不因此停用。
 
-模型失败的原文是可能含敏感信息的不可信诊断，不属于会话或协议历史。Main 运行循环通过既有后端私有结果单独返回该值，投影与落盘模块将带步骤结果的诊断沿原受保护证据存储、与回复和任务状态同事务保存；公开正文、工具结果和生命周期事件只保留安全提示。用户停止不记为模型故障，不新增公共诊断读取入口、重试器或第二套日志系统。
+模型失败的原文是可能含敏感信息的不可信诊断，不属于会话或协议历史。Main 运行循环通过既有后端私有结果单独返回该值，投影与落盘模块将带步骤结果的诊断沿原受保护证据存储、与回复和任务状态同事务保存；公开正文、工具结果和生命周期事件只保留闭合类别的安全提示。用户停止不记为模型故障，不新增公共诊断读取入口、任务级重试器或第二套日志系统。模型 HTTP 可复用有限的连接建立恢复：仅确认请求尚未送达且属于可重连 I/O 故障时，最多重连两次；不自动重发已送达请求、续接断流、重做工具、切换计费来源或放宽 TLS，等待随所属请求取消，不引入后台守护或队列。
+
+模型适配沿用原生协议的请求和终止标记，参考 Pi 对流式失败和结束状态的统一表达，将认证、授权、速率限制、用量、服务故障、连接、超时和输出中断映射为公共类别。只有明确的服务错误码能识别额度用尽，单独的 HTTP 429 归为速率限制。「测试连接」使用主对话的同一请求接口验证文本和合成工具往返。任务恢复通过持久事件代码重建相同提示。[Pi 的流式事件协议](https://github.com/earendil-works/pi/blob/main/packages/ai/src/types.ts)
 
 这并非“永不忘记”的承诺：自由文本约束仍需模型理解，不能被当作安全策略执行；普通记忆／图谱的完整空间归属与预算、工作包按任务选择哪些规则，以及长会话质量仍需独立核验。本次不把全局规则自动复制给所有 worker。今后只在真实任务暴露缺口时调整选取／渲染策略，不改权威数据合同来追逐模型版本。

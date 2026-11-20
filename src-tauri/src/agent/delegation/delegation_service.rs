@@ -73,6 +73,7 @@ pub enum DelegationServiceError {
     Review,
     StopUnavailable,
     MaterializationInProgress,
+    WorkspaceBusy,
     CleanupPending(String),
 }
 
@@ -99,6 +100,9 @@ impl std::fmt::Display for DelegationServiceError {
             }
             Self::MaterializationInProgress => {
                 f.write_str("canonical materialization outcome requires inspection; do not retry or discard its recovery evidence")
+            }
+            Self::WorkspaceBusy => {
+                f.write_str("another reviewed change is being applied to this workspace; no canonical write was dispatched for this request; keep the candidate and wait for that operation to finish")
             }
             Self::CleanupPending(attempt) => {
                 write!(f, "terminal cleanup is pending for attempt {attempt}")
@@ -1057,6 +1061,9 @@ where
                 .map_err(|error| match error {
                     super::change_pipeline::ChangePipelineError::MaterializationIndeterminate => {
                         DelegationServiceError::MaterializationInProgress
+                    }
+                    super::change_pipeline::ChangePipelineError::WorkspaceBusy => {
+                        DelegationServiceError::WorkspaceBusy
                     }
                     _ => DelegationServiceError::ChangeReviewNotReady,
                 })?;

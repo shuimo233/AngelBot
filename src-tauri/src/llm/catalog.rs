@@ -6,6 +6,9 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use tauri::Manager;
+
+use super::openai_responses::{SessionPool, SessionSlot};
 
 impl ProviderConfig {
     pub fn effective_protocol(&self) -> ModelProtocol {
@@ -91,6 +94,19 @@ pub fn create_provider_with_credentials(
     config: &ProviderConfig,
     source: Option<Arc<dyn ModelCredentialSource>>,
 ) -> Result<Box<dyn LlmProvider>, String> {
+    create_bound_provider(config, source, None)
+}
+
+struct ForegroundBinding<'a> {
+    slot: SessionSlot,
+    cache_session_id: Option<&'a str>,
+}
+
+fn create_bound_provider(
+    config: &ProviderConfig,
+    source: Option<Arc<dyn ModelCredentialSource>>,
+    foreground: Option<ForegroundBinding<'_>>,
+) -> Result<Box<dyn LlmProvider>, String> {
     let mut config = config.clone();
     if config.base_url.is_empty() {
         config.base_url = get_default_base_url(&config.provider);
@@ -117,10 +133,17 @@ pub fn create_provider_with_credentials(
             let credentials = source.unwrap_or_else(|| {
                 StaticCredentialSource::new(config.api_key.clone(), config.credential_identity())
             });
-            Ok(Box::new(OpenAiResponsesProvider::new(
-                &config,
-                credentials,
-            )?))
+            let provider = OpenAiResponsesProvider::new(&config, credentials)?;
+            Ok(Box::new(match foreground {
+                Some(binding) => {
+                    let provider = provider.with_foreground_websocket(binding.slot);
+                    match binding.cache_session_id {
+                        Some(session_id) => provider.with_session_affinity(session_id),
+                        None => provider,
+                    }
+                }
+                None => provider,
+            }))
         }
         ModelProtocol::AnthropicMessages => Ok(Box::new(
             AnthropicProvider::new(
@@ -146,16 +169,111 @@ pub fn create_provider_for_app(
     config: &ProviderConfig,
     app: Option<&tauri::AppHandle>,
 ) -> Result<Box<dyn LlmProvider>, String> {
-    let source = if config.auth_mode == ModelAuthMode::ChatgptPlan {
-        let app = app.ok_or("ChatGPT plan credential store is unavailable")?;
-        Some(super::chatgpt_auth::credential_source(
-            app,
-            config.credential_ref.as_deref().unwrap_or_default(),
-        )?)
-    } else {
-        None
+    create_app_provider(config, app, ForegroundRoute::Disabled)
+}
+
+/// A foreground execution owns its connection until its final tool step or cancellation.
+pub(crate) fn create_foreground_provider_for_app(
+    config: &ProviderConfig,
+    app: Option<&tauri::AppHandle>,
+) -> Result<Box<dyn LlmProvider>, String> {
+    create_app_provider(config, app, ForegroundRoute::OneTurn)
+}
+
+/// Only admitted append turns may share the transport. Each turn still owns
+/// its credential binding, parser, metering, and execution policy.
+pub(crate) fn create_session_foreground_provider_for_app(
+    config: &ProviderConfig,
+    app: Option<&tauri::AppHandle>,
+    session_id: &str,
+    execution_permission: &str,
+) -> Result<Box<dyn LlmProvider>, String> {
+    create_app_provider(
+        config,
+        app,
+        ForegroundRoute::Session {
+            session_id,
+            execution_permission,
+        },
+    )
+}
+
+pub(crate) fn invalidate_foreground_websocket_for_app(
+    app: Option<&tauri::AppHandle>,
+    session_id: &str,
+) {
+    if let Some(pool) = app.and_then(|app| app.try_state::<SessionPool>()) {
+        pool.invalidate(session_id);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ForegroundRoute<'a> {
+    Disabled,
+    OneTurn,
+    Session {
+        session_id: &'a str,
+        execution_permission: &'a str,
+    },
+}
+
+fn create_app_provider(
+    config: &ProviderConfig,
+    app: Option<&tauri::AppHandle>,
+    route: ForegroundRoute<'_>,
+) -> Result<Box<dyn LlmProvider>, String> {
+    if config.auth_mode != ModelAuthMode::ChatgptPlan {
+        if let ForegroundRoute::Session { session_id, .. } = route {
+            invalidate_foreground_websocket_for_app(app, session_id);
+        }
+        return create_bound_provider(config, None, None);
+    }
+
+    let app = app.ok_or("ChatGPT plan credential store is unavailable")?;
+    let credential_ref = config.credential_ref.as_deref().unwrap_or_default();
+    let binding = config
+        .validate_connection()
+        .and_then(|()| super::chatgpt_auth::credential_source_with_epoch(app, credential_ref));
+    let (source, epoch) = match binding {
+        Ok(binding) => binding,
+        Err(error) => {
+            if let ForegroundRoute::Session { session_id, .. } = route {
+                invalidate_foreground_websocket_for_app(Some(app), session_id);
+            }
+            return Err(error);
+        }
     };
-    create_provider_with_credentials(config, source)
+    let slot = match route {
+        ForegroundRoute::Disabled => None,
+        ForegroundRoute::OneTurn => Some(ForegroundBinding {
+            slot: SessionSlot::default(),
+            cache_session_id: None,
+        }),
+        ForegroundRoute::Session {
+            session_id,
+            execution_permission,
+        } => {
+            if app.try_state::<SessionPool>().is_none() {
+                app.manage(SessionPool::default());
+            }
+            let cache_session_id = Some(session_id);
+            #[cfg(test)]
+            let cache_session_id = cache_session_id.filter(|_| {
+                std::env::var("CODEX_CONTEXT_EVAL_SESSION_AFFINITY").as_deref() != Ok("0")
+            });
+            Some(ForegroundBinding {
+                slot: app.state::<SessionPool>().bind(
+                    session_id,
+                    credential_ref,
+                    epoch,
+                    &config.model,
+                    execution_permission,
+                ),
+                cache_session_id,
+            })
+        }
+    };
+    create_bound_provider(config, Some(source), slot)
 }
 
 #[cfg(test)]

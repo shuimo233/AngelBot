@@ -40,6 +40,8 @@
   --ui-size-sm: 13px;
   --ui-size-base: 14px;
   --ui-size-reading: 16px;
+  --ui-chat-font-size: var(--ui-size-base);
+  --ui-chat-font-family: var(--ui-font-sans);
   --ui-size-title: 20px;
   --ui-size-display: 32px;
   --ui-weight-read: 400;
@@ -112,14 +114,12 @@
   --motion-feedback: var(--ui-duration-fast);
   --motion-state: var(--ui-duration-base);
   --sidebar-width: 252px;
-  --right-panel-width: 336px;
   --top-bar-height: 56px;
   --feature-content-width: 1040px;
   --feature-page-gutter: clamp(20px, 3.4vw, 40px);
   --conversation-content-width: 760px;
   --conversation-gutter: clamp(20px, 3vw, 40px);
-  --bg-image: none;
-  --bg-opacity: .2;
+  --bg-opacity: .15;
 }
 
 .dark {

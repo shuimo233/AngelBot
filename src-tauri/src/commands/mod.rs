@@ -11,6 +11,7 @@ pub mod api_config;
 pub mod automation;
 pub mod branch;
 pub mod channel;
+pub(crate) mod composer_draft;
 pub(crate) mod delegated_delivery_follow_up;
 pub mod desktop;
 pub mod file;

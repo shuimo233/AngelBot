@@ -1,17 +1,27 @@
 # Desktop beta checklist
 
-This checklist is a release gate for the desktop application. It complements
-deterministic tests; it does not replace `python scripts/verify.py full`.
+This is a manual and extended-acceptance inventory, not an all-items release gate
+for an early GitHub **Pre-release**. It complements deterministic tests; it does
+not replace `python scripts/verify.py full` or permission/safety checks.
 
-Run it with a fresh local profile and one disposable project directory. Record
-the app version, OS version, and any failure before changing settings or files.
+For an early pre-release, reuse valid passing full/native/build evidence for
+unchanged inputs and disclose unsigned status, installer checks not performed
+and known limits. A clean VM, Windows signing and completing this entire list
+are not prerequisites. Unchecked does not mean a confirmed defect, and disclosure
+does not turn an unperformed check into a pass. Known data-loss, unauthorized
+actions and unsafe replay remain blockers.
 
-Release acceptance uses a clean, non-administrator Windows 11 x64 account and
-an installed build. Signed per-user installation, signed update verification,
+The manual early-release path and unchanged stable/updater workflow are described
+in [the release runbook](../.github/RELEASING.md#release-procedure).
+
+For later stable or capability-specific acceptance, select the applicable items.
+Run them with a fresh local profile and disposable project; record version, OS
+and failures. Installation acceptance uses a clean, non-administrator Windows 11
+x64 account and an installed build, not necessarily a VM. Signed installation, update verification,
 data preservation and recovery/export after failed startup require OS-level
 evidence; a debug executable or mocked relaunch does not satisfy these goals.
 
-Unchecked items require current-release live/manual acceptance. Scoped native
+Unchecked items remain unverified for the corresponding capability claims. Scoped native
 fixture and deterministic evidence is recorded in [the current roadmap](current-roadmap.md);
 it does not prove real model understanding or third-party business completion.
 
@@ -80,8 +90,8 @@ it does not prove real model understanding or third-party business completion.
 
 ## Release evidence
 
-- [ ] `python scripts/verify.py full` passes without credentials, network access, or user runtime data.
-- [ ] Attach screenshots or issue links for every failed checklist item; do not mark the release ready until each item is resolved or explicitly waived.
+- [ ] `python scripts/verify.py full` passes without credentials, network access, or user runtime data; reuse a current pass while its inputs and acceptance conditions remain unchanged.
+- [ ] Record known failures and unperformed checks in the release notes or linked issues. Fix known data-loss, unauthorized-action and unsafe-replay defects; do not require completing unrelated manual checks before an early pre-release, or mark them passed by disclosure.
 
 Before declaring an email/calendar connector supported, additionally verify its
 system-browser PKCE flow, staged read/draft/send or calendar-mutation scopes,
@@ -89,7 +99,7 @@ the active external-action policy, and revocation/reconnect behavior. This is a
 capability-specific gate, not a reason to redefine AngelBot as a mail assistant
 or infer that an unimplemented connector is available.
 
-## Continuous-use trial: acceptance procedure, not a release waiver
+## Continuous-use trial: extended evidence, not proved by a pre-release
 
 Use the normal Windows build with the owner's selected model and a disposable
 project. Do not substitute the scripted E2E profile for a connected account.
@@ -127,4 +137,5 @@ contents in public evidence. Label results **offline**, **scripted native**,
 **live model** or **natural multi-day**; never merge these into a single pass.
 Lost history, unapproved effects, replayed stopped actions or unexplained blank
 replies stop the trial until diagnosed. A correct single-day preflight makes the
-trial reproducible; it does not prove the multi-day step or the release gates.
+trial reproducible; it does not prove the multi-day step or unperformed installation,
+update or capability checks.

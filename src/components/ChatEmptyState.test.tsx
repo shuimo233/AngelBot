@@ -1,8 +1,9 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ChatEmptyState,
+  ChatStarterPrompts,
   buildSuggestions,
   greetingForHour,
   pickTodayAutomations,
@@ -10,6 +11,7 @@ import {
 } from './ChatEmptyState';
 import { useKnowledgeStore } from '$stores/knowledge';
 import { useNavigationStore } from '$stores/navigation';
+import { useSettingsStore } from '$stores/settings';
 import { useWorkspacesStore } from '$stores/workspaces';
 import type { WorkspaceAutomationStatus } from '$lib/commands/automation';
 
@@ -116,43 +118,66 @@ describe('ChatEmptyState', () => {
     useNavigationStore.setState({ currentPage: 'chat' });
   });
 
-  it('显示时间问候和发消息引导', () => {
+  it('显示时间问候', () => {
     render(<ChatEmptyState />);
     expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
-    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
+  });
+
+  it('uses the saved assistant identity and never loads an imported remote avatar', () => {
+    const { activeProfile, profile } = useSettingsStore.getState();
+    const raster = 'data:image/png;base64,aGVsbG8=';
+    useSettingsStore.setState({ activeProfile: { ...activeProfile, name: '星汐', avatar: 'https://example.invalid/avatar.png' }, profile: { ...profile, name: '未保存草稿', avatar: raster } });
+    const view = render(<ChatEmptyState />);
+    const avatar = () => view.container.querySelector('.assistant-avatar');
+    try {
+      expect(screen.getByText('星汐')).toBeVisible();
+      expect(screen.queryByText('未保存草稿')).not.toBeInTheDocument();
+      expect(avatar()).toHaveAttribute('src', expect.stringContaining('128x128.png'));
+      act(() => useSettingsStore.setState({ activeProfile: { ...activeProfile, name: '星汐', avatar: raster } }));
+      expect(avatar()).toHaveAttribute('src', raster);
+      fireEvent.error(avatar()!);
+      expect(avatar()).toHaveAttribute('src', expect.stringContaining('128x128.png'));
+    } finally {
+      view.unmount();
+      useSettingsStore.setState({ activeProfile, profile });
+    }
   });
 
   it('个人空间任务起点只写入草稿，不直接发送', async () => {
     const user = userEvent.setup();
     const onDraftSelect = vi.fn();
-    render(<ChatEmptyState onDraftSelect={onDraftSelect} />);
+    render(<ChatStarterPrompts isProject={false} hidden={false} onDraftSelect={onDraftSelect} />);
 
     await user.click(screen.getByRole('button', { name: /整理今天的安排/ }));
     expect(onDraftSelect).toHaveBeenCalledWith('帮我把今天要处理的事情整理成按优先级排序的行动清单。先问我缺少的关键信息。');
   });
 
   it('用户已在输入时不再展示会覆盖草稿的任务起点', () => {
-    render(<ChatEmptyState onDraftSelect={vi.fn()} showStarters={false} />);
-    expect(screen.queryByText('可以从这里开始')).not.toBeInTheDocument();
+    const onDraftSelect = vi.fn();
+    const { rerender } = render(<ChatStarterPrompts isProject={false} hidden={false} onDraftSelect={onDraftSelect} />);
+    const starter = screen.getByRole('button', { name: /整理今天的安排/ });
+
+    rerender(<ChatStarterPrompts isProject={false} hidden onDraftSelect={onDraftSelect} />);
+    expect(starter).toBeInTheDocument();
+    expect(starter).toBeDisabled();
+    expect(screen.queryByRole('region', { name: '对话示例' })).not.toBeInTheDocument();
+
+    rerender(<ChatStarterPrompts isProject={false} hidden={false} onDraftSelect={onDraftSelect} />);
+    expect(screen.getByRole('button', { name: /整理今天的安排/ })).toBeEnabled();
   });
 
-  it('项目空状态说明当前唯一主对话的工作边界', () => {
+  it('项目空状态提示从哪里查看文件与任务', () => {
     useWorkspacesStore.setState({
       workspaces: [{ id: 'project', kind: 'project', name: 'AngelBot', rootPath: 'D:\\AngelBot', activeSessionId: 's2', createdAt: 1, updatedAt: 1 }],
       activeWorkspaceId: 'project',
     });
     render(<ChatEmptyState />);
 
-    expect(screen.getByText('项目 · AngelBot')).toBeInTheDocument();
-    expect(screen.getByText(/文件和任务进展都在右侧工作台/)).toBeInTheDocument();
+    expect(screen.getByText('在工作台查看文件和任务。')).toBeInTheDocument();
   });
 
   it('项目任务起点优先读取和诊断，不默认修改', () => {
-    useWorkspacesStore.setState({
-      workspaces: [{ id: 'project', kind: 'project', name: 'AngelBot', rootPath: 'D:\\AngelBot', activeSessionId: 's2', createdAt: 1, updatedAt: 1 }],
-      activeWorkspaceId: 'project',
-    });
-    render(<ChatEmptyState onDraftSelect={vi.fn()} />);
+    render(<ChatStarterPrompts isProject hidden={false} onDraftSelect={vi.fn()} />);
 
     expect(screen.getByRole('button', { name: /了解当前项目/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /检查近期变更/ })).toBeInTheDocument();
@@ -169,7 +194,7 @@ describe('ChatEmptyState', () => {
 
     expect(getAutomationsMock).not.toHaveBeenCalled();
     expect(screen.queryByText('事项回看')).not.toBeInTheDocument();
-    expect(screen.getByText(/从一句话开始就好/)).toBeInTheDocument();
+    expect(screen.getByText(/^(早上好|下午好|晚上好)$/)).toBeInTheDocument();
     expect(screen.queryByText('整理笔记')).not.toBeInTheDocument();
     expect(screen.queryByText('已暂停任务')).not.toBeInTheDocument();
     expect(screen.queryByText('明天的任务')).not.toBeInTheDocument();

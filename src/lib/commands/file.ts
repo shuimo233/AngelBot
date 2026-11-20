@@ -38,6 +38,10 @@ export function listWorkDir(sessionId: string, path = ''): Promise<WorkDirEntry[
   return invoke<WorkDirEntry[]>('list_work_dir', { sessionId, path });
 }
 
+export function openDailyResultsFolder(): Promise<void> {
+  return invoke('open_daily_results_folder');
+}
+
 export type FileSaveOutcome = { status: 'cancelled' } | { status: 'saved'; name: string; bytes: number };
 
 /** The native picker authorizes one new file, not access to its parent folder. */

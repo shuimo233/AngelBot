@@ -1,12 +1,15 @@
 import { create } from 'zustand';
+import { initializeMemoryControls, saveMemoryControls, type MemoryControls } from '$lib/commands/memory';
 import type { UserPreferences } from '$types';
 
 interface PreferencesState {
   preferences: UserPreferences;
-  loadPreferences: () => void;
+  loadPreferences: () => Promise<void>;
   updatePreferences: (partial: Partial<UserPreferences>) => void;
   persistPreferences: () => void;
-  setEvolutionEnabled: (enabled: boolean) => void;
+  setMemoryControls: (partial: Partial<MemoryControls>) => Promise<void>;
+  memoryControlsBusy: boolean;
+  memoryControlsError: string | null;
   addInterest: (topic: string) => void;
   removeInterest: (topic: string) => void;
   addAvoidTopic: (topic: string) => void;
@@ -56,11 +59,48 @@ function loadFromStorage(): UserPreferences {
   return defaultPreferences;
 }
 
+function controlsFromPreferences(preferences: UserPreferences): MemoryControls {
+  return {
+    useLongTermMemory: preferences.habits.useLongTermMemory ?? true,
+    evolutionEnabled: preferences.evolutionEnabled,
+  };
+}
+
+function withMemoryControls(preferences: UserPreferences, controls: MemoryControls): UserPreferences {
+  return {
+    ...preferences,
+    habits: { ...preferences.habits, useLongTermMemory: controls.useLongTermMemory },
+    evolutionEnabled: controls.evolutionEnabled,
+  };
+}
+
+let initializingMemoryControls: Promise<void> | undefined;
+let memoryControlsLoaded = false;
+
 export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   preferences: loadFromStorage(),
+  memoryControlsBusy: false,
+  memoryControlsError: null,
 
   loadPreferences: () => {
-    set({ preferences: loadFromStorage() });
+    if (memoryControlsLoaded) return Promise.resolve();
+    if (initializingMemoryControls) return initializingMemoryControls;
+
+    set({ memoryControlsBusy: true, memoryControlsError: null });
+    initializingMemoryControls = Promise.resolve()
+      .then(() => initializeMemoryControls(controlsFromPreferences(get().preferences)))
+      .then((controls) => {
+        set((state) => ({ preferences: withMemoryControls(state.preferences, controls) }));
+        memoryControlsLoaded = true;
+      })
+      .catch((error: unknown) => {
+        set({ memoryControlsError: String(error) });
+      })
+      .finally(() => {
+        initializingMemoryControls = undefined;
+        set({ memoryControlsBusy: false });
+      });
+    return initializingMemoryControls;
   },
 
   updatePreferences: (partial) => {
@@ -74,11 +114,18 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     localStorage.setItem(STORAGE_KEY, JSON.stringify(preferences));
   },
 
-  setEvolutionEnabled: (enabled) => {
-    set((state) => ({
-      preferences: { ...state.preferences, evolutionEnabled: enabled },
-    }));
-    get().persistPreferences();
+  setMemoryControls: async (partial) => {
+    await get().loadPreferences();
+    if (!memoryControlsLoaded || get().memoryControlsBusy) return;
+    set({ memoryControlsBusy: true, memoryControlsError: null });
+    try {
+      const controls = await saveMemoryControls(partial);
+      set((state) => ({ preferences: withMemoryControls(state.preferences, controls) }));
+    } catch (error) {
+      set({ memoryControlsError: String(error) });
+    } finally {
+      set({ memoryControlsBusy: false });
+    }
   },
 
   addInterest: (topic) => {

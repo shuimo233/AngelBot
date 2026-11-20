@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { sendMessage } from './conversation-fixture.mjs';
 
 describe('native main conversation recovery', () => {
   let report;
@@ -25,26 +26,21 @@ describe('native main conversation recovery', () => {
     const sessionId = workspaces[0].activeSessionId;
     const messages = () => browser.tauri.execute(({ core }, sessionId) =>
       core.invoke('get_messages', { sessionId }), sessionId);
-    const send = async (text) => {
-      const composer = await browser.$('textarea[placeholder="给 AngelBot 发消息…"]');
-      await composer.waitForDisplayed({ timeout: 20_000 });
-      await composer.waitForEnabled({ timeout: 10_000 });
-      await composer.setValue(text);
-      const button = await browser.$('button[title="发送"]');
-      await button.waitForEnabled({ timeout: 10_000 });
-      await button.click();
-    };
+    const send = text => sendMessage(browser, text);
     const checkHistory = async (expectedCount) => {
       const rows = await messages();
       assert.equal(rows.length, expectedCount);
       assert.ok(rows[0].content.includes('native-recovery-initial'));
       const failed = rows[1];
       assert.match(failed.content, /模型请求未完成/);
-      assert.match(failed.content, /新消息/);
+      assert.match(failed.content, /检查模型连接/);
+      assert.match(failed.content, /此前已完成的操作结果已保留，不会自动重做/);
       assert.equal(failed.taskRun?.resumable, false);
       assert.equal(failed.taskRun?.status, 'provider_unavailable');
-      const results = rows.flatMap(row => row.toolResults ?? []);
-      assert.equal(results.filter(result => result.callId === 'native-recovery-list' && result.success).length, 1);
+      const receipts = rows.flatMap(row => row.toolResults ?? []).filter(result => result.callId === 'native-recovery-list');
+      assert.equal(receipts.length, 1, 'completed tool call must have exactly one durable receipt');
+      assert.equal(receipts[0].success, true);
+      assert.equal(receipts[0].toolName, 'list_automations');
       assert.doesNotMatch(JSON.stringify(rows), /desktop E2E user-data assertion failed|desktop-e2e index=/);
       assert.doesNotMatch(await browser.$('.messages').getText(), /desktop E2E|desktop-e2e index=/);
       return rows;
@@ -58,6 +54,15 @@ describe('native main conversation recovery', () => {
         timeout: 60_000, interval: 200, timeoutMsg: 'Model failure did not reach a durable safe reply',
       });
       await checkHistory(2);
+      const recovery = await browser.$('section[aria-label="任务恢复"]');
+      await recovery.$('button=检查模型连接').waitForDisplayed({ timeout: 10_000 });
+      assert.equal(await recovery.$('button=继续任务').isExisting(), false);
+      await recovery.$('button=检查模型连接').click();
+      const settings = await browser.$('[role="dialog"][aria-modal="true"]');
+      await settings.waitForDisplayed({ timeout: 10_000 });
+      await settings.$('button[aria-label="关闭"]').click();
+      await settings.waitForExist({ reverse: true, timeout: 10_000 });
+      assert.equal((await messages()).length, 2, 'inspecting model settings must not retry the task');
       await browser.saveScreenshot(join(evidence, 'failure.png'));
       await send('native-recovery-next：保留此前结果，继续回答，不再查询或执行操作。');
     } else {
@@ -84,12 +89,13 @@ describe('native main conversation recovery', () => {
       await browser.waitUntil(async () => (await browser.$('.messages').getText()).includes('native-model-waiting'), {
         timeout: 20_000, interval: 100, timeoutMsg: 'Owned model did not enter its pending streaming future',
       });
-      await browser.tauri.execute(async ({ core }, sessionId) => {
-        await core.invoke('pause_agent', { sessionId });
-        if (await core.invoke('get_agent_state', { sessionId }) !== 'Paused') throw new Error('Pause state not shared');
-        await core.invoke('resume_agent', { sessionId });
-        if (await core.invoke('get_agent_state', { sessionId }) !== 'Running') throw new Error('Resume state not shared');
-      }, sessionId);
+      const runControls = await browser.$('[aria-label="运行控制"]');
+      const state = () => browser.tauri.execute(({ core }, sessionId) => core.invoke('get_agent_state', { sessionId }), sessionId);
+      await runControls.$('button=暂停').click();
+      await browser.waitUntil(async () => await state() === 'Paused', { timeout: 5_000 });
+      await runControls.$('button=继续运行').click();
+      await browser.waitUntil(async () => await state() === 'Running', { timeout: 5_000 });
+      assert.equal((await browser.$$('button[title="停止运行"]')).length, 1);
       const stoppedAt = Date.now();
       await browser.$('button[title="停止运行"]').click();
       await browser.waitUntil(async () => (await messages()).some(row => row.taskRun?.status === 'stopped'), {
@@ -100,6 +106,8 @@ describe('native main conversation recovery', () => {
       assert.equal(stopped.taskRun.resumable, false);
       assert.equal(stopped.taskRun.stepCount, 0);
       assert.match(stopped.content, /本次运行已停止/);
+      assert.equal(stopped.modelRequestFailed ?? false, false);
+      assert.equal(stopped.taskFacts?.terminal_reason, 'stopped');
       assert.equal(stopped.toolResults?.length ?? 0, 0);
       assert.doesNotMatch(stopped.content, /native-model-waiting|模型请求未完成|agent_loop/);
       report.stopMilliseconds = Date.now() - stoppedAt;

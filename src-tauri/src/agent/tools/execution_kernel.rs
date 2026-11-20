@@ -4,7 +4,7 @@
 //! confirmation, persistence, or a tool registry.  A host owns those policy
 //! concerns and uses this module for the repeatable mechanics common to a
 //! foreground conversation and a future delegated worker: cancellation checks,
-//! bounded model timeout attempts, ordered execution milestones, and controlled-batch
+//! a cancellable model deadline, ordered execution milestones, and controlled-batch
 //! boundaries.
 
 use crate::agent::tool::ToolCancellation;
@@ -21,7 +21,6 @@ use tokio::sync::mpsc::UnboundedSender;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelEventKind {
     ModelTurnStarted,
-    ModelTurnRetrying,
     ModelTurnFinished,
     ToolBatchStarted,
     ToolBatchFinished,
@@ -30,7 +29,7 @@ pub enum KernelEventKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelEvent {
     pub kind: KernelEventKind,
-    /// One-based model attempt number. Tool-batch events use zero.
+    /// One for a model request; tool-batch events use zero.
     pub attempt: usize,
 }
 
@@ -43,7 +42,7 @@ pub enum KernelStopReason {
 pub enum KernelModelTurnError {
     Cancelled,
     Provider(LlmFailure),
-    TimedOut { attempts: usize, timeout: Duration },
+    TimedOut { timeout: Duration },
 }
 
 /// Explicit execution limits supplied by a host or its control plane.
@@ -279,21 +278,15 @@ impl Drop for ControlledToolBatch {
 pub struct ExecutionKernel {
     cancellation: ToolCancellation,
     model_timeout: Duration,
-    max_model_attempts: usize,
     budget_policy: BudgetPolicy,
     event_sink: Option<KernelEventSink>,
 }
 
 impl ExecutionKernel {
-    pub fn new(
-        cancellation: ToolCancellation,
-        model_timeout: Duration,
-        max_model_attempts: usize,
-    ) -> Self {
+    pub fn new(cancellation: ToolCancellation, model_timeout: Duration) -> Self {
         Self {
             cancellation,
             model_timeout,
-            max_model_attempts: max_model_attempts.max(1),
             budget_policy: BudgetPolicy::unbounded(),
             event_sink: None,
         }
@@ -382,9 +375,9 @@ impl ExecutionKernel {
         }
     }
 
-    /// Execute one model turn using the current foreground-compatible retry
-    /// policy. The host remains responsible for translating terminal errors
-    /// into user-visible responses and durable events.
+    /// Execute one model request. A timeout cannot prove that it was not
+    /// delivered; connection recovery belongs to the transport that can tell.
+    /// Hosts translate terminal errors into visible responses and durable events.
     pub async fn run_model_turn(
         &self,
         provider: &dyn LlmProvider,
@@ -395,49 +388,34 @@ impl ExecutionKernel {
     ) -> Result<LlmResponse, KernelModelTurnError> {
         self.check_before_model_turn()
             .map_err(|_| KernelModelTurnError::Cancelled)?;
-
-        for attempt in 1..=self.max_model_attempts {
-            self.check_before_model_turn()
-                .map_err(|_| KernelModelTurnError::Cancelled)?;
-            self.emit(KernelEventKind::ModelTurnStarted, attempt);
-            let result = tokio::select! {
-                biased;
-                _ = self.cancellation.cancelled() => return Err(KernelModelTurnError::Cancelled),
-                result = tokio::time::timeout(
-                    self.model_timeout,
-                    provider.chat_stream_classified(messages, tools, thinking, deltas.clone()),
-                ) => result,
-            };
-            // Cancellation can arrive in the same poll that produced a model
-            // response. Never settle that response or dispatch its tool calls.
-            self.check_before_model_turn()
-                .map_err(|_| KernelModelTurnError::Cancelled)?;
-            match result {
-                Ok(Ok(response)) => {
-                    self.emit(KernelEventKind::ModelTurnFinished, attempt);
-                    return Ok(response);
-                }
-                // An unclassified provider error is not permission to resend
-                // inference (authentication/invalid-body errors cannot heal by
-                // repeating it). Stop; a new host-owned turn may try again.
-                Ok(Err(error)) => return Err(KernelModelTurnError::Provider(error)),
-                Err(_) if attempt < self.max_model_attempts => {
-                    self.emit(KernelEventKind::ModelTurnRetrying, attempt);
-                    tokio::select! {
-                        biased;
-                        _ = self.cancellation.cancelled() => return Err(KernelModelTurnError::Cancelled),
-                        _ = tokio::time::sleep(Duration::from_millis(750)) => {}
-                    }
-                }
-                Err(_) => {
-                    return Err(KernelModelTurnError::TimedOut {
-                        attempts: self.max_model_attempts,
-                        timeout: self.model_timeout,
-                    });
-                }
-            }
+        if self.model_timeout.is_zero() {
+            return Err(KernelModelTurnError::TimedOut {
+                timeout: self.model_timeout,
+            });
         }
-        unreachable!("a bounded model turn always returns from its final attempt")
+
+        self.emit(KernelEventKind::ModelTurnStarted, 1);
+        let result = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => return Err(KernelModelTurnError::Cancelled),
+            result = tokio::time::timeout(
+                self.model_timeout,
+                provider.chat_stream_classified(messages, tools, thinking, deltas),
+            ) => result,
+        };
+        // Stop wins a same-poll race; never settle a late response or tool call.
+        self.check_before_model_turn()
+            .map_err(|_| KernelModelTurnError::Cancelled)?;
+        match result {
+            Ok(Ok(response)) => {
+                self.emit(KernelEventKind::ModelTurnFinished, 1);
+                Ok(response)
+            }
+            Ok(Err(error)) => Err(KernelModelTurnError::Provider(error)),
+            Err(_) => Err(KernelModelTurnError::TimedOut {
+                timeout: self.model_timeout,
+            }),
+        }
     }
 
     /// Bound a host-controlled batch with stable milestones. The host still

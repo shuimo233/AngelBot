@@ -29,6 +29,7 @@ describe('SettingsModal model save confirmation through native commands', () => 
 
   beforeEach(() => {
     localStorage.clear();
+    useSettingsStore.getState().loadProfile();
     loads = 0;
     lastSaved = savedPlan;
     save = async () => {};
@@ -107,7 +108,7 @@ describe('SettingsModal model save confirmation through native commands', () => 
     save = () => new Promise<void>((_resolve, reject) => { rejectSave = reject; });
     const user = await openAndEdit();
     await user.click(screen.getByRole('button', { name: /^保存$/ }));
-    await user.click(screen.getByRole('button', { name: '常规' }));
+    await user.click(screen.getByRole('button', { name: '性格' }));
     await act(async () => { rejectSave(new Error('offline model save failed')); });
 
     expect(screen.getByRole('button', { name: /^保存$/ })).toBeEnabled();
@@ -164,6 +165,22 @@ describe('SettingsModal model save confirmation through native commands', () => 
     await userEvent.keyboard('{Escape}');
     expect(close).not.toHaveBeenCalled();
     expect(screen.getByText(/还有未保存的模型或性格修改/)).toBeInTheDocument();
+  });
+
+  it('keeps a worldbook excerpt drafted outside settings until it is explicitly saved', async () => {
+    const user = userEvent.setup();
+    const close = vi.fn();
+    const frame = render(<SettingsModal isOpen={false} initialPage="personality" onClose={close} />);
+    act(() => useSettingsStore.getState().updateProfile({ personaNotes: '已选摘录', bio: '其他性格草稿' }));
+    frame.rerender(<SettingsModal isOpen initialPage="personality" onClose={close} />);
+    expect(useSettingsStore.getState().profile.personaNotes).toBe('已选摘录');
+    expect(useSettingsStore.getState().activeProfile.personaNotes).not.toBe('已选摘录');
+    await user.keyboard('{Escape}');
+    expect(close).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '继续编辑' }));
+    await user.click(screen.getByRole('button', { name: /^保存$/ }));
+    expect(useSettingsStore.getState().activeProfile).toMatchObject({ personaNotes: '已选摘录', bio: '其他性格草稿' });
+    expect(JSON.parse(localStorage.getItem('angelbot_profile') ?? '{}')).toMatchObject({ personaNotes: '已选摘录' });
   });
 
   it('clears saved confirmation after a subsequent model edit', async () => {

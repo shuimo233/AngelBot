@@ -1,0 +1,171 @@
+.model-connection-settings > .settings-section {
+  gap: var(--ui-space-2);
+}
+
+.model-connection-settings .model-setup-disclosure {
+  justify-self: start;
+}
+
+.model-connection-settings .model-connection-overview {
+  display: block;
+  padding: 0;
+}
+
+.model-connection-settings :is(.model-connection-identity, .model-test-panel) {
+  padding: var(--ui-space-4);
+}
+
+.model-connection-settings .model-test-panel {
+  border: 0;
+  border-block-start: 1px solid var(--color-border-muted);
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--ui-space-2) var(--ui-space-4);
+}
+
+.model-test-panel .model-test-action { min-width: unset; }
+.model-connection-settings > .model-guided-actions { padding: 0; }
+.model-guided-actions > .model-test-panel { border-block-start: 0; }
+.model-test-commands { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: var(--ui-space-2); }
+.model-simple-setup { gap: var(--ui-space-3); }
+.model-simple-setup .model-basic-fields > .settings-section-header { display: none; }
+.model-simple-setup .model-basic-fields .model-panel { padding-inline: 0; padding-block: 0; border: 0; background: transparent; }
+.model-simple-setup .model-provider-grid { grid-template-columns: minmax(0, 1fr); }
+.model-simple-setup > .model-guided-actions { border: 0; border-block-start: 1px solid var(--color-border-muted); border-radius: 0; background: transparent; }
+.model-simple-setup > .model-guided-actions > .model-test-panel { padding-inline: 0; }
+
+.model-connection-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ui-space-1) var(--ui-space-3);
+}
+
+.model-connection-settings .model-connection-id {
+  min-width: 0;
+  margin: 0;
+  font-family: var(--ui-font-mono);
+}
+
+.model-connection-settings .model-connection-facts {
+  flex-basis: 100%;
+  margin-block-start: var(--ui-space-1);
+  column-gap: var(--ui-space-2);
+}
+
+.model-connection-facts li + li::before {
+  padding-inline-end: var(--ui-space-2);
+  color: var(--color-border);
+  content: '·';
+}
+
+.model-test-copy strong {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--ui-space-2);
+}
+
+.model-test-copy strong:is([data-state='success'], [data-state='partial'], [data-state='error'])::before {
+  flex: 0 0 6px;
+  height: 6px;
+  align-self: center;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+
+.model-connection-settings .model-provider-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 175px), 1fr));
+}
+
+.model-connection-settings .model-field :is(.ui-input, .ui-select) {
+  width: 100%;
+  min-width: 0;
+}
+
+.model-connection-settings .model-field-inline > .ui-button {
+  flex-shrink: 0;
+}
+
+.model-connection-settings .model-credentials-panel {
+  gap: 0;
+  padding-block: 0;
+}
+
+.model-credentials-panel > .model-credential-row {
+  grid-template-columns: minmax(7rem, 0.43fr) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--ui-space-2) var(--ui-space-4);
+  padding-block: var(--ui-space-3);
+}
+
+@container (width > 460px) {
+  .model-simple-setup .model-provider-grid > .model-field {
+    grid-template-columns: minmax(7rem, 0.43fr) minmax(0, 1fr);
+    align-items: center;
+    column-gap: var(--ui-space-4);
+  }
+}
+
+.model-field-copy {
+  display: grid;
+  min-width: 0;
+  gap: var(--ui-space-1);
+}
+
+.model-field-copy > label {
+  color: var(--color-text);
+  font-size: var(--settings-font-ui);
+  font-weight: 600;
+}
+
+.model-credentials-panel > .model-field + .model-field {
+  border-block-start: 1px solid var(--color-border-muted);
+}
+
+.model-connection-settings .model-account-panel {
+  grid-template-columns: minmax(0, 1fr) fit-content(50%);
+  gap: var(--ui-space-2) var(--ui-space-4);
+}
+
+.model-connection-settings .model-account-actions {
+  justify-content: flex-end;
+  max-width: none;
+}
+
+.model-account-actions:empty {
+  display: none;
+}
+
+@container (max-width: 560px) {
+  .model-connection-settings .model-account-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .model-connection-settings .model-account-actions {
+    justify-content: flex-start;
+  }
+}
+
+@container (max-width: 460px) {
+  .model-credentials-panel > .model-credential-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container (max-width: 400px) {
+  .model-connection-settings .model-test-panel {
+    grid-template-columns: minmax(0, 1fr);
+    justify-content: stretch;
+  }
+
+}
+
+@container (max-width: 320px) {
+  .model-connection-settings .model-field-inline {
+    flex-wrap: wrap;
+  }
+
+  .model-connection-settings .model-field-inline > .ui-input[type='url'] {
+    flex-basis: 100%;
+  }
+}

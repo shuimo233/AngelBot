@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { createProjectWorkspace, getWorkspaces, openWorkspace, type Workspace } from '$lib/commands/workspace';
+import { createProjectWorkspace, getWorkspaces, openWorkspace, type OpenWorkspace, type Workspace } from '$lib/commands/workspace';
+import { useMessagesStore } from './messages';
 import { useSessionsStore } from './sessions';
 
 /**
@@ -27,6 +28,7 @@ export function projectCandidatesForMessage(
 interface WorkspaceState {
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
+  recentProjectIds: string[];
   loading: boolean;
   lastError: string | null;
   loadWorkspaces: () => Promise<void>;
@@ -39,9 +41,32 @@ interface WorkspaceState {
 let activationRequest = 0;
 let catalogueRequest = 0;
 let activationInFlight = false;
+const RECENT_PROJECTS_KEY = 'recent-project-ids';
+const RECENT_PROJECTS_LIMIT = 16;
+
+function loadRecentProjects(): string[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) ?? '[]');
+    if (Array.isArray(saved)) return [...new Set(saved.filter((id): id is string => typeof id === 'string'))].slice(0, RECENT_PROJECTS_LIMIT);
+  } catch { /* The catalogue still provides a default order. */ }
+  return [];
+}
+
+function recordRecentProject(ids: string[], workspace: Workspace): string[] {
+  if (workspace.kind !== 'project' || ids[0] === workspace.id) return ids;
+  const recent = [workspace.id, ...ids.filter((id) => id !== workspace.id)].slice(0, RECENT_PROJECTS_LIMIT);
+  try { localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(recent)); }
+  catch { /* Keep the recent order in this window if storage is unavailable. */ }
+  return recent;
+}
+
+function activateOpenedSession({ session, composerDraft }: OpenWorkspace) {
+  if (composerDraft) useMessagesStore.getState().registerDraft(session.id, composerDraft);
+  useSessionsStore.setState({ sessions: [session], activeSessionId: session.id, activeSession: session });
+}
 
 export const useWorkspacesStore = create<WorkspaceState>((set, get) => ({
-  workspaces: [], activeWorkspaceId: null, loading: false, lastError: null,
+  workspaces: [], activeWorkspaceId: null, recentProjectIds: loadRecentProjects(), loading: false, lastError: null,
   loadWorkspaces: async () => {
     const request = ++catalogueRequest;
     let activation = activationRequest;
@@ -78,11 +103,10 @@ export const useWorkspacesStore = create<WorkspaceState>((set, get) => ({
     try {
       const opened = await openWorkspace(id);
       if (request !== activationRequest) return false;
-      useSessionsStore.setState({
-        sessions: [opened.session], activeSessionId: opened.session.id, activeSession: opened.session,
-      });
+      activateOpenedSession(opened);
       set((state) => ({
         activeWorkspaceId: id,
+        recentProjectIds: recordRecentProject(state.recentProjectIds, opened.workspace),
         workspaces: state.workspaces.some((item) => item.id === id)
           ? state.workspaces.map((item) => item.id === id ? opened.workspace : item)
           : [opened.workspace, ...state.workspaces],
@@ -97,12 +121,13 @@ export const useWorkspacesStore = create<WorkspaceState>((set, get) => ({
     activationInFlight = true;
     try {
       const opened = await createProjectWorkspace(path, name);
-      if (request === activationRequest) useSessionsStore.setState({
-        sessions: [opened.session], activeSessionId: opened.session.id, activeSession: opened.session,
-      });
+      if (request === activationRequest) activateOpenedSession(opened);
       // A created project is real even when a newer selection superseded its UI.
       set((state) => ({
-        ...(request === activationRequest ? { activeWorkspaceId: opened.workspace.id } : {}),
+        ...(request === activationRequest ? {
+          activeWorkspaceId: opened.workspace.id,
+          recentProjectIds: recordRecentProject(state.recentProjectIds, opened.workspace),
+        } : {}),
         workspaces: request !== activationRequest && state.workspaces.some((item) => item.id === opened.workspace.id)
           ? state.workspaces
           : [opened.workspace, ...state.workspaces.filter((item) => item.id !== opened.workspace.id)],

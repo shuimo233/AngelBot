@@ -5,7 +5,12 @@ export type ModelConfigReadiness =
   | { kind: 'loading' }
   | { kind: 'ready' }
   | { kind: 'needs-credentials'; title: string; detail: string }
+  | { kind: 'unverified'; title: string; detail: string }
   | { kind: 'invalid'; title: string; detail: string };
+
+export function openModelSettings(): void {
+  window.dispatchEvent(new CustomEvent('open-settings', { detail: 'api' }));
+}
 
 /** Single readiness interface shared by chat guidance and settings. */
 export function getModelConfigReadiness(
@@ -16,10 +21,13 @@ export function getModelConfigReadiness(
   if (!loaded) return { kind: 'loading' };
   if (loadError) {
     return {
-      kind: 'invalid',
+      kind: 'unverified',
       title: '无法读取模型配置',
       detail: '可以继续浏览 AngelBot；重新检查或在设置中修复配置后即可对话。',
     };
+  }
+  if (config.authMode === 'chatgpt_plan' && config.planStatusError) {
+    return { kind: 'unverified', title: '无法读取 ChatGPT 连接状态', detail: config.planStatusError };
   }
   if (!config.provider || !config.model.trim()) {
     return {
@@ -50,8 +58,8 @@ export function getModelConfigReadiness(
     && !config.hasApiKey && !config.apiKey.trim()) {
     return {
       kind: 'needs-credentials',
-      title: '连接模型后即可开始对话',
-      detail: '主界面和项目仍可浏览；API Key 只会保存在系统凭据库中。',
+      title: '尚未连接模型',
+      detail: '可以先写草稿。',
     };
   }
   return { kind: 'ready' };

@@ -23,13 +23,21 @@ const EVIDENCE_DEDUP_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 // Delayed reviews and imported history must not make an old statement look
 // newer than a correction. Derive order from existing original evidence,
 // including for records written before this rule; never rewrite the archive.
-const PREFERENCE_SOURCES: &str = "WITH preference_sources AS (
+fn preference_sources(require_original: bool) -> String {
+    let original = if require_original {
+        "AND EXISTS (SELECT 1 FROM adaptive_constraints c WHERE c.constraint_key=e.constraint_key
+                    AND c.scope='global' AND instr(m.content,c.constraint_value)>0)"
+    } else {
+        ""
+    };
+    format!("WITH preference_sources AS (
     SELECT e.constraint_key, m.created_at, m.rowid AS source_order,
       ROW_NUMBER() OVER (PARTITION BY e.constraint_key ORDER BY m.created_at DESC,m.rowid DESC) AS rank
     FROM adaptive_constraint_evidence e JOIN messages m
       ON m.id=substr(e.source,length('explicit_user:')+1) AND e.session_id=m.session_id
-    WHERE e.source LIKE 'explicit_user:%' AND m.role='user' AND m.is_provisional=0
-)";
+    WHERE e.source LIKE 'explicit_user:%' AND m.role='user' AND m.is_provisional=0 {original}
+)")
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,7 +80,17 @@ pub(crate) fn find_preferences(
     limit: usize,
     include_observed: bool,
 ) -> Result<PreferenceLookup, String> {
-    lookup_preferences(conn, query, limit, include_observed, true)
+    lookup_preferences(conn, query, limit, include_observed, true, false)
+}
+
+/// Supplement an explicit lookup with original user evidence. Search only
+/// active global explicit statements whose quote still exists before ranking.
+pub(crate) fn find_source_backed_preferences(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<LearnedPreference>, String> {
+    lookup_preferences(conn, query, limit, false, false, true).map(|lookup| lookup.records)
 }
 
 fn lookup_preferences(
@@ -81,17 +99,20 @@ fn lookup_preferences(
     limit: usize,
     include_observed: bool,
     allow_partial: bool,
+    require_original: bool,
 ) -> Result<PreferenceLookup, String> {
     let query = query.trim().to_lowercase();
     let limit = limit.clamp(1, 50);
+    let sources = preference_sources(require_original);
     let mut stmt = conn
-        .prepare(&format!("{PREFERENCE_SOURCES}
+        .prepare(&format!("{sources}
          SELECT c.id, c.constraint_value, c.source='explicit_user_preference' OR (c.evidence_count >= ?1 AND c.confidence >= ?2),
            COALESCE(s.created_at,c.updated_at),c.source='explicit_user_preference'
          FROM adaptive_constraints c LEFT JOIN preference_sources s ON s.constraint_key=c.constraint_key AND s.rank=1
          WHERE c.scope='global' AND c.status='active' AND c.constraint_key LIKE 'interaction_preference:%'
            AND c.constraint_value != '' AND (c.expires_at IS NULL OR c.expires_at > ?3)
            AND (?5=1 OR c.source='explicit_user_preference')
+           AND (?6=0 OR s.created_at IS NOT NULL)
          ORDER BY c.source='explicit_user_preference' DESC, COALESCE(s.created_at,c.updated_at) DESC,
            s.source_order DESC,c.id LIMIT ?4"))
         .map_err(|e| e.to_string())?;
@@ -102,7 +123,8 @@ fn lookup_preferences(
         MIN_CONFIDENCE,
         now,
         row_limit,
-        include_observed
+        include_observed,
+        require_original,
     ];
     let decode = |r: &rusqlite::Row<'_>| {
         Ok(LearnedPreference {
@@ -360,7 +382,7 @@ pub(crate) fn project_for_task(
     }
     // Automatic task context never consumes partial inspection candidates.
     // Skip their character counting and second scan, rather than compute/drop.
-    let found = lookup_preferences(conn, query, 50, false, false)?;
+    let found = lookup_preferences(conn, query, 50, false, false, false)?;
     let mut candidates = Vec::new();
     for p in found.records.into_iter().filter(|p| p.ready && p.explicit) {
         // Promotion needs a still-existing verbatim user source, not just an
@@ -409,7 +431,8 @@ pub(crate) fn project_for_session(
     session_id: &str,
 ) -> Result<PreferenceProjection, String> {
     let now = Utc::now().timestamp();
-    let mut stmt = conn.prepare(&format!("{PREFERENCE_SOURCES}
+    let sources = preference_sources(false);
+    let mut stmt = conn.prepare(&format!("{sources}
          SELECT c.constraint_key, c.constraint_value, c.scope, c.confidence,c.source='explicit_user_preference',COUNT(*) OVER ()
          FROM adaptive_constraints c LEFT JOIN preference_sources s ON s.constraint_key=c.constraint_key AND s.rank=1
          WHERE c.status = 'active'

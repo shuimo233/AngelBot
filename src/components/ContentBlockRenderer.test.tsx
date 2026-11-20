@@ -10,6 +10,23 @@ function text(index: number, iterationId: number, content: string): LiveBlock {
   return { kind: 'text', index, iterationId, content };
 }
 
+it('routes streaming Main-Agent file citations through the same safe workbench locator', () => {
+  const located = vi.fn();
+  window.addEventListener('angelbot:locate-file', located);
+  try {
+    render(<ContentBlockRenderer blocks={[text(0, 0,
+      '[计划](angelbot-file:docs%2Fplan.md) [网站](https://example.invalid) [越界](angelbot-file:..%2Fsecret) [绝对路径](file:///D:/secret.txt)',
+    )]} />);
+    fireEvent.click(screen.getByRole('button', { name: '在工作台中定位 docs/plan.md' }));
+    expect(located).toHaveBeenCalledTimes(1);
+    expect((located.mock.calls[0][0] as CustomEvent).detail).toEqual({ path: 'docs/plan.md' });
+    expect(screen.getByRole('link', { name: '网站' })).toHaveAttribute('href', 'https://example.invalid');
+    expect(screen.getAllByRole('button', { name: /在工作台中定位/ })).toHaveLength(1);
+  } finally {
+    window.removeEventListener('angelbot:locate-file', located);
+  }
+});
+
 function tool(
   index: number,
   iterationId: number,
@@ -260,6 +277,47 @@ describe('ContentBlockRenderer', () => {
     await userEvent.click(screen.getByRole('button', { name: '拒绝' }));
     expect(onResolveConfirmation).toHaveBeenCalledTimes(1);
     expect(onResolveConfirmation).toHaveBeenCalledWith('write', 'rejected');
+  });
+
+  it('shows command arguments separately and blocks approval for malformed arguments', () => {
+    const pending = { callId: 'command', toolName: 'run_project_command', status: 'needs_approval' as const };
+    const args = { command: 'python', args: ['script name.py', '--label', 'a b'], timeout_seconds: 30 };
+    const { rerender } = render(<ContentBlockRenderer
+      blocks={[tool(1, 0, { ...pending, arguments: args })]}
+      onResolveConfirmation={vi.fn()}
+    />);
+    const preview = screen.getByRole('region', { name: '拟运行的命令和参数' });
+    expect(JSON.parse(preview.textContent ?? '')).toEqual(args);
+    expect(screen.getByRole('button', { name: '允许' })).toBeEnabled();
+
+    rerender(<ContentBlockRenderer
+      blocks={[tool(1, 0, { ...pending, arguments: { ...args, args: 'script name.py' } })]}
+      onResolveConfirmation={vi.fn()}
+    />);
+    expect(screen.getByRole('alert')).toHaveTextContent('无法预览拟运行的命令和参数');
+    expect(screen.getByRole('button', { name: '允许' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '拒绝' })).toBeEnabled();
+  });
+
+  it('shows the exact long-term memory and its scope before approval', () => {
+    const content = '默认用 Markdown 写发布说明\n保留必要命令示例';
+    const onResolveConfirmation = vi.fn();
+    const pending = { callId: 'save-memory', toolName: 'remember_fact', status: 'needs_approval' as const };
+    const { rerender } = render(<ContentBlockRenderer
+      blocks={[tool(1, 0, { ...pending, arguments: { content, category: 'preference' } })]}
+      onResolveConfirmation={onResolveConfirmation}
+    />);
+    expect(screen.getByText('保存长期记忆 · 偏好 · 所有对话')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '拟保存的长期记忆' }).textContent).toBe(content);
+    expect(screen.getByRole('button', { name: '允许' })).toBeEnabled();
+    expect(onResolveConfirmation).not.toHaveBeenCalled();
+
+    rerender(<ContentBlockRenderer
+      blocks={[tool(1, 0, { ...pending, arguments: { content, category: 'constraint' } })]}
+      onResolveConfirmation={onResolveConfirmation}
+    />);
+    expect(screen.getByRole('button', { name: '允许' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '拒绝' })).toBeEnabled();
   });
 
   it('shows a safe external-boundary summary for a live Web Search approval', () => {

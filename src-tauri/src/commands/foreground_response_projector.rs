@@ -5,7 +5,7 @@
 //! and future non-Tauri adapters.
 
 use crate::agent::task_facts::{TaskFacts, TaskTerminalReason};
-use crate::agent::{AgentResponse, AgentSliceOutcome};
+use crate::agent::{AgentResponse, AgentSliceOutcome, ToolResult};
 use crate::commands::foreground_message_contracts::{ToolCallInfo, ToolResultInfo};
 
 #[derive(Clone)]
@@ -47,18 +47,22 @@ pub(crate) fn project_agent_response(
                 .collect::<Vec<_>>();
             let tool_results = steps
                 .iter()
-                .map(|step| ToolResultInfo {
-                    call_id: step.call_id.clone(),
-                    tool_name: step.tool_name.clone(),
-                    success: step.success,
-                    output: step.output.clone(),
-                    error: (!step.success).then(|| step.output.clone()),
-                    confirmation_required: step.confirmation_required
-                        || (!step.success && step.output.contains("Confirmation required")),
-                    confirmation_status: step.confirmation_status.clone().or_else(|| {
-                        (!step.success && step.output.contains("Confirmation required"))
-                            .then(|| "pending".to_string())
-                    }),
+                .map(|step| {
+                    let pending =
+                        ToolResult::confirmation_status_from_output(step.success, &step.output)
+                            == Some("pending");
+                    ToolResultInfo {
+                        call_id: step.call_id.clone(),
+                        tool_name: step.tool_name.clone(),
+                        success: step.success,
+                        output: step.output.clone(),
+                        error: (!step.success).then(|| step.output.clone()),
+                        confirmation_required: step.confirmation_required || pending,
+                        confirmation_status: step
+                            .confirmation_status
+                            .clone()
+                            .or_else(|| pending.then(|| "pending".to_string())),
+                    }
                 })
                 .collect::<Vec<_>>();
             Ok(PersistedTurnOutcome {
@@ -120,7 +124,13 @@ pub(crate) fn project_private_slice_outcome(
         .protocol_transcript
         .iter()
         .any(|message| message.protocol_state.is_some())
+        || projected
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|call| call.name == "pending_user_message"))
     {
+        // Replay steering in its original user role instead of reconstructing
+        // its audit receipt as a provider tool call.
         projected.protocol_transcript = Some(result.protocol_transcript);
     }
     Ok(projected)

@@ -3,7 +3,7 @@
 //! Provides keyword search over messages and memories content using SQLite FTS5.
 //! Uses unicode61 tokenizer with remove_diacritics=0 for CJK character support.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Result from a full-text search on messages.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -117,8 +117,10 @@ impl MemoryQuery {
 
 /// Shared by Main context and its memory-inspection tool. Only active global
 /// records are eligible; unbound legacy scopes stay in storage for management.
-/// At most 64 query terms, 256 candidates of <=8KiB, and 20 results. An empty
-/// explicit query lists records; empty/non-informative context never does.
+/// At most 64 query terms, 256 candidates of <=8KiB, and 20 results. Long
+/// knowledge uses query-centred SQLite text windows, never a full-text load
+/// into the caller. Other memory categories retain their whole-record limit.
+/// An empty explicit query lists records; empty context never does.
 pub(crate) fn recall_active_memories(
     conn: &Connection,
     query: &str,
@@ -147,7 +149,8 @@ pub(crate) fn recall_active_memories(
     };
     let eligible = format!(
         "m.scope='global' AND m.forget_stage='active' AND m.superseded_by IS NULL
-        AND (?1=0 OR m.category!='constraint') AND length(CAST(m.content AS BLOB))<=8192{category}"
+        AND (?1=0 OR m.category!='constraint')
+        AND (length(CAST(m.content AS BLOB))<=8192 OR lower(m.category)='knowledge'){category}"
     );
     let latin = terms
         .iter()
@@ -157,32 +160,135 @@ pub(crate) fn recall_active_memories(
         .join(" OR ");
     // Reuse the existing FTS index for complete Latin words. Substrings such
     // as tea/team must not consume the bounded pool before final filtering.
-    let latin_ids: Vec<String> = if latin.is_empty() {
-        Vec::new()
+    // Anchor metadata only: (source character offset, whole-word occurrences,
+    // term characters). Fewer repetitions and longer complete terms provide
+    // more specific evidence than an unconditional first OR hit.
+    let latin_hits: std::collections::BTreeMap<String, (usize, usize, usize)> = if latin.is_empty()
+    {
+        Default::default()
     } else {
-        let mut query = conn.prepare(&format!("SELECT m.id FROM memories_fts JOIN memories m ON m.id=memories_fts.id
-            WHERE {eligible} AND memories_fts MATCH ?2 ORDER BY bm25(memories_fts),m.updated_at DESC,m.id LIMIT 256"))
-            .map_err(|e|e.to_string())?;
-        let ids = query
-            .query_map(params![context, latin], |r| r.get(0))
+        let mut query = conn
+            .prepare(&format!(
+                "SELECT m.id,memories_fts.rowid,length(CAST(m.content AS BLOB))>8192
+             FROM memories_fts JOIN memories m ON m.id=memories_fts.id
+             WHERE {eligible} AND memories_fts MATCH ?2
+             ORDER BY bm25(memories_fts),m.updated_at DESC,m.id LIMIT 256"
+            ))
+            .map_err(|e| e.to_string())?;
+        let chosen = query
+            .query_map(params![context, latin], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        ids
+        // Only selected long candidates need positioning. A rowid-constrained
+        // FTS lookup preserves whole-word matching even for case differences
+        // or early substring noise. No highlighted full text crosses SQLite.
+        let marker = format!("<{}>", uuid::Uuid::new_v4().simple());
+        let mut offsets = conn
+            .prepare(
+                "WITH hit AS MATERIALIZED (
+                SELECT highlight(memories_fts,1,?3,'') AS text FROM memories_fts
+                WHERE rowid=?1 AND memories_fts MATCH ?2)
+             SELECT instr(text,?3),(length(text)-length(replace(text,?3,'')))/length(?3) FROM hit",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut words = terms
+            .iter()
+            .filter(|term| !term.chars().all(is_han))
+            .collect::<Vec<_>>();
+        words.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
+        let mut hits = std::collections::BTreeMap::new();
+        for (id, rowid, is_excerpt) in chosen {
+            let mut best = None;
+            if is_excerpt {
+                // At most the original 64 query terms, and stop at the first
+                // unique match: remaining, shorter terms cannot improve it.
+                for word in &words {
+                    let found = offsets
+                        .query_row(params![rowid, format!("\"{word}\""), marker], |r| {
+                            Ok((r.get::<_, usize>(0)?, r.get::<_, usize>(1)?))
+                        })
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+                    if let Some((offset, count)) = found {
+                        let chars = word.chars().count();
+                        if best.is_none_or(|(_, frequency, length)| {
+                            count < frequency || count == frequency && chars > length
+                        }) {
+                            best = Some((offset, count, chars));
+                        }
+                        if count == 1 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let anchor = if is_excerpt {
+                best.ok_or("Memory index changed during recall")?
+            } else {
+                (0, 0, 0)
+            };
+            hits.insert(id, anchor);
+        }
+        hits
     };
     let han = terms
         .iter()
         .filter(|term| term.chars().all(is_han))
         .collect::<Vec<_>>();
+    // Literal phrases from the already-bounded query are positioning hints,
+    // not new recall terms or an eligibility/ranking expansion.
+    let query_prefix = query.chars().take(512).collect::<String>();
+    let phrases = query_prefix
+        .split(|c| !is_han(c))
+        .filter(|part| part.chars().count() > 1)
+        .take(64)
+        .collect::<Vec<_>>();
     let mut statement = conn.prepare(&format!(
-        "SELECT m.id,m.category,m.content,COALESCE(m.importance,0),COALESCE(m.frequency,0),m.last_mentioned,m.updated_at
+        "WITH candidates AS (
+         SELECT m.id,m.category,m.importance,COALESCE(m.frequency,0) AS frequency,m.last_mentioned,m.updated_at,
+             length(CAST(m.content AS BLOB))>8192 AS is_excerpt,length(m.content) AS total_chars,
+             CASE WHEN length(CAST(m.content AS BLOB))>8192 THEN COALESCE(
+                 (SELECT position FROM (
+                     SELECT json_extract(hit.value,'$[0]') AS position,json_extract(hit.value,'$[1]') AS occurrences,
+                         json_extract(hit.value,'$[2]') AS term_chars,1 AS complete
+                     FROM json_each(?4) hit WHERE hit.key=m.id AND json_extract(hit.value,'$[0]')>0
+                     UNION ALL
+                     SELECT instr(m.content,phrase.value),
+                         (length(m.content)-length(replace(m.content,phrase.value,'')))/length(phrase.value),length(phrase.value),1
+                     FROM json_each(?5) phrase WHERE instr(m.content,phrase.value)>0
+                     UNION ALL
+                     SELECT instr(m.content,term.value),
+                         (length(m.content)-length(replace(m.content,term.value,'')))/length(term.value),length(term.value),0
+                     FROM json_each(?3) term WHERE length(term.value)>1 AND instr(m.content,term.value)>0)
+                 ORDER BY complete DESC,occurrences ASC,term_chars DESC,position ASC LIMIT 1),
+                 (SELECT min(instr(m.content,term.value)) FROM json_each(?3) term
+                     WHERE instr(m.content,term.value)>0),1) ELSE 1 END AS anchor
          FROM memories m WHERE {eligible}
-           AND (?2=1 OR m.id IN(SELECT value FROM json_each(?4))
+           AND (?2=1 OR m.id IN(SELECT key FROM json_each(?4))
                 OR EXISTS(SELECT 1 FROM json_each(?3) term WHERE instr(m.content,term.value)>0))
-         ORDER BY (CASE WHEN m.id IN(SELECT value FROM json_each(?4)) THEN 2 ELSE 0 END)
+         ORDER BY (CASE WHEN m.id IN(SELECT key FROM json_each(?4)) THEN 2 ELSE 0 END)
              + COALESCE((SELECT sum(CASE WHEN length(term.value)=1 THEN 1 ELSE 2 END)
              FROM json_each(?3) term WHERE instr(m.content,term.value)>0),0) DESC,
-             m.updated_at DESC,m.importance DESC,m.id LIMIT 256"
+             m.updated_at DESC,m.importance DESC,m.id LIMIT 256),
+         windows AS (
+             SELECT *,CASE WHEN is_excerpt THEN max(1,anchor-128) ELSE 1 END AS fragment_start FROM candidates)
+         SELECT w.id,w.category,
+             CASE WHEN w.is_excerpt THEN substr(m.content,w.fragment_start,1536) ELSE m.content END,
+             COALESCE(w.importance,0),w.frequency,w.last_mentioned,w.updated_at,
+             w.is_excerpt,w.fragment_start,w.total_chars
+         FROM windows w JOIN memories m ON m.id=w.id"
     )).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
     let mut scored = statement
@@ -191,7 +297,8 @@ pub(crate) fn recall_active_memories(
                 context,
                 list,
                 serde_json::to_string(&han).unwrap(),
-                serde_json::to_string(&latin_ids).unwrap()
+                serde_json::to_string(&latin_hits).unwrap(),
+                serde_json::to_string(&phrases).unwrap()
             ],
             |row| {
                 Ok((
@@ -205,6 +312,14 @@ pub(crate) fn recall_active_memories(
                     row.get::<_, i32>(4)?,
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, bool>(7)?
+                        .then(|| {
+                            Ok::<_, rusqlite::Error>((
+                                row.get::<_, usize>(8)?.saturating_sub(1),
+                                row.get::<_, usize>(9)?,
+                            ))
+                        })
+                        .transpose()?,
                 ))
             },
         )
@@ -212,7 +327,7 @@ pub(crate) fn recall_active_memories(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter_map(|(memory, frequency, last_mentioned, updated)| {
+        .filter_map(|(memory, frequency, last_mentioned, updated, excerpt)| {
             let lexical = if list {
                 0
             } else {
@@ -220,7 +335,7 @@ pub(crate) fn recall_active_memories(
             };
             let recency =
                 crate::vector::time_based_score(frequency, last_mentioned, memory.importance, now);
-            Some((lexical, recency, updated, memory))
+            Some((lexical, recency, updated, memory, excerpt))
         })
         .collect::<Vec<_>>();
     scored.sort_by(|a, b| {
@@ -229,11 +344,25 @@ pub(crate) fn recall_active_memories(
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.3.id.cmp(&b.3.id))
     });
-    Ok(scored
+    scored
         .into_iter()
         .take(limit.min(20))
-        .map(|(_, _, _, memory)| memory)
-        .collect())
+        .map(|(_, _, _, mut memory, excerpt)| {
+            if let Some((start, total)) = excerpt {
+                let end = start + memory.content.chars().count();
+                memory.content = format!(
+                    "【资料片段，非全文；来源 memory:{}；原文字符 {}..{}/{}；其余内容未读取】\n{}",
+                    memory.id, start, end, total, memory.content
+                );
+                if memory.content.len() > 8192 {
+                    return Err(
+                        "Knowledge source reference exceeds recall output budget".to_string()
+                    );
+                }
+            }
+            Ok(memory)
+        })
+        .collect()
 }
 
 fn is_han(c: char) -> bool {
@@ -395,6 +524,41 @@ pub(crate) struct MessageRecallMatches {
     pub fallback_terms: Vec<String>,
 }
 
+fn message_phrase(query: &str) -> String {
+    format!("\"{}\"", query.trim().replace('"', "\"\""))
+}
+
+pub(crate) fn requires_literal_message_scan(query: &str) -> bool {
+    query.chars().any(is_han)
+}
+
+/// Return bounded indexed candidates only. Session and visibility filters are
+/// an initial restriction; callers must still check active ancestry.
+pub(crate) fn indexed_message_candidates(
+    conn: &Connection,
+    session: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT m.id FROM messages_fts
+             JOIN messages m ON m.id=messages_fts.id
+             WHERE messages_fts MATCH ?1 AND m.session_id=?2
+               AND m.is_provisional=0 AND m.role IN ('user','assistant')
+             ORDER BY rank, m.created_at DESC, m.id DESC LIMIT ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![message_phrase(query), session, limit as i64],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
+}
+
 /// Search host-authorized IDs in oldest-to-newest branch order. unicode61 does
 /// not tokenize inside continuous Han text: use a literal, byte-bounded scan
 /// there rather than silently returning no matches or building a second index.
@@ -416,7 +580,7 @@ pub(crate) fn search_message_ids(
     if allowed_ids.is_empty() {
         return Ok(result);
     }
-    if query.chars().any(is_han) {
+    if requires_literal_message_scan(query) {
         let ids = serde_json::to_string(allowed_ids).map_err(|e| e.to_string())?;
         // BLOB length reads the stored byte count, not all message bodies into
         // Rust. Scope/visibility are supplied by the caller's read snapshot.
@@ -497,7 +661,7 @@ pub(crate) fn search_message_ids(
         }
         return Ok(result);
     }
-    let literal = format!("\"{}\"", query.trim().replace('"', "\"\""));
+    let literal = message_phrase(query);
     let ids = serde_json::to_string(allowed_ids).map_err(|e| e.to_string())?;
     let mut statement = conn
         .prepare(
@@ -766,6 +930,142 @@ mod tests {
             .is_none());
         assert!(MemoryQuery::new("茶").direct_score("乌龙茶").is_some());
         assert!(recall_terms(&format!("{}独角兽", "x".repeat(512))).is_empty());
+    }
+
+    #[test]
+    fn long_knowledge_specific_chinese_phrase_keeps_the_tail_answer() {
+        let (_file, conn) = setup();
+        let original = format!("{}星海观测站 验证码=SEA-804", "星海背景。".repeat(1000));
+        conn.execute("INSERT INTO memories(id,scope,category,content,importance,forget_stage,created_at,updated_at) VALUES('specific-zh','global','knowledge',?1,5,'active',1,1)",[&original]).unwrap();
+        for query in ["星海观测站", "查询星海观测站"] {
+            for mode in [MemoryRecallMode::Context, MemoryRecallMode::Explicit] {
+                let rows = recall_active_memories(&conn, query, 5, mode).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert!(
+                    rows[0].content.contains("星海观测站 验证码=SEA-804"),
+                    "a prefix-only partial hit is not useful evidence: {}",
+                    rows[0].content
+                );
+                assert!(rows[0].content.len() <= 8192 && rows[0].content.contains("非全文"));
+            }
+        }
+        let stored: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id='specific-zh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, original);
+    }
+
+    #[test]
+    fn long_knowledge_specific_english_word_keeps_the_tail_answer() {
+        let (_file, conn) = setup();
+        let original = format!(
+            "{}dispatchmarker20261104 q7z answer=E-42",
+            "tea background. ".repeat(750)
+        );
+        conn.execute("INSERT INTO memories(id,scope,category,content,importance,forget_stage,created_at,updated_at) VALUES('specific-en','global','knowledge',?1,5,'active',1,1)",[&original]).unwrap();
+        for query in ["tea dispatchmarker20261104", "background q7z"] {
+            for mode in [MemoryRecallMode::Context, MemoryRecallMode::Explicit] {
+                let rows = recall_active_memories(&conn, query, 5, mode).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert!(
+                    rows[0]
+                        .content
+                        .contains("dispatchmarker20261104 q7z answer=E-42"),
+                    "generic prefix words must not hide the more specific evidence"
+                );
+                assert!(rows[0].content.len() <= 8192 && rows[0].content.contains("非全文"));
+            }
+        }
+        let stored: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id='specific-en'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, original);
+    }
+
+    #[test]
+    fn long_knowledge_recall_keeps_query_hits_bounded_and_originals_intact() {
+        let (_file, conn) = setup();
+        let english = format!(
+            "{} The tea shipment code is tailcanary20261104.",
+            "team ".repeat(1900)
+        );
+        let chinese = format!(
+            "{} 远航补给的验证码是星海观测站。",
+            "背景资料。".repeat(900)
+        );
+        let giant_token = format!(
+            "{} giantcanary20261104 has a readable tail.",
+            "x".repeat(24000)
+        );
+        for (id, content) in [
+            ("long-en", &english),
+            ("long-zh", &chinese),
+            ("long-token", &giant_token),
+        ] {
+            conn.execute("INSERT INTO memories(id,scope,category,content,importance,forget_stage,created_at,updated_at) VALUES(?1,'global','knowledge',?2,5,'active',1,1)",params![id,content]).unwrap();
+        }
+        for (id, scope, category, stage, superseded) in [
+            ("unbound-long", "session", "knowledge", "active", None),
+            ("forgotten-long", "global", "knowledge", "archived", None),
+            (
+                "replaced-long",
+                "global",
+                "knowledge",
+                "active",
+                Some("long-en"),
+            ),
+            ("rule-long", "global", "constraint", "active", None),
+            ("preference-long", "global", "preference", "active", None),
+        ] {
+            conn.execute("INSERT INTO memories(id,scope,category,content,importance,forget_stage,superseded_by,created_at,updated_at) VALUES(?1,?2,?3,?4,5,?5,?6,1,1)",params![id,scope,category,&english,stage,superseded]).unwrap();
+        }
+        conn.execute("INSERT INTO memories(id,scope,category,content,importance,forget_stage,created_at,updated_at) VALUES('short','global','knowledge','shortcanary20261104 stays complete.',5,'active',1,1)",[]).unwrap();
+        for mode in [
+            MemoryRecallMode::Context,
+            MemoryRecallMode::Explicit,
+            MemoryRecallMode::ExplicitFacts,
+        ] {
+            for (query, id, evidence) in [
+                ("TAILCANARY20261104", "long-en", "tailcanary20261104"),
+                ("tea", "long-en", "shipment code"),
+                ("星海观测站", "long-zh", "验证码是星海观测站"),
+                ("giantcanary20261104", "long-token", "readable tail"),
+            ] {
+                let rows = recall_active_memories(&conn, query, 5, mode).unwrap();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "long knowledge must remain recallable: {query}"
+                );
+                assert_eq!(rows[0].id, id);
+                assert!(rows[0].content.contains(evidence));
+                assert!(rows[0].content.contains("资料片段") && rows[0].content.contains("非全文"));
+                assert!(rows[0].content.contains(&format!("memory:{id}")));
+                assert!(rows[0].content.len() <= 8192);
+            }
+            let short = recall_active_memories(&conn, "shortcanary20261104", 5, mode).unwrap();
+            assert_eq!(short[0].content, "shortcanary20261104 stays complete.");
+        }
+        let listed =
+            recall_active_memories(&conn, "", 20, MemoryRecallMode::ExplicitFacts).unwrap();
+        assert_eq!(listed.len(), 4);
+        assert!(listed.iter().all(|r| r.content.len() <= 8192));
+        for (id, content) in [("long-en", &english), ("long-zh", &chinese)] {
+            let stored: String = conn
+                .query_row("SELECT content FROM memories WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(&stored, content, "retrieval must never rewrite the source");
+        }
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub struct Workspace {
 pub struct OpenWorkspace {
     pub workspace: Workspace,
     pub session: Session,
+    #[serde(rename = "composerDraft", skip_serializing_if = "Option::is_none")]
+    pub composer_draft: Option<super::composer_draft::ComposerDraft>,
 }
 
 #[tauri::command]
@@ -307,7 +309,12 @@ fn open_workspace_by_id(conn: &Connection, id: &str) -> Result<OpenWorkspace, St
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "工作区不存在。".to_owned())?;
     let session = session_by_id(conn, &workspace.active_session_id)?;
-    Ok(OpenWorkspace { workspace, session })
+    let composer_draft = super::composer_draft::read(conn, &session.id)?;
+    Ok(OpenWorkspace {
+        workspace,
+        session,
+        composer_draft,
+    })
 }
 
 fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {

@@ -13,7 +13,8 @@ export interface RuntimeHealthIssue {
     | 'settings_defaults'
     | 'delegation_disabled'
     | 'delegation_unavailable'
-    | 'storage_migration';
+    | 'storage_migration'
+    | 'automation_scheduler_unavailable';
   severity: 'notice' | 'warning' | 'critical';
   title: string;
   detail: string;

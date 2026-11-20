@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { fileWriteContentForPreview, getToolConfirmationSummary, mcpArgumentsForPreview } from '$lib/tool-confirmation';
+import { fileWriteContentForPreview, getToolConfirmationSummary, mcpArgumentsForPreview, memoryContentForPreview, projectCommandForPreview } from '$lib/tool-confirmation';
 import { parseMcpToolIdentity } from '$lib/tool-display';
 import { PENDING_ACTIONS_BLOCKED_MESSAGE } from '$lib/tool-action-result';
 import '../styles/content-block-renderer.css';
@@ -20,10 +20,17 @@ export function ToolActionApproval({
 }) {
   const compact = layout === 'compact';
   const [inputOpen, setInputOpen] = useState(false);
-  const content = toolName === 'write_file' ? fileWriteContentForPreview(args) : null;
+  const isMemory = toolName === 'remember_fact';
+  const isWrite = toolName === 'write_file';
+  const isCommand = toolName === 'run_project_command';
+  const content = isMemory ? memoryContentForPreview(args)
+    : isWrite ? fileWriteContentForPreview(args)
+    : isCommand ? projectCommandForPreview(args) : null;
+  const previewLabel = isMemory ? '拟保存的长期记忆' : isCommand ? '拟运行的命令和参数' : '拟写入的正文';
   const mcp = parseMcpToolIdentity(toolName);
   const mcpInput = mcp ? mcpArgumentsForPreview(args) : null;
-  const unavailable = (toolName === 'write_file' && content === null) || (mcp !== null && mcpInput === null);
+  const hasPreview = isWrite || isMemory || isCommand;
+  const unavailable = (hasPreview && content === null) || (mcp !== null && mcpInput === null);
 
   return (
     <div className={compact ? 'agent-run-text-confirmation' : 'content-block-tool-confirmation'}>
@@ -42,18 +49,18 @@ export function ToolActionApproval({
         )}
         {content !== null && (
           <div className="content-block-tool-confirmation-preview">
-            <strong>拟写入的正文</strong>
-            <pre role="region" aria-label="拟写入的正文" tabIndex={0}>{content}</pre>
-            <p className="content-block-tool-confirmation-warning">
-              {content === ''
+            <strong>{previewLabel}</strong>
+            <pre role="region" aria-label={previewLabel} tabIndex={0}>{content}</pre>
+            {!isCommand && <p className="content-block-tool-confirmation-warning">
+              {isMemory ? '确认后，相关对话可能引用这条内容。可在记忆设置中暂停召回。' : content === ''
                 ? '正文为空，将创建空文件或清空已有文件。'
                 : '将写入以上完整正文；同名文件可能被覆盖。'}
-            </p>
+            </p>}
           </div>
         )}
-        {toolName === 'write_file' && unavailable && (
+        {hasPreview && unavailable && (
           <p className="content-block-tool-confirmation-warning" role="alert">
-            无法预览拟写入的正文，请拒绝这次请求并重新生成；不会自动重试。
+            无法预览{previewLabel}，请拒绝这次请求并重新生成；不会自动重试。
           </p>
         )}
       </div>

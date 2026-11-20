@@ -1,7 +1,8 @@
 //! Own one child process and, on Windows, its descendant process tree.
 
-use std::io;
+use std::io::{self, Read};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
+use std::thread;
 
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -24,19 +25,34 @@ pub(crate) struct ProcessTree {
     job: OwnedHandle,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProcessTreeSpawnError {
+    #[error("{0}")]
+    NotStarted(String),
+    #[cfg(windows)]
+    #[error("{0}")]
+    Started(String),
+}
+
 impl ProcessTree {
     pub(crate) fn id(&self) -> u32 {
         self.child.id()
     }
 
     pub(crate) fn spawn(command: &mut Command) -> Result<Self, String> {
+        Self::spawn_with_outcome(command).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn spawn_with_outcome(command: &mut Command) -> Result<Self, ProcessTreeSpawnError> {
         #[cfg(windows)]
         {
-            let job = create_kill_on_close_job()?;
+            let job = create_kill_on_close_job().map_err(ProcessTreeSpawnError::NotStarted)?;
             // AngelBot is a GUI app in release builds. A console child
             // (including cmd.exe for npx.cmd) must not open a separate window.
             command.creation_flags(CREATE_NO_WINDOW);
-            let mut child = command.spawn().map_err(|error| error.to_string())?;
+            let mut child = command
+                .spawn()
+                .map_err(|error| ProcessTreeSpawnError::NotStarted(error.to_string()))?;
 
             // A newly spawned process can run before this call. Keep the gap as
             // small as possible and never accept an unassigned child.
@@ -50,13 +66,13 @@ impl ProcessTree {
                         _ => Some(kill_error),
                     },
                 };
-                return Err(match cleanup_error {
+                return Err(ProcessTreeSpawnError::Started(match cleanup_error {
                     Some(cleanup_error) => format!(
                         "Failed to assign child process to job: {assignment_error}; \
                          failed to reap unassigned process: {cleanup_error}"
                     ),
                     None => format!("Failed to assign child process to job: {assignment_error}"),
-                });
+                }));
             }
 
             Ok(Self { child, job })
@@ -65,7 +81,9 @@ impl ProcessTree {
         #[cfg(not(windows))]
         {
             Ok(Self {
-                child: command.spawn().map_err(|error| error.to_string())?,
+                child: command
+                    .spawn()
+                    .map_err(|error| ProcessTreeSpawnError::NotStarted(error.to_string()))?,
             })
         }
     }
@@ -110,6 +128,46 @@ impl ProcessTree {
                 },
             }
         }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CapturedStream {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+pub(crate) fn capture_stream<R: Read + Send + 'static>(
+    mut stream: R,
+    limit: usize,
+) -> thread::JoinHandle<Result<CapturedStream, String>> {
+    thread::spawn(move || {
+        let mut captured = CapturedStream::default();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = match stream.read(&mut chunk) {
+                Ok(0) => return Ok(captured),
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("无法读取进程输出：{error}")),
+            };
+            let retained = count.min(limit - captured.bytes.len());
+            captured.bytes.extend_from_slice(&chunk[..retained]);
+            captured.truncated |= retained < count;
+            // Always drain the pipe, including after the capture limit. A noisy
+            // child must not block on a full pipe or consume unbounded memory.
+        }
+    })
+}
+
+pub(crate) fn join_capture(
+    reader: Option<thread::JoinHandle<Result<CapturedStream, String>>>,
+) -> Result<CapturedStream, String> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "进程输出读取线程异常退出".to_string())?,
+        None => Ok(CapturedStream::default()),
     }
 }
 

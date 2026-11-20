@@ -1,4 +1,5 @@
 import type { SettingsPage, SettingsRegistry } from './types';
+import type { ReactNode } from 'react';
 import { settingsNavItems } from './components/SettingsIcons';
 import { PersonalitySettings } from './pages/PersonalitySettings';
 import { MemoryGovernanceSettings } from './pages/MemoryGovernanceSettings';
@@ -19,6 +20,7 @@ import { SettingsNav } from './components/SettingsNav';
 interface SettingsRouterProps {
   activePage: SettingsPage;
   onNavigate: (page: SettingsPage) => void;
+  apiSaveAction?: ReactNode;
 }
 
 export const settingsRegistry: SettingsRegistry = {
@@ -42,23 +44,6 @@ export const settingsRegistry: SettingsRegistry = {
   },
 };
 
-const pageDescriptions: Partial<Record<SettingsPage, string>> = {
-  personality: '塑造 AngelBot 的表达方式与长期互动风格。',
-  memory: '查看、筛选和管理可审计的长期记忆。',
-  api: '选择模型并配置连接与生成参数。',
-  webSearch: '选择受信任的搜索服务，并控制 AngelBot 是否可以使用联网检索。',
-  projectNetwork: '查看或撤销当前项目为探索子代理批准的联网访问范围。',
-  workMode: '设置后续回复默认采用的表达与推理方式。',
-  appearance: '调整界面显示与阅读体验。',
-  mcp: '管理已连接的工具服务及其可用状态。',
-  notifications: '设置提醒、主动消息与系统通知。',
-  data: '导入、导出或清理本地数据。',
-  executionPermission: '设置所有工作区共用的执行确认方式。',
-  fileAccess: '限定当前会话能够读取和写入的本地目录。',
-  desktopControl: '仅为受信任的应用授予经过确认的操作能力。',
-  channels: '配置外部渠道与远程访问。',
-};
-
 export function getPageComponent(pageId: SettingsPage) {
   return settingsRegistry.pages[pageId]?.component;
 }
@@ -76,36 +61,22 @@ export function registerSettingsPage(
   settingsRegistry.pages[id] = page;
 }
 
-export function SettingsRouter({ activePage, onNavigate }: SettingsRouterProps) {
-  const PageComponent = getPageComponent(activePage);
-
-  if (!PageComponent) {
-    return (
-      <div className="settings-router">
-        <SettingsNav activePage={activePage} onNavigate={onNavigate} />
-        <div className="settings-content">
-          <div className="settings-page-content">
-            <p className="settings-page-not-found">Page not found</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
+export function SettingsRouter({ activePage, onNavigate, apiSaveAction }: SettingsRouterProps) {
+  const page = settingsRegistry.pages[activePage];
+  const PageComponent = page?.component;
 
   return (
     <div className="settings-router">
       <SettingsNav activePage={activePage} onNavigate={onNavigate} />
       <div className="settings-content" key={activePage}>
-        <div className="settings-page-header">
-          <h2 className="settings-page-title">
-            {settingsRegistry.pages[activePage]?.title}
-          </h2>
-          {pageDescriptions[activePage] && (
-            <p className="settings-page-description">{pageDescriptions[activePage]}</p>
-          )}
-        </div>
+        {page && <div className="settings-page-header">
+          <h2 className="settings-page-title settings-page-layout">{page.title}</h2>
+        </div>}
         <div className="settings-page-body">
-          <PageComponent />
+          <div className="settings-page-layout">
+            {activePage === 'api' && PageComponent === ApiSettings ? <ApiSettings saveAction={apiSaveAction} />
+              : PageComponent ? <PageComponent /> : <p className="settings-page-not-found">找不到此设置页面</p>}
+          </div>
         </div>
       </div>
     </div>

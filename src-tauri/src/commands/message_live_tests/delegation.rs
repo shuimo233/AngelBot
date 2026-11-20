@@ -25,6 +25,152 @@ use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
+#[test]
+#[ignore = "explicit saved-Luna clock proposal; one request, no tool dispatch or scheduler"]
+fn configured_cache_clock_reminder_proposal() {
+    use crate::agent::foreground_conversation_state::{
+        ForegroundConversationState, ForegroundHistory,
+    };
+    use crate::agent::prompt::TurnClock;
+    use crate::llm::{LlmResponse, Message, ModelAuthMode};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    assert_eq!(
+        std::env::var("ANGELBOT_CACHE_CLOCK_TIME_CHECK").as_deref(),
+        Ok("1")
+    );
+    let root = std::path::PathBuf::from(
+        std::env::var_os("ANGELBOT_PRIVATE_CONTEXT_EVAL_ROOT").expect("owned evidence directory"),
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    let app = super::headless_credential_host().expect("headless credential host");
+    let model = crate::commands::foreground_model_factory::resolve_model_config(Some(app.handle()))
+        .expect("saved Luna configuration");
+    assert!(model.auth_mode == ModelAuthMode::ChatgptPlan && model.model.contains("luna"));
+    let db = Arc::new(Mutex::new(
+        crate::db::init(&root.join("clock-proposal.db")).unwrap(),
+    ));
+    crate::db::migrate(&db.lock().unwrap()).unwrap();
+    let mut registry = ToolRegistry::new();
+    crate::commands::foreground_automation_control::register(
+        &mut registry,
+        "clock-proposal".into(),
+        db.clone(),
+    );
+    let tools: Vec<_> = registry
+        .get_provider_schemas(false)
+        .into_iter()
+        .filter(|tool| tool.name == "schedule_reminder")
+        .collect();
+    assert_eq!(tools.len(), 1);
+    assert!(
+        registry
+            .get("schedule_reminder")
+            .unwrap()
+            .requires_confirmation
+    );
+    let snippets: Vec<_> = registry
+        .get_prompt_snippets()
+        .into_iter()
+        .filter(|(name, _)| name == "schedule_reminder")
+        .collect();
+    let mut config = crate::agent::AgentConfig::default();
+    config.preferences.use_long_term_memory = false;
+    config.preferences.evolution_enabled = false;
+    // A deterministic pair around a future midnight keeps this dry-run valid
+    // while making the two possible one-hour proposals clearly distinct.
+    let prior_day = chrono::Local::now().date_naive().succ_opt().unwrap();
+    let current_day = prior_day.succ_opt().unwrap();
+    let prior_clock = TurnClock::parse(&format!("{prior_day}T23:45:00+08:00")).unwrap();
+    let current_clock = TurnClock::parse(&format!("{current_day}T00:15:00+08:00")).unwrap();
+    let history_message = |role: &str, content: &str| crate::llm::Message {
+        role: role.into(),
+        content: content.into(),
+        tool_calls: None,
+        tool_call_id: None,
+        tool_images: Vec::new(),
+        protocol_state: None,
+    };
+    let history = [
+        prior_clock.to_message(),
+        history_message("user", "先确认办公支出提醒的标题，暂不创建。"),
+        history_message("assistant", "标题已确认。"),
+    ];
+    let messages = ForegroundConversationState::initial_context_with_turn_clock(
+        &config, &tools, &snippets,
+        "一小时后提醒我核对办公支出，标题用“核对办公支出”，内容是“检查已付和待付金额”。只设置一次提醒，不要重复日程。",
+        ForegroundHistory::Native(&history),
+        Some(current_clock),
+    );
+    let (provider, metrics) = super::agent_benchmarks::meter_provider(
+        crate::llm::create_foreground_provider_for_app(&model, Some(app.handle())).unwrap(),
+        &root,
+        1,
+    );
+    let thinking = crate::llm::resolve_thinking_settings(&model, Some("low")).unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            provider.chat_classified(&messages, Some(&tools), thinking.as_ref()),
+        )
+        .await
+    });
+    let mut row = json!({"status":"needs_work","model":model.model,"toolDispatchCount":0});
+    super::agent_benchmarks::row_metrics(&mut row, &metrics, started);
+    let sent = row["providerInputs"][0]["messages"].as_array().unwrap();
+    let clocks = sent
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            let message = serde_json::from_value::<Message>(frame.clone()).ok()?;
+            Some((index, TurnClock::from_message(&message)?.to_rfc3339()))
+        })
+        .collect::<Vec<_>>();
+    let clock = clocks
+        .last()
+        .and_then(|(_, clock)| chrono::DateTime::parse_from_rfc3339(clock).ok());
+    let proposal = match result {
+        Ok(Ok(response)) => match response.into_parts().0 {
+            LlmResponse::ToolCalls { mut calls, .. } if calls.len() == 1 => calls.pop(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let proposed_at = proposal
+        .as_ref()
+        .and_then(|call| call.arguments["when"].as_str())
+        .and_then(|when| chrono::DateTime::parse_from_rfc3339(when).ok());
+    let offset_seconds = clock
+        .zip(proposed_at)
+        .map(|(clock, when)| (when - clock).num_seconds());
+    let count: i64 = db
+        .lock()
+        .unwrap()
+        .query_row("SELECT count(*) FROM automations", [], |row| row.get(0))
+        .unwrap();
+    let checks = json!({
+        "oneRequest":row["requestCount"] == 1,
+        "orderedDeveloperClocks":clocks == [(1, prior_clock.to_rfc3339()), (4, current_clock.to_rfc3339())] && sent.last().unwrap()["role"] == "user",
+        "priorHistoryPreserved":sent[2]["content"] == history[1].content && sent[3]["content"] == history[2].content,
+        "relativeHour":offset_seconds.is_some_and(|seconds| (3540..=3660).contains(&seconds)),
+        "normalToolSchema":proposal.as_ref().is_some_and(|call| call.name == "schedule_reminder" && registry.validate_arguments(&call.name,&call.arguments).is_ok()),
+        "requestedContents":proposal.as_ref().is_some_and(|call|call.arguments["title"]=="核对办公支出" && call.arguments["body"]=="检查已付和待付金额"),
+        "noReminderCreated":count == 0,
+    });
+    let passed = checks
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|check| check == true);
+    row["checks"] = checks;
+    row["proposedOffsetSeconds"] = json!(offset_seconds);
+    row["status"] = json!(if passed { "passed" } else { "needs_work" });
+    println!("CACHE_CLOCK_TIME_ROW {row}");
+    assert!(passed, "clock proposal failed its bounded temporal checks");
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Journey {
     Direct,

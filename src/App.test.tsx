@@ -46,7 +46,10 @@ vi.mock('./stores/workspaces', () => ({
     activeWorkspaceId: appMocks.activeWorkspaceId,
   }),
 }));
-vi.mock('./lib/commands/automation', () => ({ runDueAutomations: appMocks.runDue }));
+vi.mock('./lib/commands/automation', () => ({
+  runDueAutomations: appMocks.runDue,
+  getWorkspaceAutomationOverview: vi.fn().mockResolvedValue({ items: [], truncated: false }),
+}));
 
 describe('App', () => {
   beforeEach(() => {
@@ -114,6 +117,36 @@ describe('App', () => {
     expect(menu).toHaveFocus();
   });
 
+  it('dismisses only the compact A drawer on Escape and leaves a top-level modal in control', () => {
+    const view = render(<><App /><div role="dialog" aria-modal="true"><button>弹层操作</button></div></>);
+    const menu = screen.getByRole('button', { name: '打开菜单' });
+    const drawerAction = screen.getByRole('button', { name: '布局测试入口' });
+    const modalAction = screen.getByRole('button', { name: '弹层操作' });
+    const menuRect = vi.spyOn(menu, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 36, 36));
+    fireEvent.click(menu);
+    modalAction.focus();
+    fireEvent.keyDown(modalAction, { key: 'Escape' });
+    expect(screen.getByRole('button', { name: '关闭菜单' })).toBeInTheDocument();
+    expect(modalAction).toHaveFocus();
+
+    view.rerender(<><App /></>);
+    drawerAction.focus();
+    act(() => useThemeStore.getState().setLayout('B'));
+    fireEvent.keyDown(drawerAction, { key: 'Escape' });
+    expect(drawerAction).toHaveFocus();
+    expect(screen.getByRole('button', { name: '关闭菜单' })).toBeInTheDocument();
+
+    act(() => useThemeStore.getState().setLayout('A'));
+    menuRect.mockReturnValue(new DOMRect());
+    fireEvent.keyDown(drawerAction, { key: 'Escape' });
+    expect(screen.getByRole('button', { name: '关闭菜单' })).toBeInTheDocument();
+
+    menuRect.mockReturnValue(new DOMRect(0, 0, 36, 36));
+    fireEvent.keyDown(drawerAction, { key: 'Escape' });
+    expect(screen.queryByRole('button', { name: '关闭菜单' })).not.toBeInTheDocument();
+    expect(menu).toHaveFocus();
+  });
+
   it('never dispatches an old file locator into a new workspace or restored directory scope', async () => {
     appMocks.workspaces = [{ id: 'personal', name: 'AngelBot 日常', kind: 'personal', createdAt: 1, updatedAt: 1, activeSessionId: 'personal-main' }];
     appMocks.activeWorkspaceId = 'personal';
@@ -138,5 +171,27 @@ describe('App', () => {
     view.rerender(<App />);
     expect(screen.getByRole('complementary', { name: '工作侧栏' })).not.toHaveTextContent('plan.md');
     await waitFor(() => expect(readSessionFile).toHaveBeenCalledTimes(2));
+  });
+
+  it('opens workbench shortcuts from chat and honors a repeated view request after a tab change', async () => {
+    appMocks.workspaces = [{ id: 'personal', name: 'AngelBot 日常', kind: 'personal', createdAt: 1, updatedAt: 1, activeSessionId: 'personal-main' }];
+    appMocks.activeWorkspaceId = 'personal';
+    render(<App />);
+
+    const draft = screen.getByRole('textbox', { name: '对话草稿' });
+    expect(fireEvent.keyDown(draft, { key: 'p', ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole('complementary', { name: '工作侧栏' })).not.toBeInTheDocument();
+    expect(fireEvent.keyDown(document.body, { key: 'p', ctrlKey: true })).toBe(false);
+    const files = await screen.findByRole('button', { name: '结果文件' });
+    expect(files).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(screen.getByRole('button', { name: '浏览器' }));
+    expect(files).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.keyDown(document.body, { key: 'p', ctrlKey: true });
+    expect(files).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.queryByRole('complementary', { name: '工作侧栏' })).not.toBeInTheDocument();
+    fireEvent.keyDown(document.body, { key: '.', ctrlKey: true });
+    expect(screen.getByRole('button', { name: '任务' })).toHaveAttribute('aria-pressed', 'true');
   });
 });

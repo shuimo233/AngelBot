@@ -37,6 +37,8 @@ pub struct ApiProviderConfig {
     pub plan_enabled: bool,
     #[serde(default)]
     pub plan_account_label: Option<String>,
+    #[serde(default)]
+    pub plan_status_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,7 @@ impl Default for ApiProviderConfig {
             plan_connected: false,
             plan_enabled: false,
             plan_account_label: None,
+            plan_status_error: None,
         }
     }
 }
@@ -377,7 +380,14 @@ pub fn load_full_config(app: &tauri::AppHandle) -> ApiProviderConfig {
     }
     let runtime = runtime.unwrap_or_default();
     if runtime.auth_mode != ModelAuthMode::ApiKey {
-        let plan = crate::llm::chatgpt_auth::status(app).ok();
+        let (plan, plan_status_error) = if runtime.auth_mode == ModelAuthMode::ChatgptPlan {
+            match crate::llm::chatgpt_auth::status(app) {
+                Ok(status) => (Some(status), None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {
+            (None, None)
+        };
         let matches = plan
             .as_ref()
             .is_some_and(|status| status.credential_ref == runtime.credential_ref);
@@ -391,8 +401,12 @@ pub fn load_full_config(app: &tauri::AppHandle) -> ApiProviderConfig {
             auth_mode: runtime.auth_mode,
             credential_ref: runtime.credential_ref,
             plan_connected: matches && plan.as_ref().is_some_and(|status| status.connected),
-            plan_enabled: matches && plan.as_ref().is_some_and(|status| status.plan_enabled),
+            plan_enabled: matches
+                && plan
+                    .as_ref()
+                    .is_some_and(|status| status.plan_enabled && !status.needs_sign_in),
             plan_account_label: plan.and_then(|status| status.account_label),
+            plan_status_error,
             credential_source: if runtime.auth_mode == ModelAuthMode::ChatgptPlan {
                 "chatgpt_plan".into()
             } else {

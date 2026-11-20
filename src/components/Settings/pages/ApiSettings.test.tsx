@@ -45,24 +45,38 @@ describe('ApiSettings', () => {
 
     await user.selectOptions(screen.getByLabelText('服务商'), 'ollama');
 
-    expect(screen.getByText('此服务商不需要 API Key。请先确保本地服务已经启动。')).toBeInTheDocument();
+    expect(screen.getByLabelText('API 地址')).toHaveAccessibleDescription('请先启动本地模型服务。');
+    expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '测试连接' })).toBeEnabled();
   });
 
-  it('keeps a configured connection collapsed while preserving edits across disclosure changes', async () => {
+  it('opens with just the necessary fields for first connection and allows opening details', async () => {
+    const user = userEvent.setup();
+    useSettingsStore.setState(state => ({ activeApiConfig: state.apiConfig }));
+    render(<ApiSettings saveAction={<button type="button">保存</button>} />);
+
+    expect(screen.getByLabelText('服务商')).toBeVisible();
+    expect(screen.getByLabelText('API Key')).toHaveAccessibleDescription('密钥保存在系统凭据库。');
+    expect(screen.queryByLabelText('API 地址')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('模型标识')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '测试连接' })).toBeDisabled();
+    expect(screen.getByRole('region', { name: '连接测试' })).toContainElement(screen.getByRole('button', { name: '保存' }));
+    await user.click(screen.getByRole('button', { name: '高级选项' }));
+    expect(screen.getByLabelText('API 地址')).toBeVisible();
+    expect(screen.getByLabelText('模型标识')).toBeVisible();
+    expect(saveApiConfig).not.toHaveBeenCalled();
+  });
+
+  it('shows configured connection and generation fields without disclosure and keeps changes as drafts', async () => {
     const user = userEvent.setup();
     useSettingsStore.setState(state => ({ apiConfig: { ...state.apiConfig, hasApiKey: true, credentialSource: 'keychain' } }));
     render(<ApiSettings />);
-    const summary = screen.getByText('管理连接').closest('summary')!;
-    const details = summary.closest('details')!;
-    expect(details).not.toHaveAttribute('open');
     expect(screen.getByLabelText('模型标识')).toBeVisible();
-    await user.click(summary);
-    expect(details).toHaveAttribute('open');
-    await user.type(screen.getByLabelText('API 地址'), '/gateway');
-    await user.click(summary);
-    await user.click(summary);
-    expect(screen.getByLabelText('API 地址')).toHaveValue('https://api.anthropic.com/gateway');
+    expect(screen.getByRole('region', { name: '生成参数' })).toBeVisible();
+    const endpoint = screen.getByLabelText('API 地址');
+    expect(endpoint).toBeVisible();
+    await user.type(endpoint, '/gateway');
+    expect(endpoint).toHaveValue('https://api.anthropic.com/gateway');
     expect(saveApiConfig).not.toHaveBeenCalled();
   });
 
@@ -148,7 +162,7 @@ describe('ApiSettings', () => {
     render(<ApiSettings />);
 
     expect(screen.getByLabelText('API Key')).toBeDisabled();
-    expect(screen.getByText(/当前由环境变量 ANTHROPIC_API_KEY 管理/)).toBeInTheDocument();
+    expect(screen.getByLabelText('API Key')).toHaveAccessibleDescription(/当前由环境变量 ANTHROPIC_API_KEY 管理/);
   });
 
   it('tests the current unsaved form without exposing a stored key', async () => {
@@ -162,26 +176,29 @@ describe('ApiSettings', () => {
     }));
 
     render(<ApiSettings />);
-    await user.click(screen.getByRole('button', { name: '测试连接' }));
+    const testPanel = within(screen.getByRole('region', { name: '连接测试' }));
+    const testButton = testPanel.getByRole('button', { name: '测试连接' });
+    expect(testButton).toHaveAccessibleDescription(/最多 3 次请求.*可能消耗额度.*测试不会保存/);
+    await user.click(testButton);
 
     await waitFor(() => expect(testModelConnection).toHaveBeenCalledWith(expect.objectContaining({
       base_url: 'https://api.anthropic.com', api_key: '', provider: 'anthropic', model: 'claude-sonnet-4-20250514',
     })));
     expect(within(screen.getByRole('region', { name: '连接测试' })).getByText('连接测试通过')).toBeInTheDocument();
-    expect(screen.getByText('对话和工具往返均通过验证。实际操作仍需授权，不代表复杂任务已经完成。')).toBeInTheDocument();
+    expect(testPanel.getByText('已验证对话和工具往返。')).toBeInTheDocument();
 
     for (const [status, detail] of [
-      ['notObserved', '模型未返回原生工具调用；这不等于模型不支持工具。可以继续对话，请核对协议或模型后重试。'],
-      ['invalidCall', '工具调用格式或参数未通过校验。可以继续对话，请核对协议或换用支持工具调用的模型。'],
-      ['invalidResult', '模型未正确接收工具结果并完成回答。可以继续对话，操作任务的可靠性尚未验证。'],
-      ['requestFailed', '工具验证请求失败；对话连接已通过。请检查服务状态或协议后重试，未操作文件或应用。'],
-      ['timedOut', '工具验证在总计 60 秒内未完成；对话连接已通过。请稍后重试，未操作文件或应用。'],
+      ['notObserved', '本次未收到工具调用。可核对模型或协议后重试。'],
+      ['invalidCall', '工具调用格式或参数不合要求。请核对模型和协议。'],
+      ['invalidResult', '模型未能根据工具结果完成回复。'],
+      ['requestFailed', '工具验证请求失败。可检查服务状态后重试。'],
+      ['timedOut', '工具验证在 60 秒内未完成。可稍后重试。'],
     ] as const) {
       vi.mocked(testModelConnection).mockResolvedValue({ toolRoundTrip: status });
       await user.click(screen.getByRole('button', { name: '测试连接' }));
       await waitFor(() => expect(screen.getByText(detail)).toBeInTheDocument());
       expect(within(screen.getByRole('region', { name: '连接测试' })).getByText('对话连接正常，工具往返未验证')).toBeInTheDocument();
-      expect(screen.getAllByText('对话连接正常，工具往返未验证').find((element) => element.tagName === 'DD')).toHaveAttribute('data-state', 'partial');
+      expect(screen.getByText('对话连接正常，工具往返未验证')).toHaveAttribute('data-state', 'partial');
       expect(screen.queryByText('连接测试通过')).not.toBeInTheDocument();
       expect(saveApiConfig).not.toHaveBeenCalled();
     }
@@ -210,7 +227,41 @@ describe('ApiSettings', () => {
     expect(screen.getByLabelText('API 地址')).toHaveValue('https://api.openai.com/v1');
     expect(screen.getByLabelText('协议')).toBeDisabled();
     expect(screen.getByRole('button', { name: '测试连接' })).toBeDisabled();
-    expect(screen.getByText(/不等于无限用量/)).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'ChatGPT 套餐' })).getByText(/不会切换到 API 计费/)).toBeVisible();
+  });
+
+  it('shows protected status failures and restores the saved plan through a status-only retry', async () => {
+    const user = userEvent.setup();
+    const plan = {
+      ...useSettingsStore.getState().apiConfig,
+      provider: 'openai' as const, model: 'gpt-6-luna',
+      baseUrl: 'https://api.openai.com/v1', protocol: 'openai_responses' as const,
+      authMode: 'chatgpt_plan' as const, credentialRef: 'saved-ref',
+      planConnected: true, planEnabled: true,
+    };
+    useSettingsStore.setState({ apiConfig: plan, activeApiConfig: plan });
+    vi.mocked(chatgptPlanStatus).mockRejectedValueOnce('资料正在迁移或需要恢复。');
+    vi.mocked(chatgptPlanStatus).mockResolvedValueOnce({
+      connected: true, planEnabled: true, needsSignIn: false,
+      credentialRef: 'saved-ref', accountLabel: 'saved-account',
+    });
+    render(<ApiSettings />);
+
+    const overview = within(screen.getByRole('region', { name: 'OpenAI (GPT)' }));
+    expect(await overview.findByText('无法读取 ChatGPT 连接状态')).toBeInTheDocument();
+    expect(screen.getByText('ChatGPT 授权状态未知')).toBeInTheDocument();
+    expect(useSettingsStore.getState().activeApiConfig).toMatchObject({
+      credentialRef: 'saved-ref', planEnabled: false, planStatusError: '资料正在迁移或需要恢复。',
+    });
+    expect(screen.queryByText('尚未连接 ChatGPT 账号')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Continue with ChatGPT' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重新检查连接状态' }));
+    expect(await screen.findByText('saved-account · 已授权套餐用量')).toBeInTheDocument();
+    expect(useSettingsStore.getState().activeApiConfig).toMatchObject({
+      credentialRef: 'saved-ref', planEnabled: true, planStatusError: null,
+    });
+    expect(chatgptPlanSignIn).not.toHaveBeenCalled();
+    expect(saveApiConfig).not.toHaveBeenCalled();
   });
 
   it('requires explicit sign-in, loads the authorized account catalog and does not save or auto-switch models', async () => {

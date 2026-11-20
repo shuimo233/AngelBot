@@ -8,6 +8,7 @@
 use crate::agent::attention::record_recoverable_runtime_failure;
 use crate::agent::delegate_work::{register, ForegroundRunIdentity};
 use crate::agent::delegated_model_binding::DelegatedModelBindingRequest;
+use crate::agent::event::{AgentEvent, AgentEventEmitter};
 use crate::agent::foreground_lifecycle_control::ForegroundLifecycleControl;
 #[cfg(test)]
 use crate::agent::AgentResponse;
@@ -28,6 +29,29 @@ use crate::AppState;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::AppHandle;
+
+/// Publish the saved reply through the existing terminal lifecycle barrier.
+/// Supply text only for paths where the runner did not emit MessageEnd.
+pub(crate) fn commit_foreground_reply_events(
+    lifecycle: &ForegroundLifecycleControl,
+    run: &ForegroundRun,
+    fallback_text: Option<&str>,
+) -> Result<(), String> {
+    if let Some(text) = fallback_text {
+        lifecycle.emit(
+            &run.session_id,
+            AgentEvent::MessageEnd {
+                // There may be no runner turn (model preparation failed).
+                turn_id: run.reply_id.clone(),
+                message_id: run.reply_id.clone(),
+                full_text: text.into(),
+            },
+        );
+    }
+    lifecycle.commit_terminal().map_err(|error| {
+        format!("The reply was saved, but its terminal lifecycle record could not be persisted. Completion was not exposed; retry or resume safely. ({error})")
+    })
+}
 
 /// One confirmed tool's pixels, owned only by the immediately composed turn.
 /// This is deliberately not serializable and is never placed in AppState.
@@ -235,17 +259,8 @@ impl<'a> ForegroundTurnCoordinator<'a> {
         let crate::commands::foreground_model_factory::ResolvedForegroundModel {
             provider,
             thinking_settings,
-            identity: model_identity,
-            context_window_tokens: _,
-            max_output_tokens: _,
+            ..
         } = resolved_model;
-        let provider: Box<dyn crate::llm::LlmProvider> =
-            Box::new(crate::llm::tracked::TrackedProvider::new(
-                provider,
-                crate::llm::UsageTracker::new(self.state.db.clone()),
-                session_id.clone(),
-                model_identity.model,
-            ));
         let emitter = self.lifecycle_control.clone();
         let tool_surface = match &tool_mode {
             ForegroundTurnToolMode::Standard => ForegroundToolSurface::new(self.state, self.app)
@@ -261,6 +276,12 @@ impl<'a> ForegroundTurnCoordinator<'a> {
         if let Some(root) = tool_surface.file_root {
             agent_config.work_dir = Some(root);
         }
+        let attention_context = super::foreground_context_assembler::merge_context_sections(
+            prepared_context.attention_context.take(),
+            tool_surface.file_access_notice.map(|notice| {
+                format!("【本轮文件工具】{notice} 若请求涉及文件，请说明原因和恢复办法。")
+            }),
+        );
         let supports_tool_images = provider.supports_tool_images();
         let context_projector = tool_surface.context_projector;
         let mut agent = AgentRunner::with_registry(provider, agent_config, tool_surface.registry)
@@ -290,6 +311,11 @@ impl<'a> ForegroundTurnCoordinator<'a> {
                         .as_ref()
                         .map(|host| host.service().clone()),
                 );
+                if !self.state.delegation_available {
+                    agent
+                        .tool_registry_mut()
+                        .unregister(crate::agent::delegate_work::CODEX_TOOL);
+                }
             }
         }
 
@@ -303,13 +329,36 @@ impl<'a> ForegroundTurnCoordinator<'a> {
             )?;
         }
         drop(confirmed_output);
+        let steering_registration = if matches!(&tool_mode, ForegroundTurnToolMode::Standard) {
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::agent::pending_queue::PendingMessageQueue::new(),
+            ));
+            let registration = self.state.steering.register_steering(
+                &session_id,
+                &foreground_run.reply_id,
+                queue.clone(),
+            );
+            agent = agent.with_pending_messages(queue);
+            Some(registration)
+        } else {
+            None
+        };
+        let turn_clock = if prepared_context.append_turn_clock {
+            let clock = crate::agent::prompt::TurnClock::now();
+            self.run_store.record_turn_clock(&foreground_run, clock)?;
+            Some(clock)
+        } else {
+            None
+        };
         let ai_response = agent
             .run_slice_with_owned_history(
                 &prepared_context.agent_input,
                 std::mem::take(&mut prepared_context.history),
-                prepared_context.attention_context.as_deref(),
+                attention_context.as_deref(),
+                turn_clock,
             )
             .await;
+        drop(steering_registration);
 
         let outcome = match project_private_slice_outcome(&goal, ai_response) {
             Ok(projected) => projected,
@@ -326,20 +375,29 @@ impl<'a> ForegroundTurnCoordinator<'a> {
                 };
                 // Return the same safe current-run projection that was just
                 // committed, not raw diagnostics or a second generic reason.
-                return Err(self.run_store.mark_needs_attention(&foreground_run)?);
+                let content = self.run_store.mark_needs_attention(&foreground_run)?;
+                commit_foreground_reply_events(
+                    &self.lifecycle_control,
+                    &foreground_run,
+                    Some(&content),
+                )?;
+                return Err(content);
             }
         };
 
+        // When inference failed after a tool receipt, the runner retains the
+        // receipt but closes with AgentEnd rather than MessageEnd.
+        let model_failed = outcome.private_diagnostic.is_some();
         let reply = self.run_store.complete_with_mcp_revisions(
             &foreground_run,
             outcome,
             &mcp_tool_revisions,
         )?;
-        self.lifecycle_control.commit_terminal().map_err(|error| {
-            format!(
-                "The reply was saved, but its terminal lifecycle record could not be persisted. Completion was not exposed; retry or resume safely. ({error})"
-            )
-        })?;
+        commit_foreground_reply_events(
+            &self.lifecycle_control,
+            &foreground_run,
+            model_failed.then_some(reply.content.as_str()),
+        )?;
         if reply
             .task_run
             .as_ref()
@@ -366,6 +424,254 @@ mod tests {
     use std::sync::Mutex;
 
     const PRIVATE_PROVIDER_DIAGNOSTIC: &str = "transport closed: Bearer private-coordinator-fault https://private.invalid/?request=private";
+
+    struct ProjectTaskProvider {
+        script: &'static str,
+        command_succeeds: bool,
+        reported_total: Option<i64>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ProjectTaskProvider {
+        fn name(&self) -> &str {
+            "project-task-fixture"
+        }
+
+        async fn chat(
+            &self,
+            _: &[crate::llm::Message],
+            _: Option<&[ToolSchema]>,
+            _: Option<&crate::llm::ThinkingSettings>,
+        ) -> Result<LlmResponse, String> {
+            panic!("the foreground runner must use the classified streaming boundary")
+        }
+
+        async fn chat_stream_classified(
+            &self,
+            messages: &[crate::llm::Message],
+            tools: Option<&[ToolSchema]>,
+            _: Option<&crate::llm::ThinkingSettings>,
+            _: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        ) -> Result<LlmResponse, LlmFailure> {
+            let received = |id: &str| {
+                messages
+                    .iter()
+                    .find(|message| {
+                        message.role == "tool" && message.tool_call_id.as_deref() == Some(id)
+                    })
+                    .unwrap_or_else(|| panic!("the next step requires receipt {id}"))
+                    .content
+                    .as_str()
+            };
+            let read_json = |id: &str| -> serde_json::Value {
+                let output = received(id)
+                    .strip_prefix("Result: ")
+                    .expect("successful read receipt");
+                let receipt: serde_json::Value = serde_json::from_str(output).unwrap();
+                serde_json::from_str(receipt["content"].as_str().unwrap()).unwrap()
+            };
+            let (id, name, arguments) = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => ("input", "read_file", json!({"path":"input.json"})),
+                1 => {
+                    assert_eq!(read_json("input"), json!([7, 11, 13]));
+                    (
+                        "script",
+                        "write_file",
+                        json!({"path":"calculate.py","content":self.script}),
+                    )
+                }
+                2 => (
+                    "calculate",
+                    "run_project_command",
+                    json!({"command":"python","args":["calculate.py"],"timeout_seconds":15}),
+                ),
+                3 if self.command_succeeds => {
+                    assert!(received("calculate").contains("calculation ran"));
+                    ("report", "read_file", json!({"path":"report.json"}))
+                }
+                4 if self.reported_total.is_some() => {
+                    assert_eq!(
+                        read_json("report"),
+                        json!({"total":self.reported_total.unwrap()})
+                    );
+                    (
+                        "check-report",
+                        "run_project_command",
+                        json!({"command":"node","args":["--test","verify-report.cjs"]}),
+                    )
+                }
+                _ => {
+                    if self.reported_total.is_some() {
+                        assert!(received("check-report").contains("report agrees with input"));
+                    } else if !self.command_succeeds {
+                        assert!(received("calculate").contains("\"exit_code\":7"));
+                    } else {
+                        assert!(received("report").contains("report.json"));
+                    }
+                    return Ok(LlmResponse::Text {
+                        text: if self.reported_total.is_some() {
+                            // Simulate a confident completion claim even when the independent check fails.
+                            "已读回 report.json，合计为 31。"
+                        } else if self.command_succeeds {
+                            "未能读回 report.json，无法核对交付。"
+                        } else {
+                            "计算退出码为 7，未生成报告。"
+                        }
+                        .into(),
+                        stop_reason: StopReason::EndTurn,
+                    });
+                }
+            };
+            assert!(
+                tools.unwrap().iter().any(|tool| tool.name == name),
+                "the admitted project must expose {name}"
+            );
+            Ok(LlmResponse::ToolCalls {
+                calls: vec![crate::llm::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments,
+                }],
+                text: None,
+                stop_reason: StopReason::ToolUse,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn project_task_round_trip_persists_success_and_failure_receipts() {
+        let input_json = b"[7, 11, 13]\n";
+        let verify_report = r#"
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+test('report agrees with input', () => {
+  const values = JSON.parse(fs.readFileSync('input.json', 'utf8'));
+  const report = JSON.parse(fs.readFileSync('report.json', 'utf8'));
+  assert.equal(report.total, values.reduce((sum, n) => sum + n, 0));
+});
+"#;
+        for (script, command_succeeds, reported_total) in [
+            (
+                "import json\nfrom pathlib import Path\ntotal = sum(json.loads(Path('input.json').read_text()))\nPath('report.json').write_text(json.dumps({'total': total}), encoding='utf-8')\nprint('calculation ran')\n",
+                true,
+                Some(31),
+            ),
+            ("import sys\nprint('calculation rejected', file=sys.stderr)\nraise SystemExit(7)\n", false, None),
+            ("print('calculation ran')\n", true, None),
+            (
+                "from pathlib import Path\nPath('report.json').write_text('{\"total\":30}', encoding='utf-8')\nprint('calculation ran')\n",
+                true,
+                Some(30),
+            ),
+        ] {
+            let report_verified = reported_total == Some(31);
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("project");
+            std::fs::create_dir(&workspace).unwrap();
+            let project_root =
+                crate::commands::file::display_work_dir(&workspace.canonicalize().unwrap());
+            std::fs::write(workspace.join("input.json"), input_json).unwrap();
+            std::fs::write(workspace.join("verify-report.cjs"), verify_report).unwrap();
+            let database = directory.path().join("data.db");
+            let mut state = crate::tests::test_app_state();
+            let conn = Connection::open(&database).unwrap();
+            crate::db::migrate(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO projects (id,name,path,kind,directory_confirmed,created_at)
+                 VALUES ('fixture-project','Calculation',?1,'project',1,1)",
+                [&project_root],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id,title,created_at,updated_at,project_id)
+                 VALUES ('fixture-session','Calculation',1,1,'fixture-project')",
+                [],
+            ).unwrap();
+            state.db = Arc::new(Mutex::new(conn));
+            // Exercise the normal unattended execution path in the isolated project.
+            crate::commands::message::set_agent_execution_permission_impl(&state, "full_access").unwrap();
+            let goal = "Read input.json, write and run Python code, then read and verify report.json.";
+            let request: SendMessageRequest = serde_json::from_value(json!({
+                "sessionId":"fixture-session", "role":"user", "content":goal
+            })).unwrap();
+            let store = ForegroundRunStore::new(state.db.clone());
+            let foreground_run = store.begin(BeginForegroundTurn {
+                session_id: request.session_id.clone(), user_message_id: "user".into(),
+                reply_id: "reply".into(), role: request.role.clone(), content: goal.into(),
+                text_attachments: vec![], user_turn: ForegroundUserTurn::Append, now: 100,
+            }).unwrap();
+            let input = ForegroundTurnInput {
+                goal: goal.into(), session_id: request.session_id.clone(), message_id: "user".into(), reply_id: "reply".into(),
+                prepared_context: PreparedForegroundContext {
+                    agent_config: Default::default(), history: vec![], agent_input: goal.into(), attention_context: None,
+                    append_turn_clock: false,
+                    sources: ForegroundContextSources {
+                        session_id: request.session_id.clone(), history_before_created_at: 100,
+                        used_fresh_summary: false, attention_card_ids: vec![], pending_delivery_ids: vec![],
+                        task_understanding_record_ids: vec![],
+                    },
+                },
+                resolved_model: ResolvedForegroundModel {
+                    provider: Box::new(ProjectTaskProvider { script, command_succeeds, reported_total, calls: AtomicUsize::new(0) }),
+                    thinking_settings: None, context_window_tokens: 8192, max_output_tokens: 1024,
+                    identity: ForegroundModelIdentity {
+                        provider: "synthetic".into(), model: "project-task".into(),
+                        provider_profile_ref: "synthetic-profile".into(), credential_handle_ref: "none".into(),
+                    },
+                },
+                foreground_run, request, delegation_identity: None, sandbox_root: None,
+                delegated_model_binding: None, tool_mode: ForegroundTurnToolMode::Standard,
+                after_completion: None, confirmed_output: None, cancellation: crate::agent::ToolCancellation::new(),
+            };
+            let control = Arc::new(ForegroundLifecycleControl::new(
+                Arc::new(crate::agent::event::NullEventEmitter), state.db.clone(), "reply".into(),
+            ));
+            let reply = ForegroundTurnCoordinator::new(&state, None, control, store)
+                .run(input).await.unwrap();
+            let expected_status = if report_verified { "completed" } else { "needs_attention" };
+            assert_eq!(reply.task_run.as_ref().unwrap().status, expected_status, "{reply:?}");
+            let recorded_before_execution: bool = state.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_run_events reserved
+                  JOIN agent_run_events started ON started.run_id=reserved.run_id AND started.session_id=reserved.session_id
+                  WHERE reserved.run_id='reply' AND reserved.event_type='ExternalToolDispatchReserved'
+                    AND started.event_type='ToolExecutionStart' AND reserved.sequence < started.sequence
+                    AND json_extract(reserved.payload,'$.data.call_id')='calculate'
+                    AND json_extract(started.payload,'$.data.call_id')='calculate')",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert!(recorded_before_execution);
+            drop(state);
+
+            let reopened = ForegroundRunStore::new(Arc::new(Mutex::new(Connection::open(&database).unwrap())));
+            let persisted = reopened.project_session("fixture-session").unwrap()
+                .into_iter().find(|message| message.id == "reply").unwrap();
+            assert_eq!(persisted.task_run.unwrap().status, expected_status);
+            assert_eq!(persisted.content, reply.content);
+            let receipts = persisted.tool_results.unwrap();
+            let project_steps: Vec<_> = receipts.iter().filter(|receipt| receipt.tool_name != "agent_loop")
+                .map(|receipt| (receipt.tool_name.as_str(), receipt.success)).collect();
+            let mut expected_steps = vec![("read_file", true), ("write_file", true), ("run_project_command", command_succeeds)];
+            if command_succeeds {
+                expected_steps.push(("read_file", reported_total.is_some()));
+            }
+            if reported_total.is_some() {
+                expected_steps.push(("run_project_command", report_verified));
+            }
+            assert_eq!(project_steps, expected_steps);
+            assert_eq!(std::fs::read(workspace.join("input.json")).unwrap(), input_json);
+            assert_eq!(std::fs::read(workspace.join("verify-report.cjs")).unwrap(), verify_report.as_bytes());
+            if let Some(total) = reported_total {
+                let report: serde_json::Value = serde_json::from_slice(&std::fs::read(workspace.join("report.json")).unwrap()).unwrap();
+                assert_eq!(report, json!({"total":total}));
+                if report_verified {
+                    assert!(reply.content.contains("31"));
+                }
+            } else {
+                assert!(!workspace.join("report.json").exists());
+            }
+        }
+    }
 
     struct SurfaceCaptureProvider {
         browser_name: String,
@@ -520,6 +826,7 @@ mod tests {
                     history: vec![],
                     agent_input: request.content.clone(),
                     attention_context: None,
+                    append_turn_clock: false,
                     sources: ForegroundContextSources {
                         session_id: request.session_id.clone(),
                         history_before_created_at: 100,
@@ -562,8 +869,9 @@ mod tests {
                 confirmed_output: None,
                 cancellation: crate::agent::ToolCancellation::new(),
             };
+            let events = Arc::new(crate::agent::event::DevEventStore::default());
             let control = Arc::new(ForegroundLifecycleControl::new(
-                Arc::new(crate::agent::event::NullEventEmitter),
+                events.clone(),
                 state.db.clone(),
                 "reply".into(),
             ));
@@ -583,6 +891,13 @@ mod tests {
                 .into_iter()
                 .find(|reply| reply.id == "reply")
                 .unwrap();
+            let notifications = events.events_for("personal-main");
+            assert_eq!(notifications.iter().filter_map(|event| match event {
+                crate::agent::event::AgentEvent::MessageEnd { message_id, full_text, .. }
+                    if message_id == "reply" => Some(full_text.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>(), vec![stored_reply.content.as_str()],
+                "a reopened conversation needs exactly one safe end notification for the saved reply");
             let reply = if fail_after_write.is_none() {
                 result.as_ref().unwrap()
             } else {

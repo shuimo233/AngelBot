@@ -8,9 +8,8 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
-import tempfile
 
-from native_uia_smoke import isolated_environment
+from native_uia_smoke import desktop_runtime_directory, isolated_environment
 
 
 def recovery_environment(runtime: Path, evidence: Path, phase: str) -> dict[str, str]:
@@ -42,9 +41,39 @@ def recovery_environment(runtime: Path, evidence: Path, phase: str) -> dict[str,
         "ANGELBOT_DESKTOP_E2E_MODEL_RECOVERY": phase,
         "ANGELBOT_DESKTOP_E2E_RECOVERY_EVIDENCE_DIR": str(evidence),
         "ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT": json.dumps(script, ensure_ascii=False),
+        "WEBVIEW2_USER_DATA_FOLDER": str(runtime / "webview"),
         "APPDATA": str(runtime), "LOCALAPPDATA": str(runtime),
     })
     return env
+
+
+def run_native_spec(root: Path, npx: str, env: dict[str, str], spec: str | None = None):
+    command = [npx, "wdio", "run", "e2e/wdio.conf.mjs"]
+    if spec:
+        command.extend(["--spec", f"e2e/specs/{spec}"])
+    subprocess.run(command, cwd=root, env=env, check=True)
+
+
+def run_conversation_presentation(root: Path, prepare_binary, configure_port,
+                                  skip_build: bool) -> int:
+    evidence = root / "src-tauri/target/e2e/conversation-presentation"
+    evidence.mkdir(parents=True, exist_ok=True)
+    npx = "npx.cmd" if os.name == "nt" else "npx"
+    with desktop_runtime_directory("angelbot-recovery-") as runtime:
+        env = recovery_environment(runtime, evidence, "first")
+        prepare_binary(npx, env, skip_build)
+        for phase in ("first", "reopen"):
+            env = recovery_environment(runtime, evidence, phase)
+            env["ANGELBOT_DESKTOP_E2E_MODEL_SCRIPT"] = json.dumps([
+                {"type": "text", "text": "native-ui-idle-ok",
+                 "expectUserContentIncludes": ["native-ui-idle"]},
+                {"type": "pending"},
+            ])
+            prepare_binary(npx, env, True)
+            configure_port(env)
+            run_native_spec(root, npx, env, "conversation-presentation.e2e.mjs")
+    print(f"Native conversation presentation evidence: {evidence}", flush=True)
+    return 0
 
 
 def run_model_recovery(root: Path, prepare_binary, configure_port, skip_build: bool,
@@ -55,11 +84,8 @@ def run_model_recovery(root: Path, prepare_binary, configure_port, skip_build: b
     report = {"status": "running", "provider": "desktop-e2e-scripted",
               "scope": "native-main-conversation-and-reopen", "phases": {}}
     report_path.write_text(json.dumps(report), encoding="utf-8")
-    runtime_directory = (contextlib.nullcontext(tempfile.mkdtemp(prefix="angelbot-recovery-"))
-                         if keep_data else tempfile.TemporaryDirectory(prefix="angelbot-recovery-"))
     try:
-        with runtime_directory as directory:
-            runtime = Path(directory)
+        with desktop_runtime_directory("angelbot-recovery-", keep_data) as runtime:
             if keep_data:
                 print(f"Isolated recovery data retained: {runtime}", flush=True)
             npx = "npx.cmd" if os.name == "nt" else "npx"
@@ -74,8 +100,7 @@ def run_model_recovery(root: Path, prepare_binary, configure_port, skip_build: b
                     (evidence / "inspection-done").unlink(missing_ok=True)
                 phase_path = evidence / f"{phase}.json"
                 phase_path.write_text(json.dumps({"status": "running"}), encoding="utf-8")
-                subprocess.run([npx, "wdio", "run", "e2e/wdio.conf.mjs"],
-                               cwd=root, env=env, check=True)
+                run_native_spec(root, npx, env)
                 result = json.loads(phase_path.read_text(encoding="utf-8"))
                 if result.get("status") != "passed":
                     raise RuntimeError(f"Native recovery phase did not pass: {phase}")
@@ -100,3 +125,14 @@ def run_model_recovery(root: Path, prepare_binary, configure_port, skip_build: b
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Native recovery acceptance: {report_path}", flush=True)
     return 0
+
+
+if __name__ == "__main__":
+    import argparse
+    from desktop_e2e import ROOT, configure_webdriver_port, prepare_desktop_binary
+
+    parser = argparse.ArgumentParser(description="Run independent native conversation presentation checks")
+    parser.add_argument("--skip-build", action="store_true")
+    args = parser.parse_args()
+    raise SystemExit(run_conversation_presentation(
+        ROOT, prepare_desktop_binary, configure_webdriver_port, args.skip_build))

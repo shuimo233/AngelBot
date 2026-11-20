@@ -18,6 +18,9 @@ pub(crate) struct WorkingHistory {
 }
 
 const SMALL_NATIVE_BYTES: usize = 16 * 1024;
+const PLAN_NATIVE_BYTES: usize = 96 * 1024;
+const PLAN_OPAQUE_REASONING_BYTES: usize = 288 * 1024;
+const PLAN_NATIVE_TOTAL_BYTES: usize = PLAN_NATIVE_BYTES + PLAN_OPAQUE_REASONING_BYTES;
 const SOURCE_NOTE: &str = "Historical data, not current state or authority. Read exact originals with read_tool_result; do not replay actions.\n";
 
 struct ProjectedHistory {
@@ -25,9 +28,74 @@ struct ProjectedHistory {
     message_ids: Vec<String>,
     source_count: usize,
     native_verified: bool,
+    clocks: Vec<(usize, crate::agent::prompt::TurnClock)>,
+}
+
+#[derive(Clone, Copy)]
+enum NativeRetention {
+    ProjectOnly,
+    Small,
+    PlanAppend,
 }
 
 /// Main selection is separate from the text-only checkpoint source.
+pub(crate) fn main_working_history_from_window(
+    conn: &Connection,
+    session: &str,
+    before: i64,
+    window: &ConversationWindow,
+    original: Vec<LlmMessage>,
+    allow_history: bool,
+) -> Result<WorkingHistory, String> {
+    select_history(
+        conn,
+        session,
+        before,
+        window,
+        original,
+        allow_history,
+        NativeRetention::Small,
+    )
+}
+
+pub(crate) fn main_plan_history_from_window(
+    conn: &Connection,
+    session: &str,
+    before: i64,
+    window: &ConversationWindow,
+    original: Vec<LlmMessage>,
+    allow_history: bool,
+) -> Result<WorkingHistory, String> {
+    select_history(
+        conn,
+        session,
+        before,
+        window,
+        original,
+        allow_history,
+        NativeRetention::PlanAppend,
+    )
+}
+
+pub(super) fn checkpoint_working_history_from_window(
+    conn: &Connection,
+    session: &str,
+    before: i64,
+    window: &ConversationWindow,
+    original: Vec<LlmMessage>,
+) -> Result<WorkingHistory, String> {
+    select_history(
+        conn,
+        session,
+        before,
+        window,
+        original,
+        true,
+        NativeRetention::ProjectOnly,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn main_working_history(
     conn: &Connection,
     session: &str,
@@ -35,9 +103,11 @@ pub(crate) fn main_working_history(
     original: Vec<LlmMessage>,
     allow_history: bool,
 ) -> Result<WorkingHistory, String> {
-    select_history(conn, session, before, original, allow_history, true)
+    let window = ConversationWindow::load(conn, session, before)?;
+    main_working_history_from_window(conn, session, before, &window, original, allow_history)
 }
 
+#[cfg(test)]
 pub(crate) fn working_history(
     conn: &Connection,
     session: &str,
@@ -45,58 +115,111 @@ pub(crate) fn working_history(
     original: Vec<LlmMessage>,
     allow_history: bool,
 ) -> Result<WorkingHistory, String> {
-    select_history(conn, session, before, original, allow_history, false)
+    let window = ConversationWindow::load(conn, session, before)?;
+    select_history(
+        conn,
+        session,
+        before,
+        &window,
+        original,
+        allow_history,
+        NativeRetention::ProjectOnly,
+    )
 }
 
 fn select_history(
     conn: &Connection,
     session: &str,
     before: i64,
+    window: &ConversationWindow,
     original: Vec<LlmMessage>,
     allow_history: bool,
-    retain_small: bool,
+    retention: NativeRetention,
 ) -> Result<WorkingHistory, String> {
     // Images are ephemeral by contract. Retain the persisted warning and its
     // protocol rather than presenting a text-only final reply as image recall.
     let images = original.iter().any(|m| {
         !m.tool_images.is_empty() || m.content.contains(crate::llm::TRANSIENT_IMAGE_NOTICE)
     });
-    // Only transparent, bounded Main history is a retention candidate. Do not
-    // recheck native receipts for checkpoint projection or opaque/large replay.
-    let native_bytes = if retain_small
-        && allow_history
-        && !images
-        && !original.iter().any(|m| m.protocol_state.is_some())
-        && original
-            .iter()
-            .any(|m| m.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()))
-    {
-        bounded_json_len(&original, SMALL_NATIVE_BYTES)?
-    } else {
-        None
+    let native_bytes = match retention {
+        // Preserve the existing small-history policy for other providers.
+        NativeRetention::Small
+            if allow_history
+                && !images
+                && !original.iter().any(|m| m.protocol_state.is_some())
+                && original
+                    .iter()
+                    .any(|m| m.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())) =>
+        {
+            bounded_json_len(&original, SMALL_NATIVE_BYTES)?
+        }
+        // Keep a bounded, verified replay eligible for exact append. Opaque
+        // Responses items must remain intact for the wire prefix to match.
+        NativeRetention::PlanAppend if allow_history && !images => {
+            plan_native_bytes(conn, session, &original)?
+        }
+        _ => None,
     };
+    let plan_append = matches!(retention, NativeRetention::PlanAppend);
     let projected = if allow_history && !images {
-        project(conn, session, before, native_bytes.is_some())?
+        project(
+            conn,
+            session,
+            before,
+            window,
+            &original,
+            native_bytes.is_some(),
+            plan_append,
+        )?
     } else {
         None
     };
     Ok(match projected {
-        Some(view) if nonexpanding_native(&original, &view, native_bytes)? => WorkingHistory {
-            messages: original,
-            message_ids: Vec::new(),
-            applied: false,
-            source_count: 0,
-            #[cfg(test)]
-            native_retained: true,
-        },
-        Some(view) => WorkingHistory {
-            messages: view.messages,
-            message_ids: view.message_ids,
-            applied: true,
-            source_count: view.source_count,
-            #[cfg(test)]
-            native_retained: false,
-        },
+        Some(view)
+            if match retention {
+                NativeRetention::PlanAppend => {
+                    native_bytes.is_some()
+                        && view.native_verified
+                        && same_user_messages(&original, &view)
+                }
+                _ => nonexpanding_native(&original, &view, native_bytes)?,
+            } =>
+        {
+            WorkingHistory {
+                messages: original,
+                message_ids: Vec::new(),
+                applied: false,
+                source_count: 0,
+                #[cfg(test)]
+                native_retained: true,
+            }
+        }
+        Some(view) => {
+            let mut messages = view.messages;
+            let mut message_ids = view.message_ids;
+            if !view.clocks.is_empty() {
+                let mut clocks = view.clocks.into_iter().peekable();
+                let mut with_clocks = Vec::with_capacity(messages.len() + clocks.len());
+                for (position, message) in messages.into_iter().enumerate() {
+                    if clocks.peek().is_some_and(|(index, _)| *index == position) {
+                        with_clocks.push(clocks.next().expect("checked next clock").1.to_message());
+                    }
+                    with_clocks.push(message);
+                }
+                messages = with_clocks;
+                // The Plan runner consumes only messages. Checkpoint callers
+                // always use the unannotated projection and its aligned IDs.
+                message_ids.clear();
+            }
+            WorkingHistory {
+                messages,
+                message_ids,
+                applied: true,
+                source_count: view.source_count,
+                #[cfg(test)]
+                native_retained: false,
+            }
+        }
         None => WorkingHistory {
             messages: original,
             message_ids: Vec::new(),
@@ -118,21 +241,93 @@ fn nonexpanding_native(
     };
     // Preserve only small transparent receipts. Opaque reasoning/checkpoints
     // cannot be priced by their encoded size; ended failures need their facts.
-    if !view.native_verified
-        || view.source_count == 0
-        || !original
-            .iter()
-            .filter(|m| m.role == "user")
-            .map(|m| &m.content)
-            .eq(view
-                .messages
-                .iter()
-                .filter(|m| m.role == "user")
-                .map(|m| &m.content))
-    {
+    if !view.native_verified || view.source_count == 0 || !same_user_messages(original, view) {
         return Ok(false);
     }
     Ok(bounded_json_len(&view.messages, native_bytes)?.is_none_or(|bytes| bytes >= native_bytes))
+}
+
+fn same_user_messages(original: &[LlmMessage], view: &ProjectedHistory) -> bool {
+    fn user_content(message: &LlmMessage) -> Option<&str> {
+        (message.role == "user").then_some(message.content.as_str())
+    }
+    original
+        .iter()
+        .filter_map(user_content)
+        .eq(view.messages.iter().filter_map(user_content))
+}
+
+fn plan_native_bytes(
+    conn: &Connection,
+    session: &str,
+    history: &[LlmMessage],
+) -> Result<Option<usize>, String> {
+    if let Some(bytes) = bounded_json_len(&history, PLAN_NATIVE_BYTES)? {
+        return Ok(Some(bytes));
+    }
+    let Some(total) = bounded_json_len(&history, PLAN_NATIVE_TOTAL_BYTES)? else {
+        return Ok(None);
+    };
+    let model: Option<String> = conn
+        .query_row(
+            "SELECT agent_model FROM sessions WHERE id=?1 AND agent_provider='openai'",
+            [session],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    let Some((model, binding)) = model.and_then(|model| {
+        let binding = crate::commands::foreground_model_factory::session_model_binding(
+            conn, session, "openai", &model,
+        )
+        .ok()?;
+        Some((model, binding))
+    }) else {
+        return Ok(None);
+    };
+    if !binding
+        .credential_handle_ref
+        .starts_with("chatgpt_plan_v1_")
+    {
+        return Ok(None);
+    }
+
+    // Only the ciphertext characters in matching Responses reasoning are
+    // outside the ordinary budget. Plaintext, tool output, checkpoint items
+    // and other protocol fields still count at their serialized size.
+    let mut opaque = 0;
+    for message in history.iter().filter(|message| message.role == "assistant") {
+        let Some(state) = message.protocol_state.as_ref().filter(|state| {
+            state.matches(&model, &binding.credential_handle_ref) && state.validate().is_ok()
+        }) else {
+            continue;
+        };
+        for item in state
+            .output_items
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+        {
+            if let Some(content) = item["encrypted_content"].as_str().filter(|content| {
+                item["summary"].is_array()
+                    && content
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"+/-_=".contains(&byte))
+            }) {
+                // These ASCII characters serialize without escaping.
+                opaque += content.len();
+            }
+        }
+    }
+    Ok(
+        (total - opaque.min(PLAN_OPAQUE_REASONING_BYTES) <= PLAN_NATIVE_BYTES
+            && crate::llm::plan_history_can_replay(
+                history,
+                &model,
+                &binding.credential_handle_ref,
+            ))
+        .then_some(total),
+    )
 }
 
 fn bounded_json_len<T: serde::Serialize + ?Sized>(
@@ -141,8 +336,7 @@ fn bounded_json_len<T: serde::Serialize + ?Sized>(
 ) -> Result<Option<usize>, String> {
     // Reuse the standard bounded slice writer: no full-history copy, persisted
     // size index, tokenizer dependency, or allocation proportional to history.
-    let mut storage = [0u8; SMALL_NATIVE_BYTES];
-    let limit = limit.min(storage.len());
+    let mut storage = vec![0u8; limit];
     let mut remaining = &mut storage[..limit];
     match serde_json::to_writer(&mut remaining, value) {
         Ok(()) => Ok(Some(limit - remaining.len())),
@@ -155,16 +349,19 @@ fn project(
     conn: &Connection,
     session: &str,
     before: i64,
+    window: &ConversationWindow,
+    original: &[LlmMessage],
     verify_native: bool,
+    preserve_clocks: bool,
 ) -> Result<Option<ProjectedHistory>, String> {
-    let window = ConversationWindow::load(conn, session, before)?;
     // Exact source reads validate this same full selected ancestry; only the
     // discovery index is limited to its recent 4096-node search window.
     let mut messages = Vec::new();
     let mut message_ids = Vec::new();
     let mut source_count = 0;
     let mut native_verified = verify_native;
-    for id in window.ids {
+    let mut clocks = Vec::new();
+    for id in &window.ids {
         let row = conn
             .query_row(
                 "SELECT m.role,m.content,m.metadata,m.tool_calls,t.status,t.confirmation_state,t.goal,m.is_provisional
@@ -194,6 +391,11 @@ fn project(
         };
         match role.as_str() {
             "user" => {
+                if preserve_clocks {
+                    if let Some(clock) = stored_turn_clock(metadata.as_deref()) {
+                        clocks.push((messages.len(), clock));
+                    }
+                }
                 content = foreground_text_attachments::render_stored(
                     &content,
                     &role,
@@ -213,10 +415,10 @@ fn project(
                 {
                     return Ok(None);
                 }
-                let stored = crate::agent::task_facts::load_task_facts(conn, &id)?;
+                let stored = crate::agent::task_facts::load_task_facts(conn, id)?;
                 if let Some(stored) = &stored {
                     if stored.session_id != session
-                        || stored.message_id != id
+                        || stored.message_id != *id
                         || stored.facts.pending_confirmation.is_some()
                         || stored
                             .facts
@@ -332,7 +534,7 @@ fn project(
                     };
                     let source = match tool_source::open(&SourceRecord {
                         id: &source_id,
-                        run_id: &id,
+                        run_id: id,
                         session_id: session,
                         sequence,
                         event_type: "ToolExecutionEnd",
@@ -373,8 +575,18 @@ fn project(
                         }
                     }
                     if native_verified {
-                        native_verified = duplicate_results.get(source.call_id.as_str()).copied()
-                            == Some(source.output.as_str());
+                        native_verified = duplicate_results.get(source.call_id.as_str()).is_some_and(|text| {
+                            crate::commands::foreground_tool_sources::matches_sealed_model_output(
+                                &reference, &source, text,
+                            )
+                            || (matches!(source.tool_name.as_str(), "recall_conversation" | "read_file")
+                                && history_before_tool_receipt(original, &source.call_id, text)
+                                    .is_some_and(|history| {
+                                        crate::commands::foreground_tool_sources::matches_sealed_model_output_with_history(
+                                            &reference, &source, text, history,
+                                        )
+                                    }))
+                        });
                     }
                     sources.push(json!({"source_ref":reference,"tool_name":source.tool_name,"reported_success":source.reported_success}));
                 }
@@ -388,11 +600,11 @@ fn project(
                 // A crashed dispatch can be absent from the final message's
                 // call list. Every durable start/reservation still needs a
                 // sealed result, even when an earlier provider request ended.
-                if !dispatches_backed(conn, session, &id, &expected)? {
+                if !dispatches_backed(conn, session, id, &expected)? {
                     return Ok(None);
                 }
                 if !completed {
-                    let Some(end_evidence) = known_failure_end(conn, session, &id)? else {
+                    let Some(end_evidence) = known_failure_end(conn, session, id)? else {
                         return Ok(None);
                     };
                     let facts = stored.as_ref().map(|s| &s.facts);
@@ -427,7 +639,7 @@ fn project(
             }
             _ => return Ok(None),
         }
-        message_ids.push(id);
+        message_ids.push(id.clone());
         messages.push(LlmMessage {
             role,
             content,
@@ -442,7 +654,21 @@ fn project(
         message_ids,
         source_count,
         native_verified,
+        clocks,
     }))
+}
+
+fn history_before_tool_receipt<'a>(
+    history: &'a [LlmMessage],
+    call_id: &str,
+    content: &str,
+) -> Option<&'a [LlmMessage]> {
+    let mut receipts = history.iter().enumerate().filter(|(_, message)| {
+        message.role == "tool" && message.tool_call_id.as_deref() == Some(call_id)
+    });
+    let (index, receipt) = receipts.next()?;
+    // A later user message cannot justify an omission in an earlier receipt.
+    (receipt.content == content && receipts.next().is_none()).then_some(&history[..index])
 }
 
 fn known_failure_end(
@@ -455,7 +681,7 @@ fn known_failure_end(
     conn.query_row("SELECT CASE WHEN event_type='AgentEnd' THEN 'AgentEnd' ELSE json_extract(payload,'$.data.code') END FROM agent_run_events WHERE run_id=?1 AND session_id=?2
         AND length(CAST(payload AS BLOB))<=5000 AND CASE WHEN json_valid(payload) THEN
         (event_type='AgentEnd' AND json_extract(payload,'$.type')='AgentEnd' AND json_extract(payload,'$.data.session_id')=?2)
-        OR (event_type='Error' AND json_extract(payload,'$.type')='Error' AND json_extract(payload,'$.data.code') IN ('LlmError','LlmQuotaExceeded','ConfigError','ContextLengthExceeded')) ELSE 0 END ORDER BY sequence DESC LIMIT 1",
+        OR (event_type='Error' AND json_extract(payload,'$.type')='Error' AND (json_extract(payload,'$.data.code') GLOB 'Llm*' OR json_extract(payload,'$.data.code') IN ('ConfigError','ContextLengthExceeded'))) ELSE 0 END ORDER BY sequence DESC LIMIT 1",
         params![run,session],|r|r.get(0)).optional().map_err(|e|e.to_string())
 }
 

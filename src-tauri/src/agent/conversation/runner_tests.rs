@@ -273,7 +273,98 @@ mod tests {
             .unwrap();
         assert!(written.success);
         assert!(written.verification.as_ref().unwrap().matched);
-        assert!(collect_unverified_artifacts(&steps).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn main_model_waits_past_45_seconds_without_replaying_a_saved_tool() {
+        struct DelayedAfterWrite {
+            calls: Arc<AtomicUsize>,
+            completes: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for DelayedAfterWrite {
+            fn name(&self) -> &str {
+                "owned-model-delay"
+            }
+
+            async fn chat(
+                &self,
+                messages: &[Message],
+                _tools: Option<&[ToolSchema]>,
+                _thinking: Option<&crate::llm::ThinkingSettings>,
+            ) -> Result<LlmResponse, String> {
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+                        Ok(LlmResponse::ToolCalls {
+                            calls: vec![crate::llm::ToolCall {
+                                id: "write-once".into(),
+                                name: "write_file".into(),
+                                arguments: serde_json::json!({"path":"receipt.txt","content":"one known effect"}),
+                            }],
+                            text: None,
+                            stop_reason: crate::llm::StopReason::ToolUse,
+                        })
+                    }
+                    1 if self.completes => {
+                        assert!(messages.iter().any(|message| message.role == "tool"));
+                        tokio::time::sleep(std::time::Duration::from_secs(50)).await;
+                        Ok(LlmResponse::Text {
+                            text: "回执已写入。".into(),
+                            stop_reason: crate::llm::StopReason::EndTurn,
+                        })
+                    }
+                    1 => std::future::pending().await,
+                    _ => panic!("inference must not be replayed"),
+                }
+            }
+        }
+
+        for completes in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let runner = AgentRunner::new(
+                Box::new(DelayedAfterWrite {
+                    calls: calls.clone(),
+                    completes,
+                }),
+                AgentConfig {
+                    work_dir: Some(directory.path().into()),
+                    ..default_config()
+                },
+            )
+            .with_execution_permission("full_access".into());
+            let started = tokio::time::Instant::now();
+            let response = runner.run("请写入一份回执", &[]).await;
+            let AgentResponse::TextWithToolCalls { text, steps } = response else {
+                panic!("completed tool receipt must survive: {response:?}");
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|step| step.tool_name == "write_file" && step.success)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("receipt.txt")).unwrap(),
+                "one known effect"
+            );
+            if completes {
+                assert!(
+                    text.contains("回执已写入。"),
+                    "late normal reply was lost: {text}"
+                );
+            } else {
+                assert!(text.contains("不会自动重发请求或重做操作"), "{text}");
+                assert!(text.contains("本轮时间预算已用尽"), "{text}");
+                let elapsed = started.elapsed();
+                assert!(elapsed >= DEFAULT_WALL_CLOCK_BUDGET);
+                assert!(elapsed <= DEFAULT_WALL_CLOCK_BUDGET + std::time::Duration::from_secs(1));
+            }
+        }
     }
 
     #[tokio::test]
@@ -325,6 +416,9 @@ mod tests {
         for failure_kind in [
             crate::llm::LlmFailureKind::Unclassified,
             crate::llm::LlmFailureKind::QuotaExceeded,
+            crate::llm::LlmFailureKind::TransportUnavailable,
+            crate::llm::LlmFailureKind::Authentication,
+            crate::llm::LlmFailureKind::ResponseInterrupted,
         ] {
             for write_first in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
@@ -348,12 +442,20 @@ mod tests {
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
                     if write_first { 2 } else { 1 },
-                    "quota errors must not retry inference or completed effects"
+                    "model errors must not retry inference or completed effects"
                 );
                 let visible_events =
                     serde_json::to_string(&events.events_for("model-fault")).unwrap();
+                let expected_code = match failure_kind {
+                    crate::llm::LlmFailureKind::Unclassified => "LlmError",
+                    crate::llm::LlmFailureKind::QuotaExceeded => "LlmQuotaExceeded",
+                    crate::llm::LlmFailureKind::TransportUnavailable => "LlmTransportError",
+                    crate::llm::LlmFailureKind::Authentication => "LlmAuthentication",
+                    crate::llm::LlmFailureKind::ResponseInterrupted => "LlmResponseInterrupted",
+                    other => panic!("Unexpected test failure kind: {other:?}"),
+                };
+                assert!(visible_events.contains(expected_code));
                 if let Some(notice) = failure_kind.visible_notice() {
-                    assert!(visible_events.contains("LlmQuotaExceeded"));
                     assert!(visible_events.contains(notice));
                 }
                 for secret in ["private-model-fault", "private.example", "input=secret"] {
@@ -377,11 +479,8 @@ mod tests {
                             .count(),
                         1
                     );
-                    assert!(
-                        text.contains("新消息"),
-                        "recovery advice must match the supported normal conversation path"
-                    );
-                    assert!(!text.contains("请继续任务"));
+                    assert!(text.contains("可继续任务"));
+                    assert!(!text.contains("发送新消息"));
                     if let Some(notice) = failure_kind.visible_notice() {
                         assert!(text.contains(notice));
                     }
@@ -990,7 +1089,7 @@ mod tests {
             AgentStep {
                 call_id: "verify-1".to_string(),
                 tool_name: "run_project_command".to_string(),
-                arguments: serde_json::json!({"command":"cargo test --lib"}),
+                arguments: serde_json::json!({"command":"cargo","args":["test","--lib"]}),
                 success: true,
                 output: "passed".to_string(),
                 confirmation_required: false,
@@ -1050,7 +1149,7 @@ mod tests {
             let facts = task_facts_from_steps("读取这份日常清单", &steps);
             assert_eq!(facts.failed_steps, expected_failures, "{outcomes:?}");
             assert_eq!(
-                crate::agent::task_facts::derive_task_phase(&facts, false),
+                crate::agent::task_facts::derive_task_phase(&facts),
                 if expected_failures.is_empty() {
                     crate::agent::task_facts::DerivedTaskPhase::Completed
                 } else {
@@ -1395,7 +1494,7 @@ mod tests {
         );
         let msgs = provider.messages_per_call.lock().unwrap();
         let first_msg_count = *msgs.get(0).unwrap_or(&0);
-        // build_initial_messages produces: [system_prompt, user_message] = 2 messages.
+        // The initial context contains the system prompt and the user message.
         // No soft-finish hint should be injected at iteration 0.
         assert_eq!(
             first_msg_count, 2,
@@ -2066,88 +2165,5 @@ mod tests {
             }
             other => panic!("Unexpected AgentResponse: {:?}", other),
         }
-    }
-
-    // Issue #102: collect_unverified_artifacts picks up steps whose
-    // post-call verifier said the disk disagrees, ignores everything else.
-    // It is the soft-warning source for the completion gate.
-    #[test]
-    fn collect_unverified_artifacts_lists_only_mismatches() {
-        use crate::agent::verifier::{VerificationEvidence, VerificationSource};
-        let matched = AgentStep {
-            call_id: "w".into(),
-            tool_name: "write_file".into(),
-            arguments: serde_json::json!({"path": "a.txt"}),
-            success: true,
-            output: "ok".into(),
-            confirmation_required: false,
-            confirmation_status: None,
-            verification: Some(VerificationEvidence {
-                kind: "file_exists",
-                target: "a.txt".into(),
-                declared_existence: true,
-                actual_existence: true,
-                source: VerificationSource::WorkDir,
-                matched: true,
-                note: String::new(),
-            }),
-            ..Default::default()
-        };
-        let mismatched = AgentStep {
-            call_id: "w2".into(),
-            tool_name: "write_file".into(),
-            arguments: serde_json::json!({"path": "ghost.txt"}),
-            success: true,
-            output: "ok".into(),
-            confirmation_required: false,
-            confirmation_status: None,
-            verification: Some(VerificationEvidence {
-                kind: "file_exists",
-                target: "ghost.txt".into(),
-                declared_existence: true,
-                actual_existence: false,
-                source: VerificationSource::WorkDir,
-                matched: false,
-                note: "工具声称成功，但磁盘上未找到产物".into(),
-            }),
-            ..Default::default()
-        };
-        let no_verifier = AgentStep {
-            call_id: "w3".into(),
-            tool_name: "think".into(),
-            arguments: serde_json::json!({}),
-            success: true,
-            output: "ok".into(),
-            confirmation_required: false,
-            confirmation_status: None,
-            verification: None,
-            ..Default::default()
-        };
-        let list = collect_unverified_artifacts(&[matched, mismatched, no_verifier]);
-        assert_eq!(
-            list.len(),
-            1,
-            "exactly one mismatch should be listed: {:?}",
-            list
-        );
-        assert!(list[0].contains("ghost.txt"));
-        assert!(list[0].contains("write_file"));
-    }
-
-    #[test]
-    fn collect_unverified_artifacts_empty_when_all_match() {
-        let step = AgentStep {
-            call_id: "w".into(),
-            tool_name: "write_file".into(),
-            arguments: serde_json::json!({"path": "a.txt"}),
-            success: true,
-            output: "ok".into(),
-            confirmation_required: false,
-            confirmation_status: None,
-            verification: None,
-            ..Default::default()
-        };
-        let list = collect_unverified_artifacts(&[step]);
-        assert!(list.is_empty());
     }
 }

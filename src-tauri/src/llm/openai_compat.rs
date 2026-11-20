@@ -4,8 +4,8 @@
 //! All share the same /chat/completions endpoint format.
 
 use super::{
-    LlmProvider, LlmResponse, Message, ProviderUsage, StopReason, ThinkingEffort, ThinkingProtocol,
-    ThinkingSettings, ToolCall, ToolSchema,
+    transport, LlmFailure, LlmFailureKind, LlmProvider, LlmResponse, Message, ProviderUsage,
+    StopReason, ThinkingEffort, ThinkingProtocol, ThinkingSettings, ToolCall, ToolSchema,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,6 +86,65 @@ impl OpenAiCompatibleProvider {
         request
     }
 
+    fn request_body(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        stream: bool,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({
+            "model": &*self.model.lock().unwrap(),
+            "messages": self.build_messages(messages),
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        });
+
+        if stream {
+            body["stream"] = Value::Bool(true);
+        }
+        if let Some(t) = thinking {
+            if t.protocol == ThinkingProtocol::DeepSeek && self.label == "deepseek" {
+                body["thinking"] = match t.effort {
+                    ThinkingEffort::Low => serde_json::json!({ "type": "disabled" }),
+                    ThinkingEffort::Medium | ThinkingEffort::High => {
+                        serde_json::json!({ "type": "enabled" })
+                    }
+                };
+                if t.effort != ThinkingEffort::Low {
+                    body["reasoning_effort"] = serde_json::json!(match t.effort {
+                        ThinkingEffort::Medium => "high",
+                        ThinkingEffort::High => "max",
+                        ThinkingEffort::Low => unreachable!(),
+                    });
+                    body.as_object_mut()
+                        .expect("completion body is an object")
+                        .remove("temperature");
+                }
+            }
+        }
+
+        if let Some(tools) = tools {
+            body["tools"] = serde_json::json!(tools
+                .iter()
+                .map(ToolSchema::to_openai_format)
+                .collect::<Vec<_>>());
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+        self.validate_request(&body)?;
+        Ok(body)
+    }
+
+    fn http_client(&self) -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("[{}] Client build failed: {}", self.label, e))
+    }
+
     /// Create from a ProviderConfig
     pub fn from_config(
         api_key: &str,
@@ -121,130 +180,21 @@ impl LlmProvider for OpenAiCompatibleProvider {
         tools: Option<&[ToolSchema]>,
         thinking: Option<&ThinkingSettings>,
     ) -> Result<LlmResponse, String> {
+        self.chat_classified(messages, tools, thinking)
+            .await
+            .map_err(|failure| failure.diagnostic)
+    }
+
+    async fn chat_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+    ) -> Result<LlmResponse, LlmFailure> {
         *self.last_usage.lock().unwrap() = None;
-        let mut body = serde_json::json!({
-            "model": &*self.model.lock().unwrap(),
-            "messages": self.build_messages(messages),
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-        });
-
-        // OpenAI-compatible APIs do not share a reasoning extension. Only
-        // DeepSeek gets its documented `thinking` request fields.
-        if let Some(t) = thinking {
-            if t.protocol == ThinkingProtocol::DeepSeek && self.label == "deepseek" {
-                match t.effort {
-                    ThinkingEffort::Low => {
-                        body["thinking"] = serde_json::json!({ "type": "disabled" });
-                    }
-                    ThinkingEffort::Medium => {
-                        body["thinking"] = serde_json::json!({ "type": "enabled" });
-                        body["reasoning_effort"] = serde_json::json!("high");
-                    }
-                    ThinkingEffort::High => {
-                        body["thinking"] = serde_json::json!({ "type": "enabled" });
-                        body["reasoning_effort"] = serde_json::json!("max");
-                    }
-                }
-                // DeepSeek documents that temperature is ignored in thinking
-                // mode; omit it so the request matches the native API.
-                if t.effort != ThinkingEffort::Low {
-                    body.as_object_mut()
-                        .expect("completion body is an object")
-                        .remove("temperature");
-                }
-            }
-        }
-
-        // Attach tools if provided
-        if let Some(tools) = tools {
-            let tool_schemas: Vec<_> = tools.iter().map(|t| t.to_openai_format()).collect();
-            body["tools"] = serde_json::json!(tool_schemas);
-            body["tool_choice"] = serde_json::json!("auto");
-
-            eprintln!(
-                "[{}] Sending {} tools: {:?}",
-                self.label,
-                tools.len(),
-                tool_schemas
-                    .iter()
-                    .map(|v| v
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("?"))
-                    .collect::<Vec<_>>()
-            );
-        }
-
+        let body = self.request_body(messages, tools, thinking, false)?;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
-        // Validate entire request before sending
-        self.validate_request(&body)?;
-
-        // Serialize to JSON string and re-parse to catch any serialization edge cases.
-        // This is the final validation before sending to the API.
-        let body_str = serde_json::to_string(&body)
-            .map_err(|e| format!("[{}] Failed to serialize request body: {}", self.label, e))?;
-
-        // Parse it back and validate the messages array specifically
-        let re_parsed: Value = serde_json::from_str(&body_str).map_err(|e| {
-            format!(
-                "[{}] JSON serialization round-trip failed: {}",
-                self.label, e
-            )
-        })?;
-
-        // Final check: verify every message's content is a string or null
-        if let Some(msgs) = re_parsed.get("messages").and_then(|m| m.as_array()) {
-            eprintln!(
-                "[{}] Validating {} messages after round-trip",
-                self.label,
-                msgs.len()
-            );
-            for (i, msg) in msgs.iter().enumerate() {
-                let content = msg.get("content");
-                if let Some(c) = content {
-                    if !c.is_string() && !c.is_null() {
-                        // Log enough info to debug without panicking on Chinese chars
-                        let content_type = if c.is_array() {
-                            "array"
-                        } else if c.is_object() {
-                            "object/map"
-                        } else if c.is_number() {
-                            "number"
-                        } else {
-                            "unknown"
-                        };
-                        eprintln!(
-                            "[{}] CRITICAL: messages[{}].content is {} (not string/null)",
-                            self.label, i, content_type
-                        );
-                        return Err(format!(
-                            "[{}] messages[{}].content is {} after serialization",
-                            self.label, i, content_type
-                        ));
-                    }
-                    let char_count = match c {
-                        serde_json::Value::String(s) => s.chars().count(),
-                        serde_json::Value::Null => 0,
-                        _ => 0,
-                    };
-                    eprintln!("[{}] messages[{}] OK: {} chars", self.label, i, char_count);
-                } else {
-                    eprintln!("[{}] messages[{}] has no content field", self.label, i);
-                }
-            }
-        }
-
-        // DEBUG: log the full request body
-        let body_pretty = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body_str.clone());
-        eprintln!("[{}] REQUEST BODY:\n{}", self.label, body_pretty);
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("[{}] Client build failed: {}", self.label, e))?;
+        let client = self.http_client()?;
 
         let req_builder = client
             .post(&url)
@@ -253,28 +203,22 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         let req_builder = self.apply_request_headers(req_builder);
 
-        let resp = req_builder
-            .send()
+        let resp = transport::send_model_request(req_builder)
             .await
-            .map_err(|e| format!("[{}] HTTP request failed: {}", self.label, e))?;
-
+            .map_err(|error| transport::request_failure(error, "Chat Completions"))?;
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("[{}] API error {}: {}", self.label, status, text));
+            return Err(transport::api_response_failure(resp, "Chat Completions").await);
         }
-
-        let resp_json: Value = resp
-            .json()
+        let bytes = resp
+            .bytes()
             .await
-            .map_err(|e| format!("[{}] JSON parse error: {}", self.label, e))?;
-
-        // DEBUG: log the response
-        let resp_str =
-            serde_json::to_string_pretty(&resp_json).unwrap_or_else(|_| resp_json.to_string());
-        eprintln!("[{}] RESPONSE:\n{}", self.label, resp_str);
-
-        self.parse_response(resp_json)
+            .map_err(|error| transport::response_read_failure(error, "Chat Completions"))?;
+        let resp_json: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Chat Completions response JSON is invalid")?;
+        if let Some(failure) = transport::json_response_failure(&resp_json, "Chat Completions") {
+            return Err(failure);
+        }
+        self.parse_response(resp_json).map_err(Into::into)
     }
 
     async fn chat_stream(
@@ -284,63 +228,55 @@ impl LlmProvider for OpenAiCompatibleProvider {
         thinking: Option<&ThinkingSettings>,
         delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<LlmResponse, String> {
+        self.chat_stream_classified(messages, tools, thinking, delta_sender)
+            .await
+            .map_err(|failure| failure.diagnostic)
+    }
+
+    async fn chat_stream_classified(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        thinking: Option<&ThinkingSettings>,
+        delta_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<LlmResponse, LlmFailure> {
         *self.last_usage.lock().unwrap() = None;
-        let mut body = serde_json::json!({
-            "model": &*self.model.lock().unwrap(),
-            "messages": self.build_messages(messages),
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "stream": true,
-        });
-
-        if let Some(t) = thinking {
-            if t.protocol == ThinkingProtocol::DeepSeek && self.label == "deepseek" {
-                body["thinking"] = match t.effort {
-                    ThinkingEffort::Low => serde_json::json!({ "type": "disabled" }),
-                    ThinkingEffort::Medium | ThinkingEffort::High => {
-                        serde_json::json!({ "type": "enabled" })
-                    }
-                };
-                if t.effort != ThinkingEffort::Low {
-                    body["reasoning_effort"] = serde_json::json!(match t.effort {
-                        ThinkingEffort::Medium => "high",
-                        ThinkingEffort::High => "max",
-                        ThinkingEffort::Low => unreachable!(),
-                    });
-                    body.as_object_mut()
-                        .expect("completion body is an object")
-                        .remove("temperature");
-                }
-            }
-        }
-
-        if let Some(tools) = tools {
-            body["tools"] = serde_json::json!(tools
-                .iter()
-                .map(ToolSchema::to_openai_format)
-                .collect::<Vec<_>>());
-            body["tool_choice"] = serde_json::json!("auto");
-        }
-        self.validate_request(&body)?;
+        let body = self.request_body(messages, tools, thinking, true)?;
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("[{}] Client build failed: {}", self.label, e))?;
+        let client = self.http_client()?;
         let request = client
             .post(&url)
             .header("Content-Type", "application/json; charset=utf-8")
             .json(&body);
         let request = self.apply_request_headers(request);
-        let mut response = request
-            .send()
+        let mut response = transport::send_model_request(request)
             .await
-            .map_err(|e| format!("[{}] HTTP streaming request failed: {}", self.label, e))?;
+            .map_err(|error| transport::request_failure(error, "Chat Completions"))?;
         if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(format!("[{}] API error {}: {}", self.label, status, text));
+            return Err(transport::api_response_failure(response, "Chat Completions").await);
+        }
+        let returned_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"));
+        if returned_json {
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                transport::read_error_body(&mut response),
+            )
+            .await
+            .map_err(|_| LlmFailure {
+                kind: LlmFailureKind::TimedOut,
+                diagnostic: "Chat Completions JSON response timed out".into(),
+            })??;
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            return Err(transport::json_response_failure(&value, "Chat Completions")
+                .unwrap_or_else(|| {
+                    "Chat Completions returned JSON instead of an event stream".into()
+                }));
         }
 
         // Decode complete SSE lines, not individual HTTP chunks: a chunk may
@@ -352,11 +288,12 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // Output arriving after a finish reason must receive its own terminal
         // choice; an earlier marker cannot authorize a later partial call.
         let mut last_finish_reason: Option<String> = None;
+        let mut reported_usage = None;
 
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|e| format!("[{}] SSE read failed: {}", self.label, e))?
+            .map_err(|error| transport::response_read_failure(error, "Chat Completions"))?
         {
             buffer.extend_from_slice(&chunk);
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
@@ -378,11 +315,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 }
                 let event: Value = serde_json::from_str(payload)
                     .map_err(|_| format!("[{}] SSE 事件无效；未提交工具调用。", self.label))?;
-                if event.get("error").is_some_and(|error| !error.is_null()) {
-                    return Err(format!(
-                        "[{}] SSE 返回模型错误；未提交工具调用。",
-                        self.label
-                    ));
+                if let Some(failure) =
+                    transport::json_response_failure(&event, "Chat Completions SSE")
+                {
+                    return Err(failure);
+                }
+                // Compatible providers can send usage in a separate event with no choice.
+                if let Some(usage) = parse_usage(&event["usage"]) {
+                    reported_usage = Some(usage);
                 }
                 let Some(choice) = event["choices"]
                     .as_array()
@@ -460,10 +400,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // finished. Preserve legacy non-stream compatibility in parse_response,
         // but never promote a partial stream to an executable response.
         if last_finish_reason.is_none() || buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
-            return Err(format!(
-                "[{}] SSE 响应不完整或缺少 finish_reason；未提交工具调用。",
-                self.label
-            ));
+            return Err(LlmFailure {
+                kind: LlmFailureKind::ResponseInterrupted,
+                diagnostic: "Chat Completions SSE ended without a complete terminal choice".into(),
+            });
         }
 
         let calls: Vec<Value> = tool_calls
@@ -492,8 +432,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
         {
             obj.extend(field.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        self.parse_response(serde_json::json!({ "choices": [choice] }))
+        let response = self.parse_response(serde_json::json!({ "choices": [choice] }))?;
+        if !matches!(response, LlmResponse::ProtocolViolation { .. }) {
+            *self.last_usage.lock().unwrap() = reported_usage;
+        }
+        Ok(response)
     }
+}
+
+fn parse_usage(raw: &Value) -> Option<ProviderUsage> {
+    let input = u32::try_from(raw["prompt_tokens"].as_u64()?).ok()?;
+    let output = u32::try_from(raw["completion_tokens"].as_u64()?).ok()?;
+    Some(ProviderUsage::from_response_usage(
+        input, output, raw, false,
+    ))
 }
 
 /// Normalize tool arguments so handlers always receive a serde_json::Value::Object.
@@ -1235,18 +1187,7 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_response(&self, resp: Value) -> Result<LlmResponse, String> {
-        *self.last_usage.lock().unwrap() = None;
-        if let (Some(input), Some(output)) = (
-            resp["usage"]["prompt_tokens"].as_u64(),
-            resp["usage"]["completion_tokens"].as_u64(),
-        ) {
-            *self.last_usage.lock().unwrap() = u32::try_from(input)
-                .ok()
-                .zip(u32::try_from(output).ok())
-                .map(|(input, output)| {
-                    ProviderUsage::from_response_usage(input, output, &resp["usage"], false)
-                });
-        }
+        *self.last_usage.lock().unwrap() = parse_usage(&resp["usage"]);
         let choice = resp["choices"]
             .as_array()
             .and_then(|arr| arr.first())
@@ -1406,7 +1347,7 @@ impl OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::OpenAiCompatibleProvider;
-    use crate::llm::LlmProvider;
+    use crate::llm::{LlmProvider, LlmResponse, ProviderUsage};
     use serde_json::json;
 
     fn provider() -> OpenAiCompatibleProvider {
@@ -1420,7 +1361,7 @@ mod tests {
         )
     }
 
-    async fn stream_fixture(body: String) -> Result<crate::llm::LlmResponse, String> {
+    async fn stream_fixture(body: String) -> (Result<LlmResponse, String>, Option<ProviderUsage>) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let address = server.server_addr().to_ip().unwrap();
         let handle = std::thread::spawn(move || {
@@ -1431,6 +1372,7 @@ mod tests {
             assert_eq!(request.url(), "/chat/completions");
             let value: serde_json::Value = serde_json::from_reader(request.as_reader()).unwrap();
             assert_eq!(value["stream"], true);
+            assert!(value.get("stream_options").is_none());
             request
                 .respond(tiny_http::Response::from_string(body).with_header(
                     tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap(),
@@ -1441,7 +1383,78 @@ mod tests {
         model.base_url = format!("http://{address}");
         let result = model.chat_stream(&[], None, None, None).await;
         handle.join().unwrap();
-        result
+        (result, model.latest_usage())
+    }
+
+    #[tokio::test]
+    async fn chat_and_stream_do_not_send_azure_credentials_or_body_to_redirect_targets() {
+        use std::time::Duration;
+
+        for (stream, status) in [(false, 307), (true, 308)] {
+            let origin = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let target = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let origin_address = origin.server_addr().to_ip().unwrap();
+            let target_address = target.server_addr().to_ip().unwrap();
+            let origin_handle = std::thread::spawn(move || {
+                let mut request = origin
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("origin received no request");
+                assert_eq!(request.method(), &tiny_http::Method::Post);
+                assert_eq!(request.url(), "/chat/completions");
+                assert!(request.headers().iter().any(|header| {
+                    header.field.equiv("api-key") && header.value.as_str() == "synthetic-azure-key"
+                }));
+                let value: serde_json::Value =
+                    serde_json::from_reader(request.as_reader()).unwrap();
+                assert_eq!(value["messages"][0]["content"], "synthetic-prompt");
+                assert_eq!(value["stream"].as_bool().unwrap_or(false), stream);
+                request
+                    .respond(
+                        tiny_http::Response::empty(status).with_header(
+                            tiny_http::Header::from_bytes(
+                                "Location",
+                                format!("http://localhost:{}/redirected", target_address.port()),
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+            let target_handle = std::thread::spawn(move || {
+                if let Some(request) = target.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    request.respond(tiny_http::Response::empty(200)).unwrap();
+                    true
+                } else {
+                    false
+                }
+            });
+            let model = OpenAiCompatibleProvider::new(
+                "synthetic-azure-key".into(),
+                "test-model".into(),
+                format!("http://{origin_address}"),
+                128,
+                0.0,
+                "azure".into(),
+            );
+            let messages = [crate::llm::Message {
+                role: "user".into(),
+                content: "synthetic-prompt".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                protocol_state: None,
+                tool_images: Vec::new(),
+            }];
+            let result = if stream {
+                model.chat_stream(&messages, None, None, None).await
+            } else {
+                model.chat(&messages, None, None).await
+            };
+            origin_handle.join().unwrap();
+            assert!(!target_handle.join().unwrap(), "redirect reached target");
+            let error = result.unwrap_err();
+            assert!(error.contains(&format!("API error {status}")), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -1449,6 +1462,7 @@ mod tests {
         let text = json!({"choices":[{"delta":{"content":"partial-private-marker"},"finish_reason":null}]});
         let call = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call1","function":{"name":"list_automations","arguments":"{}"}}]},"finish_reason":null}]});
         let terminal = json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]});
+        let usage = json!({"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":2}});
         let event = |value: &serde_json::Value| format!("data: {value}\n\n");
         let mut malformed = call.clone();
         malformed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] =
@@ -1456,25 +1470,26 @@ mod tests {
         for (name, body) in [
             ("text EOF", event(&text)),
             ("tool EOF", event(&call)),
-            ("DONE without finish", format!("{}data: [DONE]\n\n", event(&call))),
+            ("DONE without finish", format!("{}{}data: [DONE]\n\n", event(&call), event(&usage))),
             ("late output after finish", format!("{}{}data: [DONE]\n\n", event(&terminal), event(&call))),
-            ("malformed arguments", format!("{}{}data: [DONE]\n\n", event(&malformed), event(&terminal))),
+            ("malformed arguments", format!("{}{}{}data: [DONE]\n\n", event(&malformed), event(&terminal), event(&usage))),
             ("stream error", format!("{}data: {{\"error\":{{\"message\":\"private-marker\"}}}}\n\n{}data: [DONE]\n\n", event(&call), event(&terminal))),
             ("malformed event", format!("{}data: {{broken-private-marker\n\n{}", event(&call), event(&terminal))),
         ] {
-            let result = stream_fixture(body).await;
+            let (result, usage) = stream_fixture(body).await;
             assert!(result.is_err(), "{name}: incomplete stream must not authorize text or tool output; got {result:?}");
             let error = result.unwrap_err();
             assert!(!error.contains("private-marker"), "{name}: private payload reached error text");
+            assert!(usage.is_none(), "{name}: invalid stream recorded usage");
         }
-        let result = stream_fixture(format!(
+        let (result, usage) = stream_fixture(format!(
             "{}{}data: [DONE]\n\n",
             event(&call),
             event(&terminal)
         ))
-        .await
-        .unwrap();
-        match result {
+        .await;
+        assert!(usage.is_none());
+        match result.unwrap() {
             crate::llm::LlmResponse::ToolCalls {
                 calls, stop_reason, ..
             } => {
@@ -1487,19 +1502,57 @@ mod tests {
         }
         // Compatible gateways may omit [DONE] or delta in the terminal choice;
         // the explicit choice finish reason is authoritative, not EOF itself.
-        let response = stream_fixture(format!(
+        let (response, _) = stream_fixture(format!(
             "{}data: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\r\n\r\n",
             event(&json!({"choices":[{"delta":{"content":"你好"}}]}))
         ))
-        .await
-        .unwrap();
-        match response {
+        .await;
+        match response.unwrap() {
             crate::llm::LlmResponse::Text { text, stop_reason } => {
                 assert_eq!(text, "你好");
                 assert_eq!(stop_reason, crate::llm::StopReason::EndTurn);
             }
             _ => panic!("explicit terminal text was not retained"),
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_records_reported_cache_usage_from_terminal_and_usage_only_events() {
+        let terminal = json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]});
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 4,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 20,
+        });
+        let mut terminal_with_usage = terminal.clone();
+        terminal_with_usage["usage"] = usage.clone();
+        let usage_only = json!({"choices":[],"usage":usage});
+        for events in [
+            vec![terminal_with_usage],
+            vec![terminal.clone(), usage_only],
+        ] {
+            let mut body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            body.push_str("data: {\"choices\":[],\"usage\":null}\n\ndata: [DONE]\n\n");
+            let (response, usage) = stream_fixture(body).await;
+            assert!(matches!(response.unwrap(), LlmResponse::Text { .. }));
+            let usage = usage.unwrap();
+            assert_eq!(usage.input_tokens, 100);
+            assert_eq!(usage.output_tokens, 4);
+            assert_eq!(usage.cached_input_tokens, Some(80));
+            assert_eq!(usage.uncached_input_tokens, Some(20));
+        }
+        let invalid_usage =
+            json!({"choices":[],"usage":{"prompt_tokens":"100","completion_tokens":4}});
+        let (response, usage) = stream_fixture(format!(
+            "data: {terminal}\n\ndata: {invalid_usage}\n\ndata: [DONE]\n\n"
+        ))
+        .await;
+        assert!(response.is_ok());
+        assert!(usage.is_none());
     }
 
     #[test]

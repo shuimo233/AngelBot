@@ -99,7 +99,8 @@ impl DelegatedRuntimeFactory {
         R: HostResolver + Send + Sync + 'static,
         M: DelegatedModelHostFactory + Clone + Send + Sync + 'static,
     {
-        let review_resolver = BindingReviewModelResolver::new(db.clone(), model_factory.clone());
+        let review_resolver = BindingReviewModelResolver::new(db.clone(), model_factory.clone())
+            .with_worktree(provider.clone());
         let review_executor = Box::new(LlmReviewExecutor::new(Arc::new(review_resolver)));
         Self::build_with_explorer_runtime_adapters(
             db,
@@ -170,6 +171,7 @@ impl DelegatedRuntimeFactory {
                 Arc::new(model_factory.clone()),
                 None,
                 now_seconds,
+                provider.clone(),
             ));
         let explorer_launcher: Box<dyn super::delegated_worker_launcher::AsyncWorkerLauncher> =
             Box::new(explorer_launcher);

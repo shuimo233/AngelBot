@@ -117,6 +117,7 @@ impl ForegroundRunIdentity {
         session_id: &str,
         message_id: &str,
         call_id: &str,
+        tool_name: &str,
         work_dir: PathBuf,
     ) -> Result<Self, String> {
         let pending: Option<i64> = conn
@@ -136,10 +137,10 @@ impl ForegroundRunIdentity {
                     AND r.confirmation_state = 'pending'
                     AND r.resumable = 1
                     AND m.role = 'assistant'
-                    AND s.tool_name = 'delegate_network_exploration'
+                    AND s.tool_name = ?4
                     AND s.success = 0
                     AND s.tool_output LIKE '%Confirmation required%'",
-                rusqlite::params![message_id, session_id, call_id],
+                rusqlite::params![message_id, session_id, call_id, tool_name],
                 |row| row.get(0),
             )
             .optional()
@@ -1166,7 +1167,14 @@ impl DelegationIssuance {
         request: DelegationRequest,
         supervisor_work_id: Option<&str>,
     ) -> Result<DelegationIssuanceOutcome, DelegationIssuanceError> {
-        self.issue_internal(identity, tool_call_id, request, supervisor_work_id, true)
+        self.issue_internal(
+            identity,
+            tool_call_id,
+            request,
+            supervisor_work_id,
+            true,
+            false,
+        )
     }
 
     pub(crate) fn issue_outcome(
@@ -1176,7 +1184,37 @@ impl DelegationIssuance {
         request: DelegationRequest,
         supervisor_work_id: Option<&str>,
     ) -> Result<DelegationIssuanceOutcome, DelegationIssuanceError> {
-        self.issue_internal(identity, tool_call_id, request, supervisor_work_id, false)
+        self.issue_internal(
+            identity,
+            tool_call_id,
+            request,
+            supervisor_work_id,
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn issue_confirmed_codex_outcome(
+        &self,
+        identity: &ForegroundRunIdentity,
+        tool_call_id: &str,
+        request: DelegationRequest,
+        supervisor_work_id: Option<&str>,
+    ) -> Result<DelegationIssuanceOutcome, DelegationIssuanceError> {
+        if request.task_shape != TaskShape::Change
+            || request.worker_profile != WorkerProfile::Implementer
+            || !request.explorer_operations.is_empty()
+        {
+            return Err(DelegationIssuanceError::InvalidRequest);
+        }
+        self.issue_internal(
+            identity,
+            tool_call_id,
+            request,
+            supervisor_work_id,
+            false,
+            true,
+        )
     }
 
     fn issue_internal(
@@ -1186,6 +1224,7 @@ impl DelegationIssuance {
         request: DelegationRequest,
         supervisor_work_id: Option<&str>,
         confirmed_network_scope: bool,
+        codex_executor: bool,
     ) -> Result<DelegationIssuanceOutcome, DelegationIssuanceError> {
         let supervisor_work_id = supervisor_work_id.map(str::to_owned);
         let delegation_id = format!("dlg_{}", Uuid::new_v4().simple());
@@ -1512,6 +1551,13 @@ impl DelegationIssuance {
             },
             now,
             move |tx| {
+                if codex_executor {
+                    tx.execute(
+                        "UPDATE delegations SET executor='codex_cli' WHERE id=?1",
+                        [&resource_facts.delegation_id],
+                    )
+                    .map_err(|error| PolicyLeaseError::Storage(error.to_string()))?;
+                }
                 if let Some(confirmed_scope) = confirmed_scope.as_ref() {
                     confirmed_scope
                         .persist_in_tx(tx, now)

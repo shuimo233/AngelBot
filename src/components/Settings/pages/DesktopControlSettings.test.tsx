@@ -138,11 +138,9 @@ describe('DesktopControlSettings', () => {
 
     await user.click(await screen.findByRole('button', { name: '编辑' }));
     await user.click(screen.getByLabelText('操作控件'));
-    expect(screen.getByText(/允许后可逐次确认并调用、选中、展开或收起/)).toBeInTheDocument();
-    expect(screen.getByText(/可能触发发送、删除或其他不可撤销后果/)).toBeInTheDocument();
-    expect(screen.getByText(/最多 80 字的短名称，可能含个人内容/)).toBeInTheDocument();
-    expect(screen.getByText(/不读取字段值、密码控件或后台页面/)).toBeInTheDocument();
-    expect(screen.getByText(/仍需检查任务结果，不代表目标已完成/)).toBeInTheDocument();
+    expect(screen.getByText(/控件操作需逐次确认/)).toHaveTextContent('最多 80 字的下拉项名称');
+    expect(screen.getByText(/图像点击需确认位置/)).toHaveTextContent('操作可能触发发送或删除');
+    expect(screen.getByText(/跳过编辑框值、密码、隐藏内容和后台页面/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '保存配置' }));
     await waitFor(() => expect(saveDesktopTrustedApp).toHaveBeenLastCalledWith(expect.objectContaining({
       id: 'chat', capabilities: ['launch', 'interact'],
@@ -182,12 +180,12 @@ describe('DesktopControlSettings', () => {
     const user = userEvent.setup();
     render(<DesktopControlSettings />);
 
-    expect(await screen.findByText(/原有结构查看和操作权限保持不变/)).toHaveTextContent('可能包含私人内容');
+    expect(await screen.findByText(/确认后可把窗口图像发给模型/)).toHaveTextContent('可能含隐私');
     expect(screen.getByText(/仅结构，图像需确认/)).toBeInTheDocument();
     expect(confirmDesktopObservationScope).not.toHaveBeenCalled();
     expect(saveDesktopTrustedApp).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: '编辑' }));
-    expect(screen.getByText(/保存后会允许将此应用的单窗口图像交给当前模型/)).toBeInTheDocument();
+    expect(screen.getByText('保存即授权图像查看。')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '保存并允许查看' })).toBeInTheDocument();
     expect(screen.getAllByRole('checkbox').every((element) => !element.parentElement?.textContent?.includes('图像'))).toBe(true);
   });
@@ -269,7 +267,7 @@ describe('DesktopControlSettings', () => {
     const editButtons = await screen.findAllByRole('button', { name: '编辑' });
     await user.click(editButtons[0]);
     await user.click(screen.getByRole('button', { name: '查找当前窗口的输入框' }));
-    expect(await screen.findByText(/当前填写的名称未出现在本次查找结果中/)).toBeInTheDocument();
+    expect(await screen.findByText(/结果中没有此名称/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '保存配置' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: '选择“新输入框”' }));
     expect(screen.queryByText(/当前填写的名称未出现在本次查找结果中/)).not.toBeInTheDocument();
@@ -306,7 +304,7 @@ describe('DesktopControlSettings', () => {
     await user.type(screen.getByLabelText('程序路径'), 'C:\\Apps\\replacement.exe');
 
     expect(screen.getByRole('button', { name: '保存配置' })).toBeDisabled();
-    expect(screen.getByText(/先取消操作控件权限并保存新路径/)).toBeInTheDocument();
+    expect(screen.getByText(/先取消操作控件权限，再保存新路径/)).toBeInTheDocument();
     await user.click(screen.getByLabelText('操作控件'));
     expect(screen.getByRole('button', { name: '保存配置' })).toBeEnabled();
   });

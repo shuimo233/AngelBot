@@ -1,14 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { createAutomation, deleteAutomation, getAutomationDashboard, runAutomationNow, setAutomationEnabled, stopAutomationRun, type Automation, type AutomationDashboardItem, type AutomationRunSummary } from '$lib/commands/automation';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { createAutomation, createMaaAutomation, deleteAutomation, getAutomationDashboard, runAutomationNow, setAutomationEnabled, stopAutomationRun, type Automation, type AutomationDashboardItem, type AutomationRunRequest, type AutomationRunSummary } from '$lib/commands/automation';
+import { getDesktopTrustedApps, type TrustedDesktopApp } from '$lib/commands/desktop';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { getAutostart, setAutostart } from '$lib/commands/settings';
 import { getWorkspaces, type Workspace } from '$lib/commands/workspace';
 import { useNavigationStore } from '$stores/navigation';
+import { useMessagesStore } from '$stores/messages';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { subscribeAutomationUpdates } from '$lib/automation-events';
-import { normalizeDailySchedule } from './dailySchedule';
+import { createProjectionRefresh } from '$lib/projection-refresh';
+import { normalizeDailySchedule, previewNextDailyRun } from './dailySchedule';
 import { AutomationHistory } from './AutomationHistory';
 import { AutomationTimePicker } from './AutomationTimePicker';
+import { Button, Dialog, RadioChoices } from '../../ui';
 import './AutomationPage.css';
 
 const formatTime = (value?: number | null) => value ? new Date(value * 1000).toLocaleString() : '等待设置';
@@ -16,8 +20,47 @@ const nextTrigger = (item: Automation) => !item.enabled ? '已暂停' : item.tri
 
 const SCRIPT_PERMISSION_SUMMARY = '仅执行已配置的本地脚本；输出和退出码会保存在运行记录中。';
 const SCRIPT_LIFECYCLE_NOTICE = '脚本结束或超时会回收其自有进程树并保留日志，不影响原先打开的软件。GUI 辅助工具需要明确的任务控制接口；仅启动软件后退出的脚本不代表其中任务已执行。';
+const executorOptions = [{ value: 'agent', label: '交给 AngelBot' }, { value: 'script', label: '运行本地脚本' }, { value: 'maa', label: '明日方舟日常（MAA）' }] as const;
+const triggerOptions = [{ value: 'schedule', label: '每天定时' }, { value: 'startup', label: '登录 Windows 时' }] as const;
+const maaDefaultTitle = '明日方舟日常';
+const canLaunchMaa = (app: TrustedDesktopApp) => app.enabled && app.capabilities.includes('launch');
 const errorMessage = (cause: unknown, fallback: string) =>
   cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : fallback;
+
+const pendingRunsKey = 'angelbot.automation.pending-runs';
+const pendingRunsChanged = 'angelbot:automation-pending-runs-changed';
+const maxPendingRuns = 100;
+const sameRequest = (a: AutomationRunRequest, b: AutomationRunRequest) =>
+  a.automationId === b.automationId && a.runId === b.runId;
+let pendingRunsValue = '';
+let pendingRuns: AutomationRunRequest[] = [];
+let pendingRunsStorageUnavailable = false;
+
+function getPendingRuns() {
+  if (pendingRunsStorageUnavailable) return pendingRuns;
+  try {
+    const value = sessionStorage.getItem(pendingRunsKey) ?? '';
+    if (value !== pendingRunsValue) {
+      const parsed: unknown = value ? JSON.parse(value) : [];
+      pendingRuns = Array.isArray(parsed) ? parsed.filter((item): item is AutomationRunRequest =>
+        typeof item?.automationId === 'string' && typeof item?.runId === 'string').slice(0, maxPendingRuns) : [];
+      pendingRunsValue = value;
+    }
+  } catch { pendingRunsStorageUnavailable = true; }
+  return pendingRuns;
+}
+
+function updatePendingRuns(requests: AutomationRunRequest[]) {
+  pendingRuns = requests;
+  pendingRunsValue = JSON.stringify(requests);
+  try { sessionStorage.setItem(pendingRunsKey, pendingRunsValue); } catch { pendingRunsStorageUnavailable = true; }
+  window.dispatchEvent(new Event(pendingRunsChanged));
+}
+
+function subscribePendingRuns(listener: () => void) {
+  window.addEventListener(pendingRunsChanged, listener);
+  return () => window.removeEventListener(pendingRunsChanged, listener);
+}
 
 type AutomationStatusPresentation = {
   label: string;
@@ -45,8 +88,8 @@ function statusPresentation(item: Automation, latestRun?: AutomationRunSummary |
     }
     if (latestRun.status === 'attention_required') {
       return {
-        label: '需要处理', scheduleLabel: '本次回执', scheduleValue: '结果未知', attention: true,
-        notice: '这次运行结果未知，自动调度已暂停，不会自动重试。请先核对脚本或软件的实际状态，确认上次执行已结束且不会重复产生副作用后手动重试；得到明确结果后才能重新启用定时。',
+        label: '结果未知', scheduleLabel: '后续定时', scheduleValue: '已暂停，不会自动重试', attention: true,
+        notice: `先核对${isMaa ? ' MAA ' : '脚本'}的实际状态，确认本次已结束且不会重复操作后再运行。`,
       };
     }
     if (latestRun.status === 'cancelled') {
@@ -58,8 +101,9 @@ function statusPresentation(item: Automation, latestRun?: AutomationRunSummary |
     }
     if (latestRun.status === 'failed' || latestRun.status === 'timed_out') {
       return {
-        label: latestRun.status === 'failed' ? (isMaa ? '存在失败' : '执行失败') : '已超时', attention: true,
+        label: latestRun.status === 'failed' ? (isMaa ? '队列有失败' : '执行失败') : '已超时', attention: true,
         scheduleLabel: '下次执行', scheduleValue: nextTrigger(item),
+        notice: isMaa ? '先查看运行记录，再到 MAA 核对失败项。' : undefined,
       };
     }
     if (latestRun.status === 'completed') {
@@ -125,7 +169,7 @@ export function AutomationPage() {
   const [title, setTitle] = useState('');
   const [triggerValue, setTriggerValue] = useState('09:00');
   const [triggerKind, setTriggerKind] = useState<'schedule' | 'startup'>('schedule');
-  const [executorKind, setExecutorKind] = useState<'script' | 'agent'>('script');
+  const [executorKind, setExecutorKind] = useState<(typeof executorOptions)[number]['value']>('agent');
   const [prompt, setPrompt] = useState('');
   const [workspaceId, setWorkspaceId] = useState(useWorkspacesStore.getState().activeWorkspaceId || '');
   const [autostart, setAutostartReady] = useState<boolean | null>(null);
@@ -134,84 +178,146 @@ export function AutomationPage() {
   const [scriptPath, setScriptPath] = useState('');
   const [scriptArgs, setScriptArgs] = useState('');
   const [workingDir, setWorkingDir] = useState('');
+  const [maaApps, setMaaApps] = useState<TrustedDesktopApp[] | 'error' | null>(null);
+  const [maaAppId, setMaaAppId] = useState('');
+  const [launchEmulator, setLaunchEmulator] = useState(false);
+  const [maaRevision, setMaaRevision] = useState(0);
   const [timeoutSeconds, setTimeoutSeconds] = useState('300');
   const [review, setReview] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [scriptDialog, setScriptDialog] = useState<'options' | 'instructions' | null>(null);
   const [startupRevision, setStartupRevision] = useState(0);
   const [pickingPath, setPickingPath] = useState(false);
   const pickerInFlight = useRef(false);
   const createInFlight = useRef(false);
   const [saving, setSaving] = useState(false);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const actionRequestsInFlight = useRef(new Set<string>());
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
   // Only requests owned by this page; persisted receipts remain authoritative.
   const [pendingRunIds, setPendingRunIds] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const runRequestsInFlight = useRef(new Set<string>());
+  const unconfirmedRequests = useSyncExternalStore(subscribePendingRuns, getPendingRuns);
+  const [actionError, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const error = actionError ?? loadError;
   const setPage = useNavigationStore((state) => state.setPage);
   const target = useNavigationStore((state) => state.automationTarget);
   const openWorkspace = useWorkspacesStore((state) => state.openWorkspace);
-  const loadGeneration = useRef(0);
   const targetCard = useRef<HTMLElement>(null);
   const focusedTarget = useRef<typeof target>(null);
+  const pageTop = useRef<HTMLElement>(null);
+  const stepTitle = useRef<HTMLHeadingElement>(null);
   const targetItem = target && items.find(item => item.id === target.automationId && item.workspaceId === target.workspaceId);
 
   useEffect(() => {
+    if (!createOpen) {
+      setScriptDialog(null);
+      return;
+    }
+    pageTop.current?.scrollIntoView?.({ block: 'start' });
+    stepTitle.current?.focus({ preventScroll: true });
+  }, [createOpen, review]);
+
+  useEffect(() => {
     if (!target || !targetItem || focusedTarget.current === target) return;
+    if (createOpen) {
+      if (!saving && !pickingPath && !changingAutostart) { setCreateOpen(false); setReview(false); }
+      return;
+    }
+    if (!targetCard.current) return;
     const details = targetCard.current?.querySelector('details');
     if (details) details.open = true;
     targetCard.current?.scrollIntoView?.({ block: 'nearest', behavior: 'auto' });
     targetCard.current?.focus({ preventScroll: true });
     focusedTarget.current = target;
-  }, [target, targetItem]);
+  }, [target, targetItem, createOpen, saving, pickingPath, changingAutostart]);
 
-  const load = useCallback(async () => {
-    const generation = ++loadGeneration.current;
-    try {
-      setError(null);
-      const [automations, availableWorkspaces] = await Promise.all([
-        getAutomationDashboard(), getWorkspaces(),
+  const [reads] = useState(() => createProjectionRefresh({
+    read: async (_: null) => {
+      // Wait for both branches even on failure, so the trailing refresh cannot
+      // start a second copy of an IPC read that is still in flight.
+      const [dashboard, workspaces] = await Promise.allSettled([
+        getAutomationDashboard(getPendingRuns()), getWorkspaces(),
       ]);
-      if (generation !== loadGeneration.current) return;
+      if (dashboard.status === 'rejected' || workspaces.status === 'rejected') throw new Error('dashboard unavailable');
+      return [dashboard.value, workspaces.value] as const;
+    },
+    onSuccess: (_, [automations, availableWorkspaces]) => {
+      setLoadError(null);
       setItems(automations.items);
+      const pending = getPendingRuns();
+      const unresolved = pending.filter(request => !automations.acceptedRequests.some(receipt => sameRequest(request, receipt)));
+      if (pending.length !== unresolved.length) updatePendingRuns(unresolved);
       setLoaded(true);
       setWorkspaces(availableWorkspaces);
-    } catch {
-      if (generation !== loadGeneration.current) return;
-      setError('无法加载自动化任务。请稍后重试。');
-    }
-  }, []);
+    },
+    onError: () => setLoadError('无法加载自动化任务。请稍后重试。'),
+  }));
+  const load = () => reads.request(null);
 
   useEffect(() => {
-    const refresh = () => { void load(); };
+    const refresh = () => { void reads.request(null); };
+    const refreshVisible = () => { if (document.visibilityState !== 'hidden') refresh(); };
     refresh();
     const unsubscribe = subscribeAutomationUpdates(refresh);
+    window.addEventListener('focus', refreshVisible);
+    document.addEventListener('visibilitychange', refreshVisible);
     return () => {
-      ++loadGeneration.current;
+      reads.invalidate();
       unsubscribe();
+      window.removeEventListener('focus', refreshVisible);
+      document.removeEventListener('visibilitychange', refreshVisible);
     };
-  }, [load]);
+  }, [reads]);
 
   const hasActiveRun = pendingRunIds.length > 0 || items
     .some(item => item.latestRun?.status === 'queued' || item.latestRun?.status === 'running');
   useEffect(() => {
     if (!hasActiveRun) return undefined;
-    const timer = window.setInterval(() => { void load(); }, 5_000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden' && !reads.isPending()) void reads.request(null);
+    }, 5_000);
     return () => window.clearInterval(timer);
-  }, [hasActiveRun, load]);
+  }, [hasActiveRun, reads]);
 
   const invalidateReview = () => { setReview(false); };
-  const triggerLabel = triggerKind === 'startup' ? '开机自启（登录 Windows 后）' : normalizeDailySchedule(triggerValue) || '请选择时间';
+  const startInConversation = () => {
+    const { activeWorkspaceId, workspaces: availableWorkspaces } = useWorkspacesStore.getState();
+    const sessionId = availableWorkspaces.find(workspace => workspace.id === activeWorkspaceId)?.activeSessionId;
+    if (sessionId) {
+      const messages = useMessagesStore.getState();
+      messages.activateInput(sessionId);
+      if (!useMessagesStore.getState().input.trim()) messages.setInput('帮我设一个提醒：');
+    }
+    setPage('chat');
+  };
+  const isMaa = executorKind === 'maa';
+  const triggerLabel = triggerKind === 'startup' ? '下次登录 Windows 时触发' : normalizeDailySchedule(triggerValue) || '请选择时间';
+  const nextDailyRun = review && triggerKind === 'schedule' ? previewNextDailyRun(triggerValue) : null;
   const agentWorkspace = workspaces.find(workspace => workspace.id === workspaceId);
   const canPreview = !!title.trim() && (triggerKind !== 'startup' || autostart === true)
     && (executorKind === 'script' ? !!scriptPath.trim() : !!prompt.trim() && !!agentWorkspace);
+  const maaCandidates = Array.isArray(maaApps) ? maaApps : [];
+  const canSaveMaa = !!agentWorkspace && maaCandidates.some(app => app.id === maaAppId && canLaunchMaa(app));
 
   useEffect(() => {
-    if (!createOpen || triggerKind !== 'startup') return;
+    if (!createOpen || !isMaa) return;
+    let active = true;
+    setMaaApps(null);
+    void getDesktopTrustedApps().then(apps => {
+      if (active) setMaaApps(apps.filter(app => app.executablePath.split(/[\\/]/).pop()?.toLowerCase() === 'maa.exe'));
+    }).catch(() => { if (active) setMaaApps('error'); });
+    return () => { active = false; };
+  }, [createOpen, isMaa, maaRevision]);
+
+  useEffect(() => {
+    if (!createOpen || isMaa || triggerKind !== 'startup') return;
     let active = true;
     setAutostartReady(null);
     void getAutostart().then(value => { if (active) setAutostartReady(value); })
       .catch(cause => { if (active) setError(errorMessage(cause, '无法读取开机启动状态，请重试。')); });
     return () => { active = false; };
-  }, [createOpen, triggerKind, startupRevision]);
+  }, [createOpen, isMaa, triggerKind, startupRevision]);
 
   const changeAutostart = async (enabled: boolean) => {
     if (autostartInFlight.current) return;
@@ -251,22 +357,30 @@ export function AutomationPage() {
   };
 
   const create = async () => {
-    if (!canPreview || !review || createInFlight.current) return;
-    const dailyTriggerValue = triggerKind === 'startup' ? '登录 Windows 后' : normalizeDailySchedule(triggerValue);
+    if (createInFlight.current || (isMaa ? !canSaveMaa : !canPreview || !review)) return;
+    const dailyTriggerValue = !isMaa && triggerKind === 'startup' ? '登录 Windows 后' : normalizeDailySchedule(triggerValue);
     if (!dailyTriggerValue) {
       setError('请选择有效的每日执行时间。');
       return;
     }
     const args = scriptArgs.split(/\r\n|\r|\n/).filter(arg => arg.length > 0);
     const timeout = executorKind === 'agent' ? 300 : Number(timeoutSeconds);
-    if (!Number.isInteger(timeout) || timeout < 10 || timeout > 3600) {
+    if (!isMaa && (!Number.isInteger(timeout) || timeout < 10 || timeout > 3600)) {
       setError('超时时间必须是 10 到 3600 秒之间的整数。');
       return;
     }
     createInFlight.current = true;
     setSaving(true);
+    setError(null);
     try {
-      await createAutomation({
+      if (isMaa) {
+        const saved = await createMaaAutomation({ title: title.trim() || maaDefaultTitle,
+          triggerValue: dailyTriggerValue, workspaceId, appId: maaAppId, launchEmulator });
+        setItems(previous => previous.some(item => item.id === saved.id) ? previous
+          : [...previous, { ...saved, latestRun: null, lastSkippedAt: null }]);
+        setLoaded(true);
+        setMaaAppId(''); setLaunchEmulator(false);
+      } else await createAutomation({
         title: title.trim(), prompt: executorKind === 'agent' ? prompt.trim() : '', triggerKind, triggerValue: dailyTriggerValue,
         permissionSummary: executorKind === 'script' ? SCRIPT_PERMISSION_SUMMARY : '由归属空间的主 Agent 处理，沿用该空间现有权限和风险确认。',
         executorKind, workspaceId: executorKind === 'agent' ? workspaceId : undefined,
@@ -285,17 +399,50 @@ export function AutomationPage() {
     }
   };
 
-  const perform = async (id: string, action: () => Promise<void>, isRun = false) => {
-    if (isRun) setPendingRunIds(current => [...current, id]);
-    else setBusyId(id);
+  const perform = async (id: string, action: () => Promise<void>) => {
+    const active = actionRequestsInFlight.current;
+    if (active.has(id)) return;
+    active.add(id);
+    setBusyIds(new Set(active));
+    setError(null);
     try {
       await action();
       await load();
     } catch (cause) {
       setError(errorMessage(cause, '自动化操作失败，请重试。'));
     } finally {
-      if (isRun) setPendingRunIds(current => current.filter(candidate => candidate !== id));
-      else setBusyId(current => current === id ? null : current);
+      active.delete(id);
+      setBusyIds(new Set(active));
+    }
+  };
+
+  const runNow = async (id: string) => {
+    const pending = getPendingRuns();
+    if (actionRequestsInFlight.current.has(id) || runRequestsInFlight.current.has(id)
+      || pending.some(request => request.automationId === id)) return;
+    if (pending.length >= maxPendingRuns) {
+      setError('待核对的自动化运行过多，请先刷新运行记录。');
+      return;
+    }
+    setError(null);
+    const request = { automationId: id, runId: crypto.randomUUID() };
+    runRequestsInFlight.current.add(id);
+    setPendingRunIds(current => [...current, id]);
+    updatePendingRuns([...pending, request]);
+    try {
+      const result = await runAutomationNow(id, request.runId);
+      const remaining = getPendingRuns().filter(candidate => !sameRequest(request, candidate));
+      updatePendingRuns(remaining);
+      await load();
+      if (result.status === 'rejected') setError(result.error);
+    } catch (cause) {
+      await load();
+      if (getPendingRuns().some(candidate => sameRequest(request, candidate))) {
+        setError(errorMessage(cause, '执行请求未收到确认，请刷新查看运行记录。'));
+      }
+    } finally {
+      runRequestsInFlight.current.delete(id);
+      setPendingRunIds(current => current.filter(candidate => candidate !== id));
     }
   };
 
@@ -311,89 +458,149 @@ export function AutomationPage() {
   };
 
   return (
-    <main className="automation-page" aria-label="自动化">
+    <main ref={pageTop} className={`automation-page${createOpen ? ' automation-page--editing' : ''}`} aria-label="自动化">
       <header className="automation-header">
-        <div><h1>自动化</h1><p>定时任务需保持 AngelBot 运行。</p></div>
-        <button type="button" className="automation-create-toggle" disabled={saving || pickingPath || changingAutostart} aria-expanded={createOpen} onClick={() => setCreateOpen(open => !open)}>{createOpen ? '收起配置' : '添加自动化'}</button>
+        <h1 id="automation-page-title" ref={createOpen && !review ? stepTitle : undefined} tabIndex={createOpen && !review ? -1 : undefined}>{createOpen ? '添加自动化' : '自动化'}</h1>
+        <div className="automation-header-actions">
+          {!createOpen && <button type="button" className="secondary" onClick={startInConversation}>在对话里交代</button>}
+          <button type="button" className={`automation-create-toggle${createOpen ? ' secondary' : ''}`} disabled={saving || pickingPath || changingAutostart} aria-expanded={createOpen} onClick={() => { setCreateOpen(open => !open); setError(null); invalidateReview(); }}>{createOpen ? '返回任务' : '添加自动化'}</button>
+        </div>
       </header>
-      <p className="automation-conversation-guide">可以直接与 AngelBot 讨论并配置自动化。<button type="button" onClick={() => setPage('chat')}>去对话</button></p>
-      {createOpen && <section className="automation-create-card" aria-labelledby="automation-create-title">
-        <div className="automation-section-head"><h2 id="automation-create-title">添加自动化任务</h2></div>
+      {createOpen && !review && <section className="automation-create-card" aria-labelledby="automation-page-title">
         <fieldset className="automation-form automation-script-form" aria-label="自动化配置" disabled={saving || pickingPath || changingAutostart}>
-          <section className="automation-config-section" aria-labelledby="automation-basics-title">
-            <h3 id="automation-basics-title">基本信息</h3>
-            <div className="automation-config-fields automation-config-fields--stacked">
-              <label>任务名称<input value={title} onChange={e => { setTitle(e.target.value); invalidateReview(); }} placeholder="例如：整理下载目录" /></label>
+          <section className="automation-config-section" aria-labelledby="automation-executor-title">
+            <h2 id="automation-executor-title">要做什么</h2>
+            <div className="automation-config-fields">
+              {executorKind === 'agent' && <label className="automation-config-full">任务说明<textarea rows={2} value={prompt} onChange={e => { setPrompt(e.target.value); invalidateReview(); }} placeholder="例如：整理明天的安排，给我一份简短清单" /></label>}
+              <label>{isMaa ? '任务名称（选填）' : '任务名称'}<input value={title} onChange={e => { setTitle(e.target.value); invalidateReview(); }} placeholder={isMaa ? maaDefaultTitle : executorKind === 'agent' ? '例如：明日安排' : '例如：整理下载目录'} /></label>
+              <div className="automation-choice-field"><span>执行方式</span>
+                <RadioChoices label="执行方式" value={executorKind} options={executorOptions}
+                  onChange={value => { setExecutorKind(value); setError(null); invalidateReview(); }} />
+              </div>
             </div>
           </section>
           <section className="automation-config-section" aria-labelledby="automation-trigger-title">
-            <h3 id="automation-trigger-title">触发方式</h3>
+            <h2 id="automation-trigger-title">什么时候</h2>
             <div className="automation-config-fields">
-              <label>触发方式<select value={triggerKind} onChange={e => { setTriggerKind(e.target.value as 'schedule' | 'startup'); invalidateReview(); }}><option value="schedule">定时触发</option><option value="startup">开机自启触发</option></select>{triggerKind === 'startup' && <small>登录 Windows 后触发。</small>}</label>
-              {triggerKind === 'schedule'
+              {!isMaa && <div className="automation-choice-field"><span>触发方式</span>
+                <RadioChoices label="触发方式" value={triggerKind} options={triggerOptions}
+                  onChange={value => { setTriggerKind(value); invalidateReview(); }} />
+              </div>}
+              {isMaa || triggerKind === 'schedule'
                 ? <AutomationTimePicker value={triggerValue} onChange={value => { setTriggerValue(value); invalidateReview(); }} />
                 : <div className="automation-startup-setting"><strong>AngelBot 开机启动</strong><p>不预先运行任务；暂停任务不关闭自启。</p><button type="button" className="secondary" disabled={autostart === null || changingAutostart} onClick={() => void changeAutostart(!autostart)}>{changingAutostart ? '正在设置…' : autostart ? '关闭 AngelBot 开机启动' : autostart === null ? '正在读取…' : '启用 AngelBot 开机启动'}</button>{autostart === null && <button type="button" className="secondary" onClick={() => setStartupRevision(value => value + 1)}>重新读取启动状态</button>}<small>{autostart ? '下次登录触发，手动重开不触发。' : '启用后即可保存开机任务。'}</small></div>}
             </div>
           </section>
-          <section className="automation-config-section" aria-labelledby="automation-executor-title">
-            <h3 id="automation-executor-title">执行方式</h3>
-            <label>是否使用模型<select value={executorKind} onChange={e => { setExecutorKind(e.target.value as 'script' | 'agent'); invalidateReview(); }}><option value="script">不使用模型 · 运行本地脚本</option><option value="agent">使用模型 · 由 AngelBot 处理</option></select><small>{executorKind === 'script' ? '不消耗模型额度。' : '使用当前模型，会消耗额度。'}</small></label>
-          </section>
+          {isMaa && <section className="automation-config-section" aria-labelledby="automation-maa-title">
+            <h2 id="automation-maa-title">MAA 队列</h2>
+            <div className="automation-config-fields">
+              <label>可信 MAA<select value={maaAppId} disabled={!maaCandidates.some(canLaunchMaa)} onChange={event => { setMaaAppId(event.target.value); setError(null); }}>
+                <option value="">选择可信应用</option>
+                {maaCandidates.map(app => <option key={app.id} value={app.id} disabled={!canLaunchMaa(app)}>
+                  {app.displayName}{!app.enabled ? '（已停用）' : !canLaunchMaa(app) ? '（未授予打开应用权限）' : ''}
+                </option>)}
+              </select></label>
+              <label>归属空间<select value={workspaceId} onChange={event => { setWorkspaceId(event.target.value); setError(null); }}>
+                <option value="">选择日常或项目</option>
+                {workspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
+              </select></label>
+              {maaApps === null ? <p className="automation-config-full automation-maa-note" role="status">正在读取可信应用…</p>
+                : !maaCandidates.some(canLaunchMaa) && <div className="automation-config-full automation-maa-unavailable">
+                  <p className="automation-maa-note" role="status">{maaApps === 'error' ? '无法读取可信应用，请重新读取。'
+                    : maaCandidates.length ? '可信列表中的 MAA 已停用或未授予打开应用权限。' : '尚未添加可信的 MAA.exe。'}</p>
+                  {maaApps !== 'error' && <button type="button" className="secondary" onClick={() => window.dispatchEvent(new CustomEvent('open-settings', { detail: 'desktopControl' }))}>管理可信应用</button>}
+                  <button type="button" className="secondary" onClick={() => setMaaRevision(value => value + 1)}>重新读取可信应用</button>
+                </div>}
+              <label className="automation-config-full automation-maa-checkbox"><input type="checkbox" checked={launchEmulator} onChange={event => setLaunchEmulator(event.target.checked)} />按需启动 MAA 已配置的模拟器</label>
+              <p className="automation-config-full automation-maa-note">到点时，AngelBot 需保持运行。日程运行 MAA 当时勾选的任务队列，不改动勾选设置，也不需要连接模型。保存不会立即启动 MAA 或游戏。</p>
+            </div>
+          </section>}
           {executorKind === 'script' ? <>
           <section className="automation-config-section" aria-labelledby="automation-script-title">
-            <h3 id="automation-script-title">脚本与参数</h3>
+            <h2 id="automation-script-title">脚本与参数</h2>
             <div className="automation-config-fields automation-config-fields--stacked">
               <div className="automation-path-field"><label htmlFor="automation-script-path">脚本路径</label><div className="automation-path-input"><input id="automation-script-path" value={scriptPath} onChange={e => { setScriptPath(e.target.value); invalidateReview(); }} placeholder="选择脚本或输入完整路径" /><button type="button" disabled={pickingPath || saving} onClick={() => void choosePath(false)}>选择脚本</button></div>
                 <small>保存副本运行，原文件不变。</small>
               </div>
-              <label>参数（每行一个）<textarea value={scriptArgs} onChange={e => { setScriptArgs(e.target.value); invalidateReview(); }} rows={3} placeholder={'--profile\nC:\\Tools\\daily.json'} /></label>
             </div>
           </section>
-          <details className="automation-config-options">
-            <summary><span>运行选项</span><small>{workingDir.trim() ? '自定义工作目录' : '副本目录'} · {timeoutSeconds || '—'} 秒超时</small></summary>
-            <div className="automation-config-fields">
-              <div className="automation-path-field"><label htmlFor="automation-working-dir">脚本工作目录（可选）</label><div className="automation-path-input"><input id="automation-working-dir" value={workingDir} onChange={e => { setWorkingDir(e.target.value); invalidateReview(); }} placeholder="默认使用副本目录" /><button type="button" disabled={pickingPath || saving} onClick={() => void choosePath(true)}>选择目录</button></div></div>
-              <label>超时（秒）<input inputMode="numeric" value={timeoutSeconds} onChange={e => { setTimeoutSeconds(e.target.value); invalidateReview(); }} /><small>10–3600 秒。</small></label>
-            </div>
-          </details>
-          </> : <section className="automation-config-section" aria-labelledby="automation-agent-title">
-            <h3 id="automation-agent-title">交给 AngelBot 的任务</h3>
-            <div className="automation-config-fields automation-config-fields--stacked">
-              <label>归属空间<select value={workspaceId} onChange={e => { setWorkspaceId(e.target.value); invalidateReview(); }}><option value="">选择日常或项目</option>{workspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select><small>结果回到所选空间的主对话。</small></label>
-              <label>任务说明<textarea rows={4} value={prompt} onChange={e => { setPrompt(e.target.value); invalidateReview(); }} placeholder="描述要完成的事项、使用的资料和预期结果" /></label>
-            </div>
-          </section>}
-          <div className="automation-form-actions automation-config-footer"><button type="button" disabled={!canPreview || saving || pickingPath} onClick={() => {
-            if (triggerKind === 'schedule' && !normalizeDailySchedule(triggerValue)) return setError('请选择有效的每日执行时间。');
-            const timeout = executorKind === 'agent' ? 300 : Number(timeoutSeconds);
-            if (!Number.isInteger(timeout) || timeout < 10 || timeout > 3600) return setError('超时时间必须是 10 到 3600 秒之间的整数。');
-            setError(null); setReview(true);
-          }}>预览规则</button></div>
+          <div className="automation-config-options">
+            <small>{scriptArgs.trim() ? '已填写参数' : '参数可选'} · {workingDir.trim() ? '自定义工作目录' : '副本目录'} · {timeoutSeconds || '—'} 秒超时</small>
+            <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setScriptDialog('options')}>运行选项</button>
+            <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setScriptDialog('instructions')}>脚本使用说明</button>
+          </div>
+          </> : null}
+          <div className="automation-form-actions automation-config-footer">
+            {executorKind === 'agent' && <div className="automation-destination">
+              <label htmlFor="automation-destination">结果发到</label>
+              <select id="automation-destination" value={workspaceId} onChange={e => { setWorkspaceId(e.target.value); invalidateReview(); }}>
+                <option value="">选择日常或项目</option>
+                {workspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
+              </select>
+            </div>}
+            {isMaa ? <button type="button" disabled={!canSaveMaa || saving} onClick={() => void create()}>{saving ? '保存中…' : '保存 MAA 日程'}</button>
+            : <button type="button" disabled={!canPreview || saving || pickingPath} onClick={() => {
+              if (triggerKind === 'schedule' && !normalizeDailySchedule(triggerValue)) return setError('请选择有效的每日执行时间。');
+              const timeout = executorKind === 'agent' ? 300 : Number(timeoutSeconds);
+              if (!Number.isInteger(timeout) || timeout < 10 || timeout > 3600) return setError('超时时间必须是 10 到 3600 秒之间的整数。');
+              setError(null); setReview(true);
+            }}>预览规则</button>}
+          </div>
         </fieldset>
-        {executorKind === 'script' && <details className="automation-script-notes"><summary>脚本使用说明</summary>
-          <p className="automation-script-guidance">支持 Python、Node.js、PowerShell 和批处理。只导入可信脚本。单个脚本保存在 AngelBot 的 automation-scripts 目录；不包含配置和模块，源文件更新不会自动同步。选择启动目录不会复制该目录的内容。</p>
-          <p className="automation-script-guidance">参数每行一个，空行忽略，无需额外加引号。批处理（.bat/.cmd）不接受引号或 shell 元字符。</p>
-          <p className="automation-script-guidance">脚本按计划运行，不逐次确认，也不继承模型密钥。退出码不保证外部业务完成。暂停仅影响后续调度，不会停止已启动的脚本。{SCRIPT_LIFECYCLE_NOTICE}</p>
-        </details>}
+        <Dialog open={scriptDialog !== null} title={scriptDialog === 'options' ? '运行选项' : '脚本使用说明'}
+          onClose={() => { if (!pickingPath) setScriptDialog(null); }}>
+          {scriptDialog === 'options' ? (
+            <fieldset className="automation-form automation-script-form automation-script-options-form" aria-label="脚本运行选项" disabled={pickingPath || saving}>
+              <label>参数（每行一个）<textarea value={scriptArgs} onChange={e => { setScriptArgs(e.target.value); invalidateReview(); }} rows={3} placeholder={'--profile\nC:\\Tools\\daily.json'} /></label>
+              <div className="automation-path-field">
+                <label htmlFor="automation-working-dir">脚本工作目录（可选）</label>
+                <div className="automation-path-input">
+                  <input id="automation-working-dir" value={workingDir} onChange={e => { setWorkingDir(e.target.value); invalidateReview(); }} placeholder="默认使用副本目录" />
+                  <Button onClick={() => void choosePath(true)}>选择目录</Button>
+                </div>
+              </div>
+              <label>超时（秒）<input inputMode="numeric" value={timeoutSeconds} onChange={e => { setTimeoutSeconds(e.target.value); invalidateReview(); }} /><small>10–3600 秒。</small></label>
+              {error && <p className="automation-error" role="alert">{error}</p>}
+            </fieldset>
+          ) : (
+            <>
+              <p className="automation-script-guidance">支持 Python、Node.js、PowerShell 和批处理。只导入可信脚本。单个脚本保存在 AngelBot 的 automation-scripts 目录；不包含配置和模块，源文件更新不会自动同步。选择启动目录不会复制该目录的内容。</p>
+              <p className="automation-script-guidance">参数每行一个，空行忽略，无需额外加引号。批处理（.bat/.cmd）不接受引号或 shell 元字符。</p>
+              <p className="automation-script-guidance">脚本按计划运行，不逐次确认，也不继承模型密钥。退出码不保证外部业务完成。暂停仅影响后续调度，不会停止已启动的脚本。{SCRIPT_LIFECYCLE_NOTICE}</p>
+            </>
+          )}
+          <div className="automation-form-actions"><Button variant="primary" disabled={pickingPath} onClick={() => setScriptDialog(null)}>返回配置</Button></div>
+        </Dialog>
       </section>}
       {review && createOpen && <section className="automation-review" role="status">
-        <div className="automation-review-content"><h3>确认创建任务</h3><p>{title} · {triggerLabel}</p>
-          <dl className="automation-script-review"><dt>使用模型</dt><dd>{executorKind === 'agent' ? '是 · 当前已保存的模型' : '否 · 仅运行脚本'}</dd>{executorKind === 'script' ? <><dt>源脚本</dt><dd>{scriptPath.trim()}</dd><dt>执行副本</dt><dd>AngelBot 托管目录（原文件不变）</dd><dt>参数</dt><dd><pre>{scriptArgs.split(/\r\n|\r|\n/).filter(arg => arg.length > 0).join('\n') || '无'}</pre></dd><dt>工作目录</dt><dd>{workingDir.trim() || '副本目录'}</dd><dt>超时</dt><dd>{timeoutSeconds} 秒</dd></> : <><dt>归属空间</dt><dd>{agentWorkspace?.name}</dd><dt>任务说明</dt><dd><pre>{prompt.trim()}</pre></dd></>}</dl>
-          <small>{executorKind === 'script' ? '只运行可信脚本；仅复制单个文件，不含依赖，按 Windows 用户权限运行。' : '沿用所选空间的模型配置与权限。'}暂停不会撤销已发生的操作。{triggerKind === 'startup' && '从下次 Windows 登录开始触发。'}</small>
+        <div className="automation-review-content"><h2 ref={stepTitle} tabIndex={-1}>确认创建任务</h2><p>{title} · {triggerLabel}</p>
+          <dl className="automation-script-review">
+            <dt>预计首次运行</dt><dd>{triggerKind === 'startup' ? '下次登录 Windows' : nextDailyRun?.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) ?? '以任务列表为准'}</dd>
+            <dt>查看结果</dt><dd>{executorKind === 'agent' ? `${agentWorkspace?.name}的对话` : '自动化 → 此任务 → 运行记录'}</dd>
+            <dt>使用模型</dt><dd>{executorKind === 'agent' ? '是 · 当前已保存的模型' : '否 · 仅运行脚本'}</dd>
+            {executorKind === 'script' ? <><dt>源脚本</dt><dd>{scriptPath.trim()}</dd><dt>执行副本</dt><dd>AngelBot 托管目录（原文件不变）</dd><dt>参数</dt><dd><pre>{scriptArgs.split(/\r\n|\r|\n/).filter(arg => arg.length > 0).join('\n') || '无'}</pre></dd><dt>工作目录</dt><dd>{workingDir.trim() || '副本目录'}</dd><dt>超时</dt><dd>{timeoutSeconds} 秒</dd></> : <><dt>任务说明</dt><dd><pre>{prompt.trim()}</pre></dd></>}
+          </dl>
+          {triggerKind === 'schedule' && <p>到点时 AngelBot 需保持运行。</p>}
+          <small>{executorKind === 'script' ? '只运行可信脚本。脚本副本不含依赖，按 Windows 用户权限运行。' : '使用归属空间的模型额度与权限。'}</small>
         </div>
         <div className="automation-form-actions"><button type="button" className="secondary" disabled={saving} onClick={invalidateReview}>返回编辑</button><button type="button" disabled={saving || !canPreview || pickingPath || changingAutostart} onClick={() => void create()}>{saving ? '创建中…' : '创建任务'}</button></div>
       </section>}
-      {error && <p className="automation-error" role="alert">{error}</p>}
+      {error && scriptDialog !== 'options' && <p className="automation-error" role="alert">{error}</p>}
       {target && loaded && !targetItem && <p className="automation-error" role="status">无法定位该事项；它可能已删除或归属工作区已改变。下方仍可查看其他任务。</p>}
 
-      <section className="automation-list-section" aria-labelledby="automation-list-title">
-        <div className="automation-list-title"><div><h2 id="automation-list-title">任务</h2><p>{items.length ? `${items.length} 条自动化任务` : '还没有已保存的任务'}</p></div><button className="automation-refresh" type="button" onClick={() => void load()}>刷新</button></div>
-        {!loaded ? <p role="status">{error ? '任务尚未加载，请刷新重试。' : '正在读取自动化任务…'}</p> : items.length === 0 ? <div className="automation-empty"><strong>让重复的事，按时发生</strong><p>把重复事务交给 AngelBot，也可以手动添加通用脚本任务。</p><button type="button" className="secondary" onClick={() => setCreateOpen(true)}>添加自动化任务</button></div> : <div className="automation-grid">{items.map(item => {
+      {!createOpen && <section className="automation-list-section" aria-label="自动化任务">
+        <div className="automation-list-title">
+          {items.some(item => item.enabled && item.triggerKind === 'schedule') && <p className="automation-schedule-note">定时任务需保持 AngelBot 运行。</p>}
+          <button className="automation-refresh" type="button" onClick={() => { setError(null); void load(); }}>刷新</button>
+        </div>
+        {!loaded ? <p role="status">{loadError ? '任务尚未加载，请刷新重试。' : '正在读取自动化任务…'}</p> : items.length === 0 ? <p className="automation-empty">暂无自动化任务</p> : <div className="automation-grid">{items.map(item => {
+          const isBusy = busyIds.has(item.id);
           const latestRun = item.latestRun;
           const localAutomation = item.executorKind === 'script' || item.executorKind === 'maa';
           const activeLocalRun = localAutomation && latestRun?.status === 'running' ? latestRun : undefined;
           const activeAgentReceipt = item.executorKind === 'agent' && latestRun && ['running', 'queued', 'awaiting_confirmation'].includes(latestRun.status) ? latestRun : undefined;
           const pendingRun = pendingRunIds.includes(item.id);
+          const unconfirmedRun = !pendingRun && unconfirmedRequests.some(request => request.automationId === item.id);
           const localBusy = localAutomation && (!!activeLocalRun || pendingRun);
           const activeAgentRun = !!activeAgentReceipt;
           const unresolvedLocalRun = localAutomation && latestRun?.status === 'attention_required';
@@ -404,18 +611,31 @@ export function AutomationPage() {
           const reminderCancelled = isReminder && !item.enabled && item.lastRunAt === undefined;
           const reminderNeedsAttention = isReminder && latestRun?.status === 'needs_attention';
           const reminderSuppressed = isReminder && latestRun?.status === 'skipped';
-          const presentation = statusPresentation(item, latestRun);
+          const presentation: AutomationStatusPresentation = unconfirmedRun ? {
+            ...statusPresentation(item, latestRun), completed: false,
+            label: '结果未确认', attention: true, scheduleLabel: '手动执行请求', scheduleValue: '尚未确认是否执行',
+            notice: '运行记录不能证明这次手动执行的结果。请核对实际状态；不会自动重试。',
+          } : statusPresentation(item, latestRun);
+          const localIssue = localAutomation && !unconfirmedRun && presentation.attention;
           const sourceLabel = item.executorKind === 'agent'
             ? workspace?.name || '已删除工作区'
             : isReminder
               ? `本地通知 · ${workspace?.name || 'AngelBot'}`
               : item.executorKind === 'maa'
                 ? `MAA 当前任务队列 · ${workspace?.name || '已删除工作区'}`
-                : item.scriptPath || '未配置脚本';
+                : item.scriptPath?.split(/[\\/]/).pop() || '未配置脚本';
           const targeted = targetItem?.id === item.id;
+          const summaryFactsId = `automation-summary-${item.id}`;
+          const resultLabel = unconfirmedRun ? '运行记录（未关联本次请求）' : activeAgentReceipt ? '当前任务' : localIssue ? '本次记录' : '最近结果';
+          const resultText = latestRun?.summary || '尚无运行记录';
           return <article key={item.id} ref={targeted ? targetCard : undefined} tabIndex={targeted ? -1 : undefined} aria-label={item.title} className={`automation-card${targeted ? ' automation-card-target' : ''}`}>
-            <details className="automation-card-details">
-              <summary className="automation-card-summary" aria-label={`${item.title} 详情`}>
+            <details className="automation-card-details" onToggle={localIssue ? event => {
+              const card = event.currentTarget;
+              if (event.target !== card || !card.open) return;
+              const history = card.querySelector<HTMLDetailsElement>('.automation-output');
+              if (history) history.open = true;
+            } : undefined}>
+              <summary className="automation-card-summary" aria-label={`${item.title} ${localIssue ? '查看运行记录' : '详情'}`} aria-describedby={localIssue ? `${summaryFactsId} ${summaryFactsId}-guidance` : summaryFactsId}>
                 <h3 className="automation-card-title">{item.title}</h3>
                 <div className="automation-card-meta">
                   <p className="automation-trigger">{item.triggerValue}</p>
@@ -425,24 +645,32 @@ export function AutomationPage() {
                   <span className={`automation-status ${presentation.completed ? 'enabled' : presentation.attention ? 'attention' : ''}`}><i />{presentation.label}</span>
                   <span className="automation-card-chevron" aria-hidden="true">›</span>
                 </span>
+                <dl className="automation-summary-facts" id={summaryFactsId}>
+                  <div><dt>{presentation.scheduleLabel}</dt><dd>{presentation.scheduleValue}</dd></div>
+                  <div><dt>{resultLabel}</dt><dd>{resultText}</dd></div>
+                </dl>
+                {localIssue && <span className="automation-issue-guidance" id={`${summaryFactsId}-guidance`}>
+                  {presentation.notice && <span>{presentation.notice}</span>}
+                  <span className="automation-issue-action" aria-hidden="true">查看运行记录</span>
+                </span>}
               </summary>
               <div className="automation-card-body">
-                <dl><div><dt>{presentation.scheduleLabel}</dt><dd>{presentation.scheduleValue}</dd></div><div><dt>{activeAgentReceipt ? '当前任务' : '最近结果'}</dt><dd>{latestRun?.summary || '尚无运行记录'}</dd></div></dl>
-                {presentation.notice && <p className="automation-state-note">{presentation.notice}</p>}
+                {item.executorKind === 'script' && item.scriptPath && <dl><div className="automation-execution-path"><dt>脚本副本</dt><dd><code>{item.scriptPath}</code></dd></div></dl>}
+                {!localIssue && presentation.notice && <p className="automation-state-note">{presentation.notice}</p>}
                 {item.lastSkippedAt != null && <p className="automation-state-note">本次未启动 · {formatTime(item.lastSkippedAt)}；展开运行记录查看原因。</p>}
-                <AutomationHistory automationId={item.id} revision={`${latestRun?.id}:${latestRun?.status}:${item.lastSkippedAt}`} />
+                <AutomationHistory automationId={item.id} revision={`${latestRun?.id}:${latestRun?.status}:${item.lastSkippedAt}:${unconfirmedRun}`} />
                 <div className="automation-actions">
-                  <button className="secondary automation-delete" type="button" disabled={busyId === item.id || localBusy} aria-label={`删除 ${item.title}`} onClick={() => void perform(item.id, () => deleteAutomation(item.id))}>删除任务</button>
+                  <button className="secondary automation-delete" type="button" disabled={isBusy || localBusy || pendingRun || unconfirmedRun} aria-label={`删除 ${item.title}`} onClick={() => void perform(item.id, () => deleteAutomation(item.id))}>删除任务</button>
                   {presentation.workspaceAction && workspace && item.workspaceId && <button type="button" className="secondary automation-open-result" aria-label={`前往 ${workspace.kind === 'personal' ? 'AngelBot 日常' : workspace.name} ${presentation.workspaceAction}`} onClick={() => void openOwningWorkspace(item.workspaceId!)}>{presentation.workspaceAction}</button>}
-                  {(activeLocalRun?.stopControl === 'available' || activeLocalRun?.stopControl === 'requested') && <button type="button" className="secondary" disabled={busyId === item.id || activeLocalRun.stopControl === 'requested'} onClick={() => void perform(item.id, () => stopAutomationRun(item.id, activeLocalRun.id))}>{activeLocalRun.stopControl === 'requested' ? '正在停止' : '停止本次执行'}</button>}
-                  <button type="button" className="secondary" disabled={busyId === item.id || pendingRun || !!activeLocalRun || !!activeAgentRun || pausedAgent} onClick={() => void perform(item.id, () => runAutomationNow(item.id), true)}>{activeAgentRun ? presentation.label : activeLocalRun ? '等待结果' : pendingRun || busyId === item.id ? '处理中…' : pausedAgent ? '先启用再执行' : unresolvedLocalRun ? '核对后重新运行' : item.executorKind === 'agent' ? '立即执行' : isReminder ? '立即提醒' : '立即运行'}</button>
-                  <button type="button" className="secondary" disabled={busyId === item.id || reminderCompleted || reminderNeedsAttention || reminderSuppressed || (!item.enabled && unresolvedLocalRun)} onClick={() => void perform(item.id, () => setAutomationEnabled(item.id, !item.enabled))}>{reminderNeedsAttention ? '需检查通知' : reminderSuppressed ? '本次未发送' : reminderCompleted ? '已完成' : item.enabled ? '暂停' : reminderCancelled ? '恢复' : '启用'}</button>
+                  {(activeLocalRun?.stopControl === 'available' || activeLocalRun?.stopControl === 'requested') && <button type="button" className="secondary" disabled={isBusy || activeLocalRun.stopControl === 'requested'} onClick={() => void perform(item.id, () => stopAutomationRun(item.id, activeLocalRun.id))}>{activeLocalRun.stopControl === 'requested' ? '正在停止' : '停止本次执行'}</button>}
+                  <button type="button" className="secondary" disabled={isBusy || reminderCompleted || reminderNeedsAttention || reminderSuppressed || (!item.enabled && (unresolvedLocalRun || unconfirmedRun))} onClick={() => void perform(item.id, () => setAutomationEnabled(item.id, !item.enabled))}>{unconfirmedRun && !item.enabled ? '暂不能启用' : reminderNeedsAttention ? '需检查通知' : reminderSuppressed ? '本次未发送' : reminderCompleted ? '已完成' : item.enabled ? '暂停' : reminderCancelled ? '恢复' : '启用'}</button>
+                  <button type="button" className={localIssue ? 'secondary' : 'automation-run-button'} disabled={isBusy || pendingRun || unconfirmedRun || !!activeLocalRun || !!activeAgentRun || pausedAgent} onClick={() => void runNow(item.id)}>{unconfirmedRun ? '结果未确认' : activeAgentRun ? presentation.label : activeLocalRun ? '等待结果' : pendingRun || isBusy ? '处理中…' : pausedAgent ? '先启用再执行' : unresolvedLocalRun ? '核对后重新运行' : item.executorKind === 'agent' ? '立即执行' : isReminder ? '立即提醒' : '立即运行'}</button>
                 </div>
               </div>
             </details>
           </article>;
         })}</div>}
-      </section>
+      </section>}
     </main>
   );
 }

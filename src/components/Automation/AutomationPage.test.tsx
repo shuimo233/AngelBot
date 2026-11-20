@@ -2,11 +2,12 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createAutomation, createMaaAutomation, deleteAutomation, getAutomationRuns, getAutomationDashboard, runAutomationNow, setAutomationEnabled, stopAutomationRun, type Automation, type AutomationRun } from '$lib/commands/automation';
-import { getDesktopTrustedApps } from '$lib/commands/desktop';
+import { createAutomation, createMaaAutomation, deleteAutomation, getAutomationRuns, getAutomationDashboard, runAutomationNow, setAutomationEnabled, stopAutomationRun, type Automation, type AutomationRun, type ManualAutomationStart } from '$lib/commands/automation';
+import { getDesktopTrustedApps, type TrustedDesktopApp } from '$lib/commands/desktop';
 import { AUTOMATIONS_UPDATED_EVENT } from '$lib/automation-events';
 import { getWorkspaces } from '$lib/commands/workspace';
 import { useNavigationStore } from '$stores/navigation';
+import { useMessagesStore } from '$stores/messages';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { AutomationPage } from './AutomationPage';
 import { getAutostart, setAutostart } from '$lib/commands/settings';
@@ -66,11 +67,17 @@ const scriptAutomation = {
   triggerKind: 'schedule', triggerValue: '每天 18:00', enabled: true, scriptPath: 'scripts/daily.ps1',
 };
 const maaAutomation = { ...scriptAutomation, id: 'daily-maa', title: 'MAA 日常队列', executorKind: 'maa', scriptPath: undefined, timeoutSeconds: 3600 };
+const trustedMaa: TrustedDesktopApp = {
+  id: 'trusted-maa', displayName: '我的 MAA', executablePath: 'C:\\Tools\\Maa.exe', capabilities: ['launch'],
+  draftSelector: null, enabled: true, createdAt: 1, updatedAt: 2,
+};
 // Creation is deliberately secondary to the task list. Exercise the visible
 // disclosure before querying fields; do not force test-only component state.
-function openCreation() {
+function openCreation(executor: 'script' | 'agent' | 'maa' = 'script') {
   const create = screen.queryByRole('button', { name: '添加自动化' });
   if (create) fireEvent.click(create);
+  if (executor === 'script') fireEvent.click(screen.getByRole('radio', { name: '运行本地脚本' }));
+  if (executor === 'maa') fireEvent.click(screen.getByRole('radio', { name: '明日方舟日常（MAA）' }));
 }
 
 function taskNameInput() {
@@ -81,22 +88,30 @@ function taskNameInput() {
 describe('AutomationPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
     vi.mocked(getAutostart).mockResolvedValue(false);
     vi.mocked(setAutostart).mockResolvedValue(undefined);
     getAutomationsMock.mockResolvedValue([]);
     getAutomationRunsMock.mockResolvedValue([]);
     getHistoryMock.mockResolvedValue([]);
-    getDashboardMock.mockImplementation(async () => ({ items: await Promise.all((await getAutomationsMock()).map(async item => {
+    getDashboardMock.mockImplementation(async (pendingRequests = []) => {
+      const items = await Promise.all((await getAutomationsMock()).map(async item => {
       const runs = await getAutomationRunsMock(item.id);
+      const matched = pendingRequests.find(request => request.automationId === item.id
+        && runs.some(run => run.id === request.runId));
+      return { item, runs, matched };
+      }));
+      return { items: items.map(({ item, runs }) => {
       const eligible = runs.filter(run => run.status !== 'skipped' || item.executorKind === 'notification');
       const latestRun = eligible.find(run => run.status === 'running')
         ?? eligible.find(run => ['queued', 'awaiting_confirmation'].includes(run.status)) ?? eligible[0] ?? null;
       return { ...item, latestRun, lastSkippedAt: runs[0]?.status === 'skipped' ? runs[0].startedAt : null };
-    })) }));
+      }), acceptedRequests: items.flatMap(({ matched }) => matched ? [matched] : []) };
+    });
     getDesktopTrustedAppsMock.mockResolvedValue([]);
     vi.mocked(open).mockResolvedValue(null);
     createMaaAutomationMock.mockResolvedValue(maaAutomation);
-    runAutomationNowMock.mockResolvedValue(undefined);
+    runAutomationNowMock.mockResolvedValue({ status: 'accepted' });
     setAutomationEnabledMock.mockResolvedValue(undefined);
     stopAutomationRunMock.mockResolvedValue(undefined);
     deleteAutomationMock.mockResolvedValue(undefined);
@@ -105,6 +120,7 @@ describe('AutomationPage', () => {
       { id: 'project-a', name: '项目 A', kind: 'project', rootPath: 'C:/project-a', createdAt: 1, updatedAt: 1, activeSessionId: 'project-a-main' },
     ]);
     useNavigationStore.setState({ currentPage: 'tasks', automationTarget: null });
+    useMessagesStore.setState({ input: '', inputSessionId: null, inputToken: {}, draftInputs: {} });
     useWorkspacesStore.setState({
       workspaces: [],
       activeWorkspaceId: 'personal',
@@ -120,29 +136,132 @@ describe('AutomationPage', () => {
     });
   });
 
-  it('uses a conversation hint, not a second natural-language configuration flow, and preserves the manual draft', async () => {
+  it('links to the conversation and preserves the manual draft', async () => {
     const user = userEvent.setup();
     render(<AutomationPage />);
-    await screen.findByText(/可以直接与 AngelBot 讨论/);
+    expect(screen.getByRole('button', { name: '在对话里交代' })).toBeVisible();
     expect(screen.queryByRole('button', { name: '解析' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '一句话创建' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('任务名称')).not.toBeInTheDocument();
     expect(getDesktopTrustedAppsMock).not.toHaveBeenCalled();
     await user.type(taskNameInput(), '整理日常文件');
-    expect(screen.getByRole('heading', { name: '基本信息' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '要做什么' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '脚本与参数' })).toBeInTheDocument();
-    expect(screen.getByText('运行选项').closest('details')).not.toHaveAttribute('open');
-    expect(screen.getByRole('button', { name: '选择目录' })).not.toBeVisible();
+    expect(screen.getByRole('button', { name: '运行选项' })).toHaveAttribute('aria-haspopup', 'dialog');
+    expect(screen.queryByRole('button', { name: '选择目录' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('参数（每行一个）')).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: '任务类型' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: 'MAA 当前任务队列' })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '收起配置' }));
+    expect(screen.getByRole('radio', { name: '明日方舟日常（MAA）' })).toBeVisible();
+    expect(screen.queryByLabelText('可信 MAA')).not.toBeInTheDocument();
+    expect(getDesktopTrustedAppsMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '返回任务' }));
     await user.click(screen.getByRole('button', { name: '添加自动化' }));
     expect(screen.getByLabelText('任务名称')).toHaveValue('整理日常文件');
-    await user.click(screen.getByRole('button', { name: '去对话' }));
+    await user.type(screen.getByLabelText('脚本路径'), 'C:/Tools/daily.ps1');
+    screen.getByRole('button', { name: '预览规则' }).focus();
+    await user.keyboard('{Enter}');
+    expect(screen.queryByRole('group', { name: '自动化配置' })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '确认创建任务' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: '确认创建任务' })).toHaveFocus();
+    screen.getByRole('button', { name: '返回编辑' }).focus();
+    await user.keyboard('{Enter}');
+    expect(screen.getByRole('heading', { name: '添加自动化' })).toHaveFocus();
+    expect(screen.getByLabelText('任务名称')).toHaveValue('整理日常文件');
+    expect(screen.getByLabelText('脚本路径')).toHaveValue('C:/Tools/daily.ps1');
+    const titleInput = screen.getByLabelText('任务名称');
+    await user.type(titleInput, '（修订）');
+    expect(titleInput).toHaveFocus();
+    const readCount = getDashboardMock.mock.calls.length;
+    fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
+    await waitFor(() => expect(getDashboardMock).toHaveBeenCalledTimes(readCount + 1));
+    expect(titleInput).toHaveFocus();
+    await user.click(screen.getByRole('button', { name: '返回任务' }));
+    await user.click(screen.getByRole('button', { name: '在对话里交代' }));
     expect(useNavigationStore.getState().currentPage).toBe('chat');
     expect(useWorkspacesStore.getState().openWorkspace).not.toHaveBeenCalled();
     expect(createAutomationMock).not.toHaveBeenCalled();
     expect(createMaaAutomationMock).not.toHaveBeenCalled();
+  });
+
+  it('saves one daily MAA schedule without a model or starting the queue', async () => {
+    const user = userEvent.setup();
+    const nextRunAt = 1_793_452_800;
+    const persisted = { ...maaAutomation, title: '明日方舟日常', nextRunAt, lastRunAt: undefined };
+    let finishSave!: (item: Automation) => void;
+    createMaaAutomationMock.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
+    getDesktopTrustedAppsMock.mockResolvedValue([trustedMaa, { ...trustedMaa, id: 'other', displayName: '别的程序', executablePath: 'C:/Apps/not-maa.exe' }]);
+    render(<AutomationPage />);
+    openCreation('maa');
+    await screen.findByRole('option', { name: '我的 MAA' });
+    expect(screen.queryByRole('option', { name: '别的程序' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('radio', { name: '登录 Windows 时' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('任务说明')).not.toBeInTheDocument();
+    expect(screen.getByText(/勾选的任务队列.*不需要连接模型/)).toBeVisible();
+
+    const save = screen.getByRole('button', { name: '保存 MAA 日程' });
+    expect(save).toBeDisabled();
+    await user.selectOptions(screen.getByLabelText('可信 MAA'), 'trusted-maa');
+    await user.selectOptions(screen.getByLabelText('归属空间'), 'project-a');
+    const simulator = screen.getByRole('checkbox', { name: '按需启动 MAA 已配置的模拟器' });
+    expect(simulator).not.toBeChecked();
+    await user.click(simulator);
+    await user.click(screen.getByRole('button', { name: '选择执行时间' }));
+    await user.click(screen.getByRole('button', { name: '18 时' }));
+    await user.click(screen.getByRole('button', { name: '00 分' }));
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    act(() => { fireEvent.click(save); fireEvent.click(save); });
+    expect(screen.getByRole('button', { name: '保存中…' })).toBeDisabled();
+    expect(createMaaAutomationMock).toHaveBeenCalledTimes(1);
+    expect(createMaaAutomationMock).toHaveBeenCalledWith({ title: '明日方舟日常', triggerValue: '每天 18:00', workspaceId: 'project-a', appId: 'trusted-maa', launchEmulator: true });
+    getAutomationsMock.mockResolvedValue([persisted]);
+    await act(async () => finishSave(persisted));
+
+    const item = await screen.findByRole('article', { name: '明日方舟日常' });
+    expect(screen.getAllByRole('article', { name: '明日方舟日常' })).toHaveLength(1);
+    expect(item).toHaveTextContent(/每天 18:00.*MAA 当前任务队列 · 项目 A/);
+    expect(within(item).getByText('下次执行').nextElementSibling).toHaveTextContent(new Date(nextRunAt * 1000).toLocaleString());
+    expect(createAutomationMock).not.toHaveBeenCalled();
+    expect(runAutomationNowMock).not.toHaveBeenCalled();
+    expect(setAutostart).not.toHaveBeenCalled();
+  });
+
+  it('leaves MAA creation with no side effects and preserves the draft', async () => {
+    getDesktopTrustedAppsMock.mockResolvedValue([trustedMaa]);
+    render(<AutomationPage />);
+    openCreation('maa');
+    await screen.findByRole('option', { name: '我的 MAA' });
+    fireEvent.change(screen.getByLabelText('可信 MAA'), { target: { value: 'trusted-maa' } });
+    fireEvent.change(screen.getByLabelText('任务名称（选填）'), { target: { value: '我的日程' } });
+    fireEvent.click(screen.getByRole('button', { name: '返回任务' }));
+    expect(await screen.findByText('暂无自动化任务')).toBeVisible();
+    expect(createMaaAutomationMock).not.toHaveBeenCalled();
+    expect(runAutomationNowMock).not.toHaveBeenCalled();
+    openCreation('maa');
+    expect(await screen.findByRole('option', { name: '我的 MAA' })).toBeInTheDocument();
+    expect(screen.getByLabelText('任务名称（选填）')).toHaveValue('我的日程');
+  });
+
+  it('blocks missing and disabled trusted MAA apps and leaves native revalidation authoritative', async () => {
+    getDesktopTrustedAppsMock.mockResolvedValueOnce([]).mockResolvedValueOnce([{ ...trustedMaa, enabled: false }]).mockResolvedValue([trustedMaa]);
+    createMaaAutomationMock.mockRejectedValueOnce('MAA 已停用或未授予打开应用权限');
+    render(<AutomationPage />);
+    openCreation('maa');
+    expect(await screen.findByText('尚未添加可信的 MAA.exe。')).toBeVisible();
+    const save = screen.getByRole('button', { name: '保存 MAA 日程' });
+    expect(save).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '重新读取可信应用' }));
+    expect(await screen.findByRole('option', { name: '我的 MAA（已停用）', hidden: true })).toBeDisabled();
+    expect(screen.getByText('可信列表中的 MAA 已停用或未授予打开应用权限。')).toBeVisible();
+    expect(save).toBeDisabled();
+    expect(createMaaAutomationMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '重新读取可信应用' }));
+    await screen.findByRole('option', { name: '我的 MAA' });
+    fireEvent.change(screen.getByLabelText('可信 MAA'), { target: { value: 'trusted-maa' } });
+    await waitFor(() => expect(save).toBeEnabled());
+    fireEvent.click(save);
+    expect(await screen.findByRole('alert')).toHaveTextContent('MAA 已停用或未授予打开应用权限');
+    expect(screen.getByRole('heading', { name: '添加自动化' })).toBeVisible();
+    expect(runAutomationNowMock).not.toHaveBeenCalled();
   });
   it('shows task summaries first and opens actions only through the shared disclosure', async () => {
     const user = userEvent.setup();
@@ -151,6 +270,7 @@ describe('AutomationPage', () => {
     const summary = await screen.findByLabelText('现有脚本 详情');
     const details = summary.closest('details')!;
     expect(details).not.toHaveAttribute('open');
+    expect(summary).toHaveAccessibleDescription(/下次执行.*最近结果.*尚无运行记录/);
     expect(getHistoryMock).not.toHaveBeenCalled();
     await user.click(summary);
     expect(details).toHaveAttribute('open');
@@ -170,26 +290,28 @@ describe('AutomationPage', () => {
     render(<AutomationPage />);
     await user.type(taskNameInput(), '整理文件');
     expect(screen.getByText('保存副本运行，原文件不变。')).toBeVisible();
-    const details = screen.getByText('脚本使用说明').closest('details')!;
-    expect(details).not.toHaveAttribute('open');
-    const copyDetails = screen.getByText(/源文件更新不会自动同步/);
-    expect(copyDetails).not.toBeVisible();
-    await user.click(screen.getByText('脚本使用说明'));
-    expect(copyDetails).toBeVisible();
-    await user.click(screen.getByText('脚本使用说明'));
+    const instructions = screen.getByRole('button', { name: '脚本使用说明' });
+    expect(screen.queryByText(/源文件更新不会自动同步/)).not.toBeInTheDocument();
+    await user.click(instructions);
+    expect(screen.getByRole('dialog', { name: '脚本使用说明' })).toHaveTextContent(/源文件更新不会自动同步/);
+    await user.keyboard('{Escape}');
+    expect(instructions).toHaveFocus();
     vi.mocked(open).mockResolvedValueOnce('C:/approved/report.ps1');
     await user.click(screen.getByRole('button', { name: '选择脚本' }));
     expect(screen.getByLabelText('脚本路径')).toHaveValue('C:/approved/report.ps1');
     expect(open).toHaveBeenLastCalledWith(expect.objectContaining({ directory: false, multiple: false, defaultPath: undefined, filters: [{ name: '本地脚本', extensions: ['py', 'js', 'mjs', 'cjs', 'ps1', 'bat', 'cmd'] }] }));
-    await user.click(screen.getByText('运行选项'));
+    const options = screen.getByRole('button', { name: '运行选项' });
+    await user.click(options);
     vi.mocked(open).mockResolvedValueOnce('C:/approved/reports');
     await user.click(screen.getByRole('button', { name: '选择目录' }));
     expect(screen.getByLabelText('脚本工作目录（可选）')).toHaveValue('C:/approved/reports');
-    await user.click(screen.getByText('运行选项'));
-    expect(screen.getByRole('button', { name: '选择目录' })).not.toBeVisible();
+    await user.click(screen.getByRole('button', { name: '返回配置' }));
+    expect(options).toHaveFocus();
+    expect(screen.queryByRole('button', { name: '选择目录' })).not.toBeInTheDocument();
     expect(screen.getByText(/自定义工作目录 · 300 秒超时/)).toBeVisible();
-    await user.click(screen.getByText('运行选项'));
+    await user.click(options);
     expect(screen.getByLabelText('脚本工作目录（可选）')).toHaveValue('C:/approved/reports');
+    await user.click(screen.getByRole('button', { name: '返回配置' }));
     await user.click(screen.getByRole('button', { name: '选择脚本' }));
     expect(screen.getByLabelText('脚本路径')).toHaveValue('C:/approved/report.ps1');
     vi.mocked(open).mockRejectedValueOnce(new Error('选择器暂不可用'));
@@ -211,13 +333,14 @@ describe('AutomationPage', () => {
     expect(screen.getByRole('status')).toHaveTextContent('只运行可信脚本');
     expect(screen.getByRole('status')).toHaveTextContent('不含依赖');
     expect(screen.getByRole('status')).toHaveTextContent('300 秒');
+    await user.click(screen.getByRole('button', { name: '返回编辑' }));
     await user.type(screen.getByLabelText('任务名称'), '（修改）');
     expect(screen.queryByRole('button', { name: '创建任务' })).not.toBeInTheDocument();
     expect(createAutomationMock).not.toHaveBeenCalled();
   });
 
   it('uses one dashboard read and lazily loads history with explicit failure retry', async () => {
-    getDashboardMock.mockResolvedValue({ items: [{ ...scriptAutomation, latestRun: {
+    getDashboardMock.mockResolvedValue({ acceptedRequests: [], items: [{ ...scriptAutomation, latestRun: {
       id: 'head', status: 'completed', summary: '权威回执', startedAt: 1, exitCode: 0,
     }, lastSkippedAt: 2 }] });
     getHistoryMock.mockRejectedValueOnce(new Error('history unavailable')).mockResolvedValue([{
@@ -241,7 +364,7 @@ describe('AutomationPage', () => {
   });
 
   it('focuses an exact owner-bound target once and never runs it through navigation', async () => {
-    const payload = { items: [{ ...scriptAutomation, latestRun: null, lastSkippedAt: null }] };
+    const payload = { acceptedRequests: [], items: [{ ...scriptAutomation, latestRun: null, lastSkippedAt: null }] };
     getDashboardMock.mockResolvedValue(payload);
     useNavigationStore.getState().openAutomation({ automationId: scriptAutomation.id, workspaceId: 'project-a' });
     render(<AutomationPage />);
@@ -257,6 +380,12 @@ describe('AutomationPage', () => {
     act(() => useNavigationStore.getState().openAutomation({ automationId: scriptAutomation.id, workspaceId: 'personal' }));
     expect(await screen.findByText(/无法定位该事项/)).toBeInTheDocument();
     expect(card).not.toHaveClass('automation-card-target');
+    fireEvent.click(screen.getByRole('button', { name: '添加自动化' }));
+    fireEvent.change(screen.getByLabelText('任务名称'), { target: { value: '保留中的草稿' } });
+    act(() => useNavigationStore.getState().openAutomation({ automationId: scriptAutomation.id, workspaceId: 'project-a' }));
+    await waitFor(() => expect(screen.getByRole('article', { name: '现有脚本' })).toHaveFocus());
+    fireEvent.click(screen.getByRole('button', { name: '添加自动化' }));
+    expect(screen.getByLabelText('任务名称')).toHaveValue('保留中的草稿');
     expect(runAutomationNowMock).not.toHaveBeenCalled();
     expect(stopAutomationRunMock).not.toHaveBeenCalled();
   });
@@ -266,7 +395,7 @@ describe('AutomationPage', () => {
     getHistoryMock.mockReturnValueOnce(new Promise(resolve => { finishHistory = resolve; })).mockResolvedValueOnce([
       { id: 'current-history', status: 'failed', summary: '本次读取的记录', output: '', startedAt: 3 },
     ]);
-    getDashboardMock.mockResolvedValue({ items: [{ ...scriptAutomation, enabled: false, latestRun: {
+    getDashboardMock.mockResolvedValue({ acceptedRequests: [], items: [{ ...scriptAutomation, enabled: false, latestRun: {
       id: 'pinned', status: 'attention_required', summary: '归属未释放，结果未知', startedAt: 1,
     }, lastSkippedAt: null }] });
     const { unmount } = render(<AutomationPage />);
@@ -345,9 +474,11 @@ describe('AutomationPage', () => {
 
     await user.type(taskNameInput(), '运行现有流程');
     await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.ps1');
+    await user.click(screen.getByText('运行选项'));
     fireEvent.change(screen.getByRole('textbox', { name: /^参数/ }), {
       target: { value: '--profile\r\nC:\\Game Tools\\daily.json\r\n\r\n  spaced argument  \r\n"literal quotes"' },
     });
+    await user.click(screen.getByRole('button', { name: '返回配置' }));
     await user.click(screen.getByRole('button', { name: '预览规则' }));
     await user.click(screen.getByRole('button', { name: '创建任务' }));
 
@@ -361,13 +492,16 @@ describe('AutomationPage', () => {
     render(<AutomationPage />);
     await user.type(taskNameInput(), '每日事项汇总');
     await user.type(screen.getByLabelText('脚本路径'), 'scripts/old.py');
-    await user.selectOptions(screen.getByLabelText(/^是否使用模型/), 'agent');
+    await user.click(screen.getByRole('radio', { name: '交给 AngelBot' }));
     expect(screen.queryByLabelText('脚本路径')).not.toBeInTheDocument();
-    expect(screen.getByLabelText(/^归属空间/)).toHaveValue('personal');
+    expect(screen.getByLabelText('结果发到')).toHaveValue('personal');
     expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
     await user.type(screen.getByLabelText('任务说明'), '汇总今天待处理的事项，给出简短清单');
     await user.click(screen.getByRole('button', { name: '预览规则' }));
     expect(screen.getByRole('status')).toHaveTextContent('是 · 当前已保存的模型');
+    expect(screen.getByRole('status')).toHaveTextContent('预计首次运行');
+    expect(screen.getByRole('status')).toHaveTextContent('查看结果');
+    expect(screen.getByRole('status')).toHaveTextContent('到点时 AngelBot 需保持运行');
     await user.click(screen.getByRole('button', { name: '创建任务' }));
     await waitFor(() => expect(createAutomationMock).toHaveBeenCalledWith(expect.objectContaining({
       executorKind: 'agent', workspaceId: 'personal', prompt: '汇总今天待处理的事项，给出简短清单',
@@ -377,12 +511,33 @@ describe('AutomationPage', () => {
     expect(runAutomationNowMock).not.toHaveBeenCalled();
   });
 
+  it('starts with a task for AngelBot and keeps script setup out of the way', () => {
+    render(<AutomationPage />);
+    openCreation('agent');
+    expect(screen.getByRole('radio', { name: '交给 AngelBot' })).toBeChecked();
+    expect(screen.getByLabelText('任务说明')).toBeVisible();
+    expect(screen.queryByLabelText('脚本路径')).not.toBeInTheDocument();
+    expect(createAutomationMock).not.toHaveBeenCalled();
+  });
+
+  it('offers a reminder draft in the current conversation and preserves an existing draft', async () => {
+    const workspaces = await getWorkspaces();
+    useWorkspacesStore.setState({ workspaces });
+    render(<AutomationPage />);
+    const goToChat = screen.getByRole('button', { name: '在对话里交代' });
+    await userEvent.click(goToChat);
+    expect(useMessagesStore.getState()).toMatchObject({ inputSessionId: 'personal-main', input: '帮我设一个提醒：' });
+    useMessagesStore.getState().setInput('我的未发送草稿');
+    await userEvent.click(goToChat);
+    expect(useMessagesStore.getState().input).toBe('我的未发送草稿');
+  });
+
   it('requires explicit startup registration and never executes while creating a startup task', async () => {
     const user = userEvent.setup();
     render(<AutomationPage />);
     await user.type(taskNameInput(), '登录后整理');
     await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.ps1');
-    await user.selectOptions(screen.getByRole('combobox', { name: /^触发方式/ }), 'startup');
+    await user.click(screen.getByRole('radio', { name: '登录 Windows 时' }));
     expect(screen.queryByLabelText('每天执行时间')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
     expect(setAutostart).not.toHaveBeenCalled();
@@ -392,11 +547,12 @@ describe('AutomationPage', () => {
     expect(screen.getByRole('button', { name: '预览规则' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: '启用 AngelBot 开机启动' }));
     await user.click(screen.getByRole('button', { name: '预览规则' }));
-    expect(screen.getByRole('status')).toHaveTextContent('从下次 Windows 登录开始触发');
-    await user.selectOptions(screen.getByRole('combobox', { name: /^触发方式/ }), 'schedule');
+    expect(screen.getByRole('status')).toHaveTextContent('下次登录 Windows 时触发');
+    await user.click(screen.getByRole('button', { name: '返回编辑' }));
+    await user.click(screen.getByRole('radio', { name: '每天定时' }));
     expect(screen.queryByRole('button', { name: '创建任务' })).not.toBeInTheDocument();
     vi.mocked(getAutostart).mockResolvedValue(true);
-    await user.selectOptions(screen.getByRole('combobox', { name: /^触发方式/ }), 'startup');
+    await user.click(screen.getByRole('radio', { name: '登录 Windows 时' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '预览规则' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: '预览规则' }));
     await user.click(screen.getByRole('button', { name: '创建任务' }));
@@ -414,9 +570,11 @@ describe('AutomationPage', () => {
     render(<AutomationPage />);
     await user.type(taskNameInput(), '现有脚本');
     await user.type(screen.getByLabelText('脚本路径'), 'scripts/daily.cmd');
-    await user.click(screen.getByRole('button', { name: '预览规则' }));
+    await user.click(screen.getByRole('button', { name: '脚本使用说明' }));
     expect(screen.getByText(/脚本结束或超时会回收其自有进程树/)).toBeInTheDocument();
     expect(screen.getByText(/批处理（.bat\/\.cmd）不接受引号或 shell 元字符/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '返回配置' }));
+    await user.click(screen.getByRole('button', { name: '预览规则' }));
     await user.click(screen.getByRole('button', { name: '创建任务' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(reason);
     expect(screen.getByRole('button', { name: '创建任务' })).toBeEnabled();
@@ -441,7 +599,7 @@ describe('AutomationPage', () => {
     expect(container.querySelector('.automation-status')).toHaveTextContent('脚本已结束');
     expect(screen.getByText('定时任务需保持 AngelBot 运行。')).toBeVisible();
     openCreation();
-    expect(screen.getByText(/退出码不保证外部业务完成/)).not.toBeVisible();
+    expect(screen.queryByText(/退出码不保证外部业务完成/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByText('脚本使用说明'));
     expect(screen.getByText(/退出码不保证外部业务完成/)).toBeVisible();
     expect(screen.getByText(/GUI 辅助工具需要明确的任务控制接口/)).toBeInTheDocument();
@@ -542,7 +700,7 @@ describe('AutomationPage', () => {
     };
     getAutomationsMock.mockResolvedValueOnce([paused]).mockResolvedValue([{ ...paused, enabled: true }]);
     setAutomationEnabledMock.mockResolvedValue(undefined);
-    runAutomationNowMock.mockResolvedValue(undefined);
+    runAutomationNowMock.mockResolvedValue({ status: 'accepted' });
     render(<AutomationPage />);
 
     const runButton = await screen.findByRole('button', { name: '先启用再执行' });
@@ -555,7 +713,7 @@ describe('AutomationPage', () => {
     const enabledRunButton = await screen.findByRole('button', { name: '立即执行' });
     expect(enabledRunButton).toBeEnabled();
     await user.click(enabledRunButton);
-    await waitFor(() => expect(runAutomationNowMock).toHaveBeenCalledWith('daily-agent'));
+    await waitFor(() => expect(runAutomationNowMock).toHaveBeenCalledWith('daily-agent', expect.any(String)));
   });
 
   it.each([
@@ -565,13 +723,13 @@ describe('AutomationPage', () => {
     const user = userEvent.setup();
     const item = { ...agentAutomation, id: `paused-${executorKind}`, executorKind };
     getAutomationsMock.mockResolvedValue([item]);
-    runAutomationNowMock.mockResolvedValue(undefined);
+    runAutomationNowMock.mockResolvedValue({ status: 'accepted' });
     render(<AutomationPage />);
 
     const runButton = await screen.findByRole('button', { name: buttonLabel });
     expect(runButton).toBeEnabled();
     await user.click(runButton);
-    await waitFor(() => expect(runAutomationNowMock).toHaveBeenCalledWith(item.id));
+    await waitFor(() => expect(runAutomationNowMock).toHaveBeenCalledWith(item.id, expect.any(String)));
   });
 
   it.each([
@@ -734,7 +892,7 @@ describe('AutomationPage', () => {
     let finish!: (accepted: boolean) => void;
     const opening = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
     useWorkspacesStore.setState({ openWorkspace: opening });
-    getDashboardMock.mockResolvedValue({ items: [{ ...agentAutomation, latestRun: {
+    getDashboardMock.mockResolvedValue({ acceptedRequests: [], items: [{ ...agentAutomation, latestRun: {
       id: 'done', status: 'completed', summary: '已完成的记录', startedAt: 1,
     }, lastSkippedAt: null }] });
     render(<AutomationPage />);
@@ -754,9 +912,9 @@ describe('AutomationPage', () => {
     ]);
     render(<AutomationPage />);
 
-    expect(await screen.findByText('需要处理')).toBeInTheDocument();
-    expect(screen.getByText(/这次运行结果未知，自动调度已暂停，不会自动重试/)).toBeInTheDocument();
-    expect(screen.getByText(/得到明确结果后才能重新启用定时/)).toBeInTheDocument();
+    expect(await screen.findByText('结果未知')).toBeInTheDocument();
+    expect(screen.getByText('已暂停，不会自动重试')).toBeInTheDocument();
+    expect(screen.getByText('先核对脚本的实际状态，确认本次已结束且不会重复操作后再运行。')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '核对后重新运行' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '启用' })).toBeDisabled();
     expect(screen.queryByRole('button', { name: '停止本次执行' })).not.toBeInTheDocument();
@@ -767,7 +925,7 @@ describe('AutomationPage', () => {
   it('blocks duplicate run and delete while its own request is pending but still allows owned stop and future pause', async () => {
     const user = userEvent.setup();
     let finishRun!: () => void;
-    runAutomationNowMock.mockReturnValueOnce(new Promise<void>(resolve => { finishRun = resolve; }));
+    runAutomationNowMock.mockReturnValueOnce(new Promise<ManualAutomationStart>(resolve => { finishRun = () => resolve({ status: 'accepted' }); }));
     getAutomationsMock.mockResolvedValue([scriptAutomation]);
     render(<AutomationPage />);
 
@@ -792,18 +950,158 @@ describe('AutomationPage', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '立即运行' })).toBeEnabled());
   });
 
-  it('surfaces a raw backend busy error and releases only its pending request', async () => {
+  it.each([
+    scriptAutomation,
+    maaAutomation,
+    { ...agentAutomation, enabled: true },
+    { ...scriptAutomation, executorKind: 'notification', triggerKind: 'once', lastRunAt: undefined },
+  ])('retains an unconfirmed $executorKind request after empty or failed readback without replaying it', async (item) => {
     const user = userEvent.setup();
-    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    getAutomationsMock.mockResolvedValue([item]);
     runAutomationNowMock.mockRejectedValueOnce('此脚本已有运行中回执，请等待结果');
     render(<AutomationPage />);
 
-    await user.click(await screen.findByRole('button', { name: '立即运行' }));
+    const label = item.executorKind === 'agent' ? '立即执行' : item.executorKind === 'notification' ? '立即提醒' : '立即运行';
+    await user.click(await screen.findByRole('button', { name: label }));
     expect(await screen.findByRole('alert')).toHaveTextContent('此脚本已有运行中回执，请等待结果');
-    expect(screen.getByRole('button', { name: '立即运行' })).toBeEnabled();
+    await waitFor(() => expect(getDashboardMock).toHaveBeenCalledTimes(2));
+    const unconfirmed = screen.getByRole('button', { name: '结果未确认' });
+    expect(unconfirmed).toBeDisabled();
+    expect(screen.getByRole('button', { name: `删除 ${item.title}` })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '暂停' })).toBeEnabled();
+    await user.click(unconfirmed);
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+
+    getDashboardMock.mockRejectedValueOnce(new Error('readback unavailable'));
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法加载自动化任务');
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+    getAutomationsMock.mockResolvedValue([{ ...item, enabled: false }]);
+    await user.click(screen.getByRole('button', { name: '暂停' }));
+    await waitFor(() => expect(setAutomationEnabledMock).toHaveBeenCalledWith(item.id, false));
+    expect(screen.getByRole('button', { name: '暂不能启用' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+    expect(runAutomationNowMock).toHaveBeenCalledTimes(1);
+    expect(deleteAutomationMock).not.toHaveBeenCalled();
   });
 
-  it('does not let an older refresh replace a newer completed receipt', async () => {
+  it('refreshes already opened history after an unconfirmed request without using it as a completion receipt', async () => {
+    const user = userEvent.setup();
+    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    getHistoryMock.mockResolvedValue([{ id: 'history-only', status: 'completed', summary: '仅历史读回的结果', output: '', startedAt: 2 }]);
+    runAutomationNowMock.mockRejectedValueOnce('执行响应丢失');
+    render(<AutomationPage />);
+    await screen.findByRole('button', { name: '立即运行' });
+    await user.click(screen.getByText('运行记录与输出'));
+    await waitFor(() => expect(getHistoryMock).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('button', { name: '立即运行' }));
+    await waitFor(() => expect(getHistoryMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+    expect(runAutomationNowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads back a persisted run after a dispatch error without claiming the request was never executed', async () => {
+    const user = userEvent.setup();
+    const completed = { id: 'new-run', status: 'completed', summary: '已保存的脚本结果', output: '', startedAt: 2 };
+    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    getAutomationRunsMock.mockResolvedValueOnce([]).mockResolvedValue([completed]);
+    runAutomationNowMock.mockRejectedValueOnce('连接中断');
+    render(<AutomationPage />);
+
+    await user.click(await screen.findByRole('button', { name: '立即运行' }));
+    expect(await screen.findByText(completed.summary)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+    expect(screen.getByText('运行记录（未关联本次请求）')).toBeInTheDocument();
+    expect(runAutomationNowMock).toHaveBeenCalledTimes(1);
+    expect(getDashboardMock).toHaveBeenCalledTimes(2);
+    expect(getHistoryMock).not.toHaveBeenCalled();
+  });
+
+  it('does not attribute old or newer scheduled receipts to an unconfirmed manual request', async () => {
+    const user = userEvent.setup();
+    const old = { id: 'previous-run', status: 'completed', summary: '上次脚本结果', output: '', startedAt: 1 };
+    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    getAutomationRunsMock.mockResolvedValue([old]);
+    runAutomationNowMock.mockRejectedValueOnce('请求连接断开');
+    render(<AutomationPage />);
+    await user.click(await screen.findByRole('button', { name: '立即运行' }));
+    expect(await screen.findByRole('button', { name: '结果未确认' })).toBeDisabled();
+    expect(screen.getByText('运行记录（未关联本次请求）')).toBeInTheDocument();
+
+    getAutomationRunsMock.mockResolvedValue([{ ...old, id: 'another-old-run', startedAt: 2 }]);
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+    getAutomationRunsMock.mockResolvedValue([{ ...old, id: 'new-scheduled-run', startedAt: 3, summary: '新计划任务的结果' }]);
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+    expect(await screen.findByText('新计划任务的结果')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '结果未确认' })).toBeDisabled();
+    expect(runAutomationNowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves a lost manual acknowledgement by exact receipt after returning to the page', async () => {
+    const user = userEvent.setup();
+    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    runAutomationNowMock.mockRejectedValueOnce('请求连接断开');
+    const first = render(<AutomationPage />);
+    await user.click(await screen.findByRole('button', { name: '立即运行' }));
+    expect(await screen.findByRole('button', { name: '结果未确认' })).toBeDisabled();
+    const [[automationId, runId]] = runAutomationNowMock.mock.calls;
+    first.unmount();
+
+    render(<AutomationPage />);
+    expect(await screen.findByRole('button', { name: '结果未确认' })).toBeDisabled();
+    expect(getDashboardMock).toHaveBeenLastCalledWith([{ automationId, runId }]);
+    const receipt = { status: 'completed', summary: '脚本执行完成', output: '', startedAt: 2 };
+    getAutomationRunsMock.mockResolvedValue([
+      { ...receipt, id: 'newer-scheduled-run', startedAt: 3 },
+      { ...receipt, id: runId },
+    ]);
+    await user.click(screen.getByRole('button', { name: '刷新' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '立即运行' })).toBeEnabled());
+    expect(runAutomationNowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a confirmed pre-dispatch rejection without locking the task', async () => {
+    const user = userEvent.setup();
+    getAutomationsMock.mockResolvedValue([scriptAutomation]);
+    runAutomationNowMock.mockResolvedValueOnce({ status: 'rejected', error: '任务已不存在' });
+    render(<AutomationPage />);
+    await user.click(await screen.findByRole('button', { name: '立即运行' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('任务已不存在');
+    expect(screen.getByRole('button', { name: '立即运行' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '结果未确认' })).not.toBeInTheDocument();
+  });
+
+  it('keeps different automation cards independently busy until their own actions settle', async () => {
+    let finishFirst!: () => void;
+    let finishSecond!: () => void;
+    const second = { ...scriptAutomation, id: 'second-script', title: '另一脚本' };
+    getAutomationsMock.mockResolvedValue([scriptAutomation, second]);
+    setAutomationEnabledMock
+      .mockReturnValueOnce(new Promise(resolve => { finishFirst = resolve; }))
+      .mockReturnValueOnce(new Promise(resolve => { finishSecond = resolve; }));
+    render(<AutomationPage />);
+    const firstCard = within(await screen.findByRole('article', { name: '现有脚本' }));
+    const secondCard = within(screen.getByRole('article', { name: '另一脚本' }));
+
+    fireEvent.click(firstCard.getByRole('button', { name: '暂停' }));
+    expect(firstCard.getByRole('button', { name: '暂停' })).toBeDisabled();
+    expect(secondCard.getByRole('button', { name: '暂停' })).toBeEnabled();
+    fireEvent.click(secondCard.getByRole('button', { name: '暂停' }));
+    expect(firstCard.getByRole('button', { name: '暂停' })).toBeDisabled();
+    expect(secondCard.getByRole('button', { name: '暂停' })).toBeDisabled();
+
+    await act(async () => { finishSecond(); });
+    expect(secondCard.getByRole('button', { name: '暂停' })).toBeEnabled();
+    expect(firstCard.getByRole('button', { name: '暂停' })).toBeDisabled();
+    await act(async () => { finishFirst(); });
+    expect(firstCard.getByRole('button', { name: '暂停' })).toBeEnabled();
+    expect(setAutomationEnabledMock.mock.calls).toEqual([[scriptAutomation.id, false], [second.id, false]]);
+  });
+
+  it('coalesces a burst of automation updates into one trailing read of the latest receipt', async () => {
     let finishOldLoad!: (items: typeof scriptAutomation[]) => void;
     getAutomationsMock.mockReturnValueOnce(new Promise(resolve => { finishOldLoad = resolve; }))
       .mockResolvedValue([scriptAutomation]);
@@ -812,17 +1110,21 @@ describe('AutomationPage', () => {
     }]);
     render(<AutomationPage />);
 
-    fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
-    expect(await screen.findByText('脚本已退出，退出码 0')).toBeInTheDocument();
+    await waitFor(() => expect(getDashboardMock).toHaveBeenCalledTimes(1));
+    for (let i = 0; i < 5; i += 1) fireEvent(window, new Event(AUTOMATIONS_UPDATED_EVENT));
+    expect(getDashboardMock).toHaveBeenCalledTimes(1);
     await act(async () => { finishOldLoad([{ ...scriptAutomation, title: '旧版本标题' }]); });
+    expect(await screen.findByText('脚本已退出，退出码 0')).toBeInTheDocument();
+    expect(getDashboardMock).toHaveBeenCalledTimes(2);
+    expect(getWorkspaces).toHaveBeenCalledTimes(2);
     expect(screen.getByText('现有脚本')).toBeInTheDocument();
     expect(screen.queryByText('旧版本标题')).not.toBeInTheDocument();
   });
 
   it.each([
     ['running', '已启动，等待结果', 'MAA 启动已登记'],
-    ['failed', '存在失败', '队列结束，部分任务失败'],
-    ['attention_required', '需要处理', 'MAA 队列结果未知'],
+    ['failed', '队列有失败', '队列结束，部分任务失败'],
+    ['attention_required', '结果未知', 'MAA 队列结果未知'],
     ['completed', '队列已结束', 'MAA 当前队列已结束'],
   ])('presents MAA %s without equating queue status with all game goals', async (status, label, summary) => {
     getAutomationsMock.mockResolvedValue([{ ...maaAutomation, enabled: status !== 'attention_required' }]);
@@ -834,6 +1136,7 @@ describe('AutomationPage', () => {
     expect(await screen.findByText(label)).toBeInTheDocument();
     expect(screen.getByText(summary)).toBeInTheDocument();
     expect(screen.getByText('MAA 当前任务队列 · 项目 A')).toBeInTheDocument();
+    expect(getHistoryMock).not.toHaveBeenCalled();
     if (status === 'running') {
       expect(screen.getByRole('button', { name: '等待结果' })).toBeDisabled();
       expect(screen.getByRole('button', { name: '删除 MAA 日常队列' })).toBeDisabled();
@@ -842,9 +1145,26 @@ describe('AutomationPage', () => {
     } else if (status === 'attention_required') {
       expect(screen.getByRole('button', { name: '核对后重新运行' })).toBeEnabled();
       expect(screen.getByRole('button', { name: '启用' })).toBeDisabled();
-      expect(screen.getByText(/不会自动重试/)).toBeInTheDocument();
+      expect(screen.getByText('后续定时')).toBeInTheDocument();
+      expect(screen.getByText('已暂停，不会自动重试')).toBeInTheDocument();
+      expect(screen.getByText(/先核对 MAA 的实际状态/)).toBeInTheDocument();
+    } else if (status === 'failed') {
+      expect(screen.getByText('下次执行')).toBeInTheDocument();
+      expect(screen.queryByText('已暂停，不会自动重试')).not.toBeInTheDocument();
+      expect(screen.getByText(/再到 MAA 核对失败项/)).toBeInTheDocument();
     } else if (status === 'completed') {
+      expect(screen.queryByLabelText('MAA 日常队列 查看运行记录')).not.toBeInTheDocument();
       expect(screen.getByText('记录的是 MAA 队列执行结果，不代表游戏业务目标全部完成。')).toBeInTheDocument();
+    }
+    if (status === 'failed' || status === 'attention_required') {
+      const summary = screen.getByLabelText('MAA 日常队列 查看运行记录');
+      expect(within(summary).getAllByText('查看运行记录')).toHaveLength(1);
+      expect(within(summary).getByText('本次记录')).toBeInTheDocument();
+      fireEvent.click(summary);
+      await waitFor(() => expect(getHistoryMock).toHaveBeenCalledTimes(1));
+      expect(getHistoryMock).toHaveBeenCalledWith(maaAutomation.id);
+      expect(screen.getByRole('button', { name: status === 'failed' ? '立即运行' : '核对后重新运行' })).not.toHaveClass('automation-run-button');
+      expect(setAutomationEnabledMock).not.toHaveBeenCalled();
     }
     expect(runAutomationNowMock).not.toHaveBeenCalled();
   });

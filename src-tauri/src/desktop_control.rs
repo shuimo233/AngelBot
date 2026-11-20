@@ -2077,15 +2077,15 @@ if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|R
 $root = [Windows.Automation.AutomationElement]::FromHandle($windows[0])
 if ($null -eq $root) { throw 'TARGET_UNAVAILABLE|The trusted application window is unavailable' }
 if ((Get-UiaSafetyState $root).processId -ne $selected.processId) { throw 'TARGET_CHANGED|The trusted window identity changed' }
+$rootState = Get-UiaSafetyState $root
+if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
+if ($rootState.offscreen -or $rootState.password) { throw 'SENSITIVE_SURFACE|The trusted window cannot be captured' }
 "#
 );
 
 /// Existing UIA safety metadata, bounded walk. No field values or names exit.
 #[cfg(windows)]
-const CAPTURE_TARGET_SCRIPT: &str = r#"
-$rootState = Get-UiaSafetyState $root
-if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
-if ($rootState.offscreen -or $rootState.password) { throw 'SENSITIVE_SURFACE|The trusted window cannot be captured' }
+const CAPTURE_PASSWORD_SCAN_SCRIPT: &str = r#"
 $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
 $pending = New-Object System.Collections.Stack
 $pending.Push(@{ element = $root; depth = 0 })
@@ -2106,6 +2106,10 @@ while ($pending.Count -gt 0) {
     catch { throw 'TARGET_UNAVAILABLE|The password safety scan is unavailable' }
   }
 }
+"#;
+
+#[cfg(windows)]
+const CAPTURE_TARGET_SCRIPT: &str = r#"
 $stateAfter = Get-UiaSafetyState $root
 if ([AngelBotCaptureWindows]::IsIconic($windows[0])) { throw 'TARGET_MINIMIZED|Restore the trusted window before requesting observation again' }
 if ($stateAfter.password -or $stateAfter.offscreen -or $stateAfter.processId -ne $rootState.processId) {
@@ -2120,13 +2124,35 @@ $stdout.Flush()
 "#;
 
 #[cfg(windows)]
+fn capture_target_script(scan_descendants: bool) -> String {
+    let password_scan = if scan_descendants {
+        CAPTURE_PASSWORD_SCAN_SCRIPT
+    } else {
+        ""
+    };
+    format!(
+        "{UIA_SAFETY_HELPERS_SCRIPT}\n{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{CAPTURE_WINDOW_SCRIPT}\n{password_scan}\n{CAPTURE_TARGET_SCRIPT}"
+    )
+}
+
+#[cfg(windows)]
 pub(crate) fn capture_target_probe(
     executable_path: &str,
     is_cancelled: &dyn Fn() -> bool,
     timeout: std::time::Duration,
 ) -> Result<crate::window_capture::CaptureTarget, DesktopAdapterError> {
+    run_capture_target_probe(executable_path, is_cancelled, timeout, true)
+}
+
+#[cfg(windows)]
+fn run_capture_target_probe(
+    executable_path: &str,
+    is_cancelled: &dyn Fn() -> bool,
+    timeout: std::time::Duration,
+    scan_descendants: bool,
+) -> Result<crate::window_capture::CaptureTarget, DesktopAdapterError> {
     use std::process::Stdio;
-    let script = format!("{UIA_SAFETY_HELPERS_SCRIPT}\n{CAPTURE_WINDOW_SELECTION_SCRIPT}\n{CAPTURE_WINDOW_SCRIPT}\n{CAPTURE_TARGET_SCRIPT}");
+    let script = capture_target_script(scan_descendants);
     let mut command = WindowsDesktopAdapter::uia_command()?;
     command
         .args([
@@ -3498,6 +3524,25 @@ impl WindowsDesktopAdapter {
         Self::system_executable("explorer.exe")
     }
 
+    pub(crate) fn reveal_in_explorer(
+        canonical: &std::path::Path,
+        is_directory: bool,
+    ) -> Result<std::process::Child, DesktopAdapterError> {
+        let path = Self::process_comparison_path(canonical);
+        let mut command = desktop_child_command(Self::system_explorer()?);
+        if is_directory {
+            command.arg(path);
+        } else {
+            command.arg(format!("/select,{path}"));
+        }
+        command.spawn().map_err(|error| {
+            DesktopAdapterError::new(
+                "LAUNCH_FAILED",
+                format!("Failed to reveal workspace item: {error}"),
+            )
+        })
+    }
+
     fn inspect_draft_targets(
         &self,
         executable_path: &str,
@@ -4403,10 +4448,13 @@ impl DesktopAdapter for WindowsDesktopAdapter {
         }
         let executable = Self::canonical_executable(executable_path)?;
         let comparison = Self::process_comparison_path(&executable);
-        let target = capture_target_probe(
+        // Resolve the exact root here. The capture helper scans all descendants
+        // immediately before and after capturing pixels, within this same deadline.
+        let target = run_capture_target_probe(
             &comparison,
             is_cancelled,
             timeout.saturating_sub(started.elapsed()),
+            false,
         )?;
         // Pixel-to-screen mapping is optional metadata, not a prerequisite for
         // read-only observation. A missing mapping returns imageRef=null and
@@ -4534,19 +4582,7 @@ impl DesktopAdapter for WindowsDesktopAdapter {
                         format!("Workspace item is unavailable: {error}"),
                     )
                 })?;
-                let explorer_path = Self::process_comparison_path(&canonical);
-                let mut command = desktop_child_command(Self::system_explorer()?);
-                if *is_directory {
-                    command.arg(&explorer_path);
-                } else {
-                    command.arg(format!("/select,{explorer_path}"));
-                }
-                let child = command.spawn().map_err(|error| {
-                    DesktopAdapterError::new(
-                        "LAUNCH_FAILED",
-                        format!("Failed to reveal workspace item: {error}"),
-                    )
-                })?;
+                let child = Self::reveal_in_explorer(&canonical, *is_directory)?;
                 Ok(DesktopActionResult {
                     adapter: self.name().into(),
                     status: "dispatched".into(),
@@ -6474,6 +6510,15 @@ $unknownStyle = [AngelBotControlWindowCandidate]::new(700, 42, 0, $false)
         let root_readiness = "$script:uiaWindowReadinessWaitMs = 1500";
         assert!(control_observation_script(false).contains(root_readiness));
         assert!(!control_observation_script(true).contains(root_readiness));
+        let capture_selection = capture_target_script(false);
+        let capture_guard = capture_target_script(true);
+        for capture in [&capture_selection, &capture_guard] {
+            assert!(capture.contains("Select-CaptureWindow $candidates $expected"));
+            assert!(capture.contains("$rootState.offscreen -or $rootState.password"));
+            assert!(capture.contains("$stateAfter.processId -ne $rootState.processId"));
+        }
+        assert!(!capture_selection.contains("Password controls cannot be captured"));
+        assert!(capture_guard.contains("Password controls cannot be captured"));
         for strict_script in [
             TRUSTED_WINDOW_SCRIPT,
             DRAFT_TARGET_SCRIPT,
@@ -6481,8 +6526,8 @@ $unknownStyle = [AngelBotControlWindowCandidate]::new(700, 42, 0, $false)
             CONTROL_TARGET_SCRIPT,
             CONTROL_OPERATION_SCRIPT,
             VERIFIED_SET_VALUE_SCRIPT,
-            CAPTURE_WINDOW_SCRIPT,
-            CAPTURE_TARGET_SCRIPT,
+            &capture_selection,
+            &capture_guard,
         ] {
             assert!(!strict_script.contains(root_readiness));
         }

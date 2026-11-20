@@ -39,37 +39,35 @@ export function ExtensionsPanel({ kind }: { kind: 'skills' | 'connections' }) {
     if (server.catalogError) return '需要重新检查配置';
     return server.catalogReady ? '已设置 · 按需连接' : '等待检查配置';
   };
-  const count = isSkills ? visibleSkills.length : visibleServers.length;
-
   return <div className="library-extensions">
-    <div className="library-section-heading">
-      <div><h2>{isSkills ? '技能' : '应用连接'}</h2><p>{isSkills ? '让助手学会一种做事方法，比如整理资料或核对文档。' : '让助手使用浏览器、笔记等外部工具。'}</p></div>
-      {isSkills ? <button type="button" className="library-primary-action" aria-expanded={showAddHelp} onClick={() => setShowAddHelp(open => !open)}>如何添加技能</button> : <button type="button" className="library-primary-action" onClick={manage}>管理连接</button>}
-    </div>
-    {showAddHelp && isSkills && <section className="library-inline-guide" aria-label="添加技能说明"><h3>在对话中添加，不必手动配置文件</h3><ol><li>找到想使用的技能，复制公开 GitHub 仓库链接。</li><li>在主对话中说：“请先检查这个技能是否适合，再帮我添加。”并附上链接。</li><li>核对来源和用途，确认添加后回到这里刷新列表。</li></ol><p>也可以直接描述想补充的能力；按名称查找需要先配置联网搜索。</p></section>}
-    <div className="library-catalog-toolbar">
+    <div className="library-catalog-toolbar" role="group" aria-label={isSkills ? '技能工具栏' : '应用连接工具栏'}>
       <input type="search" aria-label={isSkills ? '搜索技能' : '搜索应用连接'} placeholder={isSkills ? '搜索技能名称或用途…' : '搜索连接名称…'} value={query} onChange={event => setQuery(event.target.value)} />
-      <span className="library-catalog-count">{loading ? '正在读取…' : error ? '读取失败' : count + (isSkills ? ' 个技能' : ' 个连接')}</span>
-      <button type="button" disabled={loading} onClick={refresh}>刷新列表</button>
+      <div className="library-catalog-actions">
+        <button type="button" disabled={loading} onClick={refresh}>刷新列表</button>
+        {isSkills ? <button type="button" aria-expanded={showAddHelp} onClick={() => setShowAddHelp(open => !open)}>如何添加技能</button> : <button type="button" className="library-primary-action" onClick={manage}>管理连接</button>}
+      </div>
     </div>
+    {showAddHelp && isSkills && <section className="library-inline-guide" aria-label="添加技能说明">
+      <p>在主对话贴上公开仓库链接，或说出想补充的能力。核对来源和用途，确认后回来刷新。</p>
+      <p>按名称查找需要启用联网搜索。</p>
+    </section>}
     {!isSkills && active && <p className="library-catalog-note"><span>当前空间</span><strong>{active.name}</strong></p>}
     {error && <div className="library-skills-error" role="alert"><p>{error}</p><button type="button" onClick={refresh}>重新加载</button></div>}
     {loading && <p role="status">{isSkills ? '正在读取已添加的技能…' : '正在读取连接配置…'}</p>}
-    {!loading && !error && isSkills && (!skills.length ? <section className="library-empty-skills"><h3>还没有已添加的技能</h3><p>点击“如何添加技能”，从常做的一件事开始。</p></section>
+    {!loading && !error && isSkills && (!skills.length ? <p className="library-empty-skills">暂无技能</p>
       : !visibleSkills.length ? <p className="library-empty-skills">没有匹配的技能，试试其他关键词。</p> : <div className="library-extension-list">{visibleSkills.map(skill => <details key={skill.id} className="library-extension-row">
-        <summary><span className="library-extension-copy"><strong>{skill.name}</strong><span>{skill.description || '暂未提供用途说明'}</span></span><span className="library-row-affordance">查看详情</span></summary>
+        <summary><span className="library-extension-copy"><strong>{skill.name}</strong>{skill.description && <span>{skill.description}</span>}</span><span className="library-row-affordance" aria-hidden="true" /></summary>
         <div className="library-extension-detail">
           <dl><dt>版本</dt><dd>{skill.version}</dd><dt>标识</dt><dd>{skill.id}</dd><dt>作者</dt><dd>{skill.author || '未声明'}</dd><dt>依赖声明</dt><dd>{skill.dependencies.join('、') || '无'}</dd><dt>权限声明</dt><dd>{skill.permissions.join('、') || '无'}</dd></dl>
-          <p>声明不是授权或兼容证明。不会自动安装依赖；实际调用仍受已有工具与空间权限限制。</p>
-          {skill.actions.map(action => <div key={action.name} className="library-action-description"><strong>{action.name}</strong><p>{action.description || '未提供动作说明'}</p><span>处理器声明：{action.handler || '无'}</span></div>)}
+          <p>技能声明不授予权限。依赖需自行安装。</p>
+          {skill.actions.map(action => <div key={action.name} className="library-action-description"><strong>{action.name}</strong>{action.description && <p>{action.description}</p>}{action.handler && <span>处理器声明：{action.handler}</span>}</div>)}
           {skill.prompts?.map((prompt, index) => <details key={prompt.name + '-' + index}><summary>模板：{prompt.name || '未命名'}</summary><pre>{prompt.content}</pre></details>)}
-          {!skill.prompts?.length && <p>此技能未提供可预览的结构化模板；原文件可能仍有其他正文。</p>}
         </div>
       </details>)}</div>)}
-    {!loading && !error && !isSkills && (!servers.length ? <section className="library-empty-skills"><h3>还没有应用连接</h3><p>在“管理连接”中添加工具，再选择使用空间。</p></section>
+    {!loading && !error && !isSkills && (!servers.length ? <p className="library-empty-skills">暂无应用连接</p>
       : !visibleServers.length ? <p className="library-empty-skills">没有匹配的连接，试试其他关键词。</p> : <div className="library-extension-list">{visibleServers.map(server => <details key={server.id} className="library-extension-row">
         <summary><span className="library-extension-copy"><strong>{server.name}</strong><span>{status(server)}</span></span><span className="library-row-affordance">使用范围</span></summary>
-        <div className="library-extension-detail"><p>启用范围：{server.enabledWorkspaceIds.map(id => workspaces.find(workspace => workspace.id === id)?.name || '未加载的空间').join('、') || '未选择'}</p><p>这里显示已保存的配置与工具目录，不代表服务正在运行。查看本页不会连接、启动或授权服务。</p><button type="button" onClick={manage}>打开连接设置</button></div>
+        <div className="library-extension-detail"><p>启用范围：{server.enabledWorkspaceIds.map(id => workspaces.find(workspace => workspace.id === id)?.name || '未加载的空间').join('、') || '未选择'}</p><button type="button" onClick={manage}>打开连接设置</button></div>
       </details>)}</div>)}
     <details className="library-compatibility">
       <summary>{isSkills ? '技能说明' : '连接说明'}</summary>

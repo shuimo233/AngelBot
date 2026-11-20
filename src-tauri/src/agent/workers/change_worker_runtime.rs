@@ -20,6 +20,7 @@ use std::{
 use rusqlite::OptionalExtension;
 
 use super::{
+    codex_cli,
     delegated_model_binding::{
         DelegatedModelBinding, DelegatedModelBindingRepository, DelegatedModelHostFactory,
     },
@@ -30,7 +31,11 @@ use super::{
         WorkerTask as PollableWorkerTask, WorkerTaskEvent,
     },
     delegation::LeaseStatus,
-    delegation_contract::{ContractLimits, DelegationBrief, DelegationDelivery},
+    delegation_contract::{
+        validate_delivery, CandidateArtifact, Confidence, ContractLimits, DelegationBrief,
+        DelegationDelivery, DeliveryStatus, KeyFact, UsageFlags, VerificationRecord,
+        VerificationStatus,
+    },
     delegation_runtime::{Heartbeat, StopReason, WorkerDispatch},
     execution_gateway::{CapabilityGrant, CapabilityLease},
     execution_kernel::ExecutionKernel,
@@ -41,12 +46,13 @@ use super::{
     work_package::WorkPackageScope,
     worker_host_contract::{WorkerHostBinding, WorkerTask},
     worker_policy::{TaskShape, WorkerProfile},
-    workspace_isolation::{WorktreeCapability, WorktreeManifestIdentity, WorktreeOperation},
+    workspace_isolation::{
+        GitWorktreeProvider, WorktreeCapability, WorktreeManifestIdentity, WorktreeOperation,
+    },
 };
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_MODEL_ATTEMPTS: usize = 8;
 
 /// Resolves the opaque worktree binding into a provider-owned capability. No
 /// path crosses this resolver; `GitWorktreeProvider` validates the manifest
@@ -123,6 +129,7 @@ pub(crate) struct ChangeLaunchContext {
     attempt: DelegatedAttempt,
     brief: DelegationBrief,
     model_binding: DelegatedModelBinding,
+    codex_executor: bool,
 }
 
 /// The durable resolver is deliberately separate from the async launcher so
@@ -140,7 +147,7 @@ pub(crate) fn resolve_change_launch(
                         p.capability_scope_ref, p.scope_digest,
                         a.id, l.id, l.status, l.expires_at,
                         l.read_roots_json, l.write_roots_json, l.tool_allowlist_json,
-                        l.network_hosts_json, p.id
+                        l.network_hosts_json, p.id, d.executor
                  FROM delegations d
                  JOIN work_packages p ON p.id=d.work_package_id
                  JOIN delegation_attempts a ON a.delegation_id=d.id AND a.id=?2
@@ -169,6 +176,7 @@ pub(crate) fn resolve_change_launch(
                         row.get::<_, String>(16)?,
                         row.get::<_, String>(17)?,
                         row.get::<_, String>(18)?,
+                        row.get::<_, String>(19)?,
                     ))
                 },
             )
@@ -197,6 +205,7 @@ pub(crate) fn resolve_change_launch(
         tool_allowlist_json,
         network_hosts_json,
         work_package_id,
+        executor,
     ) = row;
     let task_shape = TaskShape::from_str(&shape)
         .ok_or_else(|| WorkerLaunchError::Launcher("unknown task shape".into()))?;
@@ -214,6 +223,15 @@ pub(crate) fn resolve_change_launch(
             "model worker policy rejected".into(),
         ));
     }
+    let codex_executor = match executor.as_str() {
+        "internal" => false,
+        "codex_cli"
+            if task_shape == TaskShape::Change && worker_profile == WorkerProfile::Implementer =>
+        {
+            true
+        }
+        _ => return Err(WorkerLaunchError::BindingMismatch),
+    };
     let brief: DelegationBrief = serde_json::from_str(&brief_json)
         .map_err(|_| WorkerLaunchError::Launcher("delegation brief unavailable".into()))?;
     if brief.identity.delegation_id != dispatch.delegation_id
@@ -240,6 +258,11 @@ pub(crate) fn resolve_change_launch(
         tool_allowlist: parse_strings(&tool_allowlist_json)?,
         network_hosts: parse_strings(&network_hosts_json)?,
     };
+    if codex_executor
+        && (!grant.network_hosts.is_empty() || grant.write_roots != vec![PathBuf::from(".")])
+    {
+        return Err(WorkerLaunchError::BindingMismatch);
+    }
     let lease = CapabilityLease::from_grant(grant)
         .map_err(|_| WorkerLaunchError::Launcher("invalid capability lease".into()))?;
     let scope = WorkPackageScope {
@@ -278,6 +301,7 @@ pub(crate) fn resolve_change_launch(
         attempt,
         brief,
         model_binding,
+        codex_executor,
     })
 }
 
@@ -300,6 +324,7 @@ pub struct ChangeWorkerLauncher<F, M> {
     thinking: Option<crate::llm::ThinkingSettings>,
     limits: ContractLimits,
     now: fn() -> i64,
+    worktree: Arc<GitWorktreeProvider>,
 }
 
 impl<F, M> ChangeWorkerLauncher<F, M> {
@@ -309,6 +334,7 @@ impl<F, M> ChangeWorkerLauncher<F, M> {
         model_factory: Arc<M>,
         thinking: Option<crate::llm::ThinkingSettings>,
         now: fn() -> i64,
+        worktree: Arc<GitWorktreeProvider>,
     ) -> Self {
         Self {
             db,
@@ -317,6 +343,7 @@ impl<F, M> ChangeWorkerLauncher<F, M> {
             thinking,
             limits: ContractLimits::default(),
             now,
+            worktree,
         }
     }
 }
@@ -342,6 +369,59 @@ where
             || request.binding.lease_epoch != context.binding.lease_epoch()
         {
             return Err(WorkerLaunchError::BindingMismatch);
+        }
+        if context.codex_executor {
+            let executable = codex_cli::installed_executable().ok_or_else(|| {
+                WorkerLaunchError::Launcher("Codex CLI not found; no fallback".into())
+            })?;
+            let access = DurableWorktreeAccessResolver::new(self.db.clone())
+                .resolve(&context.binding)
+                .map_err(|_| WorkerLaunchError::BindingMismatch)?;
+            let (tx, event_rx) = mpsc::channel();
+            let cancelled = ToolCancellation::new();
+            let producer_cancel = cancelled.clone();
+            let worker = ChangeWorkerTask {
+                attempt_id: context.attempt.attempt_id.clone(),
+                lease_epoch: context.attempt.epoch,
+                event_rx,
+                cancelled,
+                finished: false,
+            };
+            let provider = self.worktree.clone();
+            let limits = self.limits.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut sink = ChannelSink {
+                    tx: tx.clone(),
+                    attempt_id: context.attempt.attempt_id.clone(),
+                    epoch: context.attempt.epoch,
+                };
+                if let Some(delivery) = run_codex_candidate(
+                    &provider,
+                    &executable,
+                    access,
+                    &context,
+                    &producer_cancel,
+                    &mut sink,
+                    &limits,
+                ) {
+                    if !producer_cancel.is_cancelled()
+                        && validate_delivery(&delivery, &context.brief, None, &limits).is_ok()
+                    {
+                        let _ = sink.submit_delivery(&delivery, &limits);
+                    }
+                }
+                let _ = tx.send(WorkerTaskEvent::Terminal {
+                    attempt_id: context.attempt.attempt_id,
+                    lease_epoch: context.attempt.epoch,
+                    reason: if producer_cancel.is_cancelled() {
+                        "Codex cancelled"
+                    } else {
+                        "Codex process ended"
+                    }
+                    .into(),
+                });
+            });
+            return Ok(Box::new(worker));
         }
         let task = self
             .host_factory
@@ -375,7 +455,7 @@ where
             finished: false,
         };
         let adapter = DelegatedWorkerAdapter::new(
-            ExecutionKernel::new(cancelled.clone(), MODEL_TIMEOUT, MAX_MODEL_ATTEMPTS),
+            ExecutionKernel::new(cancelled.clone(), MODEL_TIMEOUT),
             self.limits.clone(),
         );
         tauri::async_runtime::spawn(run_change_host(
@@ -389,6 +469,190 @@ where
             self.limits.clone(),
         ));
         Ok(Box::new(worker))
+    }
+}
+
+fn run_codex_candidate(
+    provider: &GitWorktreeProvider,
+    executable: &std::path::Path,
+    access: ImplementerAccess,
+    context: &ChangeLaunchContext,
+    cancelled: &ToolCancellation,
+    sink: &mut ChannelSink,
+    limits: &ContractLimits,
+) -> Option<DelegationDelivery> {
+    let remaining = context
+        .attempt
+        .lease
+        .expires_at_ms
+        .saturating_sub(chrono::Utc::now().timestamp_millis());
+    if remaining <= 0 {
+        return None;
+    }
+    let heartbeat = || Heartbeat {
+        attempt_id: context.attempt.attempt_id.clone(),
+        epoch: context.attempt.epoch,
+        stage: "codex_running".into(),
+        progress_percent: 0,
+        budget_remaining: "bounded".into(),
+        evidence_refs: vec![],
+    };
+    let prompt = format!(
+        "Implement this bounded coding task in the current candidate checkout. Leave changes uncommitted for independent review. Do not push, change Git configuration, edit outside the checkout, or use network tools. Run only relevant local checks.\n\nTask: {}\n\nAcceptance criteria: {}",
+        context.brief.goal, context.brief.completion_criteria.join("; ")
+    );
+    sink.heartbeat(heartbeat()).ok()?;
+    let timeout = MODEL_TIMEOUT.min(Duration::from_millis(remaining as u64));
+    let run = provider.with_candidate_executor(
+        &access.identity,
+        access.capability.clone(),
+        |candidate| {
+            codex_cli::run(executable, candidate, prompt, cancelled, timeout, || {
+                sink.heartbeat(heartbeat()).is_ok()
+            })
+        },
+    );
+    let mut summary = "Codex 未能交付可审校的候选修改。";
+    let mut paths = Vec::new();
+    let mut digest = String::new();
+    let mut commands = None;
+    match run {
+        Ok(Ok(receipt)) if !cancelled.is_cancelled() => {
+            let reported_sandbox_restriction = receipt.reported_sandbox_restriction;
+            let file_change_failed = receipt.file_change_failed;
+            commands = Some(receipt);
+            match provider.inspect_executor_candidate(&access.identity, access.capability) {
+                Ok((observed, hash))
+                    if !observed.is_empty() && observed.len() <= limits.max_artifacts =>
+                {
+                    paths = observed;
+                    digest = hash;
+                }
+                Ok((observed, _)) if observed.is_empty() => {
+                    summary = if file_change_failed {
+                        "Codex 的文件修改未成功，Git 未发现候选差异；未应用任何修改。"
+                    } else if reported_sandbox_restriction {
+                        "Codex 报告沙箱限制，Git 未发现候选修改；未降低隔离。"
+                    } else {
+                        "Codex 已结束，Git 未发现候选修改。"
+                    }
+                }
+                _ => summary = "Codex 已结束，但候选状态超出范围或无法核对；未提交审校。",
+            }
+        }
+        Ok(Ok(_)) | Ok(Err(codex_cli::CodexError::Cancelled)) => return None,
+        Ok(Err(codex_cli::CodexError::Failed)) => {
+            summary = "Codex 报告执行失败；未应用任何候选修改。"
+        }
+        Ok(Err(codex_cli::CodexError::TimedOut(phase))) => {
+            summary = match phase {
+                codex_cli::CodexPhase::Launch => "Codex 启动超时，尚未收到会话开始回执；已停止。",
+                codex_cli::CodexPhase::Session => "Codex 已建立会话，但未开始任务；已超时停止。",
+                codex_cli::CodexPhase::Inference => {
+                    "Codex 已开始任务，尚未收到命令开始回执；已超时停止。"
+                }
+                codex_cli::CodexPhase::Action => {
+                    "Codex 报告过执行活动但未完成任务；已超时停止，未应用候选修改。"
+                }
+            }
+        }
+        Ok(Err(codex_cli::CodexError::Unverified)) => {
+            summary = "未能核实 Codex 进程或事件流结果；未应用任何候选修改。"
+        }
+        Ok(Err(codex_cli::CodexError::Spawn)) => summary = "Codex CLI 无法启动；未切换执行器。",
+        Err(_) => summary = "候选工作树权限、基线或状态无法核实；未启动 Codex。",
+    }
+    Some(codex_delivery(
+        &context.brief,
+        paths,
+        &digest,
+        commands,
+        summary,
+    ))
+}
+
+fn codex_delivery(
+    brief: &DelegationBrief,
+    paths: Vec<String>,
+    digest: &str,
+    commands: Option<codex_cli::CodexResult>,
+    failure_summary: &str,
+) -> DelegationDelivery {
+    let evidence = format!("{}{digest}", super::workspace_isolation::CODEX_DIFF_REF);
+    let event_ref = "evidence://codex-cli/command-status".to_string();
+    let success = !paths.is_empty();
+    let mut evidence_refs = vec![];
+    let mut key_facts = vec![];
+    let mut verifications = vec![];
+    if success {
+        evidence_refs.push(evidence.clone());
+        key_facts.push(KeyFact {
+            statement: format!("宿主通过 Git 核对了 {} 个候选路径。", paths.len()),
+            confidence: Confidence::High,
+            evidence_refs: vec![evidence.clone()],
+        });
+        verifications.push(VerificationRecord {
+            item: "候选路径与基线".into(),
+            method: "本地 Git 工作树状态".into(),
+            status: VerificationStatus::Passed,
+            conclusion: "有可核对的候选改动，尚未审校或应用。".into(),
+            evidence_ref: evidence.clone(),
+        });
+    }
+    if let Some(commands) = commands {
+        evidence_refs.push(event_ref.clone());
+        verifications.push(VerificationRecord {
+            item: "Codex 命令退出状态".into(),
+            method: "CLI 结构化事件".into(),
+            status: if commands.commands_failed > 0 {
+                VerificationStatus::Failed
+            } else {
+                VerificationStatus::NotRun
+            },
+            conclusion: format!(
+                "记录到 {} 次命令结束，{} 次失败；退出状态不能证明任务测试通过。",
+                commands.commands_finished, commands.commands_failed
+            ),
+            evidence_ref: event_ref,
+        });
+    }
+    DelegationDelivery {
+        file_read_evidence: vec![],
+        schema_version: brief.schema_version,
+        delivery_id: format!("codex_{}", uuid::Uuid::new_v4().simple()),
+        delivery_revision: 1,
+        identity: brief.identity.clone(),
+        status: if success {
+            DeliveryStatus::Completed
+        } else {
+            DeliveryStatus::Failed
+        },
+        executive_summary: if success {
+            "Codex 已产出候选修改，等待独立审校；尚未应用。"
+        } else {
+            failure_summary
+        }
+        .into(),
+        key_facts,
+        milestones: vec![],
+        verifications,
+        candidate_artifacts: paths
+            .into_iter()
+            .map(|relative_ref| CandidateArtifact {
+                kind: "file".into(),
+                relative_ref,
+                description: "宿主 Git 观测到的候选改动。".into(),
+                evidence_ref: Some(evidence.clone()),
+            })
+            .collect(),
+        open_questions: vec![],
+        risks: vec![],
+        evidence_refs,
+        usage: UsageFlags {
+            context_truncated: false,
+            output_truncated: false,
+            budget_exhausted: false,
+        },
     }
 }
 

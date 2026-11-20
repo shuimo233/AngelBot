@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "fixtureId": "long-main-mixed-v1",
+  "turnCount": 64,
+  "checkpointAfterTurns": [24, 48],
+  "milestones": [
+    {
+      "id": "old_preference",
+      "turn": 2,
+      "user": "以后日常出行优先坐地铁。这是长期偏好，约定编号 PREF-METRO-17。",
+      "assistant": "明白，日常出行优先考虑地铁。"
+    },
+    {
+      "id": "old_task",
+      "turn": 5,
+      "user": "请把苔原清单写入 mossier-check.txt 并读回核验，只处理这一个文件。",
+      "assistant": "苔原清单已写入 mossier-check.txt 并读回核验。"
+    },
+    {
+      "id": "pending_confirmation",
+      "turn": 9,
+      "user": "杏汀计划只保留草稿，等我确认后再讨论下一步。当前禁止外发。事项编号 PENDING-APRICOT-42。",
+      "assistant": "已记录，草稿仍待你确认，未外发。"
+    },
+    {
+      "id": "current_correction",
+      "turn": 32,
+      "user": "更正杏汀计划：先核对收据缺项，再由我确认。仍然禁止外发，草稿不代表完成。更正编号 CORRECTION-RECEIPT-63。",
+      "assistant": "收到，先核对收据缺项，再等你确认，仍不外发。"
+    },
+    {
+      "id": "revoke_preference",
+      "turn": 38,
+      "user": "撤回「日常出行优先坐地铁」这个长期偏好，以后不再沿用。撤回编号 REVOKE-METRO-84。",
+      "assistant": "已记录撤回，以后不再默认优先地铁。"
+    }
+  ],
+  "topics": [
+    {"user": "今天读到一本关于植物的随笔。", "assistant": "可以记下一段喜欢的描写。"},
+    {"user": "帮我区分咖啡豆的浅烘与深烘。", "assistant": "浅烘常保留产地风味，深烘更突出烘焙风味。"},
+    {"user": "说说晴天和阴天拍照的区别。", "assistant": "晴天的光线方向更明显，阴天更容易获得均匀的光。"},
+    {"user": "用一句话解释为什么排序能帮人找东西。", "assistant": "排序让查找位置可以按同一规则缩小。"},
+    {"user": "周末想留半小时读诗。", "assistant": "可以把它放在一段安静且不赶时间的空档。"},
+    {"user": "介绍一下阳台花盆怎么判断缺水。", "assistant": "先摸表土下的湿度，再结合叶片和盆重判断。"},
+    {"user": "帮我想一个随手记的标题。", "assistant": "可以叫「今天记下的小事」。"},
+    {"user": "简要解释北斗七星在夜空中看起来怎样移动。", "assistant": "它在夜间看起来围绕北天极转动。"}
+  ],
+  "artifact": {"path": "mossier-check.txt", "text": "苔原清单核验值 TUNDRA-OLD-TASK-25\n"},
+  "expected": {
+    "policies": ["daily", "project"],
+    "qualityChecks": [
+      "crossDayReopen",
+      "resumedRequestGrounded",
+      "sameMainAfterProcessRestart",
+      "artifactPhysicallyUnchanged",
+      "openConfirmation",
+      "currentCorrection",
+      "revokedPreferenceAbsent",
+      "exactSourceReadback",
+      "oldTaskReadback",
+      "noWriteReplay"
+    ]
+  }
+}

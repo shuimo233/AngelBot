@@ -4,8 +4,10 @@
 //!
 //! Provides commands for managing instruction queues and agent control.
 
+use crate::agent::pending_queue::PendingMessageQueue;
 use crate::agent::steering::{AgentControlState, Instruction, InstructionPriority};
 use crate::agent::ToolCancellation;
+use crate::llm::Message;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -13,10 +15,33 @@ use std::sync::{Arc, Mutex};
 pub struct SteeringState {
     queues: Mutex<HashMap<String, Arc<Mutex<InstructionQueue>>>>,
     agent_state: Arc<Mutex<HashMap<String, AgentControlState>>>,
-    steer_messages: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
-    follow_up_messages: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+    active_steering: Mutex<HashMap<String, ActiveSteering>>,
     cancellations: Arc<Mutex<HashMap<String, ToolCancellation>>>,
     active_runs: Arc<Mutex<HashSet<String>>>,
+}
+
+struct ActiveSteering {
+    reply_id: String,
+    queue: Arc<Mutex<PendingMessageQueue>>,
+}
+
+pub(crate) struct SteeringRegistration<'a> {
+    state: &'a SteeringState,
+    session_id: String,
+}
+
+impl Drop for SteeringRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(active) = self
+            .state
+            .active_steering
+            .lock()
+            .unwrap()
+            .remove(&self.session_id)
+        {
+            active.queue.lock().unwrap().close();
+        }
+    }
 }
 
 /// Holds a session execution slot until the current agent slice ends.
@@ -39,8 +64,7 @@ impl SteeringState {
         Self {
             queues: Mutex::new(HashMap::new()),
             agent_state: Arc::new(Mutex::new(HashMap::new())),
-            steer_messages: Arc::new(Mutex::new(HashMap::new())),
-            follow_up_messages: Arc::new(Mutex::new(HashMap::new())),
+            active_steering: Mutex::new(HashMap::new()),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             active_runs: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -80,16 +104,24 @@ impl SteeringState {
         Ok(())
     }
 
-    pub fn steering_queues(
+    /// Register the runner while its foreground session permit is held.
+    pub(crate) fn register_steering(
         &self,
-    ) -> (
-        Arc<Mutex<HashMap<String, VecDeque<String>>>>,
-        Arc<Mutex<HashMap<String, VecDeque<String>>>>,
-    ) {
-        (
-            Arc::clone(&self.steer_messages),
-            Arc::clone(&self.follow_up_messages),
-        )
+        session_id: &str,
+        reply_id: &str,
+        queue: Arc<Mutex<PendingMessageQueue>>,
+    ) -> SteeringRegistration<'_> {
+        self.active_steering.lock().unwrap().insert(
+            session_id.to_owned(),
+            ActiveSteering {
+                reply_id: reply_id.to_owned(),
+                queue,
+            },
+        );
+        SteeringRegistration {
+            state: self,
+            session_id: session_id.to_owned(),
+        }
     }
 
     /// Return the signal for the current run, creating one only for callers
@@ -114,17 +146,6 @@ impl SteeringState {
             cancellation.cancel();
         }
         Ok(())
-    }
-
-    fn enqueue_mode(&self, session_id: String, content: String, mode: SteeringMode) {
-        let target = match mode {
-            SteeringMode::Steer => &self.steer_messages,
-            SteeringMode::FollowUp => &self.follow_up_messages,
-            SteeringMode::Abort => return,
-        };
-        if let Ok(mut queues) = target.lock() {
-            queues.entry(session_id).or_default().push_back(content);
-        }
     }
 
     // Caller holds active_runs before taking the control-state locks.
@@ -297,29 +318,56 @@ pub fn enqueue_instruction(
 
 /// Submit a user intervention for a task that is currently running.
 #[tauri::command]
-pub fn submit_in_progress_command(
+pub async fn submit_in_progress_command(
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
     content: String,
     mode: SteeringMode,
+    reply_id: Option<String>,
 ) -> Result<(), String> {
-    submit_in_progress_command_impl(&state.steering, session_id, content, mode)
+    submit_in_progress_command_impl(
+        &state.steering,
+        session_id,
+        content,
+        mode,
+        reply_id.as_deref(),
+    )
+    .await
 }
 
-pub(crate) fn submit_in_progress_command_impl(
+pub(crate) async fn submit_in_progress_command_impl(
     state: &SteeringState,
     session_id: String,
     content: String,
     mode: SteeringMode,
+    reply_id: Option<&str>,
 ) -> Result<(), String> {
     if mode == SteeringMode::Abort {
         return state.interrupt_run(&session_id);
     }
-    if content.trim().is_empty() {
-        return Err("Steer and follow-up messages cannot be empty".to_string());
+    if mode == SteeringMode::FollowUp {
+        return Err("请通过会话输入框排队。".into());
     }
-    state.enqueue_mode(session_id, content, mode);
-    Ok(())
+    if content.trim().is_empty() {
+        return Err("请输入引导内容。".into());
+    }
+    let received = {
+        let active = state.active_steering.lock().unwrap();
+        let run = active
+            .get(&session_id)
+            .filter(|run| Some(run.reply_id.as_str()) == reply_id)
+            .ok_or("当前轮暂时无法接收引导。")?;
+        let received = run.queue.lock().unwrap().submit(Message {
+            role: "user".into(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            tool_images: Vec::new(),
+            protocol_state: None,
+        })?;
+        received
+    };
+    received.await.map_err(|_| "当前轮已结束。".into())
 }
 
 /// Interrupt the agent for a session
@@ -482,44 +530,53 @@ mod tests {
     }
 
     #[test]
-    fn steering_modes_keep_immediate_and_follow_up_messages_separate() {
+    fn steering_requires_the_current_reply_and_acknowledges_only_drained_input() {
         let state = SteeringState::new();
-        state.enqueue_mode(
-            "s1".to_string(),
-            "change direction".to_string(),
-            SteeringMode::Steer,
-        );
-        state.enqueue_mode(
-            "s1".to_string(),
-            "then summarize".to_string(),
-            SteeringMode::FollowUp,
-        );
-
-        let (steer, follow_up) = state.steering_queues();
+        let queue = Arc::new(Mutex::new(PendingMessageQueue::new()));
+        let registration = state.register_steering("s1", "reply", queue.clone());
+        let submit = |reply| {
+            submit_in_progress_command_impl(
+                &state,
+                "s1".into(),
+                "change direction".into(),
+                SteeringMode::Steer,
+                Some(reply),
+            )
+        };
+        let mut stale = std::pin::pin!(submit("old"));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        use std::future::Future;
+        assert!(matches!(
+            stale.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        let mut active = std::pin::pin!(submit("reply"));
+        assert!(active.as_mut().poll(&mut context).is_pending());
+        assert_eq!(queue.lock().unwrap().drain()[0].content, "change direction");
         assert_eq!(
-            steer.lock().unwrap().get("s1").unwrap().front(),
-            Some(&"change direction".to_string())
+            active.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Ok(()))
         );
-        assert_eq!(
-            follow_up.lock().unwrap().get("s1").unwrap().front(),
-            Some(&"then summarize".to_string())
-        );
+        let mut undrained = std::pin::pin!(submit("reply"));
+        assert!(undrained.as_mut().poll(&mut context).is_pending());
+        drop(registration);
+        assert!(matches!(
+            undrained.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
     }
 
     #[test]
     fn abort_mode_never_enqueues_a_prompt() {
         let state = SteeringState::new();
         let (_permit, cancellation) = state.try_start_running_run("s1").unwrap();
-        state.enqueue_mode("s1".to_string(), "stop".to_string(), SteeringMode::Abort);
         state.interrupt_run("s1").unwrap();
         assert!(cancellation.is_cancelled());
         assert_eq!(
             state.agent_state.lock().unwrap().get("s1"),
             Some(&AgentControlState::Interrupted),
         );
-        let (steer, follow_up) = state.steering_queues();
-        assert!(steer.lock().unwrap().is_empty());
-        assert!(follow_up.lock().unwrap().is_empty());
+        assert!(state.active_steering.lock().unwrap().is_empty());
     }
 
     #[test]

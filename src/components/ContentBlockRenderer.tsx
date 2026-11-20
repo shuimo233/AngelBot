@@ -1,8 +1,5 @@
 import { useEffect, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { MessageMarkdown } from './MessageMarkdown';
 import type { LiveBlock } from '$stores/messages';
 import { desktopConfirmationOperation, requiresDesktopConfirmationPreview } from '$lib/tool-confirmation';
 import { toolActionReceipt } from '$lib/tool-action-result';
@@ -202,29 +199,7 @@ export function ContentBlockRenderer({
 function TextSegment({ segment }: { segment: Extract<Segment, { kind: 'text' }> }) {
   return (
     <div className="content-block-text">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          code({ className, children, ...props }) {
-            const match = /language-(\w+)/.exec(className || '');
-            const code = String(children).replace(/\n$/, '');
-            if (match) {
-              return (
-                <SyntaxHighlighter
-                  style={vscDarkPlus}
-                  language={match[1]}
-                  PreTag="div"
-                >
-                  {code}
-                </SyntaxHighlighter>
-              );
-            }
-            return <code className={className} {...props}>{children}</code>;
-          },
-        }}
-      >
-        {segment.content}
-      </ReactMarkdown>
+      <MessageMarkdown content={segment.content} />
     </div>
   );
 }

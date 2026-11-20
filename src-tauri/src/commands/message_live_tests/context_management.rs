@@ -90,10 +90,19 @@ fn recall(history: &[Message], question: &str, root: &Path) -> (Vec<MemoryContex
     let indices = rows
         .iter()
         .map(|row| {
-            sources
-                .iter()
-                .position(|source| source == &row.content)
+            // Recall may return an explicitly labelled fragment. The stable
+            // fixture ID identifies the source; content equality does not.
+            let index = row
+                .id
+                .strip_prefix("source-")
                 .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert!(
+                index < sources.len(),
+                "recall returned an unowned fixture source"
+            );
+            index
         })
         .collect();
     (

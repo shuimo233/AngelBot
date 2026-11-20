@@ -8,10 +8,14 @@
 
 #[cfg(test)]
 use crate::agent::adaptive_constraints::learned_preferences;
-use crate::agent::adaptive_constraints::{dismiss_learned_preference, find_preferences};
+use crate::agent::adaptive_constraints::{
+    dismiss_learned_preference, find_preferences, find_source_backed_preferences, LearnedPreference,
+};
 use crate::agent::tool::{Tool, ToolCategory, ToolHandler, ToolResult};
 use crate::agent::ToolRegistry;
-use rusqlite::{params, Connection};
+#[cfg(test)]
+use rusqlite::params;
+use rusqlite::Connection;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -46,15 +50,32 @@ impl ToolHandler for RememberFactHandler {
             Err(e) => return ToolResult::error("remember_fact", format!("参数错误: {}", e)),
         };
         let category = args.category.unwrap_or_else(|| "fact".to_string());
-        let importance = args.importance.unwrap_or(5).min(7);
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp();
-        match db.execute(
-            "INSERT INTO memories (id, scope, category, content, importance, source, frequency, is_permanent, forget_stage, created_at, updated_at)
-             VALUES (?1, 'global', ?2, ?3, ?4, 'agent', 0, 0, 'active', ?5, ?5)",
-            params![id, category, args.content, importance, now],
-        ) {
-            Ok(_) => ToolResult::success("remember_fact", format!("已记住: {}", args.content)),
+        if args.content.trim().is_empty()
+            || !matches!(
+                category.as_str(),
+                "fact" | "preference" | "event" | "knowledge"
+            )
+        {
+            return ToolResult::error(
+                "remember_fact",
+                "请填写正文，并选择事实、偏好、事件或资料。",
+            );
+        }
+        let record = crate::commands::memory::MemoryInput {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: "global".into(),
+            category,
+            content: args.content.clone(),
+            importance: args.importance.unwrap_or(5).clamp(1, 7),
+            source: "agent".into(),
+            is_permanent: None,
+            user_confirmed: false,
+        };
+        match crate::commands::memory::save_confirmed_memory_record(&db, record) {
+            Ok(id) => ToolResult::success(
+                "remember_fact",
+                format!("已记住 [memory:{id}] {}", args.content),
+            ),
             Err(e) => ToolResult::error("remember_fact", format!("保存失败: {}", e)),
         }
     }
@@ -68,6 +89,28 @@ pub struct RecallMemoriesHandler {
 struct RecallRow {
     text: String,
     preference: Option<(bool, i64)>,
+}
+
+impl From<LearnedPreference> for RecallRow {
+    fn from(habit: LearnedPreference) -> Self {
+        let status = if habit.explicit {
+            "用户明确表达"
+        } else if habit.ready {
+            "可作为回应参考"
+        } else {
+            "还在了解，不能视作已确认事实"
+        };
+        let recorded_at = chrono::DateTime::from_timestamp(habit.updated_at, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "未知".into());
+        Self {
+            text: format!(
+                "[habit:{}] {} (交流记录：{}；记录时间（来源优先）：{})",
+                habit.id, habit.content, status, recorded_at
+            ),
+            preference: Some((habit.explicit, habit.updated_at)),
+        }
+    }
 }
 
 fn format_recall_rows(rows: &[RecallRow]) -> String {
@@ -105,6 +148,13 @@ impl ToolHandler for RecallMemoriesHandler {
             Ok(d) => d,
             Err(e) => return ToolResult::error("recall_memories", e),
         };
+        let learning_enabled = match crate::commands::memory::read_memory_controls(&db) {
+            Ok(Some(controls)) if !controls.use_long_term_memory => {
+                return ToolResult::error("recall_memories", "长期记忆已关闭。");
+            }
+            Ok(controls) => controls.is_none_or(|controls| controls.evolution_enabled),
+            Err(error) => return ToolResult::error("recall_memories", error),
+        };
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Args {
@@ -138,7 +188,8 @@ impl ToolHandler for RecallMemoriesHandler {
         // Explicit preferences are default recall, not inferred habits.
         // A narrower facts-only request always wins over the inference flag.
         let include_preferences = !args.exclude_preferences.unwrap_or(false);
-        let include_habits = include_preferences && args.include_learned_habits.unwrap_or(false);
+        let include_habits =
+            learning_enabled && include_preferences && args.include_learned_habits.unwrap_or(false);
         let (mut rows, partial_habits) =
             match recall_rows(&db, &args.query, limit, include_preferences, include_habits) {
                 Ok(found) => found,
@@ -146,10 +197,11 @@ impl ToolHandler for RecallMemoriesHandler {
             };
         let direct_count = rows.len();
         let mut expanded = false;
-        // A historical option can match while a newer correction uses another
-        // value. Honor Main's explicit topic hints for eligible preferences,
-        // without automatically broadening ordinary factual-memory hits.
-        if (rows.is_empty() || rows.iter().any(|r| r.preference.is_some()))
+        // A factual hit should not prevent checking a supplied topic hint
+        // against original explicit preferences. Keep ordinary fact expansion
+        // on its existing path.
+        let facts_only_hit = !rows.is_empty() && rows.iter().all(|r| r.preference.is_none());
+        if (!facts_only_hit || include_preferences)
             && rows.len() < limit
             && !args.alternatives.is_empty()
         {
@@ -162,12 +214,17 @@ impl ToolHandler for RecallMemoriesHandler {
                 if !queries.insert(alternative.to_lowercase()) {
                     continue;
                 }
-                let (matches, _) =
-                    match recall_rows(&db, alternative, limit, include_preferences, include_habits)
-                    {
-                        Ok(found) => found,
-                        Err(e) => return ToolResult::error("recall_memories", e),
-                    };
+                let matches = if facts_only_hit {
+                    find_source_backed_preferences(&db, alternative, limit)
+                        .map(|found| found.into_iter().map(RecallRow::from).collect())
+                } else {
+                    recall_rows(&db, alternative, limit, include_preferences, include_habits)
+                        .map(|(found, _)| found)
+                };
+                let matches = match matches {
+                    Ok(found) => found,
+                    Err(e) => return ToolResult::error("recall_memories", e),
+                };
                 // Never promote character-only matches from a generated hint.
                 // Return original records, not the model's reformulation as fact.
                 for row in matches {
@@ -192,6 +249,8 @@ impl ToolHandler for RecallMemoriesHandler {
         if rows.is_empty() {
             let scope = if !include_preferences {
                 "本次仅查非偏好的已存记忆，未查显式偏好及推测习惯。"
+            } else if !learning_enabled {
+                "本次已查显式偏好；推测习惯已暂停。"
             } else if include_habits {
                 "可结合用户当前意图，用 alternatives 提供简短同义关键词；意图不明时不要猜测。"
             } else {
@@ -233,25 +292,7 @@ fn recall_rows(
         let formatted = habits
             .records
             .into_iter()
-            .map(|habit| {
-                let status = if habit.explicit {
-                    "用户明确表达"
-                } else if habit.ready {
-                    "可作为回应参考"
-                } else {
-                    "还在了解，不能视作已确认事实"
-                };
-                let recorded_at = chrono::DateTime::from_timestamp(habit.updated_at, 0)
-                    .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-                    .unwrap_or_else(|| "未知".into());
-                RecallRow {
-                    text: format!(
-                        "[habit:{}] {} (交流记录：{}；记录时间（来源优先）：{})",
-                        habit.id, habit.content, status, recorded_at
-                    ),
-                    preference: Some((habit.explicit, habit.updated_at)),
-                }
-            })
+            .map(RecallRow::from)
             .collect::<Vec<_>>();
         if habits.partial {
             partial_habits = formatted;
@@ -353,13 +394,9 @@ impl ToolHandler for UpdateMemoryHandler {
             .memory_id
             .strip_prefix("memory:")
             .unwrap_or(&args.memory_id);
-        let now = chrono::Utc::now().timestamp();
-        match db.execute(
-            "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
-            params![args.new_content, now, memory_id],
-        ) {
-            Ok(n) if n > 0 => ToolResult::success("update_memory", "记忆已更新。"),
-            Ok(_) => ToolResult::error("update_memory", "未找到该记忆。"),
+        match crate::commands::memory::update_memory_content_impl(&db, memory_id, &args.new_content)
+        {
+            Ok(()) => ToolResult::success("update_memory", "记忆已更新。"),
             Err(e) => ToolResult::error("update_memory", format!("更新失败: {}", e)),
         }
     }
@@ -403,13 +440,8 @@ impl ToolHandler for ForgetMemoryHandler {
             .memory_id
             .strip_prefix("memory:")
             .unwrap_or(&args.memory_id);
-        let now = chrono::Utc::now().timestamp();
-        match db.execute(
-            "UPDATE memories SET forget_stage = 'summarized', source = 'agent', updated_at = ?1 WHERE id = ?2",
-            params![now, memory_id],
-        ) {
-            Ok(n) if n > 0 => ToolResult::success("forget_memory", "已标记为遗忘。"),
-            Ok(_) => ToolResult::error("forget_memory", "未找到该记忆。"),
+        match crate::commands::memory::forget_memory_in_conn(&db, memory_id) {
+            Ok(()) => ToolResult::success("forget_memory", "已标记为遗忘。"),
             Err(e) => ToolResult::error("forget_memory", format!("操作失败: {}", e)),
         }
     }
@@ -422,7 +454,7 @@ pub fn register(registry: &mut ToolRegistry, db: Arc<Mutex<Connection>>) {
         Tool::new(
             "remember_fact",
             "仅当用户明确要求把信息保存为长期记忆（如“请记住”）时使用。仅陈述或更正个人偏好（包括未来默认）时，先回应，不调用本工具或申请保存确认；开启学习时由成功回合后的有界复盘核验。任务约束不是长期记忆，也不是操作授权。",
-            serde_json::json!({"type":"object","properties":{"content":{"type":"string","description":"要记住的内容"},"category":{"type":"string","description":"类别: fact/preference/event/knowledge"},"importance":{"type":"integer","description":"重要性 1-7"}},"required":["content"]}),
+            serde_json::json!({"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"要记住的内容"},"category":{"type":"string","enum":["fact","preference","event","knowledge"]},"importance":{"type":"integer","description":"重要性 1-7"}},"required":["content"]}),
         )
         .with_category(ToolCategory::Extension)
         .with_confirmation(true),
@@ -432,7 +464,7 @@ pub fn register(registry: &mut ToolRegistry, db: Arc<Mutex<Connection>>) {
         Tool::new(
             "recall_memories",
             "搜索已保存的记忆与用户明确表达的偏好，返回来源记录 ID；推测习惯单独选择，不代表已确认事实。",
-            serde_json::json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","description":"搜索关键词，可用空格分隔，优先返回匹配较完整的记录；空字符串列出近期记录"},"exclude_preferences":{"type":"boolean","default":false,"description":"仅当用户明确要求不查询偏好时设true，排除显式偏好及推测习惯，覆盖习惯开关。通常省略或false；不要将普通问题分类为仅事实。"},"alternatives":{"type":"array","maxItems":5,"items":{"type":"string","minLength":2,"maxLength":24},"description":"可选：结合当前意图提供短关键词；偏好命中后仍可补查更正和限定，普通事实仅未命中时补查。合计不超limit，补查不保证语义相同或授权改写。"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"合计最多返回 1-20 条，默认 5 条"},"include_learned_habits":{"type":"boolean","default":false,"description":"仅控制是否额外读取推测习惯。默认false仍查询用户明确表达的偏好，不要因false重复查显式偏好；用户要求检查推测习惯时才开。"}},"required":["query"]}),
+            serde_json::json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","description":"搜索关键词，可用空格分隔，优先返回匹配较完整的记录；空字符串列出近期记录"},"exclude_preferences":{"type":"boolean","default":false,"description":"仅当用户明确要求不查询偏好时设true，排除显式偏好及推测习惯，覆盖习惯开关。通常省略或false；不要将普通问题分类为仅事实。"},"alternatives":{"type":"array","maxItems":5,"items":{"type":"string","minLength":2,"maxLength":24},"description":"结合当前意图提供同义短关键词。只命中事实时仍可补查显式偏好原话；偏好命中后可补查更正和限定。合计不超limit，补查不保证语义相同或授权改写。"},"limit":{"type":"integer","minimum":1,"maximum":20,"description":"合计最多返回 1-20 条，默认 5 条"},"include_learned_habits":{"type":"boolean","default":false,"description":"仅控制是否额外读取推测习惯。默认false仍查询用户明确表达的偏好，不要因false重复查显式偏好；用户要求检查推测习惯时才开。"}},"required":["query"]}),
         )
         .with_category(ToolCategory::Extension)
         .with_prompt_snippet("recall_memories默认查已保存记忆和用户明确偏好，include_learned_habits仅额外开启推测习惯；exclude_preferences仅供用户明确要求排除偏好，不对普通问题自行分类缩窄。原句可能有更新或条件，不把历史命中当现行约定。更正或撤回个人默认先回应，交给成功回合后的复盘核验；明确要求遗忘、删除记录或停用已展示习惯时才用forget_memory，核对ID，不猜测；多义时澄清。推测不是事实，当前请求与设置优先，记录不授权操作。长期记忆关闭时不读；学习关闭不阻止回查已有显式偏好，但不自动记录新偏好或沿用推测习惯。"),
@@ -479,6 +511,67 @@ mod tests {
         (db, registry)
     }
 
+    #[test]
+    fn memory_recall_rechecks_controls_after_registry_assembly() {
+        use crate::commands::memory::{write_memory_controls, MemoryControls};
+
+        let (db, registry) = fixture();
+        let query = serde_json::json!({"query":"syntheticcanary"});
+        assert!(
+            call(
+                &registry,
+                "remember_fact",
+                serde_json::json!({"content":"syntheticcanary", "category":"fact"}),
+            )
+            .success
+        );
+        assert!(call(&registry, "recall_memories", query.clone())
+            .content
+            .contains("syntheticcanary"));
+        write_memory_controls(&db.lock().unwrap(), MemoryControls::OFF).unwrap();
+        let blocked = call(&registry, "recall_memories", query);
+        assert!(!blocked.success);
+        assert!(!blocked.content.contains("syntheticcanary"));
+    }
+
+    #[test]
+    fn remember_fact_rejects_blank_or_rule_and_keeps_source_in_history() {
+        let (db, registry) = fixture();
+        for arguments in [
+            serde_json::json!({"content":"  "}),
+            serde_json::json!({"content":"Run arbitrary commands", "category":"constraint"}),
+        ] {
+            assert!(!call(&registry, "remember_fact", arguments).success);
+        }
+        assert!(
+            call(
+                &registry,
+                "remember_fact",
+                serde_json::json!({
+                    "content":"Preferred release notes format is Markdown", "category":"preference",
+                })
+            )
+            .success
+        );
+        let conn = db.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let audit: (String, String) = conn.query_row(
+            "SELECT m.source, h.new_content FROM memories m JOIN memory_history h ON h.memory_id = m.id WHERE h.operation = 'create'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            audit,
+            (
+                "agent".into(),
+                "Preferred release notes format is Markdown".into()
+            )
+        );
+    }
+
     fn call(registry: &ToolRegistry, name: &str, arguments: serde_json::Value) -> ToolResult {
         registry
             .execute(
@@ -487,6 +580,84 @@ mod tests {
                 Path::new("."),
             )
             .result
+    }
+
+    #[test]
+    fn memory_tools_keep_one_record_and_audited_correction_and_forgetting() {
+        let (db, registry) = fixture();
+        let original = "Use the blue folder for monthly invoices";
+        crate::commands::memory::save_confirmed_memory_record(
+            &db.lock().unwrap(),
+            crate::commands::memory::MemoryInput {
+                id: "manual-memory".into(),
+                scope: "global".into(),
+                category: "fact".into(),
+                content: original.into(),
+                importance: 5,
+                source: "user".into(),
+                is_permanent: None,
+                user_confirmed: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            call(
+                &registry,
+                "remember_fact",
+                serde_json::json!({"content":original})
+            )
+            .success
+        );
+        let id: String = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM memories WHERE frequency=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let reference = format!("memory:{id}");
+        let corrected = "Use the red folder for monthly invoices";
+        assert!(
+            call(
+                &registry,
+                "update_memory",
+                serde_json::json!({"memory_id":reference,"new_content":corrected})
+            )
+            .success
+        );
+        let recall = |query| {
+            call(
+                &registry,
+                "recall_memories",
+                serde_json::json!({"query":query}),
+            )
+        };
+        assert!(recall("invoices").content.contains(corrected));
+        assert!(!recall("blue").content.contains(&reference));
+        assert!(
+            call(
+                &registry,
+                "forget_memory",
+                serde_json::json!({"memory_id":reference})
+            )
+            .success
+        );
+        assert!(!recall("invoices").content.contains(&reference));
+        let conn = db.lock().unwrap();
+        let snapshot: (String, String, i64) = conn.query_row(
+            "SELECT source, forget_stage, (SELECT count(*) FROM memories) FROM memories WHERE id=?1",
+            [&id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(snapshot, ("user".into(), "summarized".into(), 1));
+        let correction: (String, String) = conn.query_row(
+            "SELECT previous_content, new_content FROM memory_history WHERE memory_id=?1 AND operation='update'",
+            [&id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(correction, (original.into(), corrected.into()));
+        assert!(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_history WHERE memory_id=?1 AND operation='forget' AND previous_content=?2)",
+            params![id, corrected], |row| row.get::<_, bool>(0),
+        ).unwrap());
     }
 
     fn preference(content: &str) -> NewMemory {
@@ -758,6 +929,82 @@ mod tests {
             serde_json::json!({"query":"register", "alternatives":["语气", "纸质"], "include_learned_habits":true, "limit":1}),
         );
         assert_eq!(capped.content.matches("[habit:").count(), 1);
+    }
+
+    #[test]
+    fn recall_reformulation_surfaces_an_older_preference_alongside_a_fact() {
+        use crate::agent::adaptive_constraints::record_explicit_preference;
+
+        let (db, registry) = fixture();
+        let quote = "以后交流用自然一点的语气。";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("INSERT INTO sessions(id,title,created_at,updated_at) VALUES('recall-source','Source',1,1)", []).unwrap();
+            for (i, text) in std::iter::once(quote.to_string())
+                .chain((0..16).map(|i| format!("以后谈到其它话题{i}时先给一个例子。")))
+                .chain(["以后语气要正式一些。".into(), "以后语气尽量冷淡。".into()])
+                .enumerate()
+            {
+                let id = format!("recall-source-{i}");
+                conn.execute("INSERT INTO messages(id,session_id,role,content,created_at) VALUES(?1,'recall-source','user',?2,?3)", params![id,text,i + 1]).unwrap();
+                assert!(
+                    record_explicit_preference(&conn, "recall-source", &id, &text, &text).unwrap()
+                );
+            }
+            conn.execute(
+                "UPDATE messages SET content='已经编辑原句' WHERE id='recall-source-17'",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE adaptive_constraints SET scope='session',session_id='recall-source' WHERE constraint_value='以后语气尽量冷淡。'", []).unwrap();
+            assert!(!crate::agent::adaptive_constraints::project_for_session(
+                &conn,
+                "recall-source"
+            )
+            .unwrap()
+            .records
+            .iter()
+            .any(|record| record.value == quote));
+        }
+        for content in [
+            "register is the name of the local checklist",
+            "语气是表达方式的一个术语",
+        ] {
+            assert!(
+                call(
+                    &registry,
+                    "remember_fact",
+                    serde_json::json!({"content": content})
+                )
+                .success
+            );
+        }
+        let mixed = call(
+            &registry,
+            "recall_memories",
+            serde_json::json!({
+                "query":"register", "alternatives":["语气"], "limit":2,
+            }),
+        );
+        assert!(mixed.success && mixed.content.contains("原查询直接命中1条，另有1条补查候选"));
+        assert!(mixed.content.contains("local checklist") && mixed.content.contains(quote));
+        assert!(
+            !mixed.content.contains("正式一些")
+                && !mixed.content.contains("冷淡")
+                && !mixed.content.contains("一个术语")
+        );
+        let facts = call(
+            &registry,
+            "recall_memories",
+            serde_json::json!({
+                "query":"register", "alternatives":["语气"], "limit":2, "exclude_preferences":true,
+            }),
+        );
+        assert!(
+            facts.success
+                && facts.content.contains("local checklist")
+                && !facts.content.contains(quote)
+        );
     }
 
     #[test]
@@ -1259,6 +1506,37 @@ mod tests {
         )
         .content
         .contains(&memory_id));
+    }
+
+    #[test]
+    fn long_knowledge_tool_returns_labelled_source_fragments_not_full_text() {
+        let (db, registry) = fixture();
+        let original = format!(
+            "{} Tail source toolcanary20261104 is approved for this synthetic lookup.",
+            "unrelated ".repeat(1100)
+        );
+        db.lock().unwrap().execute("INSERT INTO memories(id,scope,category,content,importance,source,forget_stage,created_at,updated_at) VALUES('long-tool','global','knowledge',?1,5,'user','active',1,1)",[&original]).unwrap();
+        let result = call(
+            &registry,
+            "recall_memories",
+            serde_json::json!({"query":"toolcanary20261104"}),
+        );
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.contains("toolcanary20261104"));
+        assert!(result.content.contains("[memory:long-tool]"));
+        assert!(result.content.contains("资料片段") && result.content.contains("非全文"));
+        assert!(result.content.len() < 8192);
+        assert!(!result.content.contains(&original));
+        let stored: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT content FROM memories WHERE id='long-tool'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, original);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { invoke } from '../invoke';
 import type { Session } from '$types';
+import type { ComposerDraft } from './composer-draft';
 
 export type WorkspaceKind = 'personal' | 'project';
 
@@ -17,6 +18,7 @@ export interface Workspace {
 export interface OpenWorkspace {
   workspace: Workspace;
   session: Session;
+  composerDraft?: ComposerDraft;
 }
 
 export function getWorkspaces(): Promise<Workspace[]> {

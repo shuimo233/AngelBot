@@ -29,6 +29,8 @@ use super::{
 };
 
 pub const WORKSPACE_ISOLATION_SCHEMA_VERSION: u16 = 1;
+const MAX_EXECUTOR_REVIEW_PATCH_BYTES: usize = 24 * 1024;
+pub(crate) const CODEX_DIFF_REF: &str = "evidence://codex-cli/diff/";
 
 /// Stable request used by the scheduler/issuance layer to create an
 /// implementation worktree.  `scope.workspace_key` remains the durable
@@ -1076,6 +1078,191 @@ impl<R: GitCommandRunner> GitWorktreeProvider<R> {
     pub fn cleanup(&self, handle: &WorktreeHandle) -> Result<ReleaseReceipt, WorkspaceError> {
         <Self as WorkspaceProvider>::release(self, handle, ReleaseDisposition::Cleanup)
     }
+
+    /// A trusted host adapter may launch an external executor here; callers
+    /// never derive a checkout path from tool arguments or a dispatch payload.
+    pub(crate) fn with_candidate_executor<T>(
+        &self,
+        identity: &WorktreeManifestIdentity,
+        capability: WorktreeCapability,
+        run: impl FnOnce(&Path) -> T,
+    ) -> Result<T, WorkspaceError> {
+        if capability.operation != WorktreeOperation::Write {
+            return Err(WorkspaceError::AccessDenied);
+        }
+        let access = self.open_file_access(identity, capability)?;
+        let current = self
+            .resolve_manifest(identity)?
+            .ok_or(WorkspaceError::WorktreeNotFound)?;
+        self.authorize(&current.handle, &access, WorktreeOperation::Write)?;
+        if !self.executor_candidate_paths(identity, &access)?.is_empty() {
+            return Err(WorkspaceError::PermissionDrift);
+        }
+        Ok(run(&current.handle.worktree_path))
+    }
+
+    pub(crate) fn inspect_executor_candidate(
+        &self,
+        identity: &WorktreeManifestIdentity,
+        capability: WorktreeCapability,
+    ) -> Result<(Vec<String>, String), WorkspaceError> {
+        let access = self.open_file_access(identity, capability)?;
+        let paths = self.executor_candidate_paths(identity, &access)?;
+        if paths.is_empty() {
+            return Ok((paths, String::new()));
+        }
+        if paths.len() > super::delegation_contract::ContractLimits::default().max_artifacts {
+            return Err(WorkspaceError::PathNotAllowed);
+        }
+        let current = self
+            .resolve_manifest(identity)?
+            .ok_or(WorkspaceError::WorktreeNotFound)?;
+        let mut args = vec!["--literal-pathspecs".into(), "add".into(), "--".into()];
+        args.extend(paths.iter().cloned());
+        self.run_ok(&current.handle.worktree_path, "stage-for-review", args)?;
+        let diff = self.read_executor_patch(&current.handle)?;
+        let digest = hex::encode(Sha256::digest(diff.as_bytes()));
+        Ok((paths, digest))
+    }
+
+    /// Read the exact staged patch after the external writer exited. The
+    /// Reviewer receives these bytes only when they match the delivery digest.
+    pub(crate) fn executor_review_patch(
+        &self,
+        identity: &WorktreeManifestIdentity,
+        digest: &str,
+    ) -> Result<String, WorkspaceError> {
+        let current = self
+            .resolve_manifest(identity)?
+            .ok_or(WorkspaceError::WorktreeNotFound)?;
+        let diff = self.read_executor_patch(&current.handle)?;
+        if hex::encode(Sha256::digest(diff.as_bytes())) != digest {
+            return Err(WorkspaceError::PermissionDrift);
+        }
+        Ok(diff)
+    }
+
+    fn read_executor_patch(&self, handle: &WorktreeHandle) -> Result<String, WorkspaceError> {
+        // Use the base revision explicitly and disable path-dependent external
+        // diff programs. The final capture uses the same diff encoding.
+        let mut command = Command::new("git");
+        command
+            .current_dir(&handle.worktree_path)
+            .args([
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--cached",
+                &handle.base_commit,
+                "--",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = crate::child_process_tree::ProcessTree::spawn(&mut command)
+            .map_err(|_| WorkspaceError::GitFailed)?;
+        let mut bytes = Vec::new();
+        let mut stdout = child
+            .take_stdout()
+            .ok_or(WorkspaceError::GitFailed)?
+            .take((MAX_EXECUTOR_REVIEW_PATCH_BYTES + 1) as u64);
+        let exhausted = stdout.read_to_end(&mut bytes).is_err()
+            || bytes.len() > MAX_EXECUTOR_REVIEW_PATCH_BYTES;
+        if exhausted {
+            let _ = child.terminate_and_wait();
+            return Err(WorkspaceError::ArtifactInvalid);
+        }
+        drop(stdout);
+        // At EOF the only child is Git, with all external diff drivers disabled.
+        let status = loop {
+            match child.try_wait().map_err(|_| WorkspaceError::GitFailed)? {
+                Some(status) => break status,
+                None => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        };
+        let patch = String::from_utf8(bytes).map_err(|_| WorkspaceError::ArtifactInvalid)?;
+        if !status.success()
+            || patch.is_empty()
+            || patch.contains("GIT binary patch")
+            || patch
+                .lines()
+                .any(|line| line.ends_with(" 160000") || line.ends_with(" 120000"))
+        {
+            return Err(WorkspaceError::ArtifactInvalid);
+        }
+        Ok(patch)
+    }
+
+    fn executor_candidate_paths(
+        &self,
+        identity: &WorktreeManifestIdentity,
+        access: &WorktreeAccess,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        let current = self
+            .resolve_manifest(identity)?
+            .ok_or(WorkspaceError::WorktreeNotFound)?;
+        let handle = &current.handle;
+        self.authorize(handle, access, WorktreeOperation::Write)?;
+        let checkout = &handle.worktree_path;
+        let head = self.run_ok(
+            checkout,
+            "rev-parse-head",
+            vec!["rev-parse".into(), "HEAD".into()],
+        )?;
+        if trim_utf8(&head) != Some(handle.base_commit.as_str()) {
+            return Err(WorkspaceError::PermissionDrift);
+        }
+        let status = self.run_ok(
+            checkout,
+            "status",
+            vec![
+                "status".into(),
+                "--porcelain=v1".into(),
+                "--untracked-files=all".into(),
+                "--no-renames".into(),
+                "-z".into(),
+            ],
+        )?;
+        if status
+            .iter()
+            .any(|byte| *byte != 0 && byte.is_ascii_control())
+        {
+            return Err(WorkspaceError::PathNotAllowed);
+        }
+        let paths = parse_status_paths(&status)?;
+        for path in &paths {
+            if path.chars().any(char::is_control)
+                || !path_in_roots(path, &access.capability.write_roots)
+            {
+                return Err(WorkspaceError::PathNotAllowed);
+            }
+            let mut target = checkout.clone();
+            for part in Path::new(path).components() {
+                let std::path::Component::Normal(part) = part else {
+                    return Err(WorkspaceError::PathNotAllowed);
+                };
+                if part
+                    .to_string_lossy()
+                    .trim_end_matches([' ', '.'])
+                    .eq_ignore_ascii_case(".git")
+                {
+                    return Err(WorkspaceError::PathNotAllowed);
+                }
+                target.push(part);
+                match fs::symlink_metadata(&target) {
+                    Ok(info) if !is_link_or_reparse(&info) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(WorkspaceError::PathNotAllowed),
+                }
+            }
+            if target.is_dir() {
+                return Err(WorkspaceError::PathNotAllowed);
+            }
+        }
+        Ok(paths)
+    }
 }
 
 /// Bounded metadata, never a canonical workspace path or file contents.
@@ -1318,7 +1505,14 @@ impl<R: GitCommandRunner> WorkspaceProvider for GitWorktreeProvider<R> {
         let diff = self.run_ok(
             &handle.worktree_path,
             "diff",
-            vec!["diff".into(), "--binary".into(), range],
+            vec![
+                "diff".into(),
+                "--binary".into(),
+                "--no-ext-diff".into(),
+                "--no-textconv".into(),
+                "--no-renames".into(),
+                range,
+            ],
         )?;
         let diff_hash = hex::encode(Sha256::digest(&diff));
         let artifact = ReviewArtifact {
@@ -2266,6 +2460,82 @@ mod tests {
             lease_epoch: 1,
             collaboration_key: "workspace".into(),
         }
+    }
+
+    #[test]
+    fn codex_candidate_patch_matches_final_capture_and_leaves_project_untouched() {
+        fn git(root: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let repo = tempdir().unwrap();
+        let storage = tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(repo.path(), &["config", "user.name", "Fixture"]);
+        git(repo.path(), &["config", "core.autocrlf", "false"]);
+        fs::create_dir(repo.path().join("src")).unwrap();
+        fs::write(repo.path().join("src/old.txt"), "before\n").unwrap();
+        git(repo.path(), &["add", "src/old.txt"]);
+        git(repo.path(), &["commit", "-qm", "baseline"]);
+        let provider =
+            GitWorktreeProvider::new(storage.path(), storage.path().join("manifests")).unwrap();
+        let handle = provider.prepare(&request(repo.path())).unwrap();
+        let identity = WorktreeManifestIdentity::for_handle(&handle, "a".repeat(64)).unwrap();
+        provider.persist_manifest(&handle, &identity).unwrap();
+        assert!(provider
+            .with_candidate_executor(&identity, reviewer_capability(), |_| panic!("read-only"))
+            .is_err());
+        provider
+            .with_candidate_executor(&identity, writer_capability(), |path| {
+                fs::write(path.join("src/old.txt"), "after\n").unwrap();
+                fs::write(path.join("src/new.txt"), "new\n").unwrap();
+            })
+            .unwrap();
+        let (paths, digest) = provider
+            .inspect_executor_candidate(&identity, writer_capability())
+            .unwrap();
+        assert_eq!(paths, ["src/new.txt", "src/old.txt"]);
+        let patch = provider.executor_review_patch(&identity, &digest).unwrap();
+        assert!(patch.contains("+after") && patch.contains("+new"));
+        assert!(provider
+            .executor_review_patch(&identity, &"0".repeat(64))
+            .is_err());
+        let verified = provider.resolve_manifest(&identity).unwrap().unwrap();
+        let access = provider
+            .open_file_access(&identity, writer_capability())
+            .unwrap();
+        let artifact = provider
+            .capture_verified(
+                &verified,
+                &access,
+                &ReviewCaptureRequest {
+                    change_set_id: None,
+                    allowed_relative_paths: paths,
+                    scope_digest: "a".repeat(64),
+                    commit_message: "Candidate change".into(),
+                    created_at: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(artifact.diff_hash, digest);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("src/old.txt")).unwrap(),
+            "before\n"
+        );
+        assert!(!repo.path().join("src/new.txt").exists());
+        provider.cleanup(&handle).unwrap();
     }
 
     #[test]

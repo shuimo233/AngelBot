@@ -8,8 +8,10 @@
 //! concurrent access and a stable tool-name order across registry views.
 
 use super::tool::{Tool, ToolCall, ToolCategory, ToolExecutionContext, ToolHandler, ToolResult};
+use crate::llm::ToolSchema;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Host-produced rejection, before dispatch/approval. Handler errors use the
@@ -101,6 +103,37 @@ pub(crate) fn repairs_argument_rejection(
         && corrected.keys().all(|key| original.contains_key(key))
 }
 
+fn same_arguments_except(original: &Value, retry: &Value, ignored: &str) -> bool {
+    let (Some(original), Some(retry)) = (original.as_object(), retry.as_object()) else {
+        return false;
+    };
+    let fixed_fields = |args: &serde_json::Map<String, Value>| {
+        args.len() - usize::from(args.contains_key(ignored))
+    };
+    fixed_fields(original) == fixed_fields(retry)
+        && original
+            .iter()
+            .all(|(key, value)| key == ignored || retry.get(key) == Some(value))
+}
+
+fn repairs_precondition(name: &str, original: &Value, output: &str, retry: &Value) -> bool {
+    // Only native handlers produce this unwrapped receipt. Ordinary handler
+    // errors and forwarded MCP text use the Error: envelope.
+    let Ok(receipt) = serde_json::from_str::<Value>(output) else {
+        return false;
+    };
+    if receipt["code"] != "TOOL_PRECONDITION_REJECTED" || receipt["tool_name"] != name {
+        return false;
+    }
+    receipt["argument"].as_str().is_some_and(|key| {
+        original
+            .get(key)
+            .zip(retry.get(key))
+            .is_some_and(|(before, after)| before != after)
+            && same_arguments_except(original, retry, key)
+    })
+}
+
 /// The caller supplies a later successful receipt, never a dispatch or proposal.
 /// Shared by live task facts and durable transcript projection.
 pub(crate) fn operation_repair_matches(
@@ -139,6 +172,10 @@ pub(crate) fn operation_repair_matches(
         && !ToolResult::is_result_unknown(false, failed_output)
         && (recovered_compaction
             || failed_args == succeeded_args
+            || (failed_name == "run_project_command"
+                && failed_args["command"].is_string()
+                && same_arguments_except(failed_args, succeeded_args, "timeout_seconds"))
+            || repairs_precondition(failed_name, failed_args, failed_output, succeeded_args)
             || repairs_argument_rejection(
                 failed_id,
                 failed_name,
@@ -164,20 +201,20 @@ pub struct ToolExecResult {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     entries: Arc<Mutex<BTreeMap<String, ToolEntry>>>,
+    confirmed_project_root: Option<Arc<Path>>,
 }
 
 struct ToolEntry {
     tool: Tool,
     handler: Arc<dyn ToolHandler>,
+    uses_workspace_root: bool,
 }
 
 impl ToolRegistry {
     /// Create an empty registry. Foreground surfaces use this constructor so
     /// installation has one explicit, auditable entry point.
     pub fn empty() -> Self {
-        Self {
-            entries: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+        Self::default()
     }
 
     pub fn new() -> Self {
@@ -188,15 +225,41 @@ impl ToolRegistry {
 
     /// Register a new tool with its handler.
     pub fn register(&mut self, tool: Tool, handler: Arc<dyn ToolHandler>) {
+        self.insert(tool, handler, false);
+    }
+
+    pub(crate) fn register_workspace_tool(&mut self, tool: Tool, handler: Arc<dyn ToolHandler>) {
+        self.insert(tool, handler, true);
+    }
+
+    pub(crate) fn bind_project_root(&mut self, root: PathBuf) {
+        self.confirmed_project_root = Some(root.into());
+    }
+
+    fn insert(&mut self, tool: Tool, handler: Arc<dyn ToolHandler>, uses_workspace_root: bool) {
         let mut guard = self.entries.lock().unwrap();
-        guard.insert(tool.name.clone(), ToolEntry { tool, handler });
+        guard.insert(
+            tool.name.clone(),
+            ToolEntry {
+                tool,
+                handler,
+                uses_workspace_root,
+            },
+        );
     }
 
     /// Issue #095: Register a batch of extension tools.
     pub fn register_extension(&mut self, tools: Vec<(Tool, Arc<dyn ToolHandler>)>) {
         let mut guard = self.entries.lock().unwrap();
         for (tool, handler) in tools {
-            guard.insert(tool.name.clone(), ToolEntry { tool, handler });
+            guard.insert(
+                tool.name.clone(),
+                ToolEntry {
+                    tool,
+                    handler,
+                    uses_workspace_root: false,
+                },
+            );
         }
     }
 
@@ -244,18 +307,12 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Get all tool schemas, optionally with enhanced parameter descriptions (Issue #52).
-    pub fn get_schemas_with_enhanced(&self, enhanced: bool) -> Vec<Value> {
+    /// Snapshot tool schemas in stable name order for prompts and model requests.
+    pub(crate) fn get_provider_schemas(&self, enhanced: bool) -> Vec<ToolSchema> {
         let guard = self.entries.lock().unwrap();
         guard
             .values()
-            .map(|entry| {
-                if enhanced {
-                    entry.tool.to_function_schema_enhanced()
-                } else {
-                    entry.tool.to_function_schema()
-                }
-            })
+            .map(|entry| entry.tool.to_provider_schema(enhanced))
             .collect()
     }
 
@@ -459,10 +516,10 @@ impl ToolRegistry {
                 terminate_batch: false,
             };
         }
-        let handler = {
+        let (handler, uses_workspace_root) = {
             let guard = self.entries.lock().unwrap();
             match guard.get(&tool_call.name) {
-                Some(entry) => Arc::clone(&entry.handler),
+                Some(entry) => (Arc::clone(&entry.handler), entry.uses_workspace_root),
                 None => {
                     return ToolExecResult {
                         result: ToolResult::error(
@@ -474,6 +531,26 @@ impl ToolRegistry {
                     };
                 }
             }
+        };
+
+        // A turn can wait on a model or confirmation after its tool surface
+        // was built. Check its bound root before preparing or dispatching I/O.
+        let work_dir = match self
+            .confirmed_project_root
+            .as_deref()
+            .filter(|_| uses_workspace_root)
+        {
+            Some(root) => {
+                if let Err(message) = crate::commands::file::validate_confirmed_project_root(root) {
+                    return ToolExecResult {
+                        result: ToolResult::error(&tool_call.name, message),
+                        call_id: call_id.to_string(),
+                        terminate_batch: false,
+                    };
+                }
+                root
+            }
+            None => work_dir,
         };
 
         // Issue #093: Call prepare_arguments to preprocess args
@@ -526,6 +603,7 @@ pub fn is_side_effect_tool(name: &str) -> bool {
             | "click_trusted_app_image"
             | "materialize_delegated_change"
             | "delegate_network_exploration"
+            | "delegate_codex_change"
     ) || name.starts_with("mcp_")
 }
 
@@ -546,11 +624,13 @@ pub fn requires_immediate_confirmation(name: &str) -> bool {
         name,
         "delete_memory"
             | "forget_memory"
+            | "remember_fact"
             | "update_memory"
             | "clear_channel_credential"
             | "save_channel_credential"
             | "import_skill_from_github"
             | "delegate_network_exploration"
+            | "delegate_codex_change"
             | "prepare_message_draft"
             | "set_trusted_app_text"
             | "operate_trusted_app_control"
@@ -565,6 +645,7 @@ mod tests {
         Tool, ToolCall, ToolCancellation, ToolCategory, ToolExecutionContext, ToolHandler,
         ToolResult,
     };
+    use crate::llm::ToolSchema;
     use serde_json::json;
     use std::path::Path;
     use std::sync::{
@@ -601,13 +682,17 @@ mod tests {
             ),
             ("zeta".to_owned(), "Z guidance".to_owned()),
         ];
+        let params = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project file"}}
+        });
         let mut previous_views = None;
         for order in [[2, 0, 1], [1, 0, 2]] {
             let mut registry = ToolRegistry::empty();
             for index in order {
                 let (name, snippet) = &expected[index];
                 registry.register(
-                    Tool::new(name, "test guidance", json!({"type":"object"}))
+                    Tool::new(name, "test guidance", params.clone())
                         .with_prompt_snippet(snippet)
                         .with_confirmation(index == 2)
                         .with_category(if index == 1 {
@@ -624,9 +709,23 @@ mod tests {
                 handler.clone(),
             );
             assert_eq!(registry.get_prompt_snippets(), expected);
-            let plain = registry.get_schemas();
-            let enhanced = registry.get_schemas_with_enhanced(true);
-            assert_eq!(plain, registry.get_schemas_with_enhanced(false));
+            let [plain, enhanced] = [false, true].map(|with_details| {
+                registry
+                    .get_provider_schemas(with_details)
+                    .iter()
+                    .map(ToolSchema::to_openai_format)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(plain, registry.get_schemas());
+            let mut expected_enhanced = plain.clone();
+            for schema in &mut expected_enhanced {
+                if schema["function"]["name"] != "without_guidance" {
+                    schema["function"]["description"] = json!(
+                        "test guidance\n\n参数说明:\n- path: Project file（类型: string）(可选)"
+                    );
+                }
+            }
+            assert_eq!(enhanced, expected_enhanced);
             for schemas in [&plain, &enhanced] {
                 assert_eq!(
                     schemas
@@ -669,6 +768,7 @@ mod tests {
     fn protected_actions_always_require_an_exact_decision() {
         for name in [
             "delete_memory",
+            "remember_fact",
             "save_channel_credential",
             "import_skill_from_github",
             "delegate_network_exploration",

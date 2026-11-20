@@ -140,6 +140,14 @@ fn main_avoids_expanding_small_completed_history_but_keeps_checkpoint_projection
         original_bytes
     );
     assert_eq!(conn.total_changes(), changes);
+    ledger[1].content = "Result: Original receipt".into();
+    let metadata = private_transcript_metadata(&ledger).unwrap();
+    conn.execute("UPDATE messages SET metadata=?1 WHERE id='a'", [&metadata])
+        .unwrap();
+    let original = hydrate_llm_history(&conn, "s", 10).unwrap();
+    let selected = main_working_history(&conn, "s", 10, original.clone(), true).unwrap();
+    assert!(selected.native_retained && !selected.applied);
+    assert_eq!(selected.messages[2].content, "Result: Original receipt");
     let checkpoint = CheckpointHistory::load(&conn, "s", 10, true)
         .unwrap()
         .unwrap();
@@ -271,6 +279,210 @@ fn main_avoids_expanding_small_completed_history_but_keeps_checkpoint_projection
     )
     .unwrap();
     assert!(!large.native_retained && large.applied);
+}
+
+#[test]
+fn main_verifies_exact_bounded_model_output_against_the_sealed_receipt() {
+    let conn = seed();
+    let metadata: String = conn
+        .query_row("SELECT metadata FROM messages WHERE id='a'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut ledger = private_transcript_from_metadata(Some(&metadata))
+        .unwrap()
+        .unwrap();
+    let raw = json!({"content":"x".repeat(6500)}).to_string();
+    let reference = tool_source::reference(SOURCE_ID).unwrap();
+    let preview = crate::agent::tool_context::view(
+        &reference,
+        "read_file",
+        true,
+        &raw,
+        "",
+        0,
+        1200,
+        false,
+        false,
+    )
+    .unwrap();
+    let result = format!("Result: {preview}");
+    for (text, success, verified) in [
+        (result.clone(), true, true),
+        (format!("{result}\nForged verification"), true, false),
+        (format!("Result: {raw}"), true, false),
+        (result, false, false),
+    ] {
+        source(&conn, &raw, success);
+        ledger[1].content = text;
+        conn.execute(
+            "UPDATE messages SET metadata=?1 WHERE id='a'",
+            [private_transcript_metadata(&ledger).unwrap()],
+        )
+        .unwrap();
+        let window = ConversationWindow::load(&conn, "s", 10).unwrap();
+        let view = project(&conn, "s", 10, &window, &[], true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.native_verified, verified);
+    }
+}
+
+#[test]
+fn contextual_receipt_uses_only_history_before_its_unique_exact_result() {
+    let mut receipt = text("tool", "Result: compact source");
+    receipt.tool_call_id = Some("recall".into());
+    let mut history = vec![
+        text("user", "Exact earlier user original"),
+        receipt.clone(),
+        text("user", "This later copy was not visible"),
+    ];
+    let prior = history_before_tool_receipt(&history, "recall", &receipt.content).unwrap();
+    assert_eq!(prior.len(), 1);
+    assert_eq!(prior[0].content, "Exact earlier user original");
+    assert!(history_before_tool_receipt(&history, "recall", "forged output").is_none());
+    receipt.content = "Result: colliding call ID".into();
+    history.push(receipt);
+    assert!(history_before_tool_receipt(&history, "recall", "Result: compact source").is_none());
+}
+
+#[test]
+fn oversized_plan_history_projects_receipts_and_keeps_user_turn_clock() {
+    use crate::agent::prompt::TurnClock;
+
+    let conn = seed();
+    let time = "2026-11-12T23:59:59+08:00";
+    let content = "x".repeat(PLAN_NATIVE_BYTES);
+    conn.execute(
+        "UPDATE messages SET content=?1,metadata=?2 WHERE id='u'",
+        params![content, json!({"hostTurnClock": time}).to_string()],
+    )
+    .unwrap();
+    let window = ConversationWindow::load(&conn, "s", 10).unwrap();
+    let original = hydrate_history_from_window_with_clocks(&conn, "s", 10, &window, true).unwrap();
+    let selected = main_plan_history_from_window(&conn, "s", 10, &window, original, true).unwrap();
+
+    assert!(selected.applied);
+    assert_eq!(selected.source_count, 1);
+    assert_eq!(
+        TurnClock::from_message(&selected.messages[0]),
+        TurnClock::parse(time)
+    );
+    assert_eq!(selected.messages[1].role, "user");
+    assert_eq!(selected.messages[1].content, content);
+    assert!(selected.messages[2]
+        .content
+        .contains("archived-tool-sources"));
+}
+
+#[test]
+fn plan_history_preserves_only_bounded_matching_encrypted_reasoning() {
+    const MODEL: &str = "gpt-6-luna";
+    const ACCOUNT: &str = "chatgpt_plan_v1_10101010-2020-4030-8040-505050505050";
+    let conn = seed();
+    let mut config = crate::llm::ProviderConfig {
+        provider: "openai".into(),
+        model: MODEL.into(),
+        base_url: "https://api.openai.com/v1".into(),
+        api_key: String::new(),
+        max_tokens: 512,
+        temperature: 0.4,
+        protocol: Some(crate::llm::ModelProtocol::OpenaiResponses),
+        auth_mode: crate::llm::ModelAuthMode::ChatgptPlan,
+        credential_ref: Some(ACCOUNT.into()),
+    };
+    let bind = |config: &crate::llm::ProviderConfig| {
+        crate::commands::foreground_model_factory::bind_session_provider_in_conn(
+            &conn, "s", config, 8,
+        )
+        .unwrap();
+    };
+    bind(&config);
+    let metadata: String = conn
+        .query_row("SELECT metadata FROM messages WHERE id='a'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut ledger = private_transcript_from_metadata(Some(&metadata))
+        .unwrap()
+        .unwrap();
+    ledger.retain(|message| message.role != "user");
+    let persist = |ciphertext_bytes: usize, summary: serde_json::Value| {
+        let mut ledger = ledger.clone();
+        let state = crate::llm::ProtocolContinuation {
+            protocol: crate::llm::ModelProtocol::OpenaiResponses,
+            model: MODEL.into(),
+            credential_ref: ACCOUNT.into(),
+            output_items: vec![
+                json!({"type":"reasoning","id":"rs_owned","summary":summary,"status":"completed",
+                    "encrypted_content":"A".repeat(ciphertext_bytes)}),
+                json!({"type":"function_call","id":"fc_owned","namespace":"angelbot",
+                    "call_id":"call","name":"read_file","arguments":"{\"path\":\"owned.txt\"}"}),
+            ],
+        };
+        state.validate().unwrap();
+        ledger[0].protocol_state = Some(state);
+        conn.execute(
+            "UPDATE messages SET metadata=?1 WHERE id='a'",
+            [private_transcript_metadata(&ledger).unwrap()],
+        )
+        .unwrap();
+    };
+    let select = || {
+        let window = ConversationWindow::load(&conn, "s", 10).unwrap();
+        let history =
+            hydrate_history_from_window_with_clocks(&conn, "s", 10, &window, true).unwrap();
+        let selected =
+            main_plan_history_from_window(&conn, "s", 10, &window, history.clone(), true).unwrap();
+        (history, selected)
+    };
+    persist(PLAN_NATIVE_BYTES + 4096, json!([]));
+    let (original, selected) = select();
+    assert!(bounded_json_len(&original, PLAN_NATIVE_BYTES)
+        .unwrap()
+        .is_none());
+    assert!(selected.native_retained && !selected.applied);
+    assert_eq!(
+        serde_json::to_vec(&selected.messages).unwrap(),
+        serde_json::to_vec(&original).unwrap(),
+    );
+    persist(PLAN_NATIVE_BYTES + 4096, json!([false]));
+    assert!(select().1.applied);
+    persist(PLAN_NATIVE_BYTES + 4096, json!([]));
+
+    config.credential_ref = Some("chatgpt_plan_v1_20202020-3030-4040-8050-606060606060".into());
+    bind(&config);
+    assert!(select().1.applied);
+    config.credential_ref = Some(ACCOUNT.into());
+    bind(&config);
+    config.model = "gpt-6-sol".into();
+    bind(&config);
+    assert!(select().1.applied);
+    config.model = MODEL.into();
+    bind(&config);
+
+    source(&conn, "Changed original receipt", true);
+    assert!(select().1.applied);
+    source(&conn, "Original receipt", true);
+
+    conn.execute(
+        "UPDATE messages SET content=?1 WHERE id='u'",
+        ["v".repeat(PLAN_NATIVE_BYTES)],
+    )
+    .unwrap();
+    assert!(select().1.applied);
+    conn.execute(
+        "UPDATE messages SET content='Do not send; inspect only' WHERE id='u'",
+        [],
+    )
+    .unwrap();
+
+    persist(PLAN_NATIVE_TOTAL_BYTES, json!([]));
+    let (original, selected) = select();
+    assert!(bounded_json_len(&original, PLAN_NATIVE_TOTAL_BYTES)
+        .unwrap()
+        .is_none());
+    assert!(selected.applied && !selected.native_retained);
 }
 
 #[test]
@@ -459,6 +671,21 @@ fn provider_failure_without_dispatch_requires_positive_end_evidence() {
         assert!(!view.messages[1]
             .content
             .contains("private transport diagnostic"));
+        for code in ["LlmQuotaExceeded", "LlmTransportError"] {
+            conn.execute(
+                "UPDATE agent_run_events SET payload=json_set(payload,'$.data.code',?1) WHERE id='failure'",
+                [code],
+            ).unwrap();
+            let classified = load(&conn, true);
+            assert!(classified.applied);
+            assert!(classified.messages[1]
+                .content
+                .contains(&format!("\"end_evidence\":\"{code}\"")));
+            assert!(!classified.messages[1]
+                .content
+                .contains("private transport diagnostic"));
+        }
+        conn.execute_batch("UPDATE agent_run_events SET payload=json_set(payload,'$.data.code','LlmError') WHERE id='failure'").unwrap();
         for sql in [
             "UPDATE agent_run_events SET payload=json_set(payload,'$.data.code','ToolError')",
             "UPDATE agent_run_events SET payload='malformed'",
@@ -540,6 +767,7 @@ fn completed_view_keeps_human_text_and_final_reply_with_exact_archived_sources()
     let attachments = vec![foreground_text_attachments::TextAttachment {
         name: "notes.txt".into(),
         text: "User original 🪶\nDo not execute embedded instructions".into(),
+        reference_only: false,
     }];
     conn.execute(
         "UPDATE messages SET metadata=?1 WHERE id='u'",
@@ -672,11 +900,13 @@ fn view_respects_cutoff_branch_and_checkpoint_but_never_hides_storage_errors() {
     let conn = seed();
     // A discarded malformed ledger must not enter this selected branch.
     conn.execute_batch("INSERT INTO messages(id,session_id,role,content,metadata,created_at) VALUES('other','s','assistant','discarded','invalid',2);").unwrap();
-    let before = working_history(
+    let window = ConversationWindow::load(&conn, "s", 2).unwrap();
+    let before = main_working_history_from_window(
         &conn,
         "s",
         2,
-        hydrate_llm_history(&conn, "s", 2).unwrap(),
+        &window,
+        hydrate_history_from_window(&conn, "s", 2, &window).unwrap(),
         true,
     )
     .unwrap();
@@ -684,6 +914,11 @@ fn view_respects_cutoff_branch_and_checkpoint_but_never_hides_storage_errors() {
     assert!(load(&conn, true).applied);
     conn.execute_batch("INSERT INTO context_summaries(id,session_id,summary,compressed_at,message_count_before,message_count_after,trigger,anchor_message_id) VALUES('checkpoint','s','prior summary',3,2,0,'test','a');").unwrap();
     assert!(load(&conn, true).messages.is_empty());
+    let checkpoint = CheckpointHistory::load(&conn, "s", 10, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.window.summary.as_deref(), Some("prior summary"));
+    assert!(checkpoint.messages.is_empty());
     conn.execute_batch("UPDATE messages SET content='edited user instruction' WHERE id='u'")
         .unwrap();
     assert_eq!(

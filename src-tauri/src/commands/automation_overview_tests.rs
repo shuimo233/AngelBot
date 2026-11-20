@@ -350,6 +350,52 @@ fn skipped_occurrences_do_not_hide_current_unknown_or_running_receipts() {
 }
 
 #[test]
+fn manual_run_readback_matches_exact_owner_and_includes_nonlatest_receipts() {
+    let fixture = Fixture::new();
+    let run_id = "a509f7f8-846e-43c2-9cef-39bfd9a430e1";
+    let unknown_id = "0a3429d1-d311-4a62-94c5-0e3c453bf0f8";
+    fixture.add("script-a", "A", "script", Some(&fixture.workspace_id));
+    fixture.add("script-b", "B", "script", Some(&fixture.workspace_id));
+    fixture.receipt("script-a", run_id, "completed", 10);
+    fixture.receipt("script-a", "newer-scheduled-run", "completed", 20);
+    let request = |automation_id: &str, run_id: &str| AutomationRunRequest {
+        automation_id: automation_id.into(),
+        run_id: run_id.into(),
+    };
+    let result = get_automation_dashboard_with_requests(
+        &fixture.state,
+        &[
+            request("script-a", run_id),
+            request("script-b", run_id),
+            request("script-a", unknown_id),
+        ],
+    )
+    .unwrap();
+    assert_eq!(result.accepted_requests.len(), 1);
+    assert_eq!(result.accepted_requests[0].automation_id, "script-a");
+    assert_eq!(result.accepted_requests[0].run_id, run_id);
+    let script_a = result
+        .items
+        .iter()
+        .find(|item| item.automation.id == "script-a")
+        .unwrap();
+    assert_eq!(
+        script_a.latest_run.as_ref().unwrap().id,
+        "newer-scheduled-run"
+    );
+    assert!(get_automation_dashboard_with_requests(
+        &fixture.state,
+        &[request("script-a", "invalid")]
+    )
+    .is_err());
+    assert!(get_automation_dashboard_with_requests(
+        &fixture.state,
+        &vec![request("script-a", run_id); 101]
+    )
+    .is_err());
+}
+
+#[test]
 fn dashboard_contains_global_definitions_and_bounded_receipts_but_not_output_or_invented_stop() {
     let fixture = Fixture::new();
     fixture.add("owned", "Owned", "script", Some(&fixture.workspace_id));

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { SettingsSection } from '../components/SettingsSection';
+import { SettingsRow, SettingsSection } from '../components/SettingsSection';
 import { TextField } from '../components/TextField';
-import { TextField as NativeTextField } from '../../../ui';
+import { Button, IconButton, TextField as NativeTextField } from '../../../ui';
 import { ToggleField } from '../components/ToggleField';
 import {
   clearMcpEnv,
@@ -33,6 +33,7 @@ type McpRuntimeState = {
 type RuntimeAction = { serverId: string; kind: 'check' | 'stop' };
 type ServerDraft = Pick<McpServer, 'name' | 'command' | 'args'> & { id?: string };
 const validEnvKey = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const npxCommand = /^"?npx(?:\.cmd)?"?$/i;
 
 const stoppedStatus = (serverId: string): McpServerStatus => ({
   server_id: serverId,
@@ -46,7 +47,7 @@ function connectionHint(reason: unknown, command: string): string {
   // known transport failures and render our own fixed text, never the source.
   const detail = typeof reason === 'string' ? reason : reason instanceof Error ? reason.message : '';
   if (detail.includes('MCP server response timed out')) {
-    return /^"?npx(?:\.cmd)?"?$/i.test(command.trim())
+    return npxCommand.test(command.trim())
       ? '首次运行可能需要下载依赖；连接等待已超时。请检查网络和包名后重试。'
       : '服务未及时响应；请确认它可以启动并使用 MCP stdio 协议。';
   }
@@ -396,13 +397,34 @@ export function McpServersSettings() {
   };
 
   return (
-    <div className="settings-page-content">
-      <SettingsSection title="MCP 服务" description="服务只有在明确启用到工作区，并由你连接检查后，才会出现在对应主对话的工具面。检查只读取工具清单，不会调用任何工具。" defaultOpen>
-        <p className="settings-muted">MCP 服务不会自动继承 AngelBot 的模型密钥等环境变量。添加服务后，可为该服务单独配置环境变量；请勿将密钥写入命令或参数。</p>
-        <p className="settings-muted">使用 npx 的首次连接可能下载并运行第三方包，请先确认来源；连接过程中可随时取消。</p>
-        <p className="settings-muted">新服务请先连接一次以准备工具目录。之后仅在任务实际调用时启动，不随应用启动；停止连接会结束进程但保留目录，停用服务才会禁止后续调用。修改命令、参数或凭据后需重新连接。</p>
-        <p className="settings-muted">把服务启用到工作区会让该工作区的 AngelBot 使用它的工具；在“工作区自动”或“完全访问”执行权限下，普通工具可能直接运行。只启用你信任的服务，敏感操作是否专项询问仍以现有保护规则为准。</p>
+    <div className="settings-page-content mcp-settings">
+      <SettingsSection title="已配置服务" action={
+        <Button variant="primary" disabled={loading || saving || showAddForm || editingServer !== null || editingEnvServerId !== null} onClick={() => setShowAddForm(true)}>
+          <PlusIcon />添加服务
+        </Button>
+      }>
         {error && <p className="settings-error" role="alert">{error}</p>}
+        {showAddForm && (
+          <div className="add-server-form" role="group" aria-label="添加服务">
+            <div className="settings-rows">
+              <SettingsRow title="网页操作（Playwright）" description="需 Node.js 20+ 和 Edge。首次连接会下载并运行固定版本。">
+                <Button size="small" disabled={saving || preparingBrowser || !workspaces.some((workspace) => workspace.kind === 'personal' && workspace.activeSessionId)} onClick={() => void prepareBrowser()}>{preparingBrowser ? '正在准备…' : '填入浏览器配置'}</Button>
+              </SettingsRow>
+              {newServer.id && <div className="settings-info-list settings-rows-note">
+                <p>独立会话关闭后清除登录和页面数据。网页内容可能发给模型，截图可能落盘。</p>
+                <p>临时会话不隔离系统、文件或网络。快照、日志和下载不随备份，所需文件请另存。</p>
+              </div>}
+            </div>
+            <TextField label="名称" value={newServer.name} placeholder="服务名称" onChange={(name) => setNewServer({ ...newServer, name })} />
+            <TextField label="命令" value={newServer.command} placeholder="npx.cmd" onChange={(command) => setNewServer({ ...newServer, command })} />
+            <TextField label="参数" value={newServer.args} placeholder="-y @modelcontextprotocol/server-..." onChange={(args) => setNewServer({ ...newServer, args })} />
+            <div className="field-hint">Windows 用 npx.cmd，参数填 -y 和包名。含空格的路径用英文双引号。</div>
+            <div className="form-actions">
+              <button className="btn btn-secondary" type="button" onClick={() => setShowAddForm(false)}>取消</button>
+              <button className="btn btn-primary" type="button" disabled={saving || !newServer.name.trim() || !newServer.command.trim()} onClick={handleAdd}>添加</button>
+            </div>
+          </div>
+        )}
         {loading ? <p className="settings-muted">正在读取配置…</p> : (
           <div className="server-list">
             {servers.map((server) => {
@@ -417,23 +439,23 @@ export function McpServersSettings() {
               const envKeys = server.envKeys ?? [];
               return (
                 <div key={server.id} className="server-item">
-                <div className="server-info">
+                <div className="mcp-server-heading">
                   <div className="server-header">
                     <span className="server-name">{server.name}</span>
-                    <span className="status-indicator">
-                      <span className={`status-dot ${runtimeTone(server, runtime, action)}`} />
-                      <span className="status-text">{runtimeLabel(server, runtime, action)}</span>
-                    </span>
                   </div>
+                  <div className="server-actions">
+                    <Button size="small" variant="ghost" disabled={saving || busy || editingServer !== null || editingEnvServerId !== null} onClick={() => { setShowAddForm(false); setEditingServer({ id: server.id, name: server.name, command: server.command, args: server.args }); }} aria-label={`编辑 ${server.name}`}>编辑</Button>
+                    <IconButton size="small" disabled={saving || busy || editDraft !== null || envEditorOpen} onClick={() => void handleDelete(server.id)} label={`删除 ${server.name}`}><TrashIcon /></IconButton>
+                  </div>
+                </div>
+                <div className="server-info">
                   {server.catalogError && <p className="settings-error">{server.catalogError}</p>}
                   {editDraft ? (
                     <div className="add-server-form">
                       <TextField label="名称" value={editDraft.name} onChange={(name) => setEditingServer({ ...editDraft, name })} />
                       <TextField label="命令" value={editDraft.command} onChange={(command) => setEditingServer({ ...editDraft, command })} />
                       <TextField label="参数" value={editDraft.args} onChange={(args) => setEditingServer({ ...editDraft, args })} />
-                      <div className="field-hint">Windows 下使用 npx 时，命令填写 npx.cmd；-y 和包名填写在参数栏。</div>
-                      <div className="field-hint">路径包含空格时可用英文双引号包裹。</div>
-                      <div className="field-hint">修改命令或参数会停止服务并清除已有工作区授权；保存后需重新授权并连接检查。</div>
+                      <div className="field-hint">含空格的路径用英文双引号。改动命令或参数后，服务会停止，需重新授权并检查连接。</div>
                       <div className="form-actions">
                         <button className="btn btn-secondary" type="button" disabled={saving} onClick={() => setEditingServer(null)}>取消</button>
                         <button className="btn btn-primary" type="button" disabled={saving || !editDraft.name.trim() || !editDraft.command.trim()} onClick={() => void handleEdit(server)}>保存修改</button>
@@ -443,13 +465,13 @@ export function McpServersSettings() {
                     <div className="add-server-form">
                       {server.envUnavailable ? (
                         <>
-                          <p className="mcp-runtime-error" role="alert">无法读取此服务在系统凭据库中的环境变量。旧值不会显示；重置后请重新填写所需值。</p>
+                          <p className="mcp-runtime-error" role="alert">无法读取系统凭据库中的环境变量。</p>
                           {confirmClearEnvServerId === server.id ? (
                             <>
-                              <div className="field-hint">重置会清除这个服务的所有已保存环境变量，并停止服务、清除工作区授权。旧值无法从此处找回。</div>
+                              <div className="field-hint">重置会删除全部变量（不可恢复）、停止服务并撤销工作区授权。</div>
                               <div className="form-actions">
                                 <button className="btn btn-secondary" type="button" disabled={saving} onClick={() => setConfirmClearEnvServerId(null)}>取消重置</button>
-                                <button className="btn btn-primary" type="button" disabled={saving} onClick={() => void handleClearEnv(server)}>确认重置凭据</button>
+                                <Button variant="danger" disabled={saving} onClick={() => void handleClearEnv(server)}>确认重置凭据</Button>
                               </div>
                             </>
                           ) : (
@@ -461,18 +483,17 @@ export function McpServersSettings() {
                         </>
                       ) : (
                         <>
-                      <div className="field-hint">变量值仅在此输入一次，保存后不会显示。新增、更换或移除变量会停止服务并清除已有工作区授权；之后需重新授权并连接检查。</div>
+                      <div className="field-hint">修改变量会停止服务，需重新授权并检查连接。</div>
                       {envKeys.length > 0 ? (
                         <div>
-                          <div className="field-hint">已安全保存的环境变量</div>
                           {envKeys.map((key) => (
                             <div key={key} className="mcp-runtime-controls">
                               <code>{key}</code><span className="field-hint">已安全保存</span>
                               <button className="btn btn-secondary" type="button" disabled={saving} onClick={() => { setEnvKeyDraft(key); setEnvValueDraft(''); setConfirmRemoveEnvKey(null); }} aria-label={`替换环境变量 ${key}`}>替换</button>
                               {confirmRemoveEnvKey === key ? (
                                 <>
-                                  <button className="btn btn-secondary" type="button" disabled={saving} onClick={() => void handleRemoveEnv(server, key)} aria-label={`确认移除环境变量 ${key}`}>确认移除</button>
-                                  <button className="btn btn-secondary" type="button" disabled={saving} onClick={() => setConfirmRemoveEnvKey(null)}>取消移除</button>
+                                  <Button size="small" disabled={saving} onClick={() => setConfirmRemoveEnvKey(null)}>取消移除</Button>
+                                  <Button size="small" variant="danger" disabled={saving} onClick={() => void handleRemoveEnv(server, key)} aria-label={`确认移除环境变量 ${key}`}>确认移除</Button>
                                 </>
                               ) : (
                                 <button className="btn btn-secondary" type="button" disabled={saving} onClick={() => setConfirmRemoveEnvKey(key)} aria-label={`移除环境变量 ${key}`}>移除</button>
@@ -482,8 +503,8 @@ export function McpServersSettings() {
                         </div>
                       ) : <div className="field-hint">尚未配置环境变量。</div>}
                       <NativeTextField label="变量名" value={envKeyDraft} placeholder="例如 GITHUB_PERSONAL_ACCESS_TOKEN" autoComplete="off" spellCheck={false} disabled={saving} onChange={(event) => setEnvKeyDraft(event.target.value)} />
-                      <NativeTextField label="新变量值" type="password" value={envValueDraft} placeholder="输入后保存；现有值不会显示" autoComplete="new-password" spellCheck={false} disabled={saving} onChange={(event) => setEnvValueDraft(event.target.value)} />
-                      <div className="field-hint">变量名只能使用英文字母、数字和下划线，且不能以数字开头。保存同名变量会替换原值；留空不会更改。</div>
+                      <NativeTextField label="新变量值" type="password" value={envValueDraft} placeholder="现有值不会显示" hint="服务需单独配置密钥，请勿将密钥写入命令或参数。" autoComplete="new-password" spellCheck={false} disabled={saving} onChange={(event) => setEnvValueDraft(event.target.value)} />
+                      <div className="field-hint">变量名可用英文字母、数字和下划线，首位不能是数字。同名值会被替换。</div>
                       <div className="form-actions">
                         <button className="btn btn-secondary" type="button" disabled={saving} onClick={closeEnvEditor}>完成</button>
                         <button className="btn btn-primary" type="button" disabled={saving || !validEnvKey.test(envKeyDraft.trim()) || !envValueDraft} onClick={() => void handleSaveEnv(server)}>保存变量</button>
@@ -494,41 +515,53 @@ export function McpServersSettings() {
                   ) : (
                     <>
                   <code className="server-command">{server.command} {server.args}</code>
-                  <div className="field-hint">环境变量：{server.envUnavailable ? '凭据不可用' : envKeys.length ? `${envKeys.join('、')}（已安全保存）` : '尚未配置'}</div>
-                  {server.envUnavailable && <p className="mcp-runtime-error">系统凭据库中的 MCP 凭据无法读取；请打开“修复凭据”重置后重新配置。</p>}
-                  <fieldset className="mcp-workspace-access">
-                    <legend>允许在这些工作区使用</legend>
-                    {workspaces.map((workspace) => (
-                      <label key={workspace.id}>
-                        <input
-                          type="checkbox"
-                          checked={server.enabledWorkspaceIds.includes(workspace.id)}
-                          disabled={saving || busy || !server.enabled || server.envUnavailable}
-                          onChange={() => handleWorkspaceToggle(server, workspace.id)}
-                        />
-                        {workspace.name}
-                      </label>
-                    ))}
-                  </fieldset>
-                  <div className="mcp-runtime-controls">
-                    <button className="btn btn-secondary" type="button" disabled={saving || busy || editingServer !== null || editingEnvServerId !== null} onClick={() => { setShowAddForm(false); setEditingEnvServerId(server.id); setEnvKeyDraft(''); setEnvValueDraft(''); setConfirmRemoveEnvKey(null); setConfirmClearEnvServerId(null); }} aria-label={`${server.envUnavailable ? '修复' : '配置'} ${server.name} 的环境变量`}>{server.envUnavailable ? '修复凭据' : '配置变量'}</button>
-                    <button
-                      className="btn btn-secondary"
-                      type="button"
+                  <SettingsRow title="环境变量" description={server.envUnavailable ? '系统凭据库读取失败' : envKeys.length ? `${envKeys.join('、')}（已安全保存）` : '尚未配置'}>
+                    <Button size="small" disabled={saving || busy || editingServer !== null || editingEnvServerId !== null} onClick={() => { setShowAddForm(false); setEditingEnvServerId(server.id); setEnvKeyDraft(''); setEnvValueDraft(''); setConfirmRemoveEnvKey(null); setConfirmClearEnvServerId(null); }} aria-label={`${server.envUnavailable ? '修复' : '配置'} ${server.name} 的环境变量`}>{server.envUnavailable ? '修复凭据' : '配置变量'}</Button>
+                  </SettingsRow>
+                  <div className="mcp-service-access">
+                    <ToggleField label={`启用 ${server.name}`} checked={server.enabled} disabled={saving || busy} onChange={() => void handleToggle(server)} />
+                    <fieldset className="mcp-workspace-access">
+                      <legend>允许在这些工作区使用</legend>
+                      {workspaces.map((workspace) => (
+                        <label key={workspace.id}>
+                          <input
+                            type="checkbox"
+                            checked={server.enabledWorkspaceIds.includes(workspace.id)}
+                            disabled={saving || busy || !server.enabled || server.envUnavailable}
+                            onChange={() => handleWorkspaceToggle(server, workspace.id)}
+                          />
+                          {workspace.name}
+                        </label>
+                      ))}
+                    </fieldset>
+                  </div>
+                  <SettingsRow title="服务连接" description={
+                    <div>
+                      <span className="status-indicator" aria-live="polite">
+                        <span className={`status-dot ${runtimeTone(server, runtime, action)}`} />
+                        <span className="status-text">{runtimeLabel(server, runtime, action)}</span>
+                      </span>
+                      {running
+                        ? <p className="settings-row-description">停止后保留工具清单。</p>
+                        : npxCommand.test(server.command.trim()) && server.enabled && !server.envUnavailable && !server.catalogReady &&
+                          <p className="settings-row-description">首次连接可能下载并运行第三方包，请核对来源。</p>}
+                    </div>
+                  }>
+                    {(running || canStopCheck) && (
+                      <Button size="small" variant="ghost" disabled={(busy && !canStopCheck) || saving} onClick={() => void handleStop(server)}>
+                        {running ? '停止' : '取消连接'}
+                      </Button>
+                    )}
+                    <Button size="small"
                       disabled={!server.enabled || server.envUnavailable || busy || saving}
                       onClick={() => void handleCheck(server)}
                     >
                       {running ? '重新检查' : '连接并检查'}
-                    </button>
-                    {(running || canStopCheck) && (
-                      <button className="btn btn-secondary" type="button" disabled={(busy && !canStopCheck) || saving} onClick={() => void handleStop(server)}>
-                        {running ? '停止' : '取消连接'}
-                      </button>
-                    )}
-                  </div>
+                    </Button>
+                  </SettingsRow>
                   {running && runtime?.tools !== null && !runtime?.failed && (
                     <div className="mcp-runtime-summary" aria-live="polite">
-                      <span>已发现 {tools.length} 个工具；下次发送已授权工作区的消息时可供 AngelBot 使用。</span>
+                      <span>已发现 {tools.length} 个工具，可供获准的工作区使用。</span>
                       {tools.length > 0 && (
                         <span className="mcp-runtime-tools">{tools.slice(0, 8).map((tool) => tool.name).join(' · ')}{tools.length > 8 ? ' · …' : ''}</span>
                       )}
@@ -538,55 +571,30 @@ export function McpServersSettings() {
                     </>
                   )}
                 </div>
-                <div className="server-actions">
-                  <ToggleField label={`启用 ${server.name}`} checked={server.enabled} disabled={saving || busy || editDraft !== null || envEditorOpen} onChange={() => void handleToggle(server)} />
-                  <button className="btn btn-secondary" type="button" disabled={saving || busy || editingServer !== null || editingEnvServerId !== null} onClick={() => { setShowAddForm(false); setEditingServer({ id: server.id, name: server.name, command: server.command, args: server.args }); }} aria-label={`编辑 ${server.name}`}>编辑</button>
-                  <button className="delete-server-btn" type="button" disabled={saving || busy || editDraft !== null || envEditorOpen} onClick={() => void handleDelete(server.id)} aria-label={`删除 ${server.name}`}><TrashIcon /></button>
-                </div>
                 </div>
               );
             })}
             {!servers.length && <p className="settings-muted">尚未添加 MCP 服务。</p>}
           </div>
         )}
-
-        {showAddForm ? (
-          <div className="add-server-form">
-            <SettingsSection title="网页操作（Playwright）" description="可选：使用 Microsoft 官方 MCP 服务，复用现有模型和执行权限。">
-              <p className="settings-muted">需要已安装 Node.js 20 或更新版本及 Microsoft Edge。首次连接会下载并运行固定版本的第三方服务。</p>
-              <p className="settings-muted">使用独立、可见的临时浏览器会话，不接管你已有的标签页或登录账号；停止浏览器会话后不保留登录和页面存储，重开时需重新核对任务结果。</p>
-              <p className="settings-muted">临时会话不是系统、文件或网络安全沙箱。该服务包含脚本、上传和文件相关工具；只启用你完全信任的服务。网页内容可能发给当前模型，省略图像响应不等于禁止截图落盘。</p>
-              <p className="settings-muted">这里只填入配置，不会启动或授权。添加后仍需选择允许的工作区，再连接检查；不自动接入网页自行注册的工具。</p>
-              <p className="settings-muted">新配置将快照、日志及下载放入独立的浏览器临时区，不随备份。需要保留的下载由 AngelBot 复制到正式结果区后交付；也可在文件工作台查看并另存。停止服务不会自动删除文件，已有服务配置保持不变。</p>
-              <button className="btn btn-secondary" type="button" disabled={saving || preparingBrowser || !workspaces.some((workspace) => workspace.kind === 'personal' && workspace.activeSessionId)} onClick={() => void prepareBrowser()}>{preparingBrowser ? '正在准备…' : '填入浏览器配置'}</button>
-            </SettingsSection>
-            <TextField label="名称" value={newServer.name} placeholder="服务名称" onChange={(name) => setNewServer({ ...newServer, name })} />
-            <TextField label="命令" value={newServer.command} placeholder="npx.cmd" onChange={(command) => setNewServer({ ...newServer, command })} />
-            <TextField label="参数" value={newServer.args} placeholder="-y @modelcontextprotocol/server-..." onChange={(args) => setNewServer({ ...newServer, args })} />
-            <div className="field-hint">Windows 下使用 npx 时，命令填写 npx.cmd；-y 和包名填写在参数栏。</div>
-            <div className="field-hint">路径包含空格时可用英文双引号包裹。</div>
-            <div className="field-hint">添加服务后，可点击“配置变量”安全保存此服务需要的专用密钥。</div>
-            <div className="form-actions">
-              <button className="btn btn-secondary" type="button" onClick={() => setShowAddForm(false)}>取消</button>
-              <button className="btn btn-primary" type="button" disabled={saving || !newServer.name.trim() || !newServer.command.trim()} onClick={handleAdd}>添加</button>
-            </div>
-          </div>
-        ) : (
-          <button className="add-server-btn" type="button" disabled={loading || saving || editingServer !== null || editingEnvServerId !== null} onClick={() => setShowAddForm(true)}><PlusIcon />添加服务</button>
-        )}
       </SettingsSection>
-        <SettingsSection title="浏览器临时文件管理" description="仅处理已登记临时区，不按扩展名扫描普通成果或旧配置目录。">
-          <p className="settings-muted">先停止使用临时区的浏览器服务，处理当前或待确认的任务。这里只清理创建和修改均已超过 7 天的文件，每批最多 1024 个；只读文件、近期文件、目录和正式成果保留。</p>
-          <button className="btn btn-secondary" type="button" disabled={cleanup.busy || loading || saving} onClick={() => void inspectCleanup()}>{cleanup.busy ? '处理中…' : '查看 7 天前文件'}</button>
-          {cleanup.preview && cleanup.preview.fileCount > 0 && <div>
-            <p>本批 {cleanup.preview.fileCount} 个文件，共 {(cleanup.preview.bytes / 1024 / 1024).toFixed(2)} MiB；共有 {cleanup.preview.eligibleFiles} 个符合条件的旧文件。</p>
-            <p className="settings-muted">可能含尚未交付的下载，请先另存需要的文件。删除不可撤销；文件清单变化或预览超过 5 分钟需重新确认，不会自动重试。</p>
-            <details><summary>查看本批完整清单</summary><ul style={{ maxHeight: 200, overflow: 'auto' }}>{cleanup.preview.files.map((file) => <li key={file}>{file}</li>)}</ul></details>
-            <button className="btn btn-secondary" type="button" disabled={cleanup.busy} onClick={() => void confirmCleanup()}>删除本批旧临时文件</button>
-          </div>}
-          {cleanup.error && <p role="alert">{cleanup.error}</p>}
-          {cleanup.message && <p role="status">{cleanup.message}</p>}
-        </SettingsSection>
+      <SettingsSection title="浏览器临时文件管理">
+        <div className="settings-rows">
+          <SettingsRow title="清理临时文件" description="清理前请停止浏览器服务，处理待确认任务。每批最多 1,024 个。">
+            <Button size="small" disabled={cleanup.busy || loading || saving} onClick={() => void inspectCleanup()}>{cleanup.busy ? '处理中…' : '查看 7 天前文件'}</Button>
+          </SettingsRow>
+        </div>
+        {cleanup.preview && cleanup.preview.fileCount > 0 && <div>
+          <p>本批 {cleanup.preview.fileCount} 个文件，共 {(cleanup.preview.bytes / 1024 / 1024).toFixed(2)} MiB；共有 {cleanup.preview.eligibleFiles} 个符合条件的旧文件。</p>
+          <p className="settings-muted">删除不可撤销，所需下载请先另存。清单变化或超过 5 分钟需重新确认。</p>
+          <details><summary>查看本批完整清单</summary><ul style={{ maxHeight: 200, overflow: 'auto' }}>{cleanup.preview.files.map((file) => <li key={file}>{file}</li>)}</ul></details>
+          <div className="settings-form-actions">
+            <Button variant="danger" disabled={cleanup.busy} onClick={() => void confirmCleanup()}>删除本批旧临时文件</Button>
+          </div>
+        </div>}
+        {cleanup.error && <p role="alert">{cleanup.error}</p>}
+        {cleanup.message && <p role="status">{cleanup.message}</p>}
+      </SettingsSection>
     </div>
   );
 }

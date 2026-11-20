@@ -22,7 +22,7 @@ export function ActivityPage() {
   }, [attempt]);
   if (loading) return <p role="status">正在读取使用记录…</p>;
   if (error) return <div className="library-activity-error" role="alert"><p>{error}</p><button type="button" onClick={() => setAttempt(value => value + 1)}>重新加载</button></div>;
-  if (!entries.length) return <section className="library-activity-empty"><strong>暂时没有使用记录</strong><p>任务完成或失败，以及记忆的变更会显示在这里。这里用于回看，不需要提前设置。</p></section>;
+  if (!entries.length) return <p className="library-activity-empty">暂时没有使用记录</p>;
   return <ol className="library-activity-list" aria-label="使用记录">{entries.map((entry) => <li key={entry.id} className="library-activity-entry">
     <span className={`library-activity-kind ${entry.kind}`}>{kindLabel[entry.kind]}</span>
     <div><strong>{entry.title}</strong>{entry.detail && <span>{entry.detail}</span>}</div>

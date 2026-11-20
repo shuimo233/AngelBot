@@ -459,7 +459,6 @@ mod tests {
             ExecutionKernel::new(
                 crate::agent::tool::ToolCancellation::new(),
                 Duration::from_secs(1),
-                2,
             ),
             ContractLimits::default(),
         )

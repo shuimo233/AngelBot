@@ -4,6 +4,8 @@ import { useSessionsStore } from './sessions';
 import { agentEventManager } from '$lib/commands/agent-event';
 import { isResultUnknown } from '$lib/tool-action-result';
 import { useWorkspaceActivityStore } from './workspaceActivity';
+import { saveComposerDraft, type ComposerDraft } from '$lib/commands/composer-draft';
+import { isSecureWebSearchSetupDraft } from '$lib/web-search-setup';
 
 export type LiveToolStep = {
   callId: string;
@@ -80,13 +82,20 @@ function updateTaskRunFromToolResults(message: Message, toolResults: ToolResult[
   };
 }
 
+type DraftInput = { text: string; token: object; localOnly: boolean };
+
 interface MessagesState {
   messages: Message[];
   input: string;
-  /** Unsent text stays in memory only, keyed by its original Main session. */
   inputSessionId: string | null;
   inputToken: object;
-  draftInputs: Record<string, { text: string; token: object }>;
+  inputLocalOnly: boolean;
+  draftInputs: Record<string, DraftInput>;
+  durableDraftSessions: ReadonlySet<string>;
+  draftSaveErrors: ReadonlySet<string>;
+  queuedFollowUps: Record<string, QueuedFollowUp[]>;
+  /** Stop requests still awaiting a reply, including while Main is closed. */
+  stoppingSessions: ReadonlySet<string>;
   /** 工具正在执行中（用于显示加载指示器） */
   toolExecuting: boolean;
   /** 当前正在执行的工具名称 */
@@ -107,9 +116,11 @@ interface MessagesState {
   appendMessage: (message: Message) => void;
   removeMessage: (messageId: string) => void;
   updateMessageContent: (messageId: string, content: string) => void;
-  setInput: (input: string) => void;
+  setInput: (input: string, localOnly?: boolean) => void;
+  registerDraft: (sessionId: string, saved: ComposerDraft) => void;
   activateInput: (sessionId: string | null) => void;
-  clearSubmittedInput: (sessionId: string, submitted: string, token?: object) => void;
+  clearSubmittedInput: (sessionId: string, submitted: string, token: object, clearedToken?: object) => void;
+  forgetInput: (sessionId: string) => void;
   clearMessages: () => void;
   setToolExecuting: (executing: boolean, tool?: string) => void;
   addToolResult: (messageId: string, result: ToolResult) => void;
@@ -129,12 +140,43 @@ interface MessagesState {
   unsubscribeFromAgentEvents: () => void;
 }
 
+export type QueuedFollowUp = { id: string; text: string; unconfirmed?: boolean };
+
+let lastDraftRevision = 0;
+const pendingDraftWrites = new Map<string, number>();
+
+function saveInput(sessionId: string, text: string) {
+  if (!useMessagesStore.getState().durableDraftSessions.has(sessionId)) return;
+  // Use the shared monotonic epoch across page loads, and the host's last
+  // observed revision as a floor. Each edit can dispatch immediately.
+  const revision = Math.max(lastDraftRevision + 1, Math.floor(1000 * (performance.timeOrigin + performance.now())));
+  lastDraftRevision = revision;
+  pendingDraftWrites.set(sessionId, revision);
+  const settle = (saved: boolean) => {
+    if (pendingDraftWrites.get(sessionId) !== revision) return;
+    pendingDraftWrites.delete(sessionId);
+    useMessagesStore.setState((state) => {
+      if (saved === !state.draftSaveErrors.has(sessionId)) return state;
+      const draftSaveErrors = new Set(state.draftSaveErrors);
+      if (saved) draftSaveErrors.delete(sessionId);
+      else draftSaveErrors.add(sessionId);
+      return { draftSaveErrors };
+    });
+  };
+  void saveComposerDraft(sessionId, revision, text).then(settle, () => settle(false));
+}
+
 export const useMessagesStore = create<MessagesState>((set, get) => ({
   messages: [],
   input: '',
   inputSessionId: null,
   inputToken: {},
+  inputLocalOnly: false,
   draftInputs: {},
+  durableDraftSessions: new Set(),
+  draftSaveErrors: new Set(),
+  queuedFollowUps: {},
+  stoppingSessions: new Set(),
   toolExecuting: false,
   executingTool: null,
   streamingText: '',
@@ -154,28 +196,70 @@ export const useMessagesStore = create<MessagesState>((set, get) => ({
       m.id === messageId ? { ...m, content } : m
     ),
   })),
-  setInput: (input) => set((state) => state.input === input ? state : { input, inputToken: {} }),
+  setInput: (input, localOnly = false) => {
+    const state = get();
+    const inputLocalOnly = Boolean(input) && (state.inputLocalOnly || localOnly || isSecureWebSearchSetupDraft(input));
+    if (state.input === input && state.inputLocalOnly === inputLocalOnly) return;
+    set({ input, inputLocalOnly, inputToken: {} });
+    if (state.inputSessionId && (!inputLocalOnly || !state.inputLocalOnly)) {
+      saveInput(state.inputSessionId, inputLocalOnly || !input.trim() ? '' : input);
+    }
+  },
+  registerDraft: (sessionId, saved) => set((state) => {
+    lastDraftRevision = Math.max(lastDraftRevision, saved.revision);
+    if (state.durableDraftSessions.has(sessionId)) return state;
+    return {
+      durableDraftSessions: new Set([...state.durableDraftSessions, sessionId]),
+      ...(state.inputSessionId !== sessionId && !Object.prototype.hasOwnProperty.call(state.draftInputs, sessionId) && saved.text ? {
+        draftInputs: { ...state.draftInputs, [sessionId]: { text: saved.text, token: {}, localOnly: false } },
+      } : {}),
+    };
+  }),
   activateInput: (sessionId) => set((state) => {
     if (state.inputSessionId === sessionId) return state;
     const draftInputs = { ...state.draftInputs };
     if (state.inputSessionId) {
-      if (state.input) draftInputs[state.inputSessionId] = { text: state.input, token: state.inputToken };
+      if (state.input) draftInputs[state.inputSessionId] = { text: state.input, token: state.inputToken, localOnly: state.inputLocalOnly };
       else delete draftInputs[state.inputSessionId];
     }
     const draft = sessionId ? draftInputs[sessionId] : undefined;
     if (sessionId) delete draftInputs[sessionId];
-    return { input: draft?.text ?? '', inputToken: draft?.token ?? {}, inputSessionId: sessionId, draftInputs };
+    return {
+      input: draft?.text ?? '',
+      inputToken: draft?.token ?? {},
+      inputSessionId: sessionId,
+      inputLocalOnly: draft?.localOnly ?? false,
+      draftInputs,
+    };
   }),
-  clearSubmittedInput: (sessionId, submitted, token) => set((state) => {
+  clearSubmittedInput: (sessionId, submitted, token, clearedToken = {}) => {
+    const state = get();
     if (state.inputSessionId === sessionId) {
-      return state.input.trim() === submitted.trim() && (!token || token === state.inputToken)
-        ? { input: '', inputToken: {} } : state;
+      if (state.input.trim() !== submitted.trim() || token !== state.inputToken) return;
+      set({ input: '', inputToken: clearedToken, inputLocalOnly: false });
+    } else {
+      const draft = state.draftInputs[sessionId];
+      if (!draft || draft.text.trim() !== submitted.trim() || token !== draft.token) return;
+      const draftInputs = { ...state.draftInputs };
+      delete draftInputs[sessionId];
+      set({ draftInputs });
     }
-    const draft = state.draftInputs[sessionId];
-    if (!draft || draft.text.trim() !== submitted.trim() || (token && token !== draft.token)) return state;
+    saveInput(sessionId, '');
+  },
+  forgetInput: (sessionId) => set((state) => {
+    pendingDraftWrites.delete(sessionId);
+    const durableDraftSessions = new Set(state.durableDraftSessions);
+    durableDraftSessions.delete(sessionId);
+    const draftSaveErrors = new Set(state.draftSaveErrors);
+    draftSaveErrors.delete(sessionId);
     const draftInputs = { ...state.draftInputs };
     delete draftInputs[sessionId];
-    return { draftInputs };
+    return {
+      ...(state.inputSessionId === sessionId ? { input: '', inputSessionId: null, inputToken: {}, inputLocalOnly: false } : {}),
+      draftInputs,
+      durableDraftSessions,
+      draftSaveErrors,
+    };
   }),
   clearMessages: () => set({ messages: [], streamingText: '', liveStatus: '', liveBlocks: [], liveMessageId: null }),
 

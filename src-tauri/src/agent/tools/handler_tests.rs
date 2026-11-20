@@ -169,7 +169,7 @@ mod tests {
             dir.path(),
         );
         assert!(!window.success);
-        assert!(window.content.contains("Office 文本快照暂不支持局部参数"));
+        assert!(window.content.contains("文档文字快照暂不支持局部参数"));
         assert!(!window.content.contains("Office body"));
         assert_eq!(
             std::fs::read(dir.path().join("notes.DOCX")).unwrap(),
@@ -300,6 +300,189 @@ mod tests {
     }
 
     #[test]
+    fn project_command_runs_scripts_and_drains_large_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("calculate.py"),
+            "import json\nfrom pathlib import Path\nresult = sum([7, 11, 13])\nPath('result.json').write_text(json.dumps({'sum': result}), encoding='utf-8')\nprint(f'sum={result}')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("verbose.py"),
+            "import sys\nif 'escaped' in sys.argv:\n    sys.stdout.buffer.write(bytes(100_000))\n    raise SystemExit(0)\nsys.stdout.buffer.write(('\\u4e2d' * 100_000).encode('utf-8'))\nif 'fail' in sys.argv:\n    sys.stderr.write('deliberate failure\\n' + 'e' * 262_144)\n    raise SystemExit(7)\n",
+        )
+        .unwrap();
+        let handler = RunProjectCommandHandler::new();
+        let run = |args: &[&str]| {
+            handler.execute(
+                &serde_json::json!({"command": "python", "args": args, "timeout_seconds": 5}),
+                dir.path(),
+            )
+        };
+
+        let calculation = run(&["calculate.py"]);
+        assert!(calculation.success, "{}", calculation.content);
+        let receipt: serde_json::Value = serde_json::from_str(&calculation.content).unwrap();
+        assert_eq!(receipt["code"], "COMMAND_EXITED");
+        assert_eq!(receipt["exit_code"], 0);
+        assert_eq!(receipt["stdout"].as_str().unwrap().trim(), "sum=31");
+        assert_eq!(receipt["stderr"], "");
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(result["sum"], 31);
+
+        let verbose = run(&["verbose.py"]);
+        assert!(verbose.success, "{}", verbose.content);
+        let verbose_receipt: serde_json::Value = serde_json::from_str(&verbose.content).unwrap();
+        let stdout = verbose_receipt["stdout"].as_str().unwrap();
+        assert!(stdout.starts_with('中'));
+        assert!(!stdout.contains('\u{fffd}'));
+        assert!(stdout.len() <= 16_000);
+        assert_eq!(verbose_receipt["stdout_truncated"], true);
+        assert_eq!(verbose_receipt["stderr_truncated"], false);
+
+        let escaped = run(&["verbose.py", "escaped"]);
+        assert!(escaped.success, "{}", escaped.content);
+        let escaped_receipt: serde_json::Value = serde_json::from_str(&escaped.content).unwrap();
+        assert_eq!(escaped_receipt["stdout_truncated"], true);
+        assert!(escaped.content.len() < 16_250);
+
+        let failure = run(&["verbose.py", "fail"]);
+        assert!(!failure.success);
+        assert!(!failure.requires_user_review());
+        let failed_receipt: serde_json::Value =
+            serde_json::from_str(failure.content.strip_prefix("Error: ").unwrap()).unwrap();
+        let stdout = failed_receipt["stdout"].as_str().unwrap();
+        let stderr = failed_receipt["stderr"].as_str().unwrap();
+        assert_eq!(failed_receipt["code"], "COMMAND_FAILED");
+        assert_eq!(failed_receipt["exit_code"], 7);
+        assert_eq!(failed_receipt["stdout_truncated"], true);
+        assert_eq!(failed_receipt["stderr_truncated"], true);
+        assert!(stdout.starts_with('中'));
+        assert!(stderr.starts_with("deliberate failure"));
+        assert!(stdout.len() + stderr.len() <= 16_000);
+    }
+
+    #[test]
+    fn project_command_honors_cancellation_before_launch() {
+        use crate::agent::tool::{ToolCancellation, ToolExecutionContext};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fixture.py"),
+            "from pathlib import Path\nPath('started').touch()\n",
+        )
+        .unwrap();
+        let cancellation = ToolCancellation::new();
+        cancellation.cancel();
+        let result = RunProjectCommandHandler::new().execute_with_context(
+            &serde_json::json!({"command": "python", "args": ["fixture.py"]}),
+            dir.path(),
+            &ToolExecutionContext::new("pre-cancelled", cancellation),
+        );
+        assert!(!result.success);
+        assert!(!result.requires_user_review());
+        assert!(result.content.contains("取消"));
+        let receipt: serde_json::Value =
+            serde_json::from_str(result.content.strip_prefix("Error: ").unwrap()).unwrap();
+        assert_eq!(receipt["code"], "COMMAND_NOT_STARTED");
+        assert!(receipt["exit_code"].is_null());
+        assert!(!dir.path().join("started").exists());
+    }
+
+    #[test]
+    fn project_command_pauses_after_timeout_with_prior_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("append_then_wait.py"),
+            "from pathlib import Path\nimport time\nwith Path('effects.txt').open('ab') as out:\n    out.write(b'effect\\n')\nprint('script wrote one effect', flush=True)\ntime.sleep(60)\n",
+        )
+        .unwrap();
+        let result = RunProjectCommandHandler::new().execute(
+            &serde_json::json!({
+                "command": "python",
+                "args": ["append_then_wait.py"],
+                "timeout_seconds": 5,
+            }),
+            dir.path(),
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("effects.txt")).unwrap(),
+            b"effect\n",
+        );
+        assert!(result.requires_user_review(), "{}", result.content);
+        let receipt: serde_json::Value =
+            serde_json::from_str(result.content.strip_prefix("Error: ").unwrap()).unwrap();
+        assert_eq!(receipt["code"], "RESULT_UNKNOWN");
+        assert!(receipt["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("script wrote one effect"));
+        assert!(receipt["message"]
+            .as_str()
+            .unwrap()
+            .contains("命令执行超时"));
+        assert!(receipt["exit_code"].is_null());
+    }
+
+    #[test]
+    fn project_command_runs_local_npm_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"private":true,"scripts":{"verify":"node verify.cjs"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("verify.cjs"),
+            "require('node:fs').writeFileSync('verified.txt', String(6 * 7)); console.log('verified');",
+        )
+        .unwrap();
+        let result = RunProjectCommandHandler::new().execute(
+            &serde_json::json!({
+                "command": "npm", "args": ["--offline", "--silent", "run", "verify"],
+                "timeout_seconds": 15
+            }),
+            dir.path(),
+        );
+        assert!(result.success, "{}", result.content);
+        let receipt: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(receipt["stdout"].as_str().unwrap().trim(), "verified");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("verified.txt")).unwrap(),
+            "42"
+        );
+        let unsafe_arg = RunProjectCommandHandler::new().execute(
+            &serde_json::json!({
+                "command": "npm", "args": ["--offline", "--silent", "run", "missing&echo injected>unexpected.txt"],
+                "timeout_seconds": 15
+            }),
+            dir.path(),
+        );
+        assert!(!unsafe_arg.success);
+        assert!(!dir.path().join("unexpected.txt").exists());
+    }
+
+    #[test]
+    fn project_command_can_read_a_local_git_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = RunProjectCommandHandler::new();
+        let run = |args: &[&str]| {
+            handler.execute(
+                &serde_json::json!({"command": "git", "args": args}),
+                dir.path(),
+            )
+        };
+        let init = run(&["init"]);
+        assert!(init.success, "{}", init.content);
+        let read = run(&["-C", ".", "rev-parse", "--is-inside-work-tree"]);
+        assert!(read.success, "{}", read.content);
+        let receipt: serde_json::Value = serde_json::from_str(&read.content).unwrap();
+        assert_eq!(receipt["stdout"].as_str().unwrap().trim(), "true");
+    }
+
+    #[test]
     fn workspace_file_interface_lists_and_organizes_through_the_same_seam() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("draft.txt"), "hello").unwrap();
@@ -343,12 +526,25 @@ mod tests {
         let command = RunProjectCommandHandler::new();
         for arguments in [
             serde_json::json!({ "command": "python3", "args": ["-c", "print('unsafe')"] }),
+            serde_json::json!({ "command": "python", "args": ["-cprint(42)"] }),
+            serde_json::json!({ "command": "python", "args": ["-Icprint(42)"] }),
             serde_json::json!({ "command": "git", "args": ["-C", "..", "status"] }),
+            serde_json::json!({ "command": "git", "args": ["-c", "alias.probe=!echo unsafe", "probe"] }),
+            serde_json::json!({ "command": "git", "args": ["-C", ".", "-c", "alias.probe=!echo unsafe", "probe"] }),
+            serde_json::json!({ "command": "git", "args": ["--config-env=alias.probe=SYNTHETIC", "probe"] }),
+            serde_json::json!({ "command": "git", "args": ["--git-dir=/outside", "status"] }),
             serde_json::json!({ "command": "node", "args": ["--eval", "console.log(1)"] }),
+            serde_json::json!({ "command": "node", "args": ["--eval=console.log(1)"] }),
+            serde_json::json!({ "command": "deno", "args": ["eval", "console.log(1)"] }),
         ] {
             let result = command.execute(&arguments, Path::new("."));
             assert!(!result.success);
-            assert!(result.content.contains("内联解释器") || result.content.contains("父目录"));
+            assert!(
+                result.content.contains("项目命令不能"),
+                "{}",
+                result.content
+            );
+            assert!(!result.requires_user_review());
         }
     }
 
@@ -493,14 +689,21 @@ mod tests {
 
     // ─── Memory handlers (with DB) ──────────────────────────────────────────
 
+    fn migrated_memory_db() -> Arc<Mutex<rusqlite::Connection>> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrate(&conn).unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
     #[test]
     fn test_remember_fact_handler() {
-        let (_db, arc) = db();
+        let arc = migrated_memory_db();
         let h = RememberFactHandler {
             db: Some(arc.clone()),
         };
         let result = h.execute(&serde_json::json!({"content": "用户喜欢 Python", "category": "preference", "importance": 7}), Path::new("."));
-        assert!(result.success);
+        assert!(result.success, "{}", result.content);
         assert!(result.content.contains("已记住"));
         // Check DB
         let db = arc.lock().unwrap();
@@ -516,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_remember_fact_importance_capped() {
-        let (_db, arc) = db();
+        let arc = migrated_memory_db();
         let h = RememberFactHandler {
             db: Some(arc.clone()),
         };
@@ -524,7 +727,7 @@ mod tests {
             &serde_json::json!({"content": "test", "importance": 10}),
             Path::new("."),
         );
-        assert!(result.success);
+        assert!(result.success, "{}", result.content);
         let db = arc.lock().unwrap();
         let imp: i32 = db
             .query_row(
@@ -538,10 +741,7 @@ mod tests {
 
     #[test]
     fn test_recall_memories_handler() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        crate::db::migrate(&conn).unwrap();
-        let arc = Arc::new(Mutex::new(conn));
+        let arc = migrated_memory_db();
         // Insert a test memory
         {
             let db = arc.lock().unwrap();
@@ -564,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_update_memory_handler() {
-        let (_db, arc) = db();
+        let arc = migrated_memory_db();
         {
             let db = arc.lock().unwrap();
             db.execute("INSERT INTO memories (id,scope,category,content,importance,source,forget_stage,created_at,updated_at)
@@ -577,7 +777,7 @@ mod tests {
             &serde_json::json!({"memory_id": "m1", "new_content": "新内容"}),
             Path::new("."),
         );
-        assert!(result.success);
+        assert!(result.success, "{}", result.content);
         let db = arc.lock().unwrap();
         let content: String = db
             .query_row("SELECT content FROM memories WHERE id='m1'", [], |r| {
@@ -589,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_forget_memory_handler() {
-        let (_db, arc) = db();
+        let arc = migrated_memory_db();
         {
             let db = arc.lock().unwrap();
             db.execute("INSERT INTO memories (id,scope,category,content,importance,source,forget_stage,created_at,updated_at)
@@ -599,7 +799,7 @@ mod tests {
             db: Some(arc.clone()),
         };
         let result = h.execute(&serde_json::json!({"memory_id": "m1"}), Path::new("."));
-        assert!(result.success);
+        assert!(result.success, "{}", result.content);
         let db = arc.lock().unwrap();
         let stage: String = db
             .query_row("SELECT forget_stage FROM memories WHERE id='m1'", [], |r| {

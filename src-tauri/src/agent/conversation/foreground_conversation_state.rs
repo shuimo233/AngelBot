@@ -8,10 +8,9 @@
 
 use crate::agent::compaction::{CompactionHook, CompactionOutcome};
 use crate::agent::config::AgentConfig;
+use crate::agent::prompt::{PromptBuilder, TurnClock};
 use crate::agent::runner::{AgentMessage, AgentStep};
-use crate::agent::task_facts::{
-    PendingConfirmationFact, TaskFacts, TaskTerminalReason, VerificationEvidence,
-};
+use crate::agent::task_facts::{PendingConfirmationFact, TaskFacts, TaskTerminalReason};
 use crate::llm::{Message as LlmMessage, ToolSchema};
 use chrono::Utc;
 
@@ -73,13 +72,31 @@ impl ForegroundConversationState {
         user_message: &str,
         history: ForegroundHistory<'_>,
     ) -> Vec<LlmMessage> {
-        let system_prompt =
-            crate::agent::prompt::build_agent_system_prompt(config, tool_schemas, prompt_snippets);
+        Self::initial_context_with_turn_clock(
+            config,
+            tool_schemas,
+            prompt_snippets,
+            user_message,
+            history,
+            None,
+        )
+    }
+
+    pub(crate) fn initial_context_with_turn_clock(
+        config: &AgentConfig,
+        tool_schemas: &[ToolSchema],
+        prompt_snippets: &[(String, String)],
+        user_message: &str,
+        history: ForegroundHistory<'_>,
+        turn_clock: Option<TurnClock>,
+    ) -> Vec<LlmMessage> {
+        let system_prompt = PromptBuilder::new(config, tool_schemas, prompt_snippets)
+            .build_with_inline_clock(turn_clock.is_none());
         let history_len = match history {
             ForegroundHistory::Flat(history) => history.len(),
             ForegroundHistory::Native(history) => history.len(),
         };
-        let mut messages = Vec::with_capacity(history_len + 2);
+        let mut messages = Vec::with_capacity(history_len + 2 + usize::from(turn_clock.is_some()));
         messages.push(AgentMessage::System(system_prompt).to_llm_message());
 
         match history {
@@ -89,9 +106,19 @@ impl ForegroundConversationState {
                     _ => AgentMessage::User(content.clone()).to_llm_message(),
                 }));
             }
-            ForegroundHistory::Native(history) => messages.extend(history.iter().cloned()),
+            ForegroundHistory::Native(history) => messages.extend(
+                history
+                    .iter()
+                    .filter(|message| {
+                        turn_clock.is_some() || TurnClock::from_message(message).is_none()
+                    })
+                    .cloned(),
+            ),
         }
 
+        if let Some(clock) = turn_clock {
+            messages.push(clock.to_message());
+        }
         messages.push(AgentMessage::User(user_message.to_string()).to_llm_message());
         messages
     }
@@ -158,7 +185,17 @@ pub(crate) fn task_facts_from_steps(user_message: &str, steps: &[AgentStep]) -> 
         }
 
         if !step.success {
-            failed_operations.push(step);
+            if step.confirmation_required
+                || step.confirmation_status.is_some()
+                || !crate::agent::compaction::retained_original_history_receipt(
+                    &step.tool_name,
+                    &step.call_id,
+                    &step.arguments,
+                    &step.output,
+                )
+            {
+                failed_operations.push(step);
+            }
             continue;
         }
 
@@ -178,28 +215,7 @@ pub(crate) fn task_facts_from_steps(user_message: &str, steps: &[AgentStep]) -> 
             )
         });
 
-        match step.tool_name.as_str() {
-            "write_file" | "create_directory" => {
-                let path = step
-                    .arguments
-                    .get("path")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(&step.tool_name);
-                facts.record_project_mutation(path.to_string());
-            }
-            "run_project_command" => facts.verification_evidence.push(VerificationEvidence {
-                command: step
-                    .arguments
-                    .get("command")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("run_project_command")
-                    .to_string(),
-                exit_code: 0,
-                summary: step.output.clone(),
-                verified_at: Utc::now().timestamp(),
-            }),
-            _ => {}
-        }
+        facts.record_successful_project_step(&step.tool_name, &step.arguments, &step.output);
     }
     facts.failed_steps = failed_operations
         .iter()
@@ -281,5 +297,48 @@ mod tests {
             preserved[0].arguments,
             serde_json::json!({"path": "src/lib.rs"})
         );
+    }
+
+    #[test]
+    fn turn_clock_keeps_the_prior_input_and_appends_the_current_local_time() {
+        let first_clock = TurnClock::parse("2026-11-11T23:59:00+08:00").unwrap();
+        let next_clock = TurnClock::parse("2026-11-12T00:01:00+08:00").unwrap();
+        let config = AgentConfig::default();
+        let first = ForegroundConversationState::initial_context_with_turn_clock(
+            &config,
+            &[],
+            &[],
+            "first turn",
+            ForegroundHistory::Native(&[]),
+            Some(first_clock),
+        );
+        let continued = ForegroundConversationState::initial_context_with_turn_clock(
+            &config,
+            &[],
+            &[],
+            "next turn",
+            ForegroundHistory::Native(&first[1..]),
+            Some(next_clock),
+        );
+
+        assert!(!first[0].content.contains("## 当前时间"));
+        assert!(first[0].content.contains("以最新标记解释当前请求"));
+        assert_eq!(first[0].content, continued[0].content);
+        assert_eq!(first[1].content, continued[1].content);
+        assert!(!first[1].content.contains("解释当前请求"));
+        assert_eq!(TurnClock::from_message(&continued[1]), Some(first_clock));
+        assert_eq!(continued[2].content, "first turn");
+        assert_eq!(TurnClock::from_message(&continued[3]), Some(next_clock));
+        assert_eq!(continued[4].content, "next turn");
+
+        let inline = ForegroundConversationState::initial_context(
+            &config,
+            &[],
+            &[],
+            "without turn clock",
+            ForegroundHistory::Native(&first[1..]),
+        );
+        assert!(inline[0].content.contains("## 当前时间"));
+        assert_eq!(inline[1].content, "first turn");
     }
 }

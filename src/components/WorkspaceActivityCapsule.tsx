@@ -1,16 +1,37 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { dismissWorkspaceTaskReminders } from '$lib/commands/workspace-activity';
+import { useMessagesStore } from '$stores/messages';
 import { useWorkspacesStore } from '$stores/workspaces';
 import { useWorkspaceActivityStore } from '$stores/workspaceActivity';
+import { CompletedFileTask, latestCompletedFileTask } from './CompletedFileTask';
+import { latestResultToReview } from './ChatArea/pendingResultReview';
 
 export function WorkspaceActivityCapsule({
   mode = 'capsule',
   onReturnToConversation,
+  onReturnToResultReview,
+  reviewInConversation = false,
+  workbenchOpen = false,
+  onOpenTasks,
 }: {
   mode?: 'capsule' | 'panel';
   onReturnToConversation?: () => void;
+  onReturnToResultReview?: (messageId: string) => void;
+  reviewInConversation?: boolean;
+  workbenchOpen?: boolean;
+  onOpenTasks?: () => void;
 }) {
   const workspaceId = useWorkspacesStore((state) => state.activeWorkspaceId);
   const sessionId = useWorkspacesStore((state) => state.workspaces.find((item) => item.id === workspaceId)?.activeSessionId);
+  const messages = useMessagesStore((state) => mode === 'panel' ? state.messages : null);
+  const completedFileTask = useMemo(
+    () => messages && sessionId ? latestCompletedFileTask(messages, sessionId) : null,
+    [messages, sessionId],
+  );
+  const resultToCheck = useMemo(
+    () => messages ? latestResultToReview(messages, sessionId) : undefined,
+    [messages, sessionId],
+  );
   const projection = useWorkspaceActivityStore((state) => state.projection);
   const refresh = useWorkspaceActivityStore((state) => state.refresh);
   const observe = useWorkspaceActivityStore((state) => state.observe);
@@ -18,6 +39,8 @@ export function WorkspaceActivityCapsule({
   const isLoading = useWorkspaceActivityStore((state) => state.isLoading) && scopeMatches;
   const error = useWorkspaceActivityStore((state) => state.error);
   const visibleError = scopeMatches ? error : null;
+  const [dismissing, setDismissing] = useState(false);
+  const [dismissError, setDismissError] = useState<{ workspaceId: string; text: string } | null>(null);
 
   useEffect(() => {
     if (workspaceId && sessionId) return observe(workspaceId, sessionId);
@@ -30,12 +53,27 @@ export function WorkspaceActivityCapsule({
   const pending = visibleProjection?.pendingDecisions.length ?? 0;
   const attention = visibleProjection?.attention ?? null;
   const attentionCount = attention?.openCount ?? 0;
-  const active = work.filter((item) => !['completed', 'failed', 'cancelled'].includes(item.status)).length;
-  const activeWork = useMemo(
-    () => work.filter((item) => !['completed', 'failed', 'cancelled'].includes(item.status)).slice(0, 3),
-    [work],
-  );
+  const retryReminderIds = attention?.retryReminderIds ?? [];
+  const retriesOnly = attentionCount > 0 && retryReminderIds.length === attentionCount;
+  const unsettledWork = work.filter((item) => !isTerminalWorkStatus(item.status));
+  const unknown = unsettledWork.filter((item) => item.status === 'unknown').length;
+  const active = unsettledWork.length - unknown;
   const pendingDecisions = visibleProjection?.pendingDecisions ?? [];
+
+  const dismissReminders = async () => {
+    if (!workspaceId || !sessionId || !retryReminderIds.length || dismissing) return;
+    setDismissing(true);
+    setDismissError(null);
+    try {
+      await dismissWorkspaceTaskReminders(workspaceId, sessionId, retryReminderIds);
+      await refresh(workspaceId);
+    } catch (reason) {
+      setDismissError({ workspaceId, text: reason instanceof Error ? reason.message
+        : typeof reason === 'string' ? reason : '无法关闭任务提醒，请重试。' });
+    } finally {
+      setDismissing(false);
+    }
+  };
 
   if (mode === 'capsule' && !visibleProjection && visibleError) {
     return (
@@ -63,12 +101,13 @@ export function WorkspaceActivityCapsule({
   }
   // Historical Main work remains in the workbench and its header count. Do not
   // keep an old recovery card above the composer or flash loading on each visit.
-  if (mode === 'capsule' && active === 0 && pending === 0 && !visibleError) return null;
+  if (mode === 'capsule' && unsettledWork.length === 0 && pending === 0 && !visibleError) return null;
 
   const label = pending > 0
     ? `AngelBot 有 ${pending} 项需要和你确认`
     : active > 0 ? `AngelBot 正在处理 ${active} 项工作`
-      : `AngelBot 有 ${attentionCount} 项工作需要继续处理`;
+      : unknown > 0 ? `AngelBot 有 ${unknown} 项工作状态未确认`
+        : `AngelBot 有 ${attentionCount} 项工作需要继续处理`;
 
   if (mode === 'panel') {
     const shownDetails = new Map(work.slice(0, 8).map((item) => [
@@ -77,10 +116,7 @@ export function WorkspaceActivityCapsule({
     return (
       <section className="workspace-activity-panel" aria-label="任务与委派">
         <div className="workspace-activity-panel__header">
-          <div>
-            <span className="workspace-activity-panel__eyebrow">实时工作状态</span>
-            <h2>任务与委派</h2>
-          </div>
+          <h2>任务与委派</h2>
           <button type="button" onClick={() => workspaceId && void refresh(workspaceId)} disabled={!workspaceId || isLoading}>
             {isLoading ? '刷新中…' : '刷新'}
           </button>
@@ -88,7 +124,6 @@ export function WorkspaceActivityCapsule({
         {!workspaceId && (
           <div className="workspace-activity-panel__empty">
             <strong>尚未选择工作区</strong>
-            <span>选择个人空间或项目后查看对应工作。</span>
           </div>
         )}
         {workspaceId && visibleError && (
@@ -98,19 +133,27 @@ export function WorkspaceActivityCapsule({
             <button type="button" onClick={() => void refresh(workspaceId)}>重新检查</button>
           </div>
         )}
-        {workspaceId && !visibleError && !isLoading && work.length === 0 && pending === 0 && attentionCount === 0 && (
+        {workspaceId && !visibleError && !isLoading && work.length === 0 && pending === 0 && attentionCount === 0 && !completedFileTask && !(resultToCheck && onReturnToResultReview) && (
           <div className="workspace-activity-panel__empty">
             <strong>当前没有进行中的工作</strong>
-            <span>让主 Agent 处理复杂任务时，委派、审校、待确认和需要继续处理的事项会显示在这里。</span>
+          </div>
+        )}
+        {resultToCheck && onReturnToResultReview && (
+          <div className="workspace-activity-panel__attention">
+            {resultToCheck.taskRun?.goal.trim() && <p>{resultToCheck.taskRun.goal.trim().slice(0, 160)}</p>}
+            <button type="button" onClick={() => onReturnToResultReview(resultToCheck.id)}>回对话核对结果</button>
           </div>
         )}
         {workspaceId && attention && (
           <div className="workspace-activity-panel__attention" role="status">
-            <h3>需要继续处理（{attention.openCount}）</h3>
-            <p>{attention.message}</p>
-            {onReturnToConversation && (
-              <button type="button" onClick={onReturnToConversation}>回到对话</button>
-            )}
+            <h3>{retriesOnly ? '执行失败提醒' : '需要继续处理'}（{attention.openCount}）</h3>
+            <p>{retriesOnly ? '这些任务此前执行失败。可以回到对话查看记录。' : attention.message}</p>
+            <div className="workspace-activity-panel__reminder-actions">
+              {onReturnToConversation && <button type="button" onClick={onReturnToConversation}>回到对话</button>}
+              {!visibleError && retryReminderIds.length > 0 && <button type="button" disabled={dismissing || isLoading}
+                onClick={() => void dismissReminders()}>{dismissing ? '正在关闭提醒…' : retryReminderIds.length > 1 ? '关闭这批失败提醒' : '不再提醒'}</button>}
+            </div>
+            {dismissError?.workspaceId === workspaceId && <p role="alert">{dismissError.text}</p>}
           </div>
         )}
         {workspaceId && work.length > 0 && (
@@ -146,23 +189,36 @@ export function WorkspaceActivityCapsule({
             ))}
           </div>
         )}
+        {completedFileTask && <CompletedFileTask key={completedFileTask.id} task={completedFileTask} />}
       </section>
+    );
+  }
+
+  const compactReview = reviewInConversation && Boolean(onOpenTasks);
+  if (compactReview && unknown > 0 && active === 0 && pending === 0 && !visibleError) {
+    if (workbenchOpen) return null;
+    return (
+      <div className="workspace-activity-capsule workspace-activity-capsule--shortcut">
+        <button className="workspace-activity-capsule__retry" type="button" onClick={onOpenTasks}>查看任务状态（{unknown} 项）</button>
+      </div>
     );
   }
 
   return (
     <section className="workspace-activity-capsule" role="status" aria-live="polite">
-      <span className="workspace-activity-capsule__dot" aria-hidden="true" />
+      {(pending > 0 || active > 0) && <span className="workspace-activity-capsule__dot" aria-hidden="true" />}
       <div className="workspace-activity-capsule__body">
         {visibleError && <strong role="alert">任务状态暂未更新；以下为上次记录，不代表仍在执行。</strong>}
         <span>{visibleError ? `上次记录：${label}` : label}</span>
+        {unknown > 0 && (pending > 0 || active > 0) && !compactReview && <span>另有 {unknown} 项工作状态未确认</span>}
+        {unknown > 0 && onOpenTasks && !visibleError && <button className="workspace-activity-capsule__retry" type="button" onClick={onOpenTasks}>查看任务状态（{unknown} 项）</button>}
         {visibleError && workspaceId && <button type="button" onClick={() => void refresh(workspaceId)}>重新检查</button>}
-        {activeWork.map((item) => (
+        {unsettledWork.filter((item) => !compactReview || visibleError || item.status !== 'unknown').slice(0, 3).map((item) => (
           <div className="workspace-activity-capsule__item" key={item.id}>
             <span className="workspace-activity-capsule__goal">{item.goal}</span>
             <span className="workspace-activity-capsule__stage">
               {reviewerStatusLabelForActiveWork(item.status, item.reviewerStatus, 'compact')
-                ?? (item.status === 'needsDecision' ? statusLabel(item.status) : item.activity ?? statusLabel(item.status))}
+                ?? (item.status === 'needsDecision' || item.status === 'unknown' ? statusLabel(item.status) : item.activity ?? statusLabel(item.status))}
             </span>
           </div>
         ))}
@@ -198,6 +254,7 @@ function statusLabel(status: string): string {
     completed: '已完成',
     failed: '未完成',
     cancelled: '已取消',
+    unknown: '状态未确认',
   };
   return labels[status] ?? '处理中';
 }
@@ -217,6 +274,7 @@ function workDetailLabel(
   summary: string | null,
 ): string {
   if (isTerminalWorkStatus(status)) return terminalWorkDetail(status);
+  if (status === 'unknown') return '暂时无法确认这项工作是否仍在执行，请刷新后核对。';
   if (status === 'needsDecision' && !reviewerStatus) return summary ?? '执行需要处理，暂无可交付结果';
   return reviewerStatusLabelForActiveWork(status, reviewerStatus) ?? activity ?? summary ?? '等待下一步状态';
 }
@@ -235,7 +293,7 @@ function reviewerStatusLabelForActiveWork(
   reviewerStatus: string | null,
   mode: 'detail' | 'compact' = 'detail',
 ): string | null {
-  return isTerminalWorkStatus(status) ? null : reviewerStatusLabel(reviewerStatus, mode);
+  return isTerminalWorkStatus(status) || status === 'unknown' ? null : reviewerStatusLabel(reviewerStatus, mode);
 }
 
 function reviewerStatusLabel(status: string | null, mode: 'detail' | 'compact' = 'detail'): string | null {

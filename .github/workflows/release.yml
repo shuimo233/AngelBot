@@ -7,28 +7,89 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v-prefixed Git tag to release
+        description: Existing stable tag (vX.Y.Z) to release from main
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  windows:
-    name: Build signed Windows installers
-    runs-on: windows-latest
-    timeout-minutes: 45
-
+  source:
+    name: Verify stable release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.input.outputs.tag }}
+      commit: ${{ steps.input.outputs.commit }}
     steps:
-      - name: Check out release tag
+      - name: Check out protected main history and tags
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag ref and commit
+        id: input
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          GIT_NO_REPLACE_OBJECTS: '1'
+        run: |
+          fail() { printf '::error::%s\n' "$1" >&2; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/* ]]; then
+            tag=${GITHUB_REF#refs/tags/}
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/main ]]; then
+            tag=$REQUESTED_TAG
+          else
+            fail 'Stable releases require a tag push or a manual run from main.'
+          fi
+
+          stable_tag='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$tag" =~ $stable_tag ]] || fail 'Stable release tag must use vX.Y.Z.'
+          tag_ref="refs/tags/$tag"
+          main_ref=refs/remotes/origin/main
+          git show-ref --verify --quiet "$tag_ref" || fail 'The exact release tag does not exist.'
+          git show-ref --verify --quiet "$main_ref" || fail 'Cannot find fetched origin/main.'
+          commit=$(git rev-parse --verify "${tag_ref}^{commit}") || fail 'Release tag must resolve to a commit.'
+          git merge-base --is-ancestor "$commit" "$main_ref" || fail 'Release tag commit is outside origin/main history.'
+
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            event_commit=$(git rev-parse --verify "${GITHUB_SHA}^{commit}") || fail 'Cannot resolve the tag push commit.'
+            [[ "$commit" == "$event_commit" ]] || fail 'Release tag moved after the push.'
+          fi
+          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Build Windows installer and signed updater artifacts
+    needs: source
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out verified release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate release version and packaging
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.source.outputs.tag }}
+        run: python scripts/release.py check --tag $env:RELEASE_TAG
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -36,11 +97,6 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: package-lock.json
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -52,23 +108,26 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Fetch locked Cargo dependencies
+        run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Validate release inputs
-        shell: pwsh
-        env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
-        run: |
-          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'TAURI_SIGNING_PRIVATE_KEY secret is required' }
-          if (-not $env:TAURI_UPDATER_PUBLIC_KEY) { throw 'TAURI_UPDATER_PUBLIC_KEY repository variable is required' }
-          python scripts/release.py check --tag $env:RELEASE_TAG
-          python scripts/release.py write-updater-config
-
       - name: Run canonical verification
         run: python scripts/verify.py full
+
+      - name: Write updater configuration
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: python scripts/release.py write-updater-config
+
+      - name: Require updater signing key
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'TAURI_SIGNING_PRIVATE_KEY secret is required' }
 
       - name: Build installers and draft release
         uses: tauri-apps/tauri-action@v0
@@ -77,7 +136,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          tagName: ${{ needs.source.outputs.tag }}
+          releaseCommitish: ${{ needs.source.outputs.commit }}
           releaseName: 'AngelBot __VERSION__'
           releaseBody: 'Windows installers and signed update artifacts. Complete the release smoke test before publishing this draft.'
           releaseDraft: true

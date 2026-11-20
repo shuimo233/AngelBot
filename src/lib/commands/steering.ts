@@ -1,9 +1,7 @@
 import { invoke } from '$lib/invoke';
 
-export type SteeringMode = 'steer' | 'follow_up' | 'abort';
-
-export const submitInProgressCommand = (sessionId: string, content: string, mode: SteeringMode) =>
-  invoke<void>('submit_in_progress_command', { sessionId, content, mode });
+export const submitSteeringMessage = (sessionId: string, replyId: string, content: string) =>
+  invoke<void>('submit_in_progress_command', { sessionId, replyId, content, mode: 'steer' });
 
 export const pauseAgent = (sessionId: string) => invoke<void>('pause_agent', { sessionId });
 export const resumeAgent = (sessionId: string) => invoke<void>('resume_agent', { sessionId });
