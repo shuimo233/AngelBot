@@ -8,6 +8,7 @@ on:
       - '.github/workflows/installer-candidate.yml'
       - '.github/workflows/release.yml'
       - 'scripts/installed_desktop_smoke.mjs'
+      - 'scripts/installed_desktop_uia.ps1'
       - 'scripts/release.py'
       - 'src-tauri/tauri.conf.json'
 
